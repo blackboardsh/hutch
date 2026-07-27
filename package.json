@@ -1,0 +1,17 @@
+{
+  "name": "@blackboard/hutch",
+  "version": "0.2.0-canary.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "package:release": "node scripts/package-release.js",
+    "publish:release": "node scripts/upload-release-r2.js --all",
+    "test:release": "node --test scripts/release-contract.test.js scripts/release-version.test.js",
+    "release": "node scripts/tag-release.js",
+    "build": "bash scripts/build.sh",
+    "build:release": "bash scripts/build.sh build -Doptimize=ReleaseSmall -Dcpu=baseline",
+    "run": "bash scripts/run.sh",
+    "test": "bash scripts/test.sh"
+  }
+}
