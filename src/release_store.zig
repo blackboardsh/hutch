@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const version_selector = @import("version_selector.zig");
 
-const default_artifacts_base_url = "https://hutch.blackboard.sh";
+const default_hutch_artifacts_base_url = "https://hutch.blackboard.sh";
+const default_cottontail_artifacts_base_url = "https://electrobun-artifacts.blackboard.sh";
 const manifest_schema = 1;
 const max_manifest_bytes = 1024 * 1024;
 const max_archive_bytes = 256 * 1024 * 1024;
@@ -30,6 +31,13 @@ pub const Product = enum {
         return switch (self) {
             .hutch => if (builtin.os.tag == .windows) "hutch-engine.exe" else "hutch-engine",
             .cottontail => if (builtin.os.tag == .windows) "cottontail.exe" else "cottontail",
+        };
+    }
+
+    fn defaultArtifactsBaseUrl(self: Product) []const u8 {
+        return switch (self) {
+            .hutch => default_hutch_artifacts_base_url,
+            .cottontail => default_cottontail_artifacts_base_url,
         };
     }
 };
@@ -87,7 +95,7 @@ pub fn resolve(
             return active;
         }
     }
-    const base_url = try artifactsBaseUrl(init, allocator);
+    const base_url = try artifactsBaseUrl(init, allocator, product);
     const artifact = try resolveArtifact(init, allocator, home, base_url, product, selector, options);
     const platform = try platformKey();
     const root = try std.fs.path.join(allocator, &.{
@@ -199,7 +207,7 @@ pub fn checkForUpdate(
         product,
         channel,
     )) orelse return null;
-    const base_url = try artifactsBaseUrl(init, allocator);
+    const base_url = try artifactsBaseUrl(init, allocator, product);
     const selector = try version_selector.parse(channel);
     const channel_url = try std.fmt.allocPrint(
         allocator,
@@ -288,8 +296,13 @@ pub fn platformKey() ![]const u8 {
     };
 }
 
-fn artifactsBaseUrl(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    const configured = init.environ_map.get("DASH_ARTIFACTS_BASE_URL") orelse default_artifacts_base_url;
+fn artifactsBaseUrl(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: Product,
+) ![]const u8 {
+    const configured = init.environ_map.get("DASH_ARTIFACTS_BASE_URL") orelse
+        product.defaultArtifactsBaseUrl();
     const trimmed = std.mem.trimEnd(u8, configured, "/");
     if (!std.mem.startsWith(u8, trimmed, "https://") and
         !std.mem.startsWith(u8, trimmed, "http://127.0.0.1") and
@@ -298,6 +311,17 @@ fn artifactsBaseUrl(init: std.process.Init, allocator: std.mem.Allocator) ![]con
         return error.InvalidArtifactsBaseUrl;
     }
     return allocator.dupe(u8, trimmed);
+}
+
+test "products use their canonical artifact origins by default" {
+    try std.testing.expectEqualStrings(
+        "https://hutch.blackboard.sh",
+        Product.hutch.defaultArtifactsBaseUrl(),
+    );
+    try std.testing.expectEqualStrings(
+        "https://electrobun-artifacts.blackboard.sh",
+        Product.cottontail.defaultArtifactsBaseUrl(),
+    );
 }
 
 fn activeResolution(
