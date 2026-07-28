@@ -166,13 +166,12 @@ Archives contain only `bin/hutch`, `bin/hutch-engine`, and release metadata. The
 mutable channel pointer is written after every immutable archive and manifest.
 Tags are the only workflow trigger.
 
-The R2 publisher accepts `HUTCH_R2_ACCOUNT_ID`,
-`HUTCH_R2_ACCESS_KEY_ID`, `HUTCH_R2_SECRET_ACCESS_KEY`, and
-`HUTCH_R2_PUBLIC_BASE_URL`. In CircleCI, the shared `R2_ENDPOINT`,
-`R2_ACCESS_KEY_ID`, and
-`R2_SECRET_ACCESS_KEY` settings are sufficient; the account ID is derived from
-the endpoint and the public URL defaults to
-`https://hutch.blackboard.sh`.
+The R2 publisher uses the Dash Cloud CircleCI project's shared `R2_ENDPOINT`,
+`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` settings. Those credentials must
+have object-write access to the `electrobun-artifacts` bucket. The account ID is
+derived from the endpoint unless `R2_ACCOUNT_ID` is set explicitly. The public
+URL defaults to `https://hutch.blackboard.sh` and can be overridden independently
+with `HUTCH_PUBLIC_BASE_URL`.
 
 ## Commands
 

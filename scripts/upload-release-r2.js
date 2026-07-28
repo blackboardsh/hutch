@@ -181,9 +181,7 @@ if (!dryRun) {
     "R2_PUBLIC_BASE_URL",
   ].filter((name) => !setting(name));
   if (missing.length > 0) {
-    fail(
-      `missing R2 settings: ${missing.map((name) => `HUTCH_${name}`).join(", ")}`,
-    );
+    fail(`missing R2 settings: ${missing.join(", ")}`);
   }
 }
 

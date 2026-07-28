@@ -3,24 +3,19 @@ import test from "node:test";
 
 import { accountIdFromEndpoint, r2Setting } from "./r2-settings.js";
 
-test("prefers Hutch artifact credentials", () => {
+test("uses the shared R2 credentials", () => {
+  assert.equal(r2Setting("R2_ACCESS_KEY_ID", {
+    R2_ACCESS_KEY_ID: "generic",
+  }), "generic");
+});
+
+test("does not select legacy product-prefixed credentials", () => {
   assert.equal(r2Setting("R2_ACCESS_KEY_ID", {
     HUTCH_R2_ACCESS_KEY_ID: "hutch",
     DASH_CLI_R2_ACCESS_KEY_ID: "dash-cli",
     COTTONTAIL_R2_ACCESS_KEY_ID: "cottontail",
     R2_ACCESS_KEY_ID: "generic",
-  }), "hutch");
-});
-
-test("accepts existing artifact credentials before generic deployment credentials", () => {
-  assert.equal(r2Setting("R2_ACCESS_KEY_ID", {
-    DASH_CLI_R2_ACCESS_KEY_ID: "dash-cli",
-    R2_ACCESS_KEY_ID: "generic",
-  }), "dash-cli");
-  assert.equal(r2Setting("R2_SECRET_ACCESS_KEY", {
-    COTTONTAIL_R2_SECRET_ACCESS_KEY: "cottontail",
-    R2_SECRET_ACCESS_KEY: "generic",
-  }), "cottontail");
+  }), "generic");
 });
 
 test("falls back to generic settings and derives the account ID", () => {
@@ -30,6 +25,10 @@ test("falls back to generic settings and derives the account ID", () => {
   assert.equal(r2Setting("R2_ACCESS_KEY_ID", { R2_ACCESS_KEY_ID: "generic" }), "generic");
 });
 
-test("defaults the public URL to the Hutch custom domain", () => {
+test("keeps the Hutch public URL independent from R2 API settings", () => {
   assert.equal(r2Setting("R2_PUBLIC_BASE_URL", {}), "https://hutch.blackboard.sh");
+  assert.equal(r2Setting("R2_PUBLIC_BASE_URL", {
+    HUTCH_PUBLIC_BASE_URL: "https://preview.hutch.example",
+    R2_PUBLIC_BASE_URL: "https://dash-data.example",
+  }), "https://preview.hutch.example");
 });
