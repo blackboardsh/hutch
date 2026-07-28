@@ -14,6 +14,7 @@ import {
   createBuildManifest,
   createChannelManifest,
   createReleaseManifest,
+  installerKey,
   releaseManifestKey,
   validateReleaseTag,
   validateRevision,
@@ -251,13 +252,7 @@ for (const [name, contentType] of [
 ]) {
   const body = readFileSync(join(hutchRoot, "scripts", name));
   await putObject(config, {
-    key: `${product}/${name}`,
-    body,
-    contentType,
-    cacheControl: "no-cache, no-store, must-revalidate",
-  });
-  await putObject(config, {
-    key: name,
+    key: installerKey(product, name),
     body,
     contentType,
     cacheControl: "no-cache, no-store, must-revalidate",

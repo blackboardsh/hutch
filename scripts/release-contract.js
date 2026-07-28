@@ -67,6 +67,13 @@ export function channelManifestKey(product, channel) {
   return `${product}/channels/${channel}.json`;
 }
 
+export function installerKey(product, name) {
+  if (name !== "install.sh" && name !== "install.ps1") {
+    throw new Error(`Unsupported installer: ${name}`);
+  }
+  return `${product}/${name}`;
+}
+
 function platformManifest({ product, revision, publicBaseUrl, artifacts }) {
   const byPlatform = new Map(artifacts.map((artifact) => [artifact.platform, artifact]));
   const missing = RELEASE_PLATFORMS.filter((platform) => !byPlatform.has(platform));

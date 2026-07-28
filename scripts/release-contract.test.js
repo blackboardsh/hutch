@@ -6,6 +6,7 @@ import {
   createBuildManifest,
   createChannelManifest,
   createReleaseManifest,
+  installerKey,
   releaseChannel,
   validateReleaseTag,
 } from "./release-contract.js";
@@ -42,6 +43,12 @@ test("Hutch tags are product-scoped in the monorepo", () => {
     channel: "production",
   });
   assert.throws(() => validateReleaseTag("v1.2.3", "1.2.3"), /does not match/);
+});
+
+test("installers remain inside the Hutch bucket prefix", () => {
+  assert.equal(installerKey("hutch", "install.sh"), "hutch/install.sh");
+  assert.equal(installerKey("hutch", "install.ps1"), "hutch/install.ps1");
+  assert.throws(() => installerKey("hutch", "../install.sh"), /Unsupported installer/);
 });
 
 test("build and release manifests reference one archive copy", () => {

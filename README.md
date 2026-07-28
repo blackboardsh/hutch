@@ -160,11 +160,14 @@ hutch/builds/<revision>/<platform>/hutch.tar.gz
 hutch/builds/<revision>/manifest.json
 hutch/releases/<version>/manifest.json
 hutch/channels/<production|canary>.json
+hutch/install.sh
+hutch/install.ps1
 ```
 
 Archives contain only `bin/hutch`, `bin/hutch-engine`, and release metadata. The
 mutable channel pointer is written after every immutable archive and manifest.
-Tags are the only workflow trigger.
+Every published object remains under the `hutch/` bucket prefix. Tags are the
+only workflow trigger.
 
 The R2 publisher uses the Dash Cloud CircleCI project's shared `R2_ENDPOINT`,
 `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` settings. Those credentials must
