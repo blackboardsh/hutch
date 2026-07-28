@@ -16,20 +16,20 @@ it is not embedded in or version-locked to a Hutch release.
 Install the current production release on macOS or Linux:
 
 ```sh
-curl -fsSL https://hutch.blackboard.sh/install.sh | sh
+curl -fsSL https://hutch.blackboard.sh/hutch/install.sh | sh
 ```
 
 Install the canary target alongside production as `hutch-canary`:
 
 ```sh
-curl -fsSL https://hutch.blackboard.sh/install.sh |
+curl -fsSL https://hutch.blackboard.sh/hutch/install.sh |
   sh -s -- --channel canary
 ```
 
 On Windows:
 
 ```powershell
-& ([scriptblock]::Create((irm https://hutch.blackboard.sh/install.ps1)))
+& ([scriptblock]::Create((irm https://hutch.blackboard.sh/hutch/install.ps1)))
 ```
 
 Pass `-Channel canary` to install `hutch-canary.exe`. Both installers also accept
