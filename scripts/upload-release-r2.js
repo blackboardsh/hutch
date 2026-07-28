@@ -79,6 +79,7 @@ function signingHeaders({
   body,
   contentType,
   cacheControl,
+  method = "PUT",
   now = new Date(),
 }) {
   const endpoint = new URL(`https://${accountId}.r2.cloudflarestorage.com`);
@@ -96,7 +97,7 @@ function signingHeaders({
   ].join("\n");
   const signedHeaders = "cache-control;content-type;host;x-amz-content-sha256;x-amz-date";
   const canonicalRequest = [
-    "PUT",
+    method,
     canonicalUri,
     "",
     canonicalHeaders,
@@ -144,6 +145,31 @@ async function putObject(config, object) {
     );
   }
   console.log(`uploaded ${object.key}`);
+}
+
+async function deleteObject(config, key) {
+  const request = signingHeaders({
+    ...config,
+    key,
+    body: Buffer.alloc(0),
+    contentType: "application/octet-stream",
+    cacheControl: "no-cache",
+    method: "DELETE",
+  });
+  if (dryRun) {
+    console.log(`dry-run DELETE ${key}`);
+    return;
+  }
+  const response = await fetch(request.url, {
+    method: "DELETE",
+    headers: request.headers,
+  });
+  if (!response.ok) {
+    throw new Error(
+      `R2 delete failed for ${key}: ${response.status} ${await response.text()}`,
+    );
+  }
+  console.log(`deleted legacy root object ${key}`);
 }
 
 function readArtifact(platform) {
@@ -257,6 +283,12 @@ for (const [name, contentType] of [
     contentType,
     cacheControl: "no-cache, no-store, must-revalidate",
   });
+}
+
+// Canary.5 briefly published these installers at the bucket root. Keep the
+// product-prefix invariant true even if that workflow finishes late.
+for (const key of ["install.sh", "install.ps1"]) {
+  await deleteObject(config, key);
 }
 
 // Publish the mutable pointer only after every immutable object is available.
