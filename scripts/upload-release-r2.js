@@ -18,6 +18,7 @@ import {
   validateReleaseTag,
   validateRevision,
 } from "./release-contract.js";
+import { r2Setting } from "./r2-settings.js";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repositoryRoot = dirname(hutchRoot);
@@ -32,29 +33,8 @@ function fail(message) {
   process.exit(1);
 }
 
-function accountIdFromEndpoint() {
-  const endpoint = process.env.R2_ENDPOINT;
-  if (!endpoint) return undefined;
-  try {
-    const hostname = new URL(endpoint).hostname;
-    const suffix = ".r2.cloudflarestorage.com";
-    return hostname.endsWith(suffix) ? hostname.slice(0, -suffix.length) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function setting(name) {
-  const productSetting = process.env[`HUTCH_${name}`];
-  if (productSetting) return productSetting;
-
-  if (name === "R2_PUBLIC_BASE_URL") {
-    return "https://hutch.blackboard.sh";
-  }
-  if (name === "R2_ACCOUNT_ID") {
-    return process.env.R2_ACCOUNT_ID ?? accountIdFromEndpoint();
-  }
-  return process.env[name];
+  return r2Setting(name, process.env);
 }
 
 function gitRevision() {
