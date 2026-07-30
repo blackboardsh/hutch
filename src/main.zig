@@ -2,7 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const electrobun = @import("electrobun.zig");
+const package_manager = @import("package_manager/root.zig");
+const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
+const runtime_autoinstall = @import("runtime_autoinstall.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -18,22 +21,24 @@ const help_text_template =
     \\  hutch electrobun <init|build|run|dev> [args...]
     \\  hutch run [script-name] [args...]
     \\  hutch install [args...]
+    \\  hutch <add|remove|update> [args...]
+    \\  hutch <init|create|x> [args...]
     \\  hutch build [args...]
     \\  hutch self <path|version|update> [selector]
     \\  hutch cottontail <path|version|update> [selector]
-    \\  hutch update
     \\  hutch --help
     \\  hutch --version
     \\
     \\Config:
     \\  Scripts are resolved from dash.config.ts first, then package.json.
-    \\  Package-manager commands are delegated to Cottontail.
+    \\  Package-manager commands are implemented by Hutch.
     \\
 ;
 
 const Config = struct {
     raw_json: []const u8,
     root: std.json.Value,
+    dir: []const u8 = ".",
 };
 
 fn printHelp(writer: anytype) !void {
@@ -51,7 +56,10 @@ fn isVersionFlag(arg: []const u8) bool {
 fn termExitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .exited => |code| @intCast(@min(code, 255)),
-        .signal => |signal| @intCast(@min(128 + @intFromEnum(signal), 255)),
+        .signal => |signal| signal: {
+            if (builtin.os.tag != .windows) std.posix.raise(signal) catch {};
+            break :signal @intCast(@min(128 + @intFromEnum(signal), 255));
+        },
         .stopped => 1,
         .unknown => 1,
     };
@@ -121,7 +129,100 @@ fn runCottontailCommand(
         try argv.append(allocator, arg);
     }
 
-    return try runProcess(init, argv.items);
+    var env = try init.environ_map.clone(allocator);
+    defer env.deinit();
+    const hutch_path = try package_manager.host.cliExecutableForInit(init, allocator);
+    try env.put("COTTONTAIL_SPAWN_EXEC_PATH", hutch_path);
+    try env.put("COTTONTAIL_SPAWN_ARGV0", hutch_path);
+
+    if (comptime builtin.os.tag != .windows) {
+        try process_replace.replace(allocator, cottontail_path, argv.items, &env);
+        unreachable;
+    }
+
+    var child = try std.process.spawn(init.io, .{
+        .argv = argv.items,
+        .environ_map = &env,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(init.io);
+
+    return termExitCode(try child.wait(init.io));
+}
+
+fn prepareRuntimeAutoInstall(
+    init: std.process.Init,
+    entrypoint: []const u8,
+    mode: runtime_autoinstall.Mode,
+    stderr: *std.Io.Writer,
+) !bool {
+    runtime_autoinstall.prepare(init, entrypoint, mode, stderr) catch |err| {
+        if (err != error.AutoInstallFailed) {
+            try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+        }
+        try stderr.flush();
+        return false;
+    };
+    return true;
+}
+
+fn printBinaryLockfile(
+    init: std.process.Init,
+    path: []const u8,
+    stdout: *std.Io.Writer,
+) !bool {
+    if (!std.mem.endsWith(u8, path, ".lockb")) return false;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        path,
+        init.arena.allocator(),
+        .limited(256 * 1024 * 1024),
+    ) catch return false;
+    if (!package_manager.bun_lockfile.isBinaryLockfile(bytes)) return false;
+
+    try package_manager.bun_lockfile.writeYarnFromBinary(
+        init,
+        init.arena.allocator(),
+        bytes,
+        stdout,
+    );
+    try stdout.flush();
+    return true;
+}
+
+fn normalizeLeadingPackageManagerConfig(
+    allocator: std.mem.Allocator,
+    args: []const [:0]const u8,
+) ![]const [:0]const u8 {
+    if (args.len < 3) return args;
+    const first = args[1];
+    const command_index: usize = if (std.mem.eql(u8, first, "--save"))
+        2
+    else if (std.mem.startsWith(u8, first, "-c=") or
+        std.mem.startsWith(u8, first, "--config="))
+        2
+    else if ((std.mem.eql(u8, first, "-c") or
+        std.mem.eql(u8, first, "--config")) and args.len > 3)
+        3
+    else
+        return args;
+    if (command_index >= args.len or
+        !package_manager.cli.recognizes(args[command_index]))
+    {
+        return args;
+    }
+
+    const normalized = try allocator.alloc([:0]const u8, args.len);
+    normalized[0] = args[0];
+    normalized[1] = args[command_index];
+    @memcpy(normalized[2 .. command_index + 1], args[1..command_index]);
+    @memcpy(
+        normalized[command_index + 1 ..],
+        args[command_index + 1 ..],
+    );
+    return normalized;
 }
 
 fn appendJsStringLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
@@ -231,23 +332,38 @@ fn loadDashConfig(
 }
 
 fn loadPackageJson(init: std.process.Init, allocator: std.mem.Allocator) !?Config {
-    const package_path = "package.json";
-    if (!pathExists(init.io, package_path)) return null;
-
-    const source = try std.Io.Dir.cwd().readFileAlloc(
+    var current: []const u8 = try std.Io.Dir.cwd().realPathFileAlloc(
         init.io,
-        package_path,
+        ".",
         allocator,
-        .limited(16 * 1024 * 1024),
     );
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{
-        .duplicate_field_behavior = .use_last,
-    }) catch return error.PackageJsonLoadFailed;
+    while (true) {
+        const package_path = try pathJoin(allocator, &.{ current, "package.json" });
+        if (pathExists(init.io, package_path)) {
+            const source = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                package_path,
+                allocator,
+                .limited(16 * 1024 * 1024),
+            );
+            const normalized = package_manager.lockfile.normalizeJsonc(
+                allocator,
+                source,
+            ) catch return error.PackageJsonLoadFailed;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
+                .duplicate_field_behavior = .use_last,
+            }) catch return error.PackageJsonLoadFailed;
 
-    return .{
-        .raw_json = source,
-        .root = parsed,
-    };
+            return .{
+                .raw_json = source,
+                .root = parsed,
+                .dir = current,
+            };
+        }
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        current = parent;
+    }
 }
 
 fn getObjectField(value: std.json.Value, name: []const u8) ?std.json.Value {
@@ -394,6 +510,9 @@ fn runConfiguredScriptIfExists(
         try stderr.print("hutch: script must be a string: {s}\n", .{script_name});
         return 1;
     }
+    if (try loadPackageJson(init, allocator)) |package| {
+        if (!try ensurePackageDependencies(init, package, stderr)) return 1;
+    }
 
     const command = script.string;
     if (scriptLooksLikeEntrypoint(command)) {
@@ -413,22 +532,33 @@ fn packageHasDependencies(config: Config) bool {
 
 fn ensurePackageDependencies(
     init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
     package: Config,
-    stderr: anytype,
+    stderr: *std.Io.Writer,
 ) !bool {
-    if (!packageHasDependencies(package) or pathExists(init.io, "node_modules")) {
+    const node_modules = try pathJoin(
+        init.arena.allocator(),
+        &.{ package.dir, "node_modules" },
+    );
+    if (!packageHasDependencies(package) or pathExists(init.io, node_modules)) {
         return true;
     }
 
     try stderr.writeAll("hutch: installing package dependencies...\n");
     try stderr.flush();
-    const exit_code = try runCottontailCommand(
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_file_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const package_dir = try init.arena.allocator().dupeZ(u8, package.dir);
+    const install_args = [_][:0]const u8{
+        "hutch",
+        "install",
+        "--cwd",
+        package_dir,
+    };
+    const exit_code = try package_manager.cli.run(
         init,
-        allocator,
-        cottontail_path,
-        &.{"install"},
+        &install_args,
+        &stdout_file_writer.interface,
+        stderr,
     );
     return exit_code == 0;
 }
@@ -455,10 +585,11 @@ fn runPackageStage(
 fn runPackageScriptIfExists(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
     script_name: []const u8,
     script_args: []const [:0]const u8,
-    stderr: anytype,
+    stderr: *std.Io.Writer,
+    silent: bool,
+    force_runtime: bool,
 ) !?u8 {
     const package = (try loadPackageJson(init, allocator)) orelse return null;
     const scripts = getObjectField(package.root, "scripts") orelse return null;
@@ -471,60 +602,116 @@ fn runPackageScriptIfExists(
 
     if (!try ensurePackageDependencies(
         init,
-        allocator,
-        cottontail_path,
         package,
         stderr,
     )) return 1;
 
-    const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", script_name });
-    if (getObjectField(scripts, pre_name)) |pre| {
-        if (pre == .string) {
-            const exit_code = try runPackageStage(
-                init,
-                allocator,
-                pre_name,
-                pre.string,
-                &.{},
-                stderr,
-            );
-            if (exit_code != 0) return exit_code;
-        }
-    }
-
-    const exit_code = try runPackageStage(
+    return try package_manager.run.runSingleIfExists(
         init,
-        allocator,
         script_name,
-        script.string,
         script_args,
-        stderr,
+        silent,
+        force_runtime,
     );
-    if (exit_code != 0) return exit_code;
-
-    const post_name = try std.mem.concat(allocator, u8, &.{ "post", script_name });
-    if (getObjectField(scripts, post_name)) |post| {
-        if (post == .string) {
-            return try runPackageStage(
-                init,
-                allocator,
-                post_name,
-                post.string,
-                &.{},
-                stderr,
-            );
-        }
-    }
-
-    return 0;
 }
 
-fn printBuildPlaceholder(writer: anytype) !void {
-    try writer.writeAll(
-        \\hutch: native Electrobun build orchestration is scaffolded but not implemented yet.
-        \\Next step: port the Electrobun package build phases into Hutch-owned commands.
-        \\
-    );
+const PackageScriptInvocation = struct {
+    name: []const u8,
+    args: []const [:0]const u8,
+    config_path: ?[]const u8,
+    explicit_run: bool,
+    force_runtime: bool,
+    if_present: bool,
+    silent: bool,
+};
+
+fn parsePackageScriptInvocation(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+) !?PackageScriptInvocation {
+    if (args.len < 2) return null;
+
+    var index: usize = 1;
+    var explicit_run = false;
+    var config_path: ?[]const u8 = null;
+    var force_runtime = false;
+    var if_present = false;
+    var silent = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (!explicit_run and std.mem.eql(u8, arg, "run")) {
+            explicit_run = true;
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--silent")) {
+            silent = true;
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
+            force_runtime = true;
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--if-present")) {
+            if_present = true;
+            index += 1;
+            continue;
+        }
+        if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and
+            index + 1 < args.len)
+        {
+            config_path = args[index + 1];
+            index += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-c=")) {
+            config_path = arg["-c=".len..];
+            index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--config=")) {
+            config_path = arg["--config=".len..];
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cwd")) {
+            if (index + 1 >= args.len) return null;
+            try std.process.setCurrentPath(init.io, args[index + 1]);
+            index += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cwd=")) {
+            try std.process.setCurrentPath(init.io, arg["--cwd=".len..]);
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--shell")) {
+            if (index + 1 >= args.len) return null;
+            index += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--shell=")) {
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            break;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return null;
+        return .{
+            .name = arg,
+            .args = args[index + 1 ..],
+            .config_path = config_path,
+            .explicit_run = explicit_run,
+            .force_runtime = force_runtime,
+            .if_present = if_present,
+            .silent = silent,
+        };
+    }
+    return null;
 }
 
 fn runReleaseCommand(
@@ -688,8 +875,9 @@ fn maybePromptForUpdates(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const allocator = init.arena.allocator();
+    var args = try init.minimal.args.toSlice(allocator);
+    args = try normalizeLeadingPackageManagerConfig(allocator, args);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -719,9 +907,46 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (runtime_autoinstall.parseLeadingInvocation(args)) |invocation| {
+        const entrypoint = args[invocation.entry_index];
+        if (pathExists(init.io, entrypoint)) {
+            if (!try prepareRuntimeAutoInstall(init, entrypoint, invocation.mode, stderr)) {
+                std.process.exit(1);
+            }
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            const exit_code = try runCottontailCommand(
+                init,
+                allocator,
+                cottontail.executable,
+                args[1..],
+            );
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
+    }
+
+    if (package_manager.bunx.detectInvocation(
+        args,
+        init.environ_map.get("BUN_INTERNAL_BUNX_INSTALL") != null,
+        init.environ_map.get("HUTCH_LAUNCHER_PATH"),
+    )) |invocation| {
+        const exit_code = try package_manager.bunx.run(
+            init,
+            args,
+            invocation,
+            stdout,
+            stderr,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     const is_release_command = std.mem.eql(u8, command, "self") or
-        std.mem.eql(u8, command, "cottontail") or
-        std.mem.eql(u8, command, "update");
+        std.mem.eql(u8, command, "cottontail");
     if (!is_release_command) {
         try maybePromptForUpdates(init, allocator, stderr);
     }
@@ -745,31 +970,109 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "update")) {
-        const self_exit = try runReleaseCommand(
-            init,
-            allocator,
-            .hutch,
-            &.{"update"},
-            stdout,
-            stderr,
-        );
-        if (self_exit != 0) {
-            try stderr.flush();
-            std.process.exit(self_exit);
-        }
-        const runtime_exit = try runReleaseCommand(
-            init,
-            allocator,
-            .cottontail,
-            &.{"update"},
-            stdout,
-            stderr,
-        );
-        try stdout.flush();
-        try stderr.flush();
-        if (runtime_exit != 0) std.process.exit(runtime_exit);
+    if (std.mem.eql(u8, command, "upgrade") and
+        std.mem.eql(
+            u8,
+            init.environ_map.get("COTTONTAIL_UPSTREAM_RUNTIME") orelse "",
+            "bun",
+        ))
+    {
+        const exit_code = try package_manager.upgrade.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
         return;
+    }
+
+    if (package_manager.cli.recognizes(command)) {
+        const exit_code = try package_manager.cli.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (try package_manager.run.tryRun(init, args)) |exit_code| {
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    const may_be_package_script = std.mem.eql(u8, command, "run") or
+        std.mem.eql(u8, command, "--silent") or
+        std.mem.eql(u8, command, "--bun") or
+        std.mem.eql(u8, command, "-b") or
+        std.mem.eql(u8, command, "--if-present") or
+        std.mem.eql(u8, command, "-c") or
+        std.mem.eql(u8, command, "--config") or
+        std.mem.startsWith(u8, command, "-c=") or
+        std.mem.startsWith(u8, command, "--config=") or
+        std.mem.eql(u8, command, "--cwd") or
+        std.mem.startsWith(u8, command, "--cwd=") or
+        std.mem.eql(u8, command, "--shell") or
+        std.mem.startsWith(u8, command, "--shell=");
+    if (may_be_package_script) {
+        if (try parsePackageScriptInvocation(init, args)) |invocation| {
+            const configured = try package_manager.run.configuredRun(
+                init,
+                invocation.config_path,
+                invocation.silent,
+                invocation.force_runtime,
+            );
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            if (try runConfiguredScriptIfExists(
+                init,
+                allocator,
+                cottontail.executable,
+                invocation.name,
+                invocation.args,
+                stderr,
+            )) |exit_code| {
+                try stderr.flush();
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+            if (try runPackageScriptIfExists(
+                init,
+                allocator,
+                invocation.name,
+                invocation.args,
+                stderr,
+                configured.silent,
+                configured.force_runtime,
+            )) |exit_code| {
+                try stderr.flush();
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+            if (invocation.if_present) return;
+            if (pathExists(init.io, invocation.name)) {
+                if (!try prepareRuntimeAutoInstall(init, invocation.name, .auto, stderr)) {
+                    std.process.exit(1);
+                }
+                const exit_code = try runCottontailScript(
+                    init,
+                    allocator,
+                    cottontail.executable,
+                    invocation.name,
+                    invocation.args,
+                );
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+            if (package_manager.run.commandExists(init, invocation.name)) {
+                const exit_code = try package_manager.run.runSingleCommand(
+                    init,
+                    invocation.name,
+                    invocation.args,
+                    configured.silent,
+                );
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+            try stderr.print("error: Script not found \"{s}\"\n", .{invocation.name});
+            try stderr.flush();
+            std.process.exit(1);
+        }
     }
 
     if (std.mem.eql(u8, command, "run")) {
@@ -779,6 +1082,11 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         const cottontail_path = cottontail.executable;
+        if (args.len > 2 and pathExists(init.io, args[2])) {
+            if (!try prepareRuntimeAutoInstall(init, args[2], .auto, stderr)) {
+                std.process.exit(1);
+            }
+        }
 
         if (args.len <= 2) {
             const config = loadDashConfig(init, allocator, cottontail_path) catch |err| switch (err) {
@@ -807,10 +1115,19 @@ pub fn main(init: std.process.Init) !void {
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
             }
-            if (try runPackageScriptIfExists(init, allocator, cottontail_path, args[2], args[3..], stderr)) |exit_code| {
+            if (try runPackageScriptIfExists(init, allocator, args[2], args[3..], stderr, false, false)) |exit_code| {
                 try stderr.flush();
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
+            }
+            const requested: []const u8 = args[2];
+            const path_like = std.mem.indexOfScalar(u8, requested, '/') != null or
+                std.mem.indexOfScalar(u8, requested, '\\') != null or
+                std.fs.path.extension(requested).len > 0;
+            if (!path_like and !pathExists(init.io, requested)) {
+                try stderr.print("error: Script not found \"{s}\"\n", .{requested});
+                try stderr.flush();
+                std.process.exit(1);
             }
         }
 
@@ -835,7 +1152,44 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "install")) {
+    if (std.mem.eql(u8, command, "init")) {
+        const exit_code = try package_manager.init.run(init, args[2..], stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "create") or std.mem.eql(u8, command, "c")) {
+        if (try package_manager.create_source.tryRun(init, args, stdout, stderr)) |result| {
+            switch (result) {
+                .exit_code => |exit_code| {
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                },
+                .start_dev => {
+                    const exit_code = (try runPackageScriptIfExists(
+                        init,
+                        allocator,
+                        "dev",
+                        &.{},
+                        stderr,
+                        false,
+                        false,
+                    )) orelse {
+                        try stderr.writeAll("error: Script not found \"dev\"\n");
+                        try stderr.flush();
+                        std.process.exit(1);
+                    };
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                },
+            }
+        }
+        const exit_code = try package_manager.create.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "build")) {
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -846,13 +1200,39 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "build")) {
-        try printBuildPlaceholder(stderr);
-        try stderr.flush();
-        std.process.exit(1);
+    if ((std.mem.eql(u8, command, "-e") or
+        std.mem.eql(u8, command, "--eval") or
+        std.mem.eql(u8, command, "-p") or
+        std.mem.eql(u8, command, "--print")) and args.len > 2)
+    {
+        runtime_autoinstall.prepareSource(init, args[2], .auto, stderr) catch |err| {
+            if (err != error.AutoInstallFailed) {
+                try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+            }
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            args[1..],
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
     }
 
+    if (try printBinaryLockfile(init, command, stdout)) return;
+
     if (pathExists(init.io, command)) {
+        if (!try prepareRuntimeAutoInstall(init, command, .auto, stderr)) {
+            std.process.exit(1);
+        }
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -879,18 +1259,34 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     }
 
+    if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+    if (package_manager.run.commandExists(init, command)) {
+        const exit_code = try package_manager.run.runSingleCommand(
+            init,
+            command,
+            args[2..],
+            true,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+    const path_like = std.mem.indexOfAny(u8, command, "/\\") != null or
+        std.fs.path.extension(command).len > 0;
+    if (!path_like) {
+        try stderr.print("error: Script not found \"{s}\"\n", .{command});
+        try stderr.flush();
+        std.process.exit(1);
+    }
     const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
         try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
     };
-    const cottontail_path = cottontail.executable;
-    if (try runPackageScriptIfExists(init, allocator, cottontail_path, command, args[2..], stderr)) |exit_code| {
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-    const exit_code = try runCottontailCommand(init, allocator, cottontail_path, args[1..]);
+    const exit_code = try runCottontailCommand(init, allocator, cottontail.executable, args[1..]);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
@@ -929,4 +1325,17 @@ test "package dependency detection drives clean checkout bootstrap" {
         .raw_json = "",
         .root = without_dependencies,
     }));
+}
+
+test "package manager commands accept leading Bun configuration flags" {
+    const args = [_][:0]const u8{ "hutch", "--save", "ci" };
+    const normalized = try normalizeLeadingPackageManagerConfig(
+        std.testing.allocator,
+        &args,
+    );
+    defer if (normalized.ptr != args[0..].ptr)
+        std.testing.allocator.free(normalized);
+
+    try std.testing.expectEqualStrings("ci", normalized[1]);
+    try std.testing.expectEqualStrings("--save", normalized[2]);
 }

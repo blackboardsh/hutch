@@ -11,6 +11,9 @@ Cottontail is an independently released runtime. Hutch resolves it from the same
 global content store when JavaScript execution or package management is needed;
 it is not embedded in or version-locked to a Hutch release.
 
+The intended build/runtime ownership and migration path are documented in
+[docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
+
 ## Install
 
 Install the current production release on macOS or Linux:
@@ -61,7 +64,6 @@ replaces the global production or canary selection.
 ```sh
 hutch self update
 hutch cottontail update
-hutch update
 ```
 
 Interactive use checks for newer active-channel releases at most every six
@@ -80,6 +82,8 @@ cd hutch
 ./vendors/zig/zig build test
 ./vendors/zig/zig build
 ./zig-out/bin/hutch --version
+node scripts/run-bun-package-manager-tests.js --check
+node scripts/run-local-package-manager-tests.js --all
 ```
 
 `scripts/setup.sh` only installs the pinned Zig toolchain. To run JavaScript
@@ -93,6 +97,10 @@ DASH_USE_LOCAL_COTTONTAIL=1 ./zig-out/bin/hutch examples/smoke.js
 `HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `DASH_HOME` changes
 the global store and must remain set when a non-default install root is used.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
+Run `node scripts/run-bun-package-manager-tests.js --all --jobs 4` for the
+complete 102-file copied compatibility corpus. The ownership boundary and
+measured compatibility accounting are documented in
+[docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
 
 ## Electrobun Packaging
 
@@ -181,12 +189,15 @@ with `HUTCH_PUBLIC_BASE_URL`.
 - `hutch <entrypoint.js|entrypoint.ts> [args...]`
 - `hutch <script-name> [args...]`
 - `hutch run [script-name] [args...]`
-- `hutch install [args...]`
+- `hutch install|add|remove|update [args...]`
+- `hutch init|create|x [args...]`
+- `hutch build [args...]`
 - `hutch electrobun <init|build|run|dev> [args...]`
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
-- `hutch update`
 
 Scripts resolve from the nearest `dash.config.ts` first and then
-`package.json`. Package-manager and JavaScript commands are delegated to the
-selected Cottontail release.
+`package.json`. Hutch implements package management and project mutation
+directly. It invokes the selected Cottontail release for JavaScript execution,
+runtime compatibility APIs, and the compiler-backed build path retained during
+the current split.

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
+const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -78,8 +79,15 @@ fn runEngine(
 
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
+    const launcher_path = try std.process.executablePathAlloc(init.io, allocator);
     try environment.put("HUTCH_ACTIVE_CHANNEL", channel);
+    try environment.put("HUTCH_LAUNCHER_PATH", launcher_path);
     try environment.put("HUTCH_LAUNCHER_VERSION", version);
+
+    if (comptime builtin.os.tag != .windows) {
+        try process_replace.replace(allocator, engine, argv.items, &environment);
+        unreachable;
+    }
 
     var child = try std.process.spawn(init.io, .{
         .argv = argv.items,
@@ -128,7 +136,10 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 fn termExitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .exited => |code| @intCast(@min(code, 255)),
-        .signal => |signal| @intCast(@min(128 + @intFromEnum(signal), 255)),
+        .signal => |signal| signal: {
+            if (builtin.os.tag != .windows) std.posix.raise(signal) catch {};
+            break :signal @intCast(@min(128 + @intFromEnum(signal), 255));
+        },
         .stopped => 1,
         .unknown => 1,
     };
