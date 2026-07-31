@@ -142,6 +142,7 @@ function localEnvironment() {
 		HUTCH_ROOT: hutchRoot,
 		HUTCH_ENGINE_BINARY: hutchEngineBinary,
 		HUTCH_BINARY: hutchBinary,
+		HUTCH_NO_UPDATE_CHECK: "1",
 		DASH_USE_LOCAL_ELECTROBUN: "1",
 		DASH_LOCAL_ELECTROBUN_ROOT: electrobunRoot,
 	};
