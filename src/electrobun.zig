@@ -124,6 +124,7 @@ pub fn run(
         .cottontail_binary = cottontail_binary,
         .project_root = project_root,
     };
+    defer cleanupCliTempDir(&ctx);
 
     const command = args[0];
 
@@ -2638,9 +2639,23 @@ fn recreateDir(ctx: *const Context, absolute_path: []const u8) !void {
 }
 
 fn ensureCliTempDir(ctx: *const Context) ![]const u8 {
-    const tmp_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "electrobun" });
+    const tmp_dir = try cliTempDir(ctx);
     try std.Io.Dir.cwd().createDirPath(ctx.io, tmp_dir);
     return tmp_dir;
+}
+
+fn cliTempDir(ctx: *const Context) ![]const u8 {
+    const process_id = switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @as(u64, @intCast(std.posix.system.getpid())),
+    };
+    const process_dir = try std.fmt.allocPrint(ctx.allocator, "{d}", .{process_id});
+    return std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "electrobun", process_dir });
+}
+
+fn cleanupCliTempDir(ctx: *const Context) void {
+    const tmp_dir = cliTempDir(ctx) catch return;
+    std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 }
 
 fn singleValueArray(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Array {
