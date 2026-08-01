@@ -20,6 +20,7 @@ const help_text_template =
     \\  hutch <script-name> [args...]
     \\  hutch electrobun <init|build|run|dev> [args...]
     \\  hutch run [script-name] [args...]
+    \\  hutch test [files/options...]
     \\  hutch install [args...]
     \\  hutch <add|remove|update> [args...]
     \\  hutch <init|create|x> [args...]
@@ -31,6 +32,7 @@ const help_text_template =
     \\
     \\Config:
     \\  Scripts are resolved from dash.config.ts first, then package.json.
+    \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\  Package-manager commands are implemented by Hutch.
     \\
 ;
@@ -51,6 +53,14 @@ fn isHelpFlag(arg: []const u8) bool {
 
 fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
+}
+
+fn isCottontailTestCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "test");
+}
+
+fn runtimeCommandArguments(args: []const [:0]const u8) []const [:0]const u8 {
+    return if (args.len > 1) args[1..] else args[0..0];
 }
 
 fn termExitCode(term: std.process.Child.Term) u8 {
@@ -988,6 +998,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (isCottontailTestCommand(command)) {
+        const command_args = runtimeCommandArguments(args);
+        const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            command_args,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (try package_manager.run.tryRun(init, args)) |exit_code| {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
@@ -1292,10 +1319,31 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text describes dash config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
+}
+
+test "test is a reserved Cottontail command and preserves every argument" {
+    try std.testing.expect(isCottontailTestCommand("test"));
+    try std.testing.expect(!isCottontailTestCommand("test:unit"));
+
+    const args = [_][:0]const u8{
+        "hutch",
+        "test",
+        "tests/one.test.ts",
+        "tests/two test.ts",
+        "--test-name-pattern",
+        "exact value",
+        "--bail=3",
+    };
+    const forwarded = runtimeCommandArguments(&args);
+    try std.testing.expectEqual(@as(usize, args.len - 1), forwarded.len);
+    for (args[1..], forwarded) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 test "package dependency detection drives clean checkout bootstrap" {

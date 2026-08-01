@@ -1,7 +1,12 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Release artifacts must run on baseline hardware. Keep the default
+    // conservative as a second line of defense behind the release command's
+    // explicit -Dcpu=baseline argument.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const launcher = b.addExecutable(.{
@@ -47,6 +52,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const windows_icon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windows_icon.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     engine_tests.root_module.link_libc = true;
 
     const package_manager_support_tests = b.addTest(.{
@@ -60,9 +72,34 @@ pub fn build(b: *std.Build) void {
 
     const run_engine_tests = b.addRunArtifact(engine_tests);
     const run_launcher_tests = b.addRunArtifact(launcher_tests);
+    const run_windows_icon_tests = b.addRunArtifact(windows_icon_tests);
     const run_package_manager_support_tests = b.addRunArtifact(package_manager_support_tests);
+
+    const runtime_command_fixture = b.addExecutable(.{
+        .name = "hutch-runtime-command-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/runtime-command-fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const runtime_command_regression = b.addExecutable(.{
+        .name = "hutch-runtime-command-regression",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/runtime-command-regression.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_runtime_command_regression = b.addRunArtifact(runtime_command_regression);
+    run_runtime_command_regression.addArtifactArg(launcher);
+    run_runtime_command_regression.addArtifactArg(engine);
+    run_runtime_command_regression.addArtifactArg(runtime_command_fixture);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_launcher_tests.step);
+    test_step.dependOn(&run_windows_icon_tests.step);
     test_step.dependOn(&run_package_manager_support_tests.step);
+    test_step.dependOn(&run_runtime_command_regression.step);
 }

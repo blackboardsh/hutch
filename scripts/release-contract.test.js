@@ -10,6 +10,7 @@ import {
   releaseChannel,
   validateReleaseTag,
 } from "./release-contract.js";
+import "./x64-baseline-release.test.js";
 
 const revision = "0123456789abcdef0123456789abcdef01234567";
 const artifacts = [

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const windows_icon = @import("windows_icon.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
 const run_hook_template = @embedFile("electrobun_cli/run_hook_helper.js");
@@ -18,6 +19,29 @@ const BuildEnvironment = enum {
     dev,
     canary,
     production,
+};
+
+const MainProcessInspectorMode = enum {
+    inspect,
+    inspect_wait,
+    inspect_brk,
+};
+
+const MainProcessInspector = struct {
+    mode: MainProcessInspectorMode,
+    address: ?[]const u8 = null,
+};
+
+const InspectorSelection = union(enum) {
+    unspecified,
+    disabled,
+    enabled: MainProcessInspector,
+};
+
+const BuiltAppLaunchCommand = struct {
+    argv: [1][]const u8,
+    bun_inspect: ?[]const u8,
+    force_console: bool,
 };
 
 const Context = struct {
@@ -147,20 +171,23 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "run")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-        try runBuiltApp(&ctx, config);
+        const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
+        try runBuiltApp(&ctx, config, inspector);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "dev")) {
         if (hasFlag(args[1..], "--watch")) {
             const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-            try runDevWatch(&ctx, config);
+            const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
+            try runDevWatch(&ctx, config, inspector);
             return 0;
         }
 
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuild(&ctx, config);
-        try runBuiltApp(&ctx, config);
+        try runBuiltApp(&ctx, config, inspector);
         return 0;
     }
 
@@ -179,13 +206,17 @@ fn printHelp(writer: anytype) !void {
         \\  hutch electrobun init [project-name] [--template=name]
         \\  hutch electrobun config [--env=dev|canary|production]
         \\  hutch electrobun build [--env=dev|canary|production]
-        \\  hutch electrobun run [--env=dev|canary|production]
-        \\  hutch electrobun dev [--env=dev|canary|production] [--watch]
+        \\  hutch electrobun run [--env=dev|canary|production] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
+        \\  hutch electrobun dev [--env=dev|canary|production] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
         \\  - init copies templates from the installed electrobun package.
+        \\  - Main-process inspection supports Bun and Cottontail only.
+        \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
+        \\  - runtime.mainProcessInspector accepts { mode: "inspect" | "inspect-wait" | "inspect-brk", address?: string }.
+        \\  - CLI options override ELECTROBUN_INSPECT, which overrides runtime.mainProcessInspector; --no-inspect disables both.
         \\
     );
 }
@@ -212,6 +243,169 @@ fn parseBuildEnvironment(args: []const [:0]const u8) BuildEnvironment {
     }
 
     return .dev;
+}
+
+fn inspectorModeFromName(name: []const u8) ?MainProcessInspectorMode {
+    if (std.mem.eql(u8, name, "inspect")) return .inspect;
+    if (std.mem.eql(u8, name, "inspect-wait")) return .inspect_wait;
+    if (std.mem.eql(u8, name, "inspect-brk")) return .inspect_brk;
+    return null;
+}
+
+fn inspectorFromFlag(value: []const u8) ?MainProcessInspector {
+    const names = [_][]const u8{ "--inspect", "--inspect-wait", "--inspect-brk" };
+    inline for (names) |name| {
+        if (std.mem.eql(u8, value, name)) {
+            return .{ .mode = inspectorModeFromName(name[2..]).? };
+        }
+        if (value.len > name.len and value[name.len] == '=' and std.mem.startsWith(u8, value, name)) {
+            const address = std.mem.trim(u8, value[name.len + 1 ..], " \r\n\t");
+            return .{
+                .mode = inspectorModeFromName(name[2..]).?,
+                .address = if (address.len == 0) null else address,
+            };
+        }
+    }
+    return null;
+}
+
+fn inspectorSelectionFromCli(args: []const [:0]const u8) !InspectorSelection {
+    var selected: InspectorSelection = .unspecified;
+    for (args) |arg_z| {
+        const arg: []const u8 = arg_z;
+        const next: ?InspectorSelection = if (std.mem.eql(u8, arg, "--no-inspect"))
+            .disabled
+        else if (inspectorFromFlag(arg)) |inspector|
+            .{ .enabled = inspector }
+        else
+            null;
+
+        if (next) |selection| {
+            switch (selected) {
+                .unspecified => selected = selection,
+                else => return error.ConflictingInspectorOptions,
+            }
+        }
+    }
+    return selected;
+}
+
+fn inspectorSelectionFromEnvironment(environ_map: *const std.process.Environ.Map) InspectorSelection {
+    const raw = environ_map.get("ELECTROBUN_INSPECT") orelse return .unspecified;
+    const value = std.mem.trim(u8, raw, " \r\n\t");
+    if (value.len == 0 or
+        std.mem.eql(u8, value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "off"))
+    {
+        return .disabled;
+    }
+    if (std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true")) {
+        return .{ .enabled = .{ .mode = .inspect } };
+    }
+    if (inspectorFromFlag(value)) |inspector| return .{ .enabled = inspector };
+    return .{ .enabled = .{ .mode = .inspect, .address = value } };
+}
+
+fn inspectorSelectionFromConfig(root: std.json.Value) !InspectorSelection {
+    const runtime = getObjectField(root, "runtime") orelse return .unspecified;
+    const value = runtime.get("mainProcessInspector") orelse return .unspecified;
+    switch (value) {
+        .bool => |enabled| return if (enabled)
+            .{ .enabled = .{ .mode = .inspect } }
+        else
+            .disabled,
+        .string => |raw| {
+            const text = std.mem.trim(u8, raw, " \r\n\t");
+            if (text.len == 0) return .disabled;
+            if (inspectorFromFlag(text)) |inspector| return .{ .enabled = inspector };
+            return .{ .enabled = .{ .mode = .inspect, .address = text } };
+        },
+        .object => |object| {
+            const mode_name = getStringFieldFromObject(object, "mode") orelse "inspect";
+            const mode = inspectorModeFromName(mode_name) orelse return error.InvalidInspectorMode;
+            var address: ?[]const u8 = null;
+            if (getStringFieldFromObject(object, "address")) |raw| {
+                const text = std.mem.trim(u8, raw, " \r\n\t");
+                if (text.len > 0) address = text;
+            }
+            return .{ .enabled = .{ .mode = mode, .address = address } };
+        },
+        else => return error.InvalidInspectorConfig,
+    }
+}
+
+fn resolvedInspectorSelection(
+    root: std.json.Value,
+    args: []const [:0]const u8,
+    environ_map: *const std.process.Environ.Map,
+) !?MainProcessInspector {
+    const selections = [_]InspectorSelection{
+        try inspectorSelectionFromCli(args),
+        inspectorSelectionFromEnvironment(environ_map),
+        try inspectorSelectionFromConfig(root),
+    };
+    for (selections) |selection| switch (selection) {
+        .unspecified => {},
+        .disabled => return null,
+        .enabled => |inspector| return inspector,
+    };
+    return null;
+}
+
+fn mainProcessSupportsInspector(main_process: MainProcess) bool {
+    return main_process == .bun or main_process == .cottontail;
+}
+
+fn resolveMainProcessInspectorForRun(
+    ctx: *const Context,
+    root: std.json.Value,
+    args: []const [:0]const u8,
+) !?MainProcessInspector {
+    const inspector = resolvedInspectorSelection(root, args, ctx.environ_map) catch |err| {
+        ctx.writeStderr("hutch electrobun: invalid main-process inspector configuration: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const main_process = getMainProcess(root);
+    if (inspector != null and !mainProcessSupportsInspector(main_process)) {
+        ctx.writeStderr(
+            "hutch electrobun: main-process inspection is supported for Bun and Cottontail, not {s}\n",
+            .{mainProcessName(main_process)},
+        );
+        return error.UnsupportedMainProcessInspector;
+    }
+    return inspector;
+}
+
+fn inspectorEnvironmentValue(
+    allocator: std.mem.Allocator,
+    inspector: MainProcessInspector,
+) ![]const u8 {
+    const address = inspector.address orelse "127.0.0.1:6499";
+    return switch (inspector.mode) {
+        .inspect => try allocator.dupe(u8, address),
+        .inspect_wait => try std.fmt.allocPrint(allocator, "{s}?wait=1", .{address}),
+        .inspect_brk => try std.fmt.allocPrint(allocator, "{s}?break=1", .{address}),
+    };
+}
+
+fn buildBuiltAppLaunchCommand(
+    allocator: std.mem.Allocator,
+    main_process: MainProcess,
+    launcher_path: []const u8,
+    inspector: ?MainProcessInspector,
+) !BuiltAppLaunchCommand {
+    if (inspector != null and !mainProcessSupportsInspector(main_process)) {
+        return error.UnsupportedMainProcessInspector;
+    }
+    return .{
+        .argv = .{launcher_path},
+        .bun_inspect = if (inspector) |configured|
+            try inspectorEnvironmentValue(allocator, configured)
+        else
+            null,
+        .force_console = inspector != null,
+    };
 }
 
 fn environmentFlagEnabled(environ_map: *const std.process.Environ.Map, name: []const u8) bool {
@@ -734,13 +928,18 @@ fn createOuterWrapper(
         hash,
         try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "metadata.json" }),
     );
-    try installBundleAssets(ctx, config, bundle);
+    try installBundleAssets(ctx, config, bundle, false);
 }
 
-fn installBundleAssets(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) !void {
-    const platform = platformBuildObject(config.root) orelse return;
+fn installBundleAssets(
+    ctx: *const Context,
+    config: CommandContext,
+    bundle: AppBundlePaths,
+    embed_main_process_icon: bool,
+) !void {
     switch (builtin.os.tag) {
         .macos => {
+            const platform = platformBuildObject(config.root) orelse return;
             if (getStringFieldFromObject(platform, "icons")) |icons| {
                 const source = try absoluteProjectPath(ctx, icons);
                 if (!pathExists(ctx.io, source)) {
@@ -787,30 +986,9 @@ fn installBundleAssets(ctx: *const Context, config: CommandContext, bundle: AppB
             }
             try copyDocumentTypeIcons(ctx, config, bundle.resources_dir);
         },
-        .linux => {
-            const icon = getStringFieldFromObject(platform, "icon") orelse return;
-            const source = try absoluteProjectPath(ctx, icon);
-            if (!pathExists(ctx.io, source)) {
-                ctx.writeStderr("hutch electrobun: Linux icon not found: {s}\n", .{source});
-                return;
-            }
-            try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "appIcon.png" }));
-            try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "app", "icon.png" }));
-
-            const app = getObjectField(config.root, "app") orelse return;
-            const description = getStringFieldFromObject(app, "description") orelse try getAppName(ctx, config.root);
-            const desktop = try std.fmt.allocPrint(
-                ctx.allocator,
-                "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\nIcon=appIcon.png\nTerminal=false\nStartupWMClass={s}\nCategories=Utility;Application;\n",
-                .{ try getAppName(ctx, config.root), description, try getAppName(ctx, config.root) },
-            );
-            const desktop_name = try std.mem.concat(ctx.allocator, u8, &.{ try getAppName(ctx, config.root), ".desktop" });
-            try std.Io.Dir.cwd().writeFile(ctx.io, .{
-                .sub_path = try std.fs.path.join(ctx.allocator, &.{ bundle.bundle_root, desktop_name }),
-                .data = desktop,
-            });
-        },
+        .linux => try installLinuxBundleAssets(ctx, config, bundle),
         .windows => {
+            if (platformBuildObject(config.root) == null) return;
             const icon_path = try prepareWindowsIcon(ctx, config) orelse return;
             try copyPath(
                 ctx,
@@ -822,9 +1000,47 @@ fn installBundleAssets(ctx: *const Context, config: CommandContext, bundle: AppB
                 &.{ bundle.exec_dir, launcherFileName() },
             );
             try embedWindowsIcon(ctx, launcher_path, icon_path);
+            if (embed_main_process_icon) {
+                const main_process_path = try std.fs.path.join(
+                    ctx.allocator,
+                    &.{ bundle.exec_dir, windowsMainProcessExecutableName(getMainProcess(config.root)) },
+                );
+                if (!pathExists(ctx.io, main_process_path)) return error.WindowsMainProcessNotFound;
+                try embedWindowsIcon(ctx, main_process_path, icon_path);
+            }
         },
         else => {},
     }
+}
+
+fn installLinuxBundleAssets(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) !void {
+    if (getObjectField(config.root, "build")) |build| {
+        if (getObjectFieldFromObject(build, "linux")) |platform| {
+            if (getStringFieldFromObject(platform, "icon")) |icon| {
+                const source = try absoluteProjectPath(ctx, icon);
+                if (!pathExists(ctx.io, source)) {
+                    ctx.writeStderr("hutch electrobun: Linux icon not found: {s}\n", .{source});
+                } else {
+                    try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "appIcon.png" }));
+                    try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "app", "icon.png" }));
+                }
+            }
+        }
+    }
+
+    const app = getObjectField(config.root, "app") orelse return error.InvalidConfig;
+    const app_name = try getAppName(ctx, config.root);
+    const description = getStringFieldFromObject(app, "description") orelse app_name;
+    const desktop = try std.fmt.allocPrint(
+        ctx.allocator,
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\nIcon=appIcon.png\nTerminal=false\nStartupWMClass={s}\nCategories=Utility;Application;\n",
+        .{ app_name, description, app_name },
+    );
+    const desktop_name = try std.mem.concat(ctx.allocator, u8, &.{ app_name, ".desktop" });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try std.fs.path.join(ctx.allocator, &.{ bundle.bundle_root, desktop_name }),
+        .data = desktop,
+    });
 }
 
 fn copyDocumentTypeIcons(
@@ -1395,79 +1611,50 @@ fn prepareWindowsIcon(ctx: *const Context, config: CommandContext) !?[]const u8 
     const source = try absoluteProjectPath(ctx, icon);
     if (!pathExists(ctx.io, source)) {
         ctx.writeStderr("hutch electrobun: Windows icon not found: {s}\n", .{source});
-        return null;
+        return error.WindowsIconNotFound;
     }
     if (std.ascii.endsWithIgnoreCase(source, ".ico")) return source;
     if (!std.ascii.endsWithIgnoreCase(source, ".png")) {
         ctx.writeStderr(
-            "hutch electrobun: Windows icons must be PNG or ICO files; leaving the default icon unchanged\n",
+            "hutch electrobun: Windows icons must be PNG or ICO files\n",
             .{},
         );
-        return null;
+        return error.UnsupportedWindowsIconFormat;
     }
 
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return null;
     const converted_path = try std.fs.path.join(
         ctx.allocator,
-        &.{ try buildOutputRoot(ctx, config), ".dash-windows-icon.ico" },
+        &.{ try buildOutputRoot(ctx, config), ".hutch-windows-icon.ico" },
     );
-    if (pathExists(ctx.io, converted_path)) return converted_path;
-
-    const dependency_root = std.fs.path.dirname(package_root) orelse package_root;
-    const converter_candidates = [_][]const u8{
-        try std.fs.path.join(ctx.allocator, &.{ package_root, "node_modules", "png-to-ico", "bin", "cli.js" }),
-        try std.fs.path.join(ctx.allocator, &.{ dependency_root, "png-to-ico", "bin", "cli.js" }),
+    const png = try std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        source,
+        ctx.allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    const ico = windows_icon.icoFromPng(ctx.allocator, png) catch |err| {
+        ctx.writeStderr("hutch electrobun: invalid Windows PNG icon: {t}\n", .{err});
+        return err;
     };
-    for (converter_candidates) |converter| {
-        if (!pathExists(ctx.io, converter)) continue;
-        const result = try std.process.run(ctx.allocator, ctx.io, .{
-            .argv = &.{ try resolveCottontailBinary(ctx), converter, source },
-            .cwd = .{ .path = package_root },
-            .environ_map = ctx.environ_map,
-            .create_no_window = true,
-            .stdout_limit = .limited(64 * 1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-        });
-        defer ctx.allocator.free(result.stdout);
-        defer ctx.allocator.free(result.stderr);
-        if (termExitCode(result.term) != 0 or result.stdout.len == 0) {
-            ctx.writeStderr(
-                "hutch electrobun: PNG-to-ICO conversion failed; leaving the default Windows icon unchanged\n{s}",
-                .{result.stderr},
-            );
-            return null;
-        }
-        try std.Io.Dir.cwd().writeFile(ctx.io, .{
-            .sub_path = converted_path,
-            .data = result.stdout,
-        });
-        return converted_path;
-    }
-
-    ctx.writeStderr(
-        "hutch electrobun: png-to-ico is unavailable; leaving the default Windows icon unchanged\n",
-        .{},
-    );
-    return null;
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = converted_path,
+        .data = ico,
+    });
+    return converted_path;
 }
 
 fn embedWindowsIcon(ctx: *const Context, executable_path: []const u8, icon_path: []const u8) !void {
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return;
-    const dependency_root = std.fs.path.dirname(package_root) orelse package_root;
-    const candidates = [_][]const u8{
-        try std.fs.path.join(ctx.allocator, &.{ package_root, "node_modules", "rcedit", "bin", "rcedit-x64.exe" }),
-        try std.fs.path.join(ctx.allocator, &.{ package_root, "node_modules", "rcedit", "bin", "rcedit.exe" }),
-        try std.fs.path.join(ctx.allocator, &.{ dependency_root, "rcedit", "bin", "rcedit-x64.exe" }),
-        try std.fs.path.join(ctx.allocator, &.{ dependency_root, "rcedit", "bin", "rcedit.exe" }),
+    const ico = try std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        icon_path,
+        ctx.allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    windows_icon.embed(ctx.allocator, executable_path, ico) catch |err| {
+        ctx.writeStderr("hutch electrobun: failed to embed Windows icon in {s}: {t}\n", .{ executable_path, err });
+        return err;
     };
-    for (candidates) |rcedit| {
-        if (!pathExists(ctx.io, rcedit)) continue;
-        if (!try runReleaseCommandSuccess(ctx, &.{ rcedit, executable_path, "--set-icon", icon_path }, ctx.project_root, null)) {
-            ctx.writeStderr("hutch electrobun: rcedit failed; leaving the extractor icon unchanged\n", .{});
-        }
-        return;
-    }
-    ctx.writeStderr("hutch electrobun: rcedit is unavailable; leaving the extractor icon unchanged\n", .{});
+    ctx.writeStdout("embedded Windows icon in {s}\n", .{std.fs.path.basename(executable_path)});
 }
 
 fn createLinuxInstaller(ctx: *const Context, config: CommandContext, state: ReleaseState) ![]const u8 {
@@ -1594,10 +1781,14 @@ fn writeReleaseArtifacts(
     }
 }
 
-fn runBuiltApp(ctx: *const Context, config: CommandContext) !void {
+fn runBuiltApp(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !void {
     const main_process = getMainProcess(config.root);
     switch (main_process) {
-        .bun, .cottontail, .zig, .rust, .go, .odin => try runBundledElectrobunApp(ctx, config),
+        .bun, .cottontail, .zig, .rust, .go, .odin => try runBundledElectrobunApp(ctx, config, inspector),
     }
 }
 
@@ -1658,10 +1849,14 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
 }
 
-fn runDevWatch(ctx: *const Context, config: CommandContext) !void {
+fn runDevWatch(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !void {
     try runBuild(ctx, config);
 
-    var child = try spawnBuiltApp(ctx, config);
+    var child = try spawnBuiltApp(ctx, config, inspector);
     defer {
         child.kill(ctx.io);
         _ = child.wait(ctx.io) catch {};
@@ -1682,7 +1877,7 @@ fn runDevWatch(ctx: *const Context, config: CommandContext) !void {
         _ = child.wait(ctx.io) catch {};
 
         try runBuild(ctx, config);
-        child = try spawnBuiltApp(ctx, config);
+        child = try spawnBuiltApp(ctx, config, inspector);
     }
 }
 
@@ -2175,7 +2370,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
 
     try buildViews(ctx, config.root, bundle.app_code_dir);
     try copyStaticAssets(ctx, config.root, bundle.app_code_dir);
-    try installBundleAssets(ctx, config, bundle);
+    try installBundleAssets(ctx, config, bundle, true);
 
     const carrot_dir = try buildCarrotOutput(ctx, config, bundle);
     if (carrot_dir) |dir| {
@@ -2297,8 +2492,12 @@ fn buildCarrotOutput(ctx: *const Context, config: CommandContext, bundle: AppBun
     return carrot_dir;
 }
 
-fn runBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
-    var child = try spawnBuiltApp(ctx, config);
+fn runBundledElectrobunApp(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !void {
+    var child = try spawnBuiltApp(ctx, config, inspector);
     defer child.kill(ctx.io);
 
     const term = try child.wait(ctx.io);
@@ -2315,16 +2514,36 @@ fn buildCottontailLauncherScript(ctx: *const Context, bundle: AppBundlePaths) !v
     });
 }
 
-fn spawnBuiltApp(ctx: *const Context, config: CommandContext) !std.process.Child {
+fn spawnBuiltApp(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !std.process.Child {
     return switch (getMainProcess(config.root)) {
-        .bun, .cottontail, .zig, .rust, .go, .odin => blk: {
+        .bun, .cottontail, .zig, .rust, .go, .odin => |main_process| blk: {
             const bundle = try appBundlePaths(ctx, config);
             const launcher_path = try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() });
             if (!pathExists(ctx.io, launcher_path)) return error.BuiltMainNotFound;
 
+            const command = try buildBuiltAppLaunchCommand(
+                ctx.allocator,
+                main_process,
+                launcher_path,
+                inspector,
+            );
+            var environment = try ctx.environ_map.clone(ctx.allocator);
+            defer environment.deinit();
+            if (command.bun_inspect) |value| {
+                try environment.put("BUN_INSPECT", value);
+            }
+            if (command.force_console) {
+                try environment.put("ELECTROBUN_CONSOLE", "1");
+            }
+
             break :blk try std.process.spawn(ctx.io, .{
-                .argv = &[_][]const u8{launcher_path},
+                .argv = &command.argv,
                 .cwd = .{ .path = bundle.exec_dir },
+                .environ_map = &environment,
                 .stdin = .inherit,
                 .stdout = .inherit,
                 .stderr = .inherit,
@@ -2986,12 +3205,68 @@ fn shouldIgnoreWatchPath(ctx: *const Context, root: std.json.Value, full_path: [
 }
 
 fn watchIgnoreMatches(relative_path: []const u8, pattern: []const u8) bool {
-    if (std.mem.eql(u8, relative_path, pattern)) return true;
-    if (std.mem.endsWith(u8, pattern, "/**")) {
-        const prefix = pattern[0 .. pattern.len - 3];
-        return std.mem.startsWith(u8, relative_path, prefix);
+    if (watchPathsEqual(relative_path, pattern)) return true;
+
+    if (pattern.len >= 3 and
+        isWatchPathSeparator(pattern[pattern.len - 3]) and
+        std.mem.eql(u8, pattern[pattern.len - 2 ..], "**"))
+    {
+        const base = pattern[0 .. pattern.len - 3];
+        if (base.len == 0 or watchPathsEqual(relative_path, base)) return true;
+
+        return relative_path.len > base.len and
+            watchPathStartsWith(relative_path, base) and
+            isWatchPathSeparator(relative_path[base.len]);
     }
+
     return false;
+}
+
+fn watchPathsEqual(left: []const u8, right: []const u8) bool {
+    return left.len == right.len and watchPathStartsWith(left, right);
+}
+
+fn watchPathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (path.len < prefix.len) return false;
+
+    for (prefix, 0..) |expected, index| {
+        const actual = path[index];
+        if (actual == expected) continue;
+        if (!isWatchPathSeparator(actual) or !isWatchPathSeparator(expected)) return false;
+    }
+
+    return true;
+}
+
+fn isWatchPathSeparator(character: u8) bool {
+    return character == '/' or character == '\\';
+}
+
+test "watchIgnore globstar includes its base directory without matching sibling prefixes" {
+    const ignored_paths = [_][]const u8{
+        "src",
+        "src/",
+        "src/main.ts",
+        "src/components/button.tsx",
+        "src\\main.ts",
+    };
+    for (ignored_paths) |path| {
+        try std.testing.expect(watchIgnoreMatches(path, "src/**"));
+    }
+
+    const watched_paths = [_][]const u8{
+        "src-old",
+        "src-old/main.ts",
+        "src2/main.ts",
+        "source/src/main.ts",
+    };
+    for (watched_paths) |path| {
+        try std.testing.expect(!watchIgnoreMatches(path, "src/**"));
+    }
+
+    try std.testing.expect(watchIgnoreMatches("assets/generated", "assets/generated/**"));
+    try std.testing.expect(watchIgnoreMatches("assets\\generated\\app.js", "assets/generated/**"));
+    try std.testing.expect(!watchIgnoreMatches("assets/generated-old/app.js", "assets/generated/**"));
 }
 
 fn launcherFileName() []const u8 {
@@ -3006,6 +3281,22 @@ fn bunBinaryFileName() []const u8 {
         .windows => "bun.exe",
         else => "bun",
     };
+}
+
+fn windowsMainProcessExecutableName(main_process: MainProcess) []const u8 {
+    return switch (main_process) {
+        .bun => "bun.exe",
+        .cottontail => "cottontail.exe",
+        .zig, .rust, .go, .odin => "main.exe",
+    };
+}
+
+test "Windows icon embedding covers every main-process executable" {
+    try std.testing.expectEqualStrings("bun.exe", windowsMainProcessExecutableName(.bun));
+    try std.testing.expectEqualStrings("cottontail.exe", windowsMainProcessExecutableName(.cottontail));
+    inline for (.{ MainProcess.zig, MainProcess.rust, MainProcess.go, MainProcess.odin }) |main_process| {
+        try std.testing.expectEqualStrings("main.exe", windowsMainProcessExecutableName(main_process));
+    }
 }
 
 fn cottontailBinaryFileName() []const u8 {
@@ -3875,20 +4166,45 @@ test "bundled CEF layouts match the native wrapper contract" {
     }
 }
 
+fn bundledRuntimeMetadataJson(ctx: *const Context, config: CommandContext) ![]const u8 {
+    const runtime_value = getValueFieldFromObject(config.root.object, "runtime") orelse std.json.Value{ .object = .empty };
+    const platform = platformBuildObject(config.root);
+
+    var available_renderers = std.json.Array.init(ctx.allocator);
+    try available_renderers.append(.{ .string = "native" });
+    if (bundleUsesCef(config.root)) try available_renderers.append(.{ .string = "cef" });
+
+    var metadata: std.json.ObjectMap = .empty;
+    try metadata.put(ctx.allocator, "mainProcess", .{ .string = mainProcessName(getMainProcess(config.root)) });
+    try metadata.put(
+        ctx.allocator,
+        "defaultRenderer",
+        .{ .string = if (platform) |value| getStringFieldFromObject(value, "defaultRenderer") orelse "native" else "native" },
+    );
+    try metadata.put(ctx.allocator, "availableRenderers", .{ .array = available_renderers });
+    try metadata.put(ctx.allocator, "buildEnvironment", .{ .string = buildEnvironmentName(config.build_env) });
+    try metadata.put(ctx.allocator, "runtime", runtime_value);
+
+    if (platform) |value| {
+        if (value.get("chromiumFlags")) |chromium_flags| {
+            if (chromium_flags == .object and chromium_flags.object.count() > 0) {
+                try metadata.put(ctx.allocator, "chromiumFlags", chromium_flags);
+            }
+        }
+    }
+
+    return std.json.Stringify.valueAlloc(
+        ctx.allocator,
+        std.json.Value{ .object = metadata },
+        .{},
+    );
+}
+
 fn writeBundledRuntimeMetadata(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) !void {
     const identifier = try getAppIdentifier(ctx, config.root);
     const app_name = try appDisplayName(ctx, config);
     const version_name = try getAppVersion(ctx, config.root);
-    const runtime_value = getValueFieldFromObject(config.root.object, "runtime") orelse std.json.Value{ .object = .empty };
-    const runtime_json = try std.json.Stringify.valueAlloc(ctx.allocator, runtime_value, .{});
-    const default_renderer = if (platformBuildObject(config.root)) |platform| getStringFieldFromObject(platform, "defaultRenderer") orelse "native" else "native";
-    const available_renderers = if (bundleUsesCef(config.root)) "[\"native\",\"cef\"]" else "[\"native\"]";
-    const main_process = mainProcessName(getMainProcess(config.root));
-    const build_json = try std.fmt.allocPrint(
-        ctx.allocator,
-        "{{\"mainProcess\":\"{s}\",\"defaultRenderer\":\"{s}\",\"availableRenderers\":{s},\"runtime\":{s}}}",
-        .{ main_process, default_renderer, available_renderers, runtime_json },
-    );
+    const build_json = try bundledRuntimeMetadataJson(ctx, config);
     const version_json = try std.fmt.allocPrint(
         ctx.allocator,
         "{{\"version\":\"{s}\",\"hash\":\"dev\",\"channel\":\"{s}\",\"name\":\"{s}\",\"identifier\":\"{s}\",\"baseUrl\":\"\"}}",
@@ -3903,6 +4219,91 @@ fn writeBundledRuntimeMetadata(ctx: *const Context, config: CommandContext, bund
         .sub_path = try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "version.json" }),
         .data = version_json,
     });
+}
+
+test "bundled runtime metadata carries CEF debugging policy inputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = "",
+    };
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "build": {
+        \\    "mainProcess": "cottontail",
+        \\    "mac": {
+        \\      "bundleCEF": true,
+        \\      "defaultRenderer": "cef",
+        \\      "chromiumFlags": {"remote-debugging-port": "9331", "show-paint-rects": true}
+        \\    },
+        \\    "win": {
+        \\      "bundleCEF": true,
+        \\      "defaultRenderer": "cef",
+        \\      "chromiumFlags": {"remote-debugging-port": "9332", "show-paint-rects": true}
+        \\    },
+        \\    "linux": {
+        \\      "bundleCEF": true,
+        \\      "defaultRenderer": "cef",
+        \\      "chromiumFlags": {"remote-debugging-port": "9333", "show-paint-rects": true}
+        \\    }
+        \\  },
+        \\  "runtime": {"exitOnLastWindowClosed": false}
+        \\}
+    ,
+        .{},
+    );
+    const json = try bundledRuntimeMetadataJson(&ctx, .{
+        .raw_json = "",
+        .root = root,
+        .build_env = .dev,
+    });
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+
+    try std.testing.expectEqualStrings("dev", getStringField(metadata, "buildEnvironment").?);
+    try std.testing.expectEqualStrings("cef", getStringField(metadata, "defaultRenderer").?);
+    const renderers = metadata.object.get("availableRenderers").?;
+    try std.testing.expectEqual(@as(usize, 2), renderers.array.items.len);
+
+    const chromium_flags = metadata.object.get("chromiumFlags").?;
+    const expected_port = switch (builtin.os.tag) {
+        .macos => "9331",
+        .windows => "9332",
+        else => "9333",
+    };
+    try std.testing.expectEqualStrings(
+        expected_port,
+        getStringFieldFromObject(chromium_flags.object, "remote-debugging-port").?,
+    );
+    try std.testing.expect(chromium_flags.object.get("show-paint-rects").?.bool);
+    try std.testing.expect(!metadata.object.get("runtime").?.object.get("exitOnLastWindowClosed").?.bool);
+
+    const packaged_root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"cottontail"},"runtime":{}}
+    ,
+        .{},
+    );
+    const packaged_json = try bundledRuntimeMetadataJson(&ctx, .{
+        .raw_json = "",
+        .root = packaged_root,
+        .build_env = .production,
+    });
+    const packaged = try std.json.parseFromSliceLeaky(std.json.Value, allocator, packaged_json, .{});
+    try std.testing.expectEqualStrings("production", getStringField(packaged, "buildEnvironment").?);
+    try std.testing.expect(packaged.object.get("chromiumFlags") == null);
 }
 
 fn termExitCode(term: std.process.Child.Term) u8 {
@@ -4120,6 +4521,107 @@ test "PowerShell installer paths escape single quotes" {
     try std.testing.expectEqualStrings("O''Brien''s App", escaped);
 }
 
+test "Electrobun issue 397 constructs Bun and Cottontail inspector launcher environments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    for ([_]MainProcess{ .bun, .cottontail }) |main_process| {
+        const command = try buildBuiltAppLaunchCommand(
+            allocator,
+            main_process,
+            "/app/launcher",
+            .{ .mode = .inspect_wait, .address = "127.0.0.1:9229" },
+        );
+        try std.testing.expectEqual(@as(usize, 1), command.argv.len);
+        try std.testing.expectEqualStrings("/app/launcher", command.argv[0]);
+        try std.testing.expectEqualStrings("127.0.0.1:9229?wait=1", command.bun_inspect.?);
+        try std.testing.expect(command.force_console);
+    }
+
+    const breakpoint = try buildBuiltAppLaunchCommand(
+        allocator,
+        .cottontail,
+        "/app/launcher",
+        .{ .mode = .inspect_brk },
+    );
+    try std.testing.expectEqualStrings("127.0.0.1:6499?break=1", breakpoint.bun_inspect.?);
+
+    const normal = try buildBuiltAppLaunchCommand(allocator, .bun, "/app/launcher", null);
+    try std.testing.expect(normal.bun_inspect == null);
+    try std.testing.expect(!normal.force_console);
+}
+
+test "Electrobun issue 397 resolves inspector CLI environment and config precedence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "build": { "mainProcess": "cottontail" },
+        \\  "runtime": {
+        \\    "mainProcessInspector": {
+        \\      "mode": "inspect-brk",
+        \\      "address": "127.0.0.1:7000"
+        \\    }
+        \\  }
+        \\}
+    ,
+        .{},
+    );
+
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("ELECTROBUN_INSPECT", "--inspect-wait=127.0.0.1:8000");
+
+    const cli_args = [_][:0]const u8{"--inspect=127.0.0.1:9000"};
+    const cli = (try resolvedInspectorSelection(root, &cli_args, &environment)).?;
+    try std.testing.expectEqual(MainProcessInspectorMode.inspect, cli.mode);
+    try std.testing.expectEqualStrings("127.0.0.1:9000", cli.address.?);
+
+    const no_args = [_][:0]const u8{};
+    const from_environment = (try resolvedInspectorSelection(root, &no_args, &environment)).?;
+    try std.testing.expectEqual(MainProcessInspectorMode.inspect_wait, from_environment.mode);
+    try std.testing.expectEqualStrings("127.0.0.1:8000", from_environment.address.?);
+
+    var no_environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer no_environment.deinit();
+    const from_config = (try resolvedInspectorSelection(root, &no_args, &no_environment)).?;
+    try std.testing.expectEqual(MainProcessInspectorMode.inspect_brk, from_config.mode);
+    try std.testing.expectEqualStrings("127.0.0.1:7000", from_config.address.?);
+
+    const disable_args = [_][:0]const u8{"--no-inspect"};
+    try std.testing.expect((try resolvedInspectorSelection(root, &disable_args, &environment)) == null);
+}
+
+test "Electrobun issue 397 rejects conflicting and unsupported inspector launches" {
+    const conflicting = [_][:0]const u8{ "--inspect", "--inspect-wait=9229" };
+    try std.testing.expectError(
+        error.ConflictingInspectorOptions,
+        inspectorSelectionFromCli(&conflicting),
+    );
+
+    try std.testing.expectError(
+        error.UnsupportedMainProcessInspector,
+        buildBuiltAppLaunchCommand(
+            std.testing.allocator,
+            .zig,
+            "/app/launcher",
+            .{ .mode = .inspect },
+        ),
+    );
+
+    const native_normal = try buildBuiltAppLaunchCommand(
+        std.testing.allocator,
+        .rust,
+        "/app/launcher",
+        null,
+    );
+    try std.testing.expectEqualStrings("/app/launcher", native_normal.argv[0]);
+}
+
 test "notarization response must explicitly be accepted" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4183,4 +4685,117 @@ test "Linux installer payload uses the extractor marker contract" {
             "ELECTROBUN_ARCHIVE_V1ARCHIVE",
         bytes,
     );
+}
+
+test "Linux bundle archives desktop entries independently of icon configuration" {
+    const IconState = enum { valid, absent, invalid };
+    const cases = [_]struct {
+        directory: []const u8,
+        icon_state: IconState,
+        config_json: []const u8,
+    }{
+        .{
+            .directory = "valid-icon",
+            .icon_state = .valid,
+            .config_json =
+            \\{
+            \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
+            \\  "build": {"mainProcess":"cottontail","linux":{"icon":"icon.png"}}
+            \\}
+            ,
+        },
+        .{
+            .directory = "without-icon",
+            .icon_state = .absent,
+            .config_json =
+            \\{
+            \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
+            \\  "build": {"mainProcess":"zig"}
+            \\}
+            ,
+        },
+        .{
+            .directory = "invalid-icon",
+            .icon_state = .invalid,
+            .config_json =
+            \\{
+            \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
+            \\  "build": {"mainProcess":"go","linux":{"icon":"missing.png"}}
+            \\}
+            ,
+        },
+    };
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    switch (builtin.os.tag) {
+        .windows => {
+            try env_map.put("PATH", "C:\\Windows\\System32");
+            try env_map.put("SystemRoot", "C:\\Windows");
+        },
+        else => try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    }
+
+    for (cases) |case| {
+        const case_root = try std.fs.path.join(allocator, &.{ absolute_root, case.directory });
+        const bundle_root = try std.fs.path.join(allocator, &.{ case_root, "bundle" });
+        const resources_dir = try std.fs.path.join(allocator, &.{ bundle_root, "Resources" });
+        const app_code_dir = try std.fs.path.join(allocator, &.{ resources_dir, "app" });
+        try std.Io.Dir.cwd().createDirPath(io, app_code_dir);
+
+        if (case.icon_state == .valid) {
+            try std.Io.Dir.cwd().writeFile(io, .{
+                .sub_path = try std.fs.path.join(allocator, &.{ case_root, "icon.png" }),
+                .data = "PNG",
+            });
+        }
+
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, case.config_json, .{});
+        const config = CommandContext{
+            .raw_json = case.config_json,
+            .root = root,
+            .build_env = .production,
+        };
+        const ctx = Context{
+            .io = io,
+            .allocator = allocator,
+            .environ_map = &env_map,
+            .self_exe_path = "",
+            .cottontail_home = "",
+            .cottontail_binary = "",
+            .project_root = case_root,
+        };
+        const bundle = AppBundlePaths{
+            .build_root = case_root,
+            .bundle_root = bundle_root,
+            .exec_dir = try std.fs.path.join(allocator, &.{ bundle_root, "bin" }),
+            .resources_dir = resources_dir,
+            .frameworks_dir = null,
+            .app_code_dir = app_code_dir,
+        };
+
+        try installLinuxBundleAssets(&ctx, config, bundle);
+
+        const desktop_path = try std.fs.path.join(allocator, &.{ bundle_root, "Archive App.desktop" });
+        const desktop = try std.Io.Dir.cwd().readFileAlloc(io, desktop_path, allocator, .limited(4096));
+        try std.testing.expect(std.mem.indexOf(u8, desktop, "[Desktop Entry]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, desktop, "Name=Archive App") != null);
+
+        const bundled_icon = try std.fs.path.join(allocator, &.{ resources_dir, "appIcon.png" });
+        try std.testing.expectEqual(case.icon_state == .valid, pathExists(io, bundled_icon));
+
+        const tar_path = try std.fs.path.join(allocator, &.{ case_root, "bundle.tar" });
+        try createBundleTar(&ctx, bundle_root, tar_path);
+        const archive = try std.Io.Dir.cwd().readFileAlloc(io, tar_path, allocator, .limited(1024 * 1024));
+        try std.testing.expect(std.mem.indexOf(u8, archive, "Archive App.desktop") != null);
+    }
 }

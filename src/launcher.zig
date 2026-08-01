@@ -74,8 +74,7 @@ fn runEngine(
 ) !u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.append(allocator, engine);
-    for (original_args[1..]) |argument| try argv.append(allocator, argument);
+    try appendEngineArguments(allocator, &argv, engine, original_args);
 
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
@@ -98,6 +97,17 @@ fn runEngine(
     });
     defer child.kill(init.io);
     return termExitCode(try child.wait(init.io));
+}
+
+fn appendEngineArguments(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    engine: []const u8,
+    original_args: []const [:0]const u8,
+) !void {
+    try argv.append(allocator, engine);
+    if (original_args.len <= 1) return;
+    for (original_args[1..]) |argument| try argv.append(allocator, argument);
 }
 
 fn activeChannel(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -170,4 +180,31 @@ test "global launcher aliases select independent channels" {
     try std.testing.expectEqualStrings("production", channelForExecutableName("hutch.exe"));
     try std.testing.expectEqualStrings("canary", channelForExecutableName("hutch-canary"));
     try std.testing.expectEqualStrings("canary", channelForExecutableName("hutch-canary.exe"));
+}
+
+test "launcher preserves the complete test invocation for the engine" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+
+    const original_args = [_][:0]const u8{
+        "hutch",
+        "test",
+        "tests/one.test.ts",
+        "tests/two test.ts",
+        "--test-name-pattern",
+        "exact value",
+        "--bail=3",
+    };
+    try appendEngineArguments(
+        std.testing.allocator,
+        &argv,
+        "/tmp/hutch-engine",
+        &original_args,
+    );
+
+    try std.testing.expectEqual(@as(usize, original_args.len), argv.items.len);
+    try std.testing.expectEqualStrings("/tmp/hutch-engine", argv.items[0]);
+    for (original_args[1..], argv.items[1..]) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
