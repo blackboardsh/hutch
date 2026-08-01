@@ -1,4 +1,4 @@
-// @dash cli=0.3.0-canary.2 cottontail=0.2.0-canary.1
+// @dash cli=0.3.0-canary.2 cottontail=0.2.2
 export default {
   scripts: {
     smoke: "examples/smoke.js",
