@@ -84,4 +84,19 @@ test("Unix release jobs build Hutch before integration tests", () => {
   assert.ok(start >= 0 && end > start, "build_hutch_unix command exists");
   assert.ok(build >= 0 && tests >= 0, "build and test steps exist");
   assert.ok(build < tests, "Hutch executables are available to integration tests");
+  assert.match(command, /node --test --test-concurrency=1 \\\n/);
+});
+
+test("Linux ARM releases run on the Cottontail-compatible Ubuntu image", () => {
+  const config = readFileSync(
+    new URL("../../.circleci/config.yml", import.meta.url),
+    "utf8",
+  );
+  const start = config.indexOf("  build-hutch-linux-arm64:");
+  const end = config.indexOf("\n  build-hutch-macos-arm64:", start);
+  const job = config.slice(start, end);
+
+  assert.ok(start >= 0 && end > start, "Linux ARM release job exists");
+  assert.match(job, /image: ubuntu-2404:current/);
+  assert.match(job, /resource_class: arm\.medium/);
 });

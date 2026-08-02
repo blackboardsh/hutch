@@ -8,7 +8,7 @@
     "package:release": "node scripts/package-release.js",
     "publish:release": "node scripts/upload-release-r2.js --all",
     "test:release": "node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js",
-    "test:electrobun": "node --test tests/electrobun/decorator-bundle.test.js tests/electrobun/non-index-main-entrypoint.test.js tests/electrobun/tsconfig-path-alias-bundle.test.js",
+    "test:electrobun": "node --test --test-concurrency=1 tests/electrobun/decorator-bundle.test.js tests/electrobun/non-index-main-entrypoint.test.js tests/electrobun/tsconfig-path-alias-bundle.test.js",
     "compat:package-manager:check": "node scripts/run-bun-package-manager-tests.js --check",
     "compat:package-manager:list": "node scripts/run-bun-package-manager-tests.js --list",
     "compat:package-manager": "node scripts/run-bun-package-manager-tests.js",
