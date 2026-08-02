@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -67,4 +68,20 @@ test("complete platform matrices are required", () => {
     () => createBuildManifest({ ...options, artifacts: artifacts.slice(1) }),
     /missing macos-arm64/,
   );
+});
+
+test("Unix release jobs build Hutch before integration tests", () => {
+  const config = readFileSync(
+    new URL("../../.circleci/config.yml", import.meta.url),
+    "utf8",
+  );
+  const start = config.indexOf("  build_hutch_unix:");
+  const end = config.indexOf("\njobs:", start);
+  const command = config.slice(start, end);
+  const build = command.indexOf("name: Build Hutch release executables");
+  const tests = command.indexOf("name: Run Hutch tests");
+
+  assert.ok(start >= 0 && end > start, "build_hutch_unix command exists");
+  assert.ok(build >= 0 && tests >= 0, "build and test steps exist");
+  assert.ok(build < tests, "Hutch executables are available to integration tests");
 });
