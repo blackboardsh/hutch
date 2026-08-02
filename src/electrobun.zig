@@ -112,6 +112,29 @@ const ReleaseState = struct {
     hash: []const u8,
     compressed_tar_path: []const u8,
     patch_path: ?[]const u8,
+    flatpak_payload_path: ?[]const u8,
+};
+
+const FlatpakManifestOptions = struct {
+    app_id: []const u8,
+    channel: []const u8,
+    architecture: []const u8,
+    runtime: []const u8,
+    runtime_version: []const u8,
+    sdk: []const u8,
+    payload_path: []const u8,
+    desktop_path: []const u8,
+    has_icon: bool,
+    finish_args: []const []const u8,
+};
+
+const default_flatpak_finish_args = [_][]const u8{
+    "--share=ipc",
+    "--share=network",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--socket=pulseaudio",
+    "--device=dri",
 };
 
 pub fn forceLink() void {}
@@ -500,6 +523,12 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
     }
 
     if (config.build_env == .dev) {
+        if (builtin.os.tag == .linux and flatpakEnabled(config.root)) {
+            const bundle = try appBundlePaths(ctx, config);
+            const payload_path = try stageFlatpakPayload(ctx, bundle);
+            defer std.Io.Dir.cwd().deleteTree(ctx.io, payload_path) catch {};
+            try writeFlatpakOutput(ctx, config, payload_path);
+        }
         try runHook(ctx, config, "postPackage", null);
         ctx.writeStdout("electrobun build complete: {s}\n", .{build_root});
         return;
@@ -531,6 +560,10 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
     const bundle = try appBundlePaths(ctx, config);
     const hash = try hashBundle(ctx, bundle.bundle_root);
     try writeVersionMetadata(ctx, config, bundle, hash);
+    const flatpak_payload_path = if (builtin.os.tag == .linux and flatpakEnabled(config.root))
+        try stageFlatpakPayload(ctx, bundle)
+    else
+        null;
 
     if (shouldCodesign(config)) {
         const entitlements_path = try writeEntitlementsFile(ctx, config);
@@ -560,6 +593,7 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
         .hash = hash,
         .compressed_tar_path = compressed_tar_path,
         .patch_path = patch_path,
+        .flatpak_payload_path = flatpak_payload_path,
     };
 }
 
@@ -1014,6 +1048,7 @@ fn installBundleAssets(
 }
 
 fn installLinuxBundleAssets(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) !void {
+    var icon_available = false;
     if (getObjectField(config.root, "build")) |build| {
         if (getObjectFieldFromObject(build, "linux")) |platform| {
             if (getStringFieldFromObject(platform, "icon")) |icon| {
@@ -1023,6 +1058,7 @@ fn installLinuxBundleAssets(ctx: *const Context, config: CommandContext, bundle:
                 } else {
                     try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "appIcon.png" }));
                     try copyPath(ctx, source, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "app", "icon.png" }));
+                    icon_available = true;
                 }
             }
         }
@@ -1031,12 +1067,22 @@ fn installLinuxBundleAssets(ctx: *const Context, config: CommandContext, bundle:
     const app = getObjectField(config.root, "app") orelse return error.InvalidConfig;
     const app_name = try getAppName(ctx, config.root);
     const description = getStringFieldFromObject(app, "description") orelse app_name;
+    const artifact_name = try artifactAppFileName(ctx, config);
+    const display_name = switch (config.build_env) {
+        .production => app_name,
+        .canary => try std.fmt.allocPrint(ctx.allocator, "{s} (Canary)", .{app_name}),
+        .dev => try std.fmt.allocPrint(ctx.allocator, "{s} (Development)", .{app_name}),
+    };
+    // Desktop files require either an absolute path or a theme icon name. The
+    // extractor replaces this extensionless bundle placeholder with the final
+    // absolute path after installation.
+    const icon_line = if (icon_available) "Icon=appIcon\n" else "";
     const desktop = try std.fmt.allocPrint(
         ctx.allocator,
-        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\nIcon=appIcon.png\nTerminal=false\nStartupWMClass={s}\nCategories=Utility;Application;\n",
-        .{ app_name, description, app_name },
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\n{s}Terminal=false\nStartupWMClass={s}\nCategories=Utility;\n",
+        .{ display_name, description, icon_line, artifact_name },
     );
-    const desktop_name = try std.mem.concat(ctx.allocator, u8, &.{ app_name, ".desktop" });
+    const desktop_name = try std.mem.concat(ctx.allocator, u8, &.{ artifact_name, ".desktop" });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(ctx.allocator, &.{ bundle.bundle_root, desktop_name }),
         .data = desktop,
@@ -1477,6 +1523,10 @@ fn finishRelease(ctx: *const Context, config: CommandContext, state: ReleaseStat
     }
 
     try writeReleaseArtifacts(ctx, config, state, installer_path);
+    if (state.flatpak_payload_path) |payload_path| {
+        defer std.Io.Dir.cwd().deleteTree(ctx.io, payload_path) catch {};
+        try writeFlatpakOutput(ctx, config, payload_path);
+    }
 }
 
 fn createDmg(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) ![]const u8 {
@@ -1696,6 +1746,255 @@ fn createLinuxInstaller(ctx: *const Context, config: CommandContext, state: Rele
     try env_map.put("COPYFILE_DISABLE", "1");
     try runReleaseCommand(ctx, &.{ "tar", "-czf", archive_path, "-C", staging, "." }, ctx.project_root, &env_map);
     return archive_path;
+}
+
+fn flatpakConfigObject(root: std.json.Value) ?std.json.ObjectMap {
+    const build = getObjectField(root, "build") orelse return null;
+    const linux = getObjectFieldFromObject(build, "linux") orelse return null;
+    return getObjectFieldFromObject(linux, "flatpak");
+}
+
+fn flatpakEnabled(root: std.json.Value) bool {
+    const config = flatpakConfigObject(root) orelse return false;
+    return getBoolFieldFromObject(config, "enabled");
+}
+
+fn flatpakConfigString(root: std.json.Value, field: []const u8, default: []const u8) []const u8 {
+    const config = flatpakConfigObject(root) orelse return default;
+    return getStringFieldFromObject(config, field) orelse default;
+}
+
+fn flatpakFinishArgs(ctx: *const Context, root: std.json.Value) ![]const []const u8 {
+    const config = flatpakConfigObject(root) orelse return default_flatpak_finish_args[0..];
+    const value = config.get("finishArgs") orelse return default_flatpak_finish_args[0..];
+    if (value != .array) return default_flatpak_finish_args[0..];
+
+    var args: std.ArrayList([]const u8) = .empty;
+    for (value.array.items) |item| {
+        if (item == .string) try args.append(ctx.allocator, item.string);
+    }
+    return args.toOwnedSlice(ctx.allocator);
+}
+
+fn flatpakArchitectureName() ![]const u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => error.UnsupportedFlatpakArchitecture,
+    };
+}
+
+fn stageFlatpakPayload(ctx: *const Context, bundle: AppBundlePaths) ![]const u8 {
+    const payload_path = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".flatpak-payload" });
+    try recreateDir(ctx, payload_path);
+    try copyPath(ctx, bundle.exec_dir, try std.fs.path.join(ctx.allocator, &.{ payload_path, "bin" }));
+    try copyPath(ctx, bundle.resources_dir, try std.fs.path.join(ctx.allocator, &.{ payload_path, "Resources" }));
+    return payload_path;
+}
+
+fn annotateFlatpakPayloadMetadata(ctx: *const Context, payload_path: []const u8) !void {
+    const resources_path = try std.fs.path.join(ctx.allocator, &.{ payload_path, "Resources" });
+    const version_path = try std.fs.path.join(ctx.allocator, &.{ resources_path, "version.json" });
+    const build_path = try std.fs.path.join(ctx.allocator, &.{ resources_path, "build.json" });
+
+    const files = [_]struct {
+        path: []const u8,
+        clear_base_url: bool,
+    }{
+        .{ .path = version_path, .clear_base_url = true },
+        .{ .path = build_path, .clear_base_url = false },
+    };
+
+    for (files) |file| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            ctx.io,
+            file.path,
+            ctx.allocator,
+            .limited(1024 * 1024),
+        );
+        var parsed = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, bytes, .{});
+        if (parsed != .object) return error.InvalidFlatpakPayloadMetadata;
+        if (file.clear_base_url) {
+            try parsed.object.put(ctx.allocator, "baseUrl", .{ .string = "" });
+        }
+        try parsed.object.put(ctx.allocator, "packaging", .{ .string = "flatpak" });
+        try parsed.object.put(ctx.allocator, "selfExtraction", .{ .bool = false });
+        try parsed.object.put(ctx.allocator, "electrobunUpdater", .{ .string = "unsupported" });
+        const json = try std.json.Stringify.valueAlloc(
+            ctx.allocator,
+            parsed,
+            .{ .whitespace = .indent_2 },
+        );
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{
+            .sub_path = file.path,
+            .data = try std.mem.concat(ctx.allocator, u8, &.{ json, "\n" }),
+        });
+    }
+}
+
+fn flatpakDesktopEntry(
+    allocator: std.mem.Allocator,
+    app_name: []const u8,
+    description: []const u8,
+    app_id: []const u8,
+    wm_class: []const u8,
+    has_icon: bool,
+) ![]const u8 {
+    const icon_line = if (has_icon)
+        try std.fmt.allocPrint(allocator, "Icon={s}\n", .{app_id})
+    else
+        "";
+    return std.fmt.allocPrint(
+        allocator,
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\n{s}Terminal=false\nStartupWMClass={s}\nCategories=Utility;\n",
+        .{ app_name, description, icon_line, wm_class },
+    );
+}
+
+fn flatpakManifestJson(allocator: std.mem.Allocator, options: FlatpakManifestOptions) ![]const u8 {
+    var finish_args = std.json.Array.init(allocator);
+    for (options.finish_args) |arg| try finish_args.append(.{ .string = arg });
+
+    var architecture = std.json.Array.init(allocator);
+    try architecture.append(.{ .string = options.architecture });
+
+    var build_commands = std.json.Array.init(allocator);
+    try build_commands.append(.{ .string = "mkdir -p /app/bin /app/Resources /app/share/applications" });
+    try build_commands.append(.{ .string = "cp -a payload/bin/. /app/bin/" });
+    try build_commands.append(.{ .string = "cp -a payload/Resources/. /app/Resources/" });
+    try build_commands.append(.{ .string = "chmod 0755 /app/bin/launcher" });
+    try build_commands.append(.{ .string = try std.fmt.allocPrint(
+        allocator,
+        "install -Dm644 {s} /app/share/applications/{s}.desktop",
+        .{ options.desktop_path, options.app_id },
+    ) });
+    if (options.has_icon) {
+        try build_commands.append(.{ .string = try std.fmt.allocPrint(
+            allocator,
+            "install -Dm644 payload/Resources/appIcon.png /app/share/icons/hicolor/256x256/apps/{s}.png",
+            .{options.app_id},
+        ) });
+    }
+
+    var payload_source: std.json.ObjectMap = .empty;
+    try payload_source.put(allocator, "type", .{ .string = "dir" });
+    try payload_source.put(allocator, "path", .{ .string = options.payload_path });
+    try payload_source.put(allocator, "dest", .{ .string = "payload" });
+    try payload_source.put(allocator, "only-arches", .{ .array = architecture });
+
+    var desktop_architecture = std.json.Array.init(allocator);
+    try desktop_architecture.append(.{ .string = options.architecture });
+    var desktop_source: std.json.ObjectMap = .empty;
+    try desktop_source.put(allocator, "type", .{ .string = "file" });
+    try desktop_source.put(allocator, "path", .{ .string = options.desktop_path });
+    try desktop_source.put(allocator, "only-arches", .{ .array = desktop_architecture });
+
+    var sources = std.json.Array.init(allocator);
+    try sources.append(.{ .object = payload_source });
+    try sources.append(.{ .object = desktop_source });
+
+    var module: std.json.ObjectMap = .empty;
+    try module.put(allocator, "name", .{ .string = "electrobun-app" });
+    try module.put(allocator, "buildsystem", .{ .string = "simple" });
+    try module.put(allocator, "build-commands", .{ .array = build_commands });
+    try module.put(allocator, "sources", .{ .array = sources });
+    var modules = std.json.Array.init(allocator);
+    try modules.append(.{ .object = module });
+
+    var electrobun_metadata: std.json.ObjectMap = .empty;
+    try electrobun_metadata.put(allocator, "status", .{ .string = "mvp" });
+    try electrobun_metadata.put(allocator, "channel", .{ .string = options.channel });
+    try electrobun_metadata.put(allocator, "architecture", .{ .string = options.architecture });
+    try electrobun_metadata.put(allocator, "self-extraction", .{ .string = "disabled-expanded-payload" });
+    try electrobun_metadata.put(allocator, "built-in-updater", .{ .string = "unsupported-use-flatpak-updates" });
+
+    var manifest: std.json.ObjectMap = .empty;
+    try manifest.put(allocator, "id", .{ .string = options.app_id });
+    try manifest.put(allocator, "branch", .{ .string = options.channel });
+    try manifest.put(allocator, "runtime", .{ .string = options.runtime });
+    try manifest.put(allocator, "runtime-version", .{ .string = options.runtime_version });
+    try manifest.put(allocator, "sdk", .{ .string = options.sdk });
+    try manifest.put(allocator, "command", .{ .string = "launcher" });
+    try manifest.put(allocator, "finish-args", .{ .array = finish_args });
+    try manifest.put(allocator, "x-electrobun", .{ .object = electrobun_metadata });
+    try manifest.put(allocator, "modules", .{ .array = modules });
+
+    return std.json.Stringify.valueAlloc(
+        allocator,
+        std.json.Value{ .object = manifest },
+        .{ .whitespace = .indent_2 },
+    );
+}
+
+fn writeFlatpakOutput(ctx: *const Context, config: CommandContext, staged_payload_path: []const u8) !void {
+    const app_id = try getAppIdentifier(ctx, config.root);
+    const channel = buildEnvironmentName(config.build_env);
+    const architecture = try flatpakArchitectureName();
+    const output_path = flatpakConfigString(config.root, "outputPath", "flatpak");
+    const output_base = if (std.fs.path.isAbsolute(output_path))
+        output_path
+    else
+        try std.fs.path.join(ctx.allocator, &.{ try artifactOutputRoot(ctx, config.root), output_path });
+    const output_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{s}", .{ app_id, channel, architecture });
+    const output_root = try std.fs.path.join(ctx.allocator, &.{ output_base, output_name });
+    try recreateDir(ctx, output_root);
+
+    const payload_path = try std.fs.path.join(ctx.allocator, &.{ output_root, "payload" });
+    try copyPath(ctx, staged_payload_path, payload_path);
+    try annotateFlatpakPayloadMetadata(ctx, payload_path);
+
+    const icon_path = try std.fs.path.join(ctx.allocator, &.{ payload_path, "Resources", "appIcon.png" });
+    const has_icon = pathExists(ctx.io, icon_path);
+    const app = getObjectField(config.root, "app") orelse return error.InvalidConfig;
+    const base_app_name = try getAppName(ctx, config.root);
+    const display_name = switch (config.build_env) {
+        .production => base_app_name,
+        .canary => try std.fmt.allocPrint(ctx.allocator, "{s} (Canary)", .{base_app_name}),
+        .dev => try std.fmt.allocPrint(ctx.allocator, "{s} (Development)", .{base_app_name}),
+    };
+    const description = getStringFieldFromObject(app, "description") orelse base_app_name;
+    const desktop_name = try std.mem.concat(ctx.allocator, u8, &.{ app_id, ".desktop" });
+    const desktop = try flatpakDesktopEntry(
+        ctx.allocator,
+        display_name,
+        description,
+        app_id,
+        try artifactAppFileName(ctx, config),
+        has_icon,
+    );
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try std.fs.path.join(ctx.allocator, &.{ output_root, desktop_name }),
+        .data = desktop,
+    });
+
+    const manifest_name = try std.mem.concat(ctx.allocator, u8, &.{ app_id, ".json" });
+    const manifest = try flatpakManifestJson(ctx.allocator, .{
+        .app_id = app_id,
+        .channel = channel,
+        .architecture = architecture,
+        .runtime = flatpakConfigString(config.root, "runtime", "org.freedesktop.Platform"),
+        .runtime_version = flatpakConfigString(config.root, "runtimeVersion", "25.08"),
+        .sdk = flatpakConfigString(config.root, "sdk", "org.freedesktop.Sdk"),
+        .payload_path = "payload",
+        .desktop_path = desktop_name,
+        .has_icon = has_icon,
+        .finish_args = try flatpakFinishArgs(ctx, config.root),
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try std.fs.path.join(ctx.allocator, &.{ output_root, manifest_name }),
+        .data = try std.mem.concat(ctx.allocator, u8, &.{ manifest, "\n" }),
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try std.fs.path.join(ctx.allocator, &.{ output_root, "FLATPAK-MVP.txt" }),
+        .data = "This is an opt-in Flatpak manifest and expanded Electrobun payload.\n" ++
+            "The self-extracting launcher is intentionally not used inside the sandbox.\n" ++
+            "Electrobun's built-in updater is unsupported; publish updates through Flatpak.\n" ++
+            "Hutch generated this output but did not invoke flatpak-builder or validate a runtime.\n",
+    });
+    ctx.writeStdout(
+        "Flatpak MVP output: {s} (expanded /app payload; built-in updater unsupported)\n",
+        .{output_root},
+    );
 }
 
 fn extractorMetadataJson(ctx: *const Context, config: CommandContext, hash: []const u8) ![]const u8 {
@@ -1944,8 +2243,11 @@ fn zigTargetName() []const u8 {
     return switch (builtin.os.tag) {
         .windows => "x86_64-windows",
         .linux => switch (builtin.cpu.arch) {
-            .aarch64 => "aarch64-linux",
-            else => "x86_64-linux",
+            // Linux main processes dynamically load Electrobun's glibc-based
+            // core. An unspecified ABI lets Zig select a static libc, which
+            // cannot safely load that shared-library stack.
+            .aarch64 => "aarch64-linux-gnu",
+            else => "x86_64-linux-gnu",
         },
         .macos => switch (builtin.cpu.arch) {
             .aarch64 => "aarch64-macos",
@@ -1953,6 +2255,12 @@ fn zigTargetName() []const u8 {
         },
         else => "native",
     };
+}
+
+test "Linux Zig main target selects the GNU ABI" {
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(std.mem.endsWith(u8, zigTargetName(), "-linux-gnu"));
+    }
 }
 
 fn appendZigStringLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
@@ -4692,11 +5000,17 @@ test "Linux bundle archives desktop entries independently of icon configuration"
     const cases = [_]struct {
         directory: []const u8,
         icon_state: IconState,
+        build_env: BuildEnvironment,
+        desktop_stem: []const u8,
+        display_name: []const u8,
         config_json: []const u8,
     }{
         .{
             .directory = "valid-icon",
             .icon_state = .valid,
+            .build_env = .production,
+            .desktop_stem = "ArchiveApp",
+            .display_name = "Archive App",
             .config_json =
             \\{
             \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
@@ -4707,6 +5021,9 @@ test "Linux bundle archives desktop entries independently of icon configuration"
         .{
             .directory = "without-icon",
             .icon_state = .absent,
+            .build_env = .canary,
+            .desktop_stem = "ArchiveApp-canary",
+            .display_name = "Archive App (Canary)",
             .config_json =
             \\{
             \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
@@ -4717,6 +5034,9 @@ test "Linux bundle archives desktop entries independently of icon configuration"
         .{
             .directory = "invalid-icon",
             .icon_state = .invalid,
+            .build_env = .dev,
+            .desktop_stem = "ArchiveApp-dev",
+            .display_name = "Archive App (Development)",
             .config_json =
             \\{
             \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.archive","version":"1.0.0"},
@@ -4763,7 +5083,7 @@ test "Linux bundle archives desktop entries independently of icon configuration"
         const config = CommandContext{
             .raw_json = case.config_json,
             .root = root,
-            .build_env = .production,
+            .build_env = case.build_env,
         };
         const ctx = Context{
             .io = io,
@@ -4785,10 +5105,18 @@ test "Linux bundle archives desktop entries independently of icon configuration"
 
         try installLinuxBundleAssets(&ctx, config, bundle);
 
-        const desktop_path = try std.fs.path.join(allocator, &.{ bundle_root, "Archive App.desktop" });
+        const desktop_name = try std.mem.concat(allocator, u8, &.{ case.desktop_stem, ".desktop" });
+        const desktop_path = try std.fs.path.join(allocator, &.{ bundle_root, desktop_name });
         const desktop = try std.Io.Dir.cwd().readFileAlloc(io, desktop_path, allocator, .limited(4096));
         try std.testing.expect(std.mem.indexOf(u8, desktop, "[Desktop Entry]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, desktop, "Name=Archive App") != null);
+        const expected_name = try std.fmt.allocPrint(allocator, "Name={s}\n", .{case.display_name});
+        try std.testing.expect(std.mem.indexOf(u8, desktop, expected_name) != null);
+        const expected_wm_class = try std.fmt.allocPrint(allocator, "StartupWMClass={s}\n", .{case.desktop_stem});
+        try std.testing.expect(std.mem.indexOf(u8, desktop, expected_wm_class) != null);
+        try std.testing.expectEqual(
+            case.icon_state == .valid,
+            std.mem.indexOf(u8, desktop, "Icon=appIcon\n") != null,
+        );
 
         const bundled_icon = try std.fs.path.join(allocator, &.{ resources_dir, "appIcon.png" });
         try std.testing.expectEqual(case.icon_state == .valid, pathExists(io, bundled_icon));
@@ -4796,6 +5124,212 @@ test "Linux bundle archives desktop entries independently of icon configuration"
         const tar_path = try std.fs.path.join(allocator, &.{ case_root, "bundle.tar" });
         try createBundleTar(&ctx, bundle_root, tar_path);
         const archive = try std.Io.Dir.cwd().readFileAlloc(io, tar_path, allocator, .limited(1024 * 1024));
-        try std.testing.expect(std.mem.indexOf(u8, archive, "Archive App.desktop") != null);
+        try std.testing.expect(std.mem.indexOf(u8, archive, desktop_name) != null);
     }
+}
+
+test "Flatpak manifest uses identifier channel architecture and only /app install paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const finish_args = [_][]const u8{
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--device=dri",
+    };
+
+    const json = try flatpakManifestJson(allocator, .{
+        .app_id = "com.example.ArchiveApp",
+        .channel = "canary",
+        .architecture = "aarch64",
+        .runtime = "org.freedesktop.Platform",
+        .runtime_version = "25.08",
+        .sdk = "org.freedesktop.Sdk",
+        .payload_path = "payload",
+        .desktop_path = "com.example.ArchiveApp.desktop",
+        .has_icon = true,
+        .finish_args = &finish_args,
+    });
+    const manifest = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+
+    try std.testing.expectEqualStrings("com.example.ArchiveApp", getStringField(manifest, "id").?);
+    try std.testing.expectEqualStrings("canary", getStringField(manifest, "branch").?);
+    try std.testing.expectEqualStrings("org.freedesktop.Platform", getStringField(manifest, "runtime").?);
+    try std.testing.expectEqualStrings("25.08", getStringField(manifest, "runtime-version").?);
+    try std.testing.expectEqualStrings("org.freedesktop.Sdk", getStringField(manifest, "sdk").?);
+    try std.testing.expectEqualStrings("launcher", getStringField(manifest, "command").?);
+
+    const permissions = manifest.object.get("finish-args").?.array.items;
+    try std.testing.expectEqual(finish_args.len, permissions.len);
+    for (finish_args, permissions) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual.string);
+    }
+
+    const metadata = manifest.object.get("x-electrobun").?.object;
+    try std.testing.expectEqualStrings("canary", getStringFieldFromObject(metadata, "channel").?);
+    try std.testing.expectEqualStrings("aarch64", getStringFieldFromObject(metadata, "architecture").?);
+    try std.testing.expectEqualStrings(
+        "disabled-expanded-payload",
+        getStringFieldFromObject(metadata, "self-extraction").?,
+    );
+    try std.testing.expectEqualStrings(
+        "unsupported-use-flatpak-updates",
+        getStringFieldFromObject(metadata, "built-in-updater").?,
+    );
+
+    const module = manifest.object.get("modules").?.array.items[0].object;
+    const commands = module.get("build-commands").?.array.items;
+    var saw_launcher = false;
+    var saw_desktop = false;
+    var saw_icon = false;
+    for (commands) |command| {
+        try std.testing.expect(std.mem.indexOf(u8, command.string, "/usr/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, command.string, "/app/") != null);
+        saw_launcher = saw_launcher or std.mem.indexOf(u8, command.string, "/app/bin/launcher") != null;
+        saw_desktop = saw_desktop or std.mem.indexOf(
+            u8,
+            command.string,
+            "/app/share/applications/com.example.ArchiveApp.desktop",
+        ) != null;
+        saw_icon = saw_icon or std.mem.indexOf(
+            u8,
+            command.string,
+            "/app/share/icons/hicolor/256x256/apps/com.example.ArchiveApp.png",
+        ) != null;
+    }
+    try std.testing.expect(saw_launcher);
+    try std.testing.expect(saw_desktop);
+    try std.testing.expect(saw_icon);
+
+    const sources = module.get("sources").?.array.items;
+    try std.testing.expectEqualStrings("payload", getStringFieldFromObject(sources[0].object, "path").?);
+    try std.testing.expectEqualStrings(
+        "aarch64",
+        sources[0].object.get("only-arches").?.array.items[0].string,
+    );
+}
+
+test "Flatpak desktop entry uses exported launcher and icon names" {
+    const with_icon = try flatpakDesktopEntry(
+        std.testing.allocator,
+        "Archive App (Canary)",
+        "Archive fixture",
+        "com.example.ArchiveApp",
+        "ArchiveApp-canary",
+        true,
+    );
+    defer std.testing.allocator.free(with_icon);
+    try std.testing.expect(std.mem.indexOf(u8, with_icon, "Exec=launcher\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_icon, "Icon=com.example.ArchiveApp\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_icon, "Icon=appIcon.png") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_icon, "Icon=appIcon\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, with_icon, "StartupWMClass=ArchiveApp-canary\n") != null);
+
+    const without_icon = try flatpakDesktopEntry(
+        std.testing.allocator,
+        "Archive App",
+        "Archive fixture",
+        "com.example.ArchiveApp",
+        "ArchiveApp",
+        false,
+    );
+    defer std.testing.allocator.free(without_icon);
+    try std.testing.expect(std.mem.indexOf(u8, without_icon, "Icon=") == null);
+}
+
+test "opt-in Flatpak output stages expanded payload and disables release metadata updates" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const staged_payload = try std.fs.path.join(allocator, &.{ project_root, "staged-payload" });
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ staged_payload, "bin" }));
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ staged_payload, "Resources" }));
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ staged_payload, "bin", "launcher" }),
+        .data = "LAUNCHER",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ staged_payload, "Resources", "appIcon.png" }),
+        .data = "PNG",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ staged_payload, "Resources", "version.json" }),
+        .data = "{\"baseUrl\":\"https://updates.example.test\",\"channel\":\"canary\"}",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ staged_payload, "Resources", "build.json" }),
+        .data = "{\"mainProcess\":\"cottontail\"}",
+    });
+
+    const config_json =
+        \\{
+        \\  "app": {"name":"Archive App","description":"Archive fixture","identifier":"com.example.ArchiveApp","version":"1.0.0"},
+        \\  "build": {
+        \\    "artifactFolder":"dist-artifacts",
+        \\    "mainProcess":"cottontail",
+        \\    "linux":{"flatpak":{"enabled":true,"outputPath":"flatpak-mvp"}}
+        \\  }
+        \\}
+    ;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, config_json, .{});
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+    const config = CommandContext{
+        .raw_json = config_json,
+        .root = root,
+        .build_env = .canary,
+    };
+    try std.testing.expect(flatpakEnabled(root));
+    try writeFlatpakOutput(&ctx, config, staged_payload);
+
+    const architecture = try flatpakArchitectureName();
+    const output_name = try std.fmt.allocPrint(
+        allocator,
+        "com.example.ArchiveApp-canary-{s}",
+        .{architecture},
+    );
+    const output_root = try std.fs.path.join(
+        allocator,
+        &.{ project_root, "dist-artifacts", "flatpak-mvp", output_name },
+    );
+    try std.testing.expect(pathExists(io, try std.fs.path.join(
+        allocator,
+        &.{ output_root, "com.example.ArchiveApp.json" },
+    )));
+
+    const desktop = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ output_root, "com.example.ArchiveApp.desktop" }),
+        allocator,
+        .limited(4096),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "Exec=launcher\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "Icon=com.example.ArchiveApp\n") != null);
+
+    const version_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ output_root, "payload", "Resources", "version.json" }),
+        allocator,
+        .limited(4096),
+    );
+    const version = try std.json.parseFromSliceLeaky(std.json.Value, allocator, version_bytes, .{});
+    try std.testing.expectEqualStrings("", getStringField(version, "baseUrl").?);
+    try std.testing.expectEqualStrings("flatpak", getStringField(version, "packaging").?);
+    try std.testing.expect(!version.object.get("selfExtraction").?.bool);
+    try std.testing.expectEqualStrings("unsupported", getStringField(version, "electrobunUpdater").?);
 }

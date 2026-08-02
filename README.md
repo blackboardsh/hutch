@@ -120,6 +120,30 @@ produces a Setup ZIP, and Linux produces a self-extracting installer tarball.
 Set `release.baseUrl` to the published artifact root to generate a delta from
 the previous release, or set `release.generatePatch` to false to skip it.
 
+Linux can also emit an opt-in Flatpak MVP without invoking Flatpak tooling:
+
+```ts
+build: {
+  linux: {
+    icon: "assets/icon.png",
+    flatpak: {
+      enabled: true,
+      outputPath: "flatpak",
+      // runtime, runtimeVersion, sdk, and finishArgs are optional overrides.
+    },
+  },
+}
+```
+
+The relative `outputPath` is created under `build.artifactFolder`, with separate
+identifier/channel/architecture directories. Each contains a manifest, a
+Flatpak-named desktop entry, and an expanded payload that the manifest installs
+under `/app`. This is intentionally an MVP recipe, not a built `.flatpak`:
+`flatpak-builder` is not run, system-WebKit/runtime dependencies still require
+real sandbox validation, and Electrobun's self-extractor and built-in updater
+are unsupported there. Publish Flatpak builds and updates through the Flatpak
+repository instead.
+
 The native packager runs `preBuild`, `postBuild`, `postWrap`, and `postPackage`.
 `postWrap` receives `ELECTROBUN_WRAPPER_BUNDLE_PATH` before signing.
 

@@ -8,6 +8,7 @@ node "$SCRIPT_DIR/local-stack.test.js"
 node --test "$SCRIPT_DIR/release-contract.test.js" "$SCRIPT_DIR/release-version.test.js"
 node --test \
   "$SCRIPT_DIR/../tests/electrobun/decorator-bundle.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/init-scaffold.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/non-index-main-entrypoint.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/tsconfig-path-alias-bundle.test.js"
 node "$SCRIPT_DIR/run-bun-package-manager-tests.js" --check

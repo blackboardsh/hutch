@@ -57,6 +57,21 @@ const defaultConfig = {
     linux: {
       bundleCEF: false,
       bundleWGPU: false,
+      flatpak: {
+        enabled: false,
+        outputPath: "flatpak",
+        runtime: "org.freedesktop.Platform",
+        runtimeVersion: "25.08",
+        sdk: "org.freedesktop.Sdk",
+        finishArgs: [
+          "--share=ipc",
+          "--share=network",
+          "--socket=wayland",
+          "--socket=fallback-x11",
+          "--socket=pulseaudio",
+          "--device=dri",
+        ],
+      },
     },
     views: {},
     copy: {},
