@@ -23,8 +23,8 @@ const windows_api = if (builtin.os.tag == .windows) struct {
 
     extern "kernel32" fn UpdateResourceW(
         update: windows.HANDLE,
-        resource_type: ?windows.LPCWSTR,
-        resource_name: ?windows.LPCWSTR,
+        resource_type: ?*const anyopaque,
+        resource_name: ?*const anyopaque,
         language: windows.LANGID,
         data: ?*const anyopaque,
         data_size: windows.DWORD,
@@ -45,8 +45,8 @@ const windows_api = if (builtin.os.tag == .windows) struct {
 
     extern "kernel32" fn FindResourceExW(
         module: windows.HMODULE,
-        resource_type: ?windows.LPCWSTR,
-        resource_name: ?windows.LPCWSTR,
+        resource_type: ?*const anyopaque,
+        resource_name: ?*const anyopaque,
         language: windows.WORD,
     ) callconv(.winapi) ?*anyopaque;
 
@@ -68,7 +68,10 @@ const windows_api = if (builtin.os.tag == .windows) struct {
     const default_icon_language = 1033;
     const load_library_as_datafile = 0x00000002;
 
-    fn intResource(id: u16) ?windows.LPCWSTR {
+    // MAKEINTRESOURCEW encodes an integer ID as a deliberately small pointer.
+    // Model it as opaque so Zig does not impose wchar_t's two-byte alignment
+    // and panic on valid odd IDs such as RT_ICON (3).
+    fn intResource(id: u16) ?*const anyopaque {
         if (id == 0) return null;
         return @ptrFromInt(@as(usize, id));
     }
