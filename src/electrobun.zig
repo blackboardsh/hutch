@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const electrobun_templates = @import("electrobun_templates.zig");
 const windows_icon = @import("windows_icon.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
@@ -45,6 +46,7 @@ const BuiltAppLaunchCommand = struct {
 };
 
 const Context = struct {
+    init: std.process.Init,
     io: std.Io,
     allocator: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
@@ -163,6 +165,7 @@ pub fn run(
     const project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
 
     const ctx = Context{
+        .init = init,
         .io = init.io,
         .allocator = init.arena.allocator(),
         .environ_map = init.environ_map,
@@ -182,7 +185,10 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, command, "init")) {
-        try runInit(&ctx, args[1..]);
+        runInit(&ctx, args[1..]) catch |err| {
+            ctx.writeStderr("hutch electrobun init: {s}\n", .{@errorName(err)});
+            return 1;
+        };
         return 0;
     }
 
@@ -226,7 +232,7 @@ fn printHelp(writer: anytype) !void {
         \\Electrobun app build commands orchestrated by Hutch.
         \\
         \\Usage:
-        \\  hutch electrobun init [project-name] [--template=name]
+        \\  hutch electrobun init [project-name] [--template=name] [--channel=production|canary] [--offline]
         \\  hutch electrobun config [--env=dev|canary|production]
         \\  hutch electrobun build [--env=dev|canary|production]
         \\  hutch electrobun run [--env=dev|canary|production] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
@@ -235,7 +241,7 @@ fn printHelp(writer: anytype) !void {
         \\Notes:
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
-        \\  - init copies templates from the installed electrobun package.
+        \\  - init downloads the latest template set for the active Hutch channel.
         \\  - Main-process inspection supports Bun and Cottontail only.
         \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
         \\  - runtime.mainProcessInspector accepts { mode: "inspect" | "inspect-wait" | "inspect-brk", address?: string }.
@@ -2092,14 +2098,18 @@ fn runBuiltApp(
 }
 
 fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
-    const templates_root = (try resolveElectrobunTemplatesRoot(ctx)) orelse return error.TemplateRootNotFound;
-
     var template_name: ?[]const u8 = null;
     var project_name: ?[]const u8 = null;
+    var channel = try electrobun_templates.activeChannel(ctx.environ_map);
+    var offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE");
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--template=")) {
             template_name = arg["--template=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--channel=")) {
+            channel = try electrobun_templates.parseChannel(arg["--channel=".len..]);
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            offline = true;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
             if (project_name == null) {
                 project_name = arg;
@@ -2109,43 +2119,67 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         }
     }
 
+    const catalog = try electrobun_templates.load(
+        ctx.init,
+        ctx.allocator,
+        channel,
+        .{ .offline = offline },
+    );
+
     if (template_name == null) {
         if (project_name) |name| {
-            const candidate = try std.fs.path.join(ctx.allocator, &.{ templates_root, name });
-            if (pathExists(ctx.io, candidate)) {
-                template_name = name;
-            }
+            if (catalog.find(name) != null) template_name = name;
         }
     }
 
     if (template_name == null) {
-        ctx.writeStdout("Available templates:\n", .{});
-        var templates_dir = try std.Io.Dir.openDirAbsolute(ctx.io, templates_root, .{ .iterate = true });
-        defer templates_dir.close(ctx.io);
-
-        var iterator = templates_dir.iterate();
-        while (try iterator.next(ctx.io)) |entry| {
-            if (entry.kind == .directory) {
-                ctx.writeStdout("  {s}\n", .{entry.name});
-            }
+        ctx.writeStdout("Electrobun {s} templates ({s}):\n", .{ catalog.version, channel.name() });
+        for (catalog.templates) |template| {
+            ctx.writeStdout("  {s} - {s}\n", .{ template.id, template.description });
         }
-        ctx.writeStdout("\nUsage: hutch electrobun init <project-name> --template=<name>\n", .{});
+        ctx.writeStdout(
+            "\nUsage: hutch electrobun init <project-name> --template=<name> [--channel={s}]\n",
+            .{channel.name()},
+        );
         return;
     }
 
     if (project_name == null) {
         project_name = template_name;
     }
+    try validateProjectName(project_name.?);
 
-    const source_dir = try std.fs.path.join(ctx.allocator, &.{ templates_root, template_name.? });
-    if (!pathExists(ctx.io, source_dir)) return error.TemplateNotFound;
+    const template = catalog.find(template_name.?) orelse return error.TemplateNotFound;
 
     const project_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, project_name.? });
     if (pathExists(ctx.io, project_dir)) return error.ProjectAlreadyExists;
 
-    try copyPath(ctx, source_dir, project_dir);
+    ctx.writeStdout(
+        "Downloading {s} from Electrobun {s} ({s})...\n",
+        .{ template.id, catalog.version, channel.name() },
+    );
+    try electrobun_templates.install(
+        ctx.init,
+        ctx.allocator,
+        template,
+        project_dir,
+        .{ .offline = offline },
+    );
     ctx.writeStdout("Created Electrobun project at {s}\n", .{project_dir});
     ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
+}
+
+fn validateProjectName(name: []const u8) !void {
+    if (name.len == 0 or std.fs.path.isAbsolute(name)) return error.InvalidProjectName;
+    var components = std.mem.splitAny(u8, name, "/\\");
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.InvalidProjectName;
+        }
+    }
 }
 
 fn runDevWatch(
@@ -3657,17 +3691,6 @@ fn resolveElectrobunDist(ctx: *const Context) !?[]const u8 {
     return null;
 }
 
-fn resolveElectrobunTemplatesRoot(ctx: *const Context) !?[]const u8 {
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return null;
-    const in_package = try std.fs.path.join(ctx.allocator, &.{ package_root, "templates" });
-    if (pathExists(ctx.io, in_package)) return in_package;
-
-    const sibling_templates = try std.fs.path.join(ctx.allocator, &.{ package_root, "..", "templates" });
-    if (pathExists(ctx.io, sibling_templates)) return sibling_templates;
-
-    return null;
-}
-
 fn getPlatformPaths(ctx: *const Context) !PlatformPaths {
     const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return error.ElectrobunPackageNotFound;
     const shared_dist_dir = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist" });
@@ -3822,6 +3845,51 @@ fn platformBuildObject(root: std.json.Value) ?std.json.ObjectMap {
         .windows => getObjectFieldFromObject(build, "win"),
         else => getObjectFieldFromObject(build, "linux"),
     };
+}
+
+const windows_auto_grant_permissions = [_][]const u8{
+    "camera",
+    "microphone",
+    "geolocation",
+    "notifications",
+};
+
+fn appendWindowsAutoGrantPermissions(
+    allocator: std.mem.Allocator,
+    metadata: *std.json.ObjectMap,
+    root: std.json.Value,
+    target_is_windows: bool,
+) !void {
+    if (!target_is_windows) return;
+    const build = getObjectField(root, "build") orelse return;
+    const windows = getObjectFieldFromObject(build, "win") orelse return;
+    const configured = windows.get("autoGrantPermissions") orelse return;
+    if (configured != .array) return error.InvalidConfig;
+
+    var permissions = std.json.Array.init(allocator);
+    for (configured.array.items) |item| {
+        if (item != .string) return error.InvalidConfig;
+        var allowed = false;
+        for (windows_auto_grant_permissions) |permission| {
+            if (std.mem.eql(u8, item.string, permission)) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) return error.InvalidConfig;
+
+        var duplicate = false;
+        for (permissions.items) |existing| {
+            if (std.mem.eql(u8, existing.string, item.string)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try permissions.append(.{ .string = item.string });
+    }
+    if (permissions.items.len > 0) {
+        try metadata.put(allocator, "autoGrantPermissions", .{ .array = permissions });
+    }
 }
 
 const EntitlementUsageDescription = struct {
@@ -4492,6 +4560,7 @@ fn bundledRuntimeMetadataJson(ctx: *const Context, config: CommandContext) ![]co
     try metadata.put(ctx.allocator, "availableRenderers", .{ .array = available_renderers });
     try metadata.put(ctx.allocator, "buildEnvironment", .{ .string = buildEnvironmentName(config.build_env) });
     try metadata.put(ctx.allocator, "runtime", runtime_value);
+    try appendWindowsAutoGrantPermissions(ctx.allocator, &metadata, config.root, builtin.os.tag == .windows);
 
     if (platform) |value| {
         if (value.get("chromiumFlags")) |chromium_flags| {
@@ -4612,6 +4681,43 @@ test "bundled runtime metadata carries CEF debugging policy inputs" {
     const packaged = try std.json.parseFromSliceLeaky(std.json.Value, allocator, packaged_json, .{});
     try std.testing.expectEqualStrings("production", getStringField(packaged, "buildEnvironment").?);
     try std.testing.expect(packaged.object.get("chromiumFlags") == null);
+}
+
+test "Windows runtime metadata validates and deduplicates auto-granted permissions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"win":{"autoGrantPermissions":["microphone","camera","microphone"]}}}
+    ,
+        .{},
+    );
+
+    var metadata: std.json.ObjectMap = .empty;
+    try appendWindowsAutoGrantPermissions(allocator, &metadata, root, true);
+    const permissions = metadata.get("autoGrantPermissions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), permissions.len);
+    try std.testing.expectEqualStrings("microphone", permissions[0].string);
+    try std.testing.expectEqualStrings("camera", permissions[1].string);
+
+    var non_windows_metadata: std.json.ObjectMap = .empty;
+    try appendWindowsAutoGrantPermissions(allocator, &non_windows_metadata, root, false);
+    try std.testing.expect(non_windows_metadata.get("autoGrantPermissions") == null);
+
+    const invalid = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"win":{"autoGrantPermissions":["clipboard-read"]}}}
+    ,
+        .{},
+    );
+    var invalid_metadata: std.json.ObjectMap = .empty;
+    try std.testing.expectError(
+        error.InvalidConfig,
+        appendWindowsAutoGrantPermissions(allocator, &invalid_metadata, invalid, true),
+    );
 }
 
 fn termExitCode(term: std.process.Child.Term) u8 {

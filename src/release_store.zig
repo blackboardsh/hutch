@@ -570,7 +570,7 @@ fn manifestCacheIsCurrent(io: std.Io, path: []const u8) bool {
     return now - stat.mtime.nanoseconds <= channel_cache_lifetime_ns;
 }
 
-fn writeCacheFile(
+pub fn writeCacheFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -584,7 +584,7 @@ fn writeCacheFile(
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
 }
 
-fn fetchBytes(
+pub fn fetchBytes(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -893,7 +893,7 @@ fn validateArchiveMetadata(
     }
 }
 
-fn sha256Matches(bytes: []const u8, expected: []const u8) bool {
+pub fn sha256Matches(bytes: []const u8, expected: []const u8) bool {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const actual = std.fmt.bytesToHex(digest, .lower);
@@ -941,9 +941,7 @@ fn extractArchive(
             .directory => try destination.createDirPath(io, path),
             .file => {
                 if (std.fs.path.dirname(path)) |parent| try destination.createDirPath(io, parent);
-                const permissions: std.Io.File.Permissions = if (
-                    std.Io.File.Permissions.has_executable_bit and (entry.mode & 0o100) != 0
-                ) .executable_file else .default_file;
+                const permissions: std.Io.File.Permissions = if (std.Io.File.Permissions.has_executable_bit and (entry.mode & 0o100) != 0) .executable_file else .default_file;
                 var file = try destination.createFile(io, path, .{
                     .truncate = true,
                     .permissions = permissions,
