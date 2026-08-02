@@ -84,7 +84,9 @@ test("Unix release jobs build Hutch before integration tests", () => {
   assert.ok(start >= 0 && end > start, "build_hutch_unix command exists");
   assert.ok(build >= 0 && tests >= 0, "build and test steps exist");
   assert.ok(build < tests, "Hutch executables are available to integration tests");
-  assert.match(command, /node --test --test-concurrency=1 \\\n/);
+  const serializedTests = /node --test --test-concurrency=1 \\\r?\n/;
+  assert.match(command, serializedTests);
+  assert.match(command.replace(/\r?\n/g, "\r\n"), serializedTests);
 });
 
 test("Linux ARM releases run on the Cottontail-compatible Ubuntu image", () => {
