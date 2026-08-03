@@ -285,14 +285,14 @@ fn editWorkspaceProtocols(
             blk: {
                 if (!has_lockfile) {
                     try stderr.print(
-                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `bun install` and try again.\n",
+                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
                         .{ dependency_name, section_name },
                     );
                     return error.WorkspaceVersionUnresolved;
                 }
                 const version = workspaceVersion(discovery.entries, dependency_name) orelse {
                     try stderr.print(
-                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `bun install` and try again.\n",
+                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
                         .{ dependency_name, section_name },
                     );
                     return error.WorkspaceVersionUnresolved;

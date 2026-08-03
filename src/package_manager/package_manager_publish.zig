@@ -262,7 +262,7 @@ pub fn publish(
 ) !u8 {
     const allocator = init.arena.allocator();
     if (registry.authorization == null) {
-        try stderr.writeAll("error: missing authentication (run `bunx npm login`)\n");
+        try stderr.writeAll("error: missing authentication (run `hutch x npm login`)\n");
         try stderr.flush();
         return 1;
     }

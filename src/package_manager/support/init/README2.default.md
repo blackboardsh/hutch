@@ -3,7 +3,7 @@
 To install dependencies:
 
 ```bash
-bun install
+hutch install
 ```
 
 To start a development server:

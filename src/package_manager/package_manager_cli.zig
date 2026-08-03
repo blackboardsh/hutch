@@ -1342,7 +1342,7 @@ fn runPm(
         const cache_path = try packageCachePath(init, init.arena.allocator());
         if (options.positionals.len > 1 and std.mem.eql(u8, options.positionals[1], "rm")) {
             std.Io.Dir.cwd().deleteTree(init.io, cache_path) catch {};
-            try stdout.writeAll("Cleared 'bun install' cache\n");
+            try stdout.writeAll("Cleared 'hutch install' cache\n");
         } else {
             try stdout.writeAll(cache_path);
         }
@@ -1817,7 +1817,7 @@ fn runPmWhoami(
         return 0;
     }
     if (manager.registry_authorization == null) {
-        try stderr.writeAll("error: missing authentication (run `bunx npm login`)\n");
+        try stderr.writeAll("error: missing authentication (run `hutch x npm login`)\n");
         try stderr.flush();
         return 1;
     }
@@ -2578,7 +2578,7 @@ const Manager = struct {
             !internal_bunx_install and
             manager.options.command == .install;
         if (install_header_printed) {
-            try manager.stdout.print("bun install v{s} (cottontail)\n\n", .{bun_compat_version});
+            try manager.stdout.print("hutch install v{s}\n\n", .{version});
             try manager.stdout.flush();
         }
 
@@ -2972,7 +2972,7 @@ const Manager = struct {
 
         try manager.loadLockfile(&root);
         if (manager.lock_graph == null) {
-            try manager.stderr.writeAll("error: Lockfile not found. Run 'bun install' first.\n");
+            try manager.stderr.writeAll("error: Lockfile not found. Run 'hutch install' first.\n");
             return error.PackageManagerErrorReported;
         }
         try manager.discoverWorkspaces(&root);
@@ -3895,7 +3895,7 @@ const Manager = struct {
 
     fn selectPatchPackage(manager: *Manager, argument: []const u8) !PatchSelection {
         const graph = if (manager.lock_graph) |*value| value else {
-            try manager.stderr.writeAll("error: Cannot find lockfile. Install packages with `bun install` before patching them.\n");
+            try manager.stderr.writeAll("error: Cannot find lockfile. Install packages with `hutch install` before patching them.\n");
             return error.PackageManagerErrorReported;
         };
 
@@ -13071,6 +13071,22 @@ pub fn extractTarballArchive(
     destination: std.Io.Dir,
     archive: []const u8,
 ) !void {
+    return extractTarGzipArchive(io, allocator, destination, archive, .{});
+}
+
+pub const TarGzipExtractOptions = struct {
+    // npm tarballs normally wrap files in `package/`. Other release archives,
+    // such as Electrobun's platform bundles, are already rooted correctly.
+    strip_components: ?u32 = null,
+};
+
+pub fn extractTarGzipArchive(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    destination: std.Io.Dir,
+    archive: []const u8,
+    options: TarGzipExtractOptions,
+) !void {
     var compressed_reader: std.Io.Reader = .fixed(archive);
     var decompression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &decompression_buffer);
@@ -13089,7 +13105,8 @@ pub fn extractTarballArchive(
         .diagnostics = &diagnostics,
     });
     while (try iterator.next()) |entry| {
-        const strip_components: u32 = if (std.mem.startsWith(u8, entry.name, "./")) 0 else 1;
+        const strip_components: u32 = options.strip_components orelse
+            if (std.mem.startsWith(u8, entry.name, "./")) 0 else 1;
         const path_len = sanitizeTarPath(&sanitized_path_buffer, entry.name, strip_components) catch continue;
         if (path_len == 0 and entry.kind != .directory) continue;
         const path = sanitized_path_buffer[0..path_len];

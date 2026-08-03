@@ -605,7 +605,7 @@ fn installDependencies(
     stderr: *std.Io.Writer,
 ) !u8 {
     const allocator = init.arena.allocator();
-    try stdout.writeAll("\n$ bun install\n");
+    try stdout.writeAll("\n$ hutch install\n");
     try stdout.flush();
     try stderr.flush();
 
@@ -1014,7 +1014,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
             "  --open             Start the project and open it in a browser\n" ++
             "  --verbose          Print additional command details\n\n" ++
             "Templates:\n" ++
-            "  NPM templates run bunx create-<template>.\n" ++
+            "  NPM templates run hutch x create-<template>.\n" ++
             "  GitHub repositories are downloaded directly.\n" ++
             "  Local templates are loaded from BUN_CREATE_DIR, ./.bun-create, or $HOME/.bun-create.\n",
     );
