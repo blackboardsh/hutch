@@ -2168,7 +2168,16 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     }
 
     if (project_name == null) {
-        project_name = template_name;
+        switch (try terminal_ui.prompt(
+            ctx.init,
+            ctx.allocator,
+            "Project name",
+            template_name.?,
+        )) {
+            .value => |value| project_name = value,
+            .cancelled => return,
+            .unavailable => project_name = template_name,
+        }
     }
     try validateProjectName(project_name.?);
 

@@ -145,6 +145,23 @@ test("hutch electrobun init lists and downloads the active remote template chann
       'console.log("hello");\n',
     );
 
+    const aliasProjectName = "alias-app";
+    const aliased = await run(
+      hutch,
+      [
+        "x",
+        "electrobun",
+        "init",
+        aliasProjectName,
+        "--template=hello-world",
+        "--offline",
+      ],
+      { cwd: workspace, env },
+    );
+    assert.equal(aliased.status, 0, aliased.stderr || aliased.stdout);
+    assert.match(aliased.stdout, new RegExp(`cd ${aliasProjectName}\\n`));
+    assert.ok(existsSync(join(workspace, aliasProjectName, "package.json")));
+
     const cached = await run(
       hutch,
       [

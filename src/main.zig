@@ -60,6 +60,17 @@ fn isCottontailTestCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "test");
 }
 
+fn electrobunInitAliasArgs(args: []const [:0]const u8) ?[]const [:0]const u8 {
+    if (args.len < 4 or
+        !std.mem.eql(u8, args[1], "x") or
+        !std.mem.eql(u8, args[2], "electrobun") or
+        !std.mem.eql(u8, args[3], "init"))
+    {
+        return null;
+    }
+    return args[3..];
+}
+
 fn runtimeCommandArguments(args: []const [:0]const u8) []const [:0]const u8 {
     return if (args.len > 1) args[1..] else args[0..0];
 }
@@ -960,6 +971,23 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (electrobunInitAliasArgs(args)) |electrobun_args| {
+        try maybePromptForUpdates(init, allocator, stderr);
+        const cottontail = resolveCottontail(init, allocator, args[2..]) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try electrobun.run(
+            init,
+            electrobun_args,
+            cottontail.executable,
+            cottontail.root,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (package_manager.bunx.detectInvocation(
         args,
         init.environ_map.get("BUN_INTERNAL_BUNX_INSTALL") != null,
@@ -1365,6 +1393,17 @@ test "test is a reserved Cottontail command and preserves every argument" {
     for (args[1..], forwarded) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "hutch x electrobun init aliases the canonical init command" {
+    const direct = [_][:0]const u8{ "hutch", "x", "electrobun", "init", "my-app" };
+    const forwarded = electrobunInitAliasArgs(&direct).?;
+    try std.testing.expectEqual(@as(usize, 2), forwarded.len);
+    try std.testing.expectEqualStrings("init", forwarded[0]);
+    try std.testing.expectEqualStrings("my-app", forwarded[1]);
+
+    const versioned = [_][:0]const u8{ "hutch", "x", "electrobun@2.0.0", "init" };
+    try std.testing.expect(electrobunInitAliasArgs(&versioned) == null);
 }
 
 test "package dependency detection drives clean checkout bootstrap" {

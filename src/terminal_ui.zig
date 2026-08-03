@@ -12,6 +12,12 @@ pub const SelectResult = union(enum) {
     unavailable,
 };
 
+pub const PromptResult = union(enum) {
+    value: []const u8,
+    cancelled,
+    unavailable,
+};
+
 const Key = enum {
     up,
     down,
@@ -116,6 +122,39 @@ pub fn select(
         try output.flush();
         return result;
     }
+}
+
+pub fn prompt(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    suggested: []const u8,
+) !PromptResult {
+    if (!(std.Io.File.stdin().isTty(init.io) catch false) or
+        !(std.Io.File.stdout().isTty(init.io) catch false))
+    {
+        return .unavailable;
+    }
+
+    var output_buffer: [1024]u8 = undefined;
+    var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
+    const output = &output_file.interface;
+    try output.print("{s} [{s}]: ", .{ label, suggested });
+    try output.flush();
+
+    var input_buffer: [1024]u8 = undefined;
+    var input_file = std.Io.File.stdin().readerStreaming(init.io, &input_buffer);
+    const line = (input_file.interface.takeDelimiter('\n') catch null) orelse {
+        try output.writeAll("\nCancelled\n");
+        try output.flush();
+        return .cancelled;
+    };
+    return .{ .value = try allocator.dupe(u8, promptValue(suggested, line)) };
+}
+
+fn promptValue(suggested: []const u8, input: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\r");
+    return if (trimmed.len == 0) suggested else trimmed;
 }
 
 fn renderedRowWidth(items: []const Item, terminal_columns: usize) usize {
@@ -412,4 +451,9 @@ test "selected rows use reverse video across the padded row" {
         "\x1b[7m> Hello  cottontail     \x1b[0m\n",
         output.written(),
     );
+}
+
+test "text prompts accept their suggestion or a trimmed replacement" {
+    try std.testing.expectEqualStrings("hello-world", promptValue("hello-world", "\r"));
+    try std.testing.expectEqualStrings("my-app", promptValue("hello-world", "  my-app \r"));
 }

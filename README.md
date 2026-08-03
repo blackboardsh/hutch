@@ -104,6 +104,22 @@ complete 102-file copied compatibility corpus. The ownership boundary and
 measured compatibility accounting are documented in
 [docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
 
+## Electrobun Projects
+
+Run `hutch electrobun init` to choose a release template interactively, then
+accept or replace its suggested project name. The chosen name controls the
+created directory and the printed next steps. The following spelling is a
+direct alias and does not install the Electrobun npm package:
+
+```sh
+hutch x electrobun init
+```
+
+The published Electrobun npm package also delegates `npx electrobun init` and
+`bunx electrobun init` to this command, installing the matching Hutch channel
+when needed. Starter templates always come from the latest production or
+canary Electrobun catalog rather than from an npm package version.
+
 ## Electrobun Packaging
 
 `hutch electrobun build --env=dev` creates a runnable inner application bundle.
