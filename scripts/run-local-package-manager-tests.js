@@ -52,7 +52,6 @@ const tests = [
     file: "package-manager-bunx.cjs",
     passHutch: true,
     marker: "package-manager bunx: pass",
-    expectedFailure: "Pre-split gap: installed JavaScript bins launch through the system Node shebang instead of the selected runtime.",
   },
   {
     name: "cache-concurrency",

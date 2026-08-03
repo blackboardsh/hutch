@@ -156,7 +156,7 @@ pub fn run(
         },
         .binary_missing => {
             try stderr.writeAll("error: When using --package, you must specify the binary to run\n");
-            try stderr.writeAll("  usage: bunx --package=<package-name> <binary-name> [args...]\n");
+            try stderr.writeAll("  usage: hutch x --package=<package-name> <binary-name> [args...]\n");
             try stderr.flush();
             return 1;
         },
@@ -233,7 +233,7 @@ pub fn run(
             if (!cache_is_stale or options.no_install) {
                 if (cache_is_stale) {
                     try stderr.print(
-                        "warn: Using a stale installation of {s} because --no-install was passed. Run `bunx` without --no-install to use a fresh binary.\n",
+                        "warn: Using a stale installation of {s} because --no-install was passed. Run `hutch x` without --no-install to use a fresh binary.\n",
                         .{request.display_name},
                     );
                     try stderr.flush();
@@ -842,7 +842,7 @@ fn installPackage(
         .stderr = .inherit,
         .create_no_window = true,
     }) catch |err| {
-        try stderr.print("error: bunx failed to install {s}: {s}\n", .{ install_param, @errorName(err) });
+        try stderr.print("error: hutch x failed to install {s}: {s}\n", .{ install_param, @errorName(err) });
         try stderr.flush();
         return 1;
     };
@@ -862,29 +862,19 @@ fn runBinary(
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator) catch path;
     const executable_kind = classifyExecutable(init.io, resolved);
     const is_script = executable_kind != .native;
-    const node_executable = if (is_script and !force_runtime and executable_kind != .bun_script)
-        try findExecutableInPath(init.io, allocator, environment.get("PATH") orelse "", "node", null)
-    else
-        null;
-    const use_runtime = is_script and (force_runtime or executable_kind == .bun_script or node_executable == null);
-    const use_node = is_script and !use_runtime and node_executable != null;
+    _ = force_runtime;
+    const use_runtime = is_script;
     const executable = if (use_runtime)
         try Host.runtimeExecutable(init, allocator)
-    else if (use_node)
-        node_executable.?
     else
         resolved;
-    if (use_node) {
-        try environment.put("NODE", executable);
-        try environment.put("npm_node_execpath", executable);
-    }
-    const extra = if (use_runtime or use_node) @as(usize, 1) else 0;
+    const extra = if (use_runtime) @as(usize, 1) else 0;
     var argv = try allocator.alloc([]const u8, passthrough.len + 1 + extra);
     argv[0] = executable;
-    if (use_runtime or use_node) argv[1] = path;
+    if (use_runtime) argv[1] = path;
     for (passthrough, 0..) |arg, index| argv[index + 1 + extra] = arg;
 
-    if (builtin.os.tag == .windows and !use_runtime and !use_node and
+    if (builtin.os.tag == .windows and !use_runtime and
         (std.ascii.eqlIgnoreCase(std.fs.path.extension(resolved), ".cmd") or
             std.ascii.eqlIgnoreCase(std.fs.path.extension(resolved), ".bat")))
     {
@@ -967,7 +957,7 @@ fn isBunxArgv0(argv0: []const u8) bool {
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: hutch x [--bun] [--no-install] [--package <package>] <package-or-bin> [args...]
-        \\       bunx [--bun] [--no-install] [--package <package>] <package-or-bin> [args...]
+        \\       hutch x [--bun] [--no-install] [--package <package>] <package-or-bin> [args...]
         \\
     );
 }

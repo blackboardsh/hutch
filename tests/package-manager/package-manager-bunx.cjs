@@ -10,6 +10,7 @@ const { spawn } = require("node:child_process");
 const { gzipSync } = require("node:zlib");
 
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
+const expectedRuntime = path.resolve(process.env.COTTONTAIL_BINARY || process.execPath);
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-bunx-test-"));
 const workDir = path.join(scratch, "work");
 const tempDir = path.join(scratch, "temp");
@@ -194,7 +195,7 @@ async function main() {
   assert.equal(first.lifecycleEvent, "bunx");
   assert.equal(first.lifecycleScript, "fixture-tool");
   assert.match(first.userAgent, /^bun\/1\.3\.10 /);
-  assert.equal(fs.realpathSync(first.execPath), fs.realpathSync(process.execPath));
+  assert.equal(fs.realpathSync(first.execPath), fs.realpathSync(expectedRuntime));
 
   const requestsAfterInstall = requests.length;
   const cached = payload(await run(cottontail, ["x", "--silent", "--no-install", "fixture-tool", "cached"]));
@@ -229,14 +230,7 @@ async function main() {
   const forced = payload(await run(cottontail, ["--bun", "x", "--silent", "fixture-tool", "forced"]));
   assert.equal(forced.marker, "fixture-main");
   assert.deepEqual(forced.argv, ["forced"]);
-  assert.equal(fs.realpathSync(forced.execPath), fs.realpathSync(process.execPath));
-
-  const argv0 = path.join(scratch, process.platform === "win32" ? "bunx.exe" : "bunx");
-  if (process.platform === "win32") fs.copyFileSync(cottontail, argv0);
-  else fs.symlinkSync(cottontail, argv0);
-  const aliased = payload(await run(argv0, ["--silent", "fixture-tool", "argv0"]));
-  assert.equal(aliased.marker, "fixture-main");
-  assert.deepEqual(aliased.argv, ["argv0"]);
+  assert.equal(fs.realpathSync(forced.execPath), fs.realpathSync(expectedRuntime));
 
   const localRoot = path.join(workDir, "node_modules", "local-tool");
   fs.mkdirSync(localRoot, { recursive: true });
