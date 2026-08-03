@@ -27,3 +27,22 @@ test("every Hutch release build explicitly targets the baseline CPU", () => {
   assert.ok(windowsCommand);
   assert.match(windowsCommand, /-Dtarget=x86_64-windows-msvc/);
 });
+
+test("Linux Hutch releases target the Electrobun glibc baseline", () => {
+  assert.match(
+    circleConfig,
+    /linux-x64\) target="x86_64-linux-gnu\.2\.35"/,
+  );
+  assert.match(
+    circleConfig,
+    /linux-arm64\) target="aarch64-linux-gnu\.2\.35"/,
+  );
+  assert.match(
+    circleConfig,
+    /target_arg=\("-Dtarget=\$target"\)/,
+  );
+  assert.match(
+    circleConfig,
+    /verify-linux-glibc\.js zig-out\/bin\/hutch-engine 2\.35/,
+  );
+});
