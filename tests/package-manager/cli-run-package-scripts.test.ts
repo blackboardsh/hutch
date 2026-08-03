@@ -153,3 +153,43 @@ test("single package scripts do not install the public bun package", () => {
   expect(readFileSync(join(directory, "package.json"), "utf8")).toBe(packageJson);
   expect(existsSync(join(directory, "node_modules", "bun"))).toBe(false);
 });
+
+test("package scripts repair an incomplete node_modules tree", () => {
+  const directory = join(scratch, "partial-install");
+  const dependency = join(scratch, "local-dependency");
+  mkdirSync(join(directory, "node_modules", "unrelated"), { recursive: true });
+  mkdirSync(dependency, { recursive: true });
+  writeFileSync(
+    join(directory, "package.json"),
+    JSON.stringify({
+      name: "partial-install",
+      version: "1.0.0",
+      dependencies: { "local-dependency": "file:../local-dependency" },
+      scripts: { probe: "bun probe.js" },
+    }, null, 2),
+  );
+  writeFileSync(
+    join(directory, "node_modules", "unrelated", "package.json"),
+    '{"name":"unrelated","version":"1.0.0"}\n',
+  );
+  writeFileSync(
+    join(dependency, "package.json"),
+    '{"name":"local-dependency","version":"1.0.0","main":"index.js"}\n',
+  );
+  writeFileSync(join(dependency, "index.js"), "module.exports = 42;\n");
+  writeFileSync(
+    join(directory, "probe.js"),
+    'console.log(require("local-dependency"));\n',
+  );
+
+  const first = run(directory, ["run", "probe"]);
+  expect(first.exitCode, `${first.stdout}\n${first.stderr}`).toBe(0);
+  expect(first.stdout).toContain("42\n");
+  expect(first.stderr).toContain("hutch: installing package dependencies...");
+  expect(existsSync(join(directory, "node_modules", "local-dependency", "package.json"))).toBe(true);
+
+  const second = run(directory, ["run", "probe"]);
+  expect(second.exitCode, `${second.stdout}\n${second.stderr}`).toBe(0);
+  expect(second.stdout).toContain("42\n");
+  expect(second.stderr).not.toContain("hutch: installing package dependencies...");
+});

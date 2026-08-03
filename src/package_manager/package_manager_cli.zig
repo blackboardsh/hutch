@@ -10005,9 +10005,21 @@ const Manager = struct {
         spec: []const u8,
         fetch_log_level: FetchLogLevel,
     ) !RegistryPackage {
-        const refresh_manifest = manager.refresh_direct_registry and
-            !manager.refreshed_update_manifests.contains(name);
+        return manager.resolveRegistryPackageWithLogLevelInternal(name, spec, fetch_log_level, false);
+    }
+
+    fn resolveRegistryPackageWithLogLevelInternal(
+        manager: *Manager,
+        name: []const u8,
+        spec: []const u8,
+        fetch_log_level: FetchLogLevel,
+        force_manifest_refresh: bool,
+    ) !RegistryPackage {
+        const refresh_manifest = force_manifest_refresh or (manager.refresh_direct_registry and
+            !manager.refreshed_update_manifests.contains(name));
+        var manifest_was_cached = false;
         const cached_manifest: ?*Value = if (refresh_manifest) null else manager.registry_manifests.get(name);
+        if (cached_manifest != null) manifest_was_cached = true;
         const manifest = cached_manifest orelse blk: {
             if (!refresh_manifest and fetch_log_level == .err and manager.registry_manifest_failures.contains(name)) {
                 return error.RegistryManifestRequestFailed;
@@ -10021,6 +10033,7 @@ const Manager = struct {
                         if (try manager.parseRegistryManifest(cached)) |parsed| {
                             if (manager.cachedRegistryManifestIsUsable(parsed)) {
                                 try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                                manifest_was_cached = true;
                                 break :blk parsed;
                             }
                         }
@@ -10047,7 +10060,12 @@ const Manager = struct {
             break :blk parsed;
         };
         if (manifest.* != .object) return error.InvalidRegistryManifest;
-        const versions_value = manifest.object.get("versions") orelse return error.PackageNotFound;
+        const versions_value = manifest.object.get("versions") orelse {
+            if (manifest_was_cached and !force_manifest_refresh) {
+                return manager.resolveRegistryPackageWithLogLevelInternal(name, spec, fetch_log_level, true);
+            }
+            return error.PackageNotFound;
+        };
         if (versions_value != .object) return error.InvalidRegistryManifest;
 
         var latest_version: ?[]const u8 = null;
@@ -10060,7 +10078,7 @@ const Manager = struct {
                 }
             }
         }
-        const selection = try MinimumReleaseAge.selectVersion(
+        const selection = MinimumReleaseAge.selectVersion(
             manager.allocator,
             manifest,
             name,
@@ -10068,7 +10086,12 @@ const Manager = struct {
             manager.options.minimum_release_age_ms,
             manager.minimum_release_age_excludes,
             manager.started_wall_ms,
-        );
+        ) catch |err| {
+            if (err == error.NoMatchingVersion and manifest_was_cached and !force_manifest_refresh) {
+                return manager.resolveRegistryPackageWithLogLevelInternal(name, spec, fetch_log_level, true);
+            }
+            return err;
+        };
         if (manager.options.verbose) {
             if (selection.newest_filtered) |newest_filtered| {
                 const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;

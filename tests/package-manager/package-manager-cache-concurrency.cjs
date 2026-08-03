@@ -168,8 +168,8 @@ const server = http.createServer((request, response) => {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           name,
-          "dist-tags": { latest: "1.0.0" },
-          versions: { "1.0.0": metadata },
+          "dist-tags": { latest: metadata.version },
+          versions: { [metadata.version]: metadata },
         }));
       }
     }
@@ -220,19 +220,50 @@ try {
   expectSuccess(warmUnlocked);
   assert.equal(readStats().requests, coldStats.requests, "manifest-cache reinstall contacted the registry");
 
+  const upgradedName = "delayed-package-0";
+  const upgradedMetadata = { name: upgradedName, version: "2.0.0" };
+  const upgradedArchive = packageArchive(upgradedMetadata);
+  fs.writeFileSync(path.join(registryRoot, `${upgradedName}.tgz`), upgradedArchive);
+  fs.writeFileSync(
+    path.join(registryRoot, `${upgradedName}.json`),
+    JSON.stringify({
+      metadata: upgradedMetadata,
+      integrity: `sha512-${crypto.createHash("sha512").update(upgradedArchive).digest("base64")}`,
+    }),
+  );
+  dependencies[upgradedName] = "2.0.0";
+  fs.writeFileSync(
+    path.join(projectRoot, "package.json"),
+    `${JSON.stringify({ name: "cache-concurrency", version: "1.0.0", dependencies }, null, 2)}\n`,
+  );
+  removeInstall({ lockfile: true });
+  const staleExact = runInstall();
+  expectSuccess(staleExact);
+  const staleStats = readStats();
+  assert.equal(
+    staleStats.requests,
+    coldStats.requests + 2,
+    "an exact version missing from cached metadata did not fetch one fresh manifest and archive",
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(projectRoot, "node_modules", upgradedName, "package.json"), "utf8")).version,
+    "2.0.0",
+  );
+
   removeInstall({ lockfile: true });
   const noCache = runInstall(["--no-cache"]);
   expectSuccess(noCache);
   assert.equal(
     readStats().requests,
-    coldStats.requests + packageCount * 2,
+    staleStats.requests + packageCount * 2,
     "--no-cache reused registry artifacts",
   );
 
   console.log(
     `package-manager cache concurrency: pass ` +
       `(cold=${cold.elapsedMs.toFixed(2)}ms, warm-lock=${warmLocked.elapsedMs.toFixed(2)}ms, ` +
-      `warm-unlocked=${warmUnlocked.elapsedMs.toFixed(2)}ms, no-cache=${noCache.elapsedMs.toFixed(2)}ms, ` +
+      `warm-unlocked=${warmUnlocked.elapsedMs.toFixed(2)}ms, stale-exact=${staleExact.elapsedMs.toFixed(2)}ms, ` +
+      `no-cache=${noCache.elapsedMs.toFixed(2)}ms, ` +
       `max-active=${coldStats.maxActive})`,
   );
 } finally {

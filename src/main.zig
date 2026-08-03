@@ -540,16 +540,39 @@ fn packageHasDependencies(config: Config) bool {
     return false;
 }
 
+fn packageDependenciesInstalled(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: Config,
+) bool {
+    if (!packageHasDependencies(config)) return true;
+
+    const node_modules = pathJoin(allocator, &.{ config.dir, "node_modules" }) catch return false;
+    const node_modules_stat = std.Io.Dir.cwd().statFile(io, node_modules, .{}) catch return false;
+    if (node_modules_stat.kind != .directory) return false;
+
+    for ([_][]const u8{ "dependencies", "devDependencies" }) |field| {
+        const dependencies = getObjectField(config.root, field) orelse continue;
+        if (dependencies != .object) continue;
+        var iterator = dependencies.object.iterator();
+        while (iterator.next()) |entry| {
+            const package_json = pathJoin(
+                allocator,
+                &.{ node_modules, entry.key_ptr.*, "package.json" },
+            ) catch return false;
+            const stat = std.Io.Dir.cwd().statFile(io, package_json, .{}) catch return false;
+            if (stat.kind != .file) return false;
+        }
+    }
+    return true;
+}
+
 fn ensurePackageDependencies(
     init: std.process.Init,
     package: Config,
     stderr: *std.Io.Writer,
 ) !bool {
-    const node_modules = try pathJoin(
-        init.arena.allocator(),
-        &.{ package.dir, "node_modules" },
-    );
-    if (!packageHasDependencies(package) or pathExists(init.io, node_modules)) {
+    if (packageDependenciesInstalled(init.io, init.arena.allocator(), package)) {
         return true;
     }
 
@@ -1373,6 +1396,37 @@ test "package dependency detection drives clean checkout bootstrap" {
         .raw_json = "",
         .root = without_dependencies,
     }));
+}
+
+test "package dependency preflight detects incomplete node_modules" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"dependencies":{"electrobun":"1.0.0"},"optionalDependencies":{"optional-native":"1.0.0"}}
+    ,
+        .{},
+    );
+    const config: Config = .{ .raw_json = "", .root = parsed, .dir = root };
+    try std.testing.expect(!packageDependenciesInstalled(io, arena.allocator(), config));
+
+    try tmp.dir.createDirPath(io, "node_modules/electrobun");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "node_modules/electrobun/package.json",
+        .data = "{}\n",
+    });
+    try std.testing.expect(packageDependenciesInstalled(io, arena.allocator(), config));
+
+    try tmp.dir.deleteFile(io, "node_modules/electrobun/package.json");
+    try std.testing.expect(!packageDependenciesInstalled(io, arena.allocator(), config));
 }
 
 test "package manager commands accept leading Bun configuration flags" {

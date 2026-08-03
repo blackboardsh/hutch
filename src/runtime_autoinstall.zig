@@ -70,8 +70,6 @@ pub fn prepare(
         try std.Io.Dir.cwd().realPathFileAlloc(init.io, entrypoint, allocator);
     const entry_dir = std.fs.path.dirname(entry_absolute) orelse ".";
 
-    if (mode == .auto and directoryHasNodeModules(init.io, allocator, entry_dir)) return;
-
     const cache_root = try autoInstallCacheRoot(init, allocator);
     const staging_root = try std.fs.path.join(allocator, &.{
         cache_root,
@@ -629,23 +627,6 @@ fn exposeInstalledPackage(
             request.install_specifier,
         });
         try createDirectoryLink(init, installed_dir, alias);
-    }
-}
-
-fn directoryHasNodeModules(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    start_dir: []const u8,
-) bool {
-    var current = start_dir;
-    while (true) {
-        const path = std.fs.path.join(allocator, &.{ current, "node_modules" }) catch return false;
-        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch null;
-        if (stat != null and stat.?.kind == .directory) return true;
-
-        const parent = std.fs.path.dirname(current) orelse return false;
-        if (std.mem.eql(u8, parent, current)) return false;
-        current = parent;
     }
 }
 

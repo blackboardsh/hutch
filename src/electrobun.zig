@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const electrobun_templates = @import("electrobun_templates.zig");
+const terminal_ui = @import("terminal_ui.zig");
 const windows_icon = @import("windows_icon.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
@@ -2133,15 +2134,30 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     }
 
     if (template_name == null) {
-        ctx.writeStdout("Electrobun {s} templates ({s}):\n", .{ catalog.version, channel.name() });
-        for (catalog.templates) |template| {
-            ctx.writeStdout("  {s} - {s}\n", .{ template.id, template.description });
+        const items = try ctx.allocator.alloc(terminal_ui.Item, catalog.templates.len);
+        for (catalog.templates, items) |template, *item| {
+            item.* = .{ .label = template.name, .detail = template.main_process };
         }
-        ctx.writeStdout(
-            "\nUsage: hutch electrobun init <project-name> --template=<name> [--channel={s}]\n",
+        const title = try std.fmt.allocPrint(
+            ctx.allocator,
+            "Choose an Electrobun {s} template",
             .{channel.name()},
         );
-        return;
+        switch (try terminal_ui.select(ctx.init, items, title)) {
+            .selected => |index| template_name = catalog.templates[index].id,
+            .cancelled => return,
+            .unavailable => {
+                ctx.writeStdout("Electrobun {s} templates ({s}):\n", .{ catalog.version, channel.name() });
+                for (catalog.templates) |template| {
+                    ctx.writeStdout("  {s} - {s}\n", .{ template.id, template.description });
+                }
+                ctx.writeStdout(
+                    "\nUsage: hutch electrobun init <project-name> --template=<name> [--channel={s}]\n",
+                    .{channel.name()},
+                );
+                return;
+            },
+        }
     }
 
     if (project_name == null) {
