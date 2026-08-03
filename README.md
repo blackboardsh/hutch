@@ -42,6 +42,7 @@ channel launcher, while `hutch self update` advances the engine pointer used on
 the next invocation. The Unix installer adds `~/.dash/bin` to the detected
 zsh, bash, fish, or POSIX shell profile and prints the command that activates it
 in the current terminal. Pass `--no-modify-path` to only print that command.
+`stable` is accepted as an installer channel alias for `production`.
 
 ## Project Pins
 
@@ -51,8 +52,9 @@ The first line of `dash.config.ts` can pin either layer:
 // @dash cli=0.4.1 cottontail=0.2.3
 ```
 
-Accepted selectors are `production`, `canary`, an exact semantic version, or
-`build:<full-git-revision>`. The same pragma works in a directly invoked
+Accepted selectors are `production`, `stable`, `canary`, an exact semantic
+version, or `build:<full-git-revision>`. `stable` resolves to `production`. The
+same pragma works in a directly invoked
 JavaScript or TypeScript entrypoint. An entrypoint field overrides the matching
 config field; omitted fields continue to use the invocation channel.
 
@@ -115,7 +117,8 @@ hutch electrobun build --env=production
 ```
 
 Production app and installer names are unsuffixed; canary names include
-`-canary`. macOS produces a DMG unless `build.mac.createDmg` is false. Windows
+`-canary`. `--env=stable` remains an alias for `--env=production`. macOS
+produces a DMG unless `build.mac.createDmg` is false. Windows
 produces a Setup ZIP, and Linux produces a self-extracting installer tarball.
 Set `release.baseUrl` to the published artifact root to generate a delta from
 the previous release, or set `release.generatePatch` to false to skip it.

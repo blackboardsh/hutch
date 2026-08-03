@@ -759,7 +759,7 @@ fn runReleaseCommand(
     if (args.len == 0 or isHelpFlag(args[0])) {
         const namespace = if (product == .hutch) "self" else "cottontail";
         try stderr.print(
-            "Usage: hutch {s} <path|version|update> [production|canary|<semver>|build:<revision>]\n",
+            "Usage: hutch {s} <path|version|update> [production|stable|canary|<semver>|build:<revision>]\n",
             .{namespace},
         );
         return if (args.len == 0) 1 else 0;
@@ -822,10 +822,7 @@ fn runReleaseCommand(
 
 fn activeReleaseChannel(environment: *const std.process.Environ.Map) ![]const u8 {
     const channel = environment.get("HUTCH_ACTIVE_CHANNEL") orelse "production";
-    if (!std.mem.eql(u8, channel, "production") and !std.mem.eql(u8, channel, "canary")) {
-        return error.InvalidReleaseChannel;
-    }
-    return channel;
+    return version_selector.normalizeChannel(channel);
 }
 
 fn environmentFlag(environment: *const std.process.Environ.Map, name: []const u8) bool {

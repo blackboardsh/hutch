@@ -141,6 +141,13 @@ test "strict dash pragma parses independent CLI and runtime selectors" {
     )).?;
     try std.testing.expectEqual(version_selector.Kind.version, pragma.cli.?.kind);
     try std.testing.expectEqual(version_selector.Kind.build, pragma.cottontail.?.kind);
+
+    const stable = (try parseFirstLine(
+        "// @dash cli=stable cottontail=stable\n",
+    )).?;
+    try std.testing.expectEqual(version_selector.Kind.production, stable.cli.?.kind);
+    try std.testing.expectEqualStrings("production", stable.cli.?.value);
+    try std.testing.expectEqual(version_selector.Kind.production, stable.cottontail.?.kind);
 }
 
 test "ordinary comments are not dash pragmas" {

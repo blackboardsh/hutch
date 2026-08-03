@@ -112,10 +112,7 @@ fn appendEngineArguments(
 
 fn activeChannel(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("HUTCH_ACTIVE_CHANNEL")) |channel| {
-        if (!std.mem.eql(u8, channel, "production") and !std.mem.eql(u8, channel, "canary")) {
-            return error.InvalidReleaseChannel;
-        }
-        return channel;
+        return version_selector.normalizeChannel(channel);
     }
 
     const executable = try std.process.executablePathAlloc(init.io, allocator);
@@ -180,6 +177,13 @@ test "global launcher aliases select independent channels" {
     try std.testing.expectEqualStrings("production", channelForExecutableName("hutch.exe"));
     try std.testing.expectEqualStrings("canary", channelForExecutableName("hutch-canary"));
     try std.testing.expectEqualStrings("canary", channelForExecutableName("hutch-canary.exe"));
+}
+
+test "stable active channel uses the production release" {
+    try std.testing.expectEqualStrings(
+        "production",
+        try version_selector.normalizeChannel("stable"),
+    );
 }
 
 test "launcher preserves the complete test invocation for the engine" {

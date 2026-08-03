@@ -17,6 +17,7 @@ import test from "node:test";
 const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const scratchRoot = join(hutchRoot, ".cottontail-tmp", "tests");
 const marker = "NON_INDEX_MAIN_ENTRYPOINT_EXECUTED";
+const sdkMarker = "CANONICAL_MAIN_SDK_IMPORTED";
 
 function executableName(name) {
   return process.platform === "win32" ? `${name}.exe` : name;
@@ -80,7 +81,10 @@ function createPackageFixture(root, cottontail) {
   write(join(dist, names.core));
   write(join(dist, names.native));
   write(join(dist, names.asar));
-  write(join(dist, "api", "sdks", "bun", "index.ts"), "export {};\n");
+  write(
+    join(dist, "api", "sdks", "main", "index.ts"),
+    `export const sdkMarker = "${sdkMarker}";\n`,
+  );
   write(join(dist, "api", "browser", "index.ts"), "export {};\n");
   copyFileSync(cottontail, runtime);
   chmodSync(runtime, 0o755);
@@ -126,7 +130,10 @@ test("Electrobun launches a non-index Bun entrypoint from the canonical artifact
     assert.ok(existsSync(engine), `Hutch engine must be built before this test: ${engine}`);
     createPackageFixture(packageRoot, cottontail);
 
-    write(join(project, "src", "bun", "electrobun-main.ts"), `console.log("${marker}");\n`);
+    write(
+      join(project, "src", "bun", "electrobun-main.ts"),
+      `import { sdkMarker } from "electrobun/main";\nconsole.log("${marker}", sdkMarker);\n`,
+    );
     write(join(project, "electrobun.config.ts"), `
 export default {
   app: {
@@ -167,6 +174,7 @@ export default {
     assert.ok(existsSync(canonicalMain), `Expected canonical main artifact: ${canonicalMain}`);
     assert.equal(existsSync(sourceNamedOutput), false, "The source basename must not leak into the launcher contract");
     assert.match(readFileSync(canonicalMain, "utf8"), new RegExp(marker));
+    assert.match(readFileSync(canonicalMain, "utf8"), new RegExp(sdkMarker));
     assert.match(readFileSync(launchBridge, "utf8"), /\.\/app\/bun\/index\.js/);
 
     const launch = process.platform === "win32"
@@ -174,6 +182,7 @@ export default {
       : spawnSync(hutch, ["electrobun", "run", "--env=dev"], { cwd: project, encoding: "utf8", env });
     assert.equal(launch.status, 0, launch.stderr || launch.stdout);
     assert.match(launch.stdout, new RegExp(marker));
+    assert.match(launch.stdout, new RegExp(sdkMarker));
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

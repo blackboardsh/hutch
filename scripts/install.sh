@@ -13,9 +13,9 @@ usage() {
 Install Hutch
 
 Usage:
-  install.sh [--channel production|canary]
-  install.sh --version <semver> [--channel production|canary]
-  install.sh --build <full-revision> [--channel production|canary]
+  install.sh [--channel production|stable|canary]
+  install.sh --version <semver> [--channel production|stable|canary]
+  install.sh --build <full-revision> [--channel production|stable|canary]
   install.sh [--dash-home <path>]
   install.sh [--no-modify-path]
 EOF
@@ -55,8 +55,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$channel" = "stable" ]; then
+  channel="production"
+fi
 if [ "$channel" != "production" ] && [ "$channel" != "canary" ]; then
-  echo "hutch installer: channel must be production or canary" >&2
+  echo "hutch installer: channel must be production, stable, or canary" >&2
   exit 1
 fi
 if [ -n "$version" ] && [ -n "$build" ]; then

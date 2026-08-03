@@ -51,9 +51,15 @@ pub const LoadOptions = struct {
 };
 
 pub fn parseChannel(value: []const u8) !Channel {
-    if (std.mem.eql(u8, value, "production")) return .production;
+    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) return .production;
     if (std.mem.eql(u8, value, "canary")) return .canary;
     return error.InvalidTemplateChannel;
+}
+
+test "stable template channel resolves to production" {
+    try std.testing.expectEqual(Channel.production, try parseChannel("stable"));
+    try std.testing.expectEqual(Channel.production, try parseChannel("production"));
+    try std.testing.expectEqual(Channel.canary, try parseChannel("canary"));
 }
 
 pub fn activeChannel(environment: *const std.process.Environ.Map) !Channel {

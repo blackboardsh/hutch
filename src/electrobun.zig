@@ -235,11 +235,11 @@ fn printHelp(writer: anytype) !void {
         \\Electrobun app build commands orchestrated by Hutch.
         \\
         \\Usage:
-        \\  hutch electrobun init [project-name] [--template=name] [--channel=production|canary] [--offline]
-        \\  hutch electrobun config [--env=dev|canary|production]
-        \\  hutch electrobun build [--env=dev|canary|production]
-        \\  hutch electrobun run [--env=dev|canary|production] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
-        \\  hutch electrobun dev [--env=dev|canary|production] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
+        \\  hutch electrobun init [project-name] [--template=name] [--channel=production|stable|canary] [--offline]
+        \\  hutch electrobun config [--env=dev|canary|production|stable]
+        \\  hutch electrobun build [--env=dev|canary|production|stable]
+        \\  hutch electrobun run [--env=dev|canary|production|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
+        \\  hutch electrobun dev [--env=dev|canary|production|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
         \\  - esbuild is vendored automatically on first use as a native binary.
@@ -269,12 +269,17 @@ fn parseBuildEnvironment(args: []const [:0]const u8) BuildEnvironment {
         if (std.mem.startsWith(u8, arg, "--env=")) {
             const value = arg["--env=".len..];
             if (std.mem.eql(u8, value, "canary")) return .canary;
-            if (std.mem.eql(u8, value, "production")) return .production;
+            if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) return .production;
             return .dev;
         }
     }
 
     return .dev;
+}
+
+test "stable build environment resolves to production" {
+    const args = [_][:0]const u8{"--env=stable"};
+    try std.testing.expectEqual(BuildEnvironment.production, parseBuildEnvironment(&args));
 }
 
 fn inspectorModeFromName(name: []const u8) ?MainProcessInspectorMode {
@@ -3152,21 +3157,21 @@ fn addElectrobunImportAliases(
 ) !void {
     const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return;
 
-    const default_bun_sdk = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "bun", "index.ts" });
+    const default_main_sdk = try defaultElectrobunMainSdk(ctx, package_root);
     const default_view_sdk = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "browser", "index.ts" });
-    const bun_sdk = if (use_runtime_sdk_aliases)
-        (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_BUN_MODULE")) orelse default_bun_sdk
+    const main_sdk = if (use_runtime_sdk_aliases)
+        (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_MAIN_MODULE")) orelse
+            (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_BUN_MODULE")) orelse
+            default_main_sdk
     else
-        default_bun_sdk;
+        default_main_sdk;
     const view_sdk = if (use_runtime_sdk_aliases)
         (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_VIEW_MODULE")) orelse default_view_sdk
     else
         default_view_sdk;
 
     var alias: std.json.ObjectMap = .empty;
-    try alias.put(ctx.allocator, "electrobun", .{ .string = bun_sdk });
-    try alias.put(ctx.allocator, "electrobun/bun", .{ .string = bun_sdk });
-    try alias.put(ctx.allocator, "electrobun/cottontail", .{ .string = bun_sdk });
+    try putElectrobunMainAliases(ctx.allocator, &alias, main_sdk);
     try alias.put(ctx.allocator, "electrobun/view", .{ .string = view_sdk });
 
     // Cottontail's Bun.build resolves its Bun and Node compatibility modules
@@ -3186,6 +3191,74 @@ fn addElectrobunImportAliases(
     }
 
     try spec.put(ctx.allocator, "alias", .{ .object = alias });
+}
+
+fn defaultElectrobunMainSdk(ctx: *const Context, package_root: []const u8) ![]const u8 {
+    const canonical = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "main", "index.ts" });
+    if (pathExists(ctx.io, canonical)) return canonical;
+    return std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "bun", "index.ts" });
+}
+
+fn putElectrobunMainAliases(
+    allocator: std.mem.Allocator,
+    alias: *std.json.ObjectMap,
+    main_sdk: []const u8,
+) !void {
+    try alias.put(allocator, "electrobun", .{ .string = main_sdk });
+    try alias.put(allocator, "electrobun/main", .{ .string = main_sdk });
+    try alias.put(allocator, "electrobun/bun", .{ .string = main_sdk });
+    try alias.put(allocator, "electrobun/cottontail", .{ .string = main_sdk });
+}
+
+test "Electrobun build aliases use the runtime-neutral main SDK" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var aliases: std.json.ObjectMap = .empty;
+    try putElectrobunMainAliases(arena.allocator(), &aliases, "/sdk/main/index.ts");
+
+    for ([_][]const u8{
+        "electrobun",
+        "electrobun/main",
+        "electrobun/bun",
+        "electrobun/cottontail",
+    }) |specifier| {
+        const value = aliases.get(specifier) orelse return error.MissingElectrobunAlias;
+        try std.testing.expectEqualStrings("/sdk/main/index.ts", value.string);
+    }
+}
+
+test "Electrobun SDK resolution supports packages from both namespace layouts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const package_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = package_root,
+    };
+
+    try tmp.dir.createDirPath(io, "dist/api/sdks/bun");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dist/api/sdks/bun/index.ts", .data = "export {};" });
+    const legacy = try defaultElectrobunMainSdk(&ctx, package_root);
+    try std.testing.expect(std.mem.endsWith(u8, legacy, "dist/api/sdks/bun/index.ts"));
+
+    try tmp.dir.createDirPath(io, "dist/api/sdks/main");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dist/api/sdks/main/index.ts", .data = "export {};" });
+    const canonical = try defaultElectrobunMainSdk(&ctx, package_root);
+    try std.testing.expect(std.mem.endsWith(u8, canonical, "dist/api/sdks/main/index.ts"));
 }
 
 fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {

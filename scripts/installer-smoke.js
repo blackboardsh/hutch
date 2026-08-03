@@ -5,6 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   createReadStream,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -44,6 +45,7 @@ const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 const temporary = mkdtempSync(join(tmpdir(), "hutch-installer-smoke-"));
 const dashHome = join(temporary, "home");
 const shellHome = join(temporary, "shell-home");
+const stableAliasHome = join(temporary, "stable-alias-home");
 
 const server = createServer((request, response) => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -91,6 +93,21 @@ const server = createServer((request, response) => {
           },
         },
       },
+    },
+  };
+
+  // A stable request must use the production channel endpoint. The installer
+  // contract is independent of whether this smoke test was built from a
+  // production or canary release artifact.
+  bodies["/hutch/channels/production.json"] = {
+    schema: 1,
+    kind: "channel",
+    product: "hutch",
+    channel: "production",
+    version: metadata.version,
+    revision: metadata.revision,
+    release: {
+      url: `${baseUrl}/hutch/releases/${metadata.version}/manifest.json`,
     },
   };
 
@@ -201,6 +218,21 @@ try {
       },
     ).trim();
     assert.equal(output, metadata.version);
+
+    await run("powershell.exe", [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      join(hutchRoot, "scripts", "install.ps1"),
+      "-Channel",
+      "stable",
+      "-DashHome",
+      stableAliasHome,
+      "-ArtifactsBaseUrl",
+      baseUrl,
+    ]);
   } else {
     mkdirSync(shellHome, { recursive: true });
     const installerEnvironment = {
@@ -241,6 +273,50 @@ try {
       },
     ).trim();
     assert.equal(output, metadata.version);
+
+    await run("sh", [
+      join(hutchRoot, "scripts", "install.sh"),
+      "--channel",
+      "stable",
+      "--dash-home",
+      stableAliasHome,
+      "--no-modify-path",
+    ], installerEnvironment);
+  }
+
+  const productionPointer = join(
+    stableAliasHome,
+    "channels",
+    "hutch",
+    "production",
+  );
+  assert(existsSync(productionPointer));
+  assert(!existsSync(join(stableAliasHome, "channels", "hutch", "stable")));
+  const stableCommand = join(
+    stableAliasHome,
+    "bin",
+    process.platform === "win32" ? "hutch.exe" : "hutch",
+  );
+  assert(existsSync(stableCommand));
+  if (metadata.channel === "production") {
+    const stableInstallRoot = readFileSync(productionPointer, "utf8").trim();
+    const stableEngine = join(
+      stableInstallRoot,
+      "bin",
+      process.platform === "win32" ? "hutch-engine.exe" : "hutch-engine",
+    );
+    assert.equal(
+      execFileSync(stableEngine, ["self", "path", "stable"], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          DASH_HOME: stableAliasHome,
+          DASH_RELEASE_OFFLINE: "1",
+          HUTCH_ACTIVE_CHANNEL: "stable",
+        },
+      }).trim(),
+      stableEngine,
+    );
   }
 
   const pinProject = join(temporary, "pinned-project");

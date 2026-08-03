@@ -20,9 +20,19 @@ pub const Selector = struct {
     }
 };
 
+pub fn normalizeChannel(value: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) {
+        return "production";
+    }
+    if (std.mem.eql(u8, value, "canary")) return "canary";
+    return error.InvalidReleaseChannel;
+}
+
 pub fn parse(value: []const u8) !Selector {
     if (value.len == 0 or value.len > 128) return error.InvalidVersionSelector;
-    if (std.mem.eql(u8, value, "production")) return .{ .kind = .production, .value = value };
+    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) {
+        return .{ .kind = .production, .value = "production" };
+    }
     if (std.mem.eql(u8, value, "canary")) return .{ .kind = .canary, .value = value };
 
     if (std.mem.startsWith(u8, value, "build:")) {
@@ -42,6 +52,10 @@ pub fn parse(value: []const u8) !Selector {
 
 test "version selectors accept channels, semver, and full revisions" {
     try std.testing.expectEqual(Kind.production, (try parse("production")).kind);
+    const stable = try parse("stable");
+    try std.testing.expectEqual(Kind.production, stable.kind);
+    try std.testing.expectEqualStrings("production", stable.value);
+    try std.testing.expectEqualStrings("production", stable.channel().?);
     try std.testing.expectEqual(Kind.canary, (try parse("canary")).kind);
     try std.testing.expectEqual(Kind.version, (try parse("1.2.3-canary.4")).kind);
 
@@ -50,7 +64,7 @@ test "version selectors accept channels, semver, and full revisions" {
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", build.value);
 }
 
-test "version selectors reject aliases and abbreviated revisions" {
+test "version selectors reject unknown aliases and abbreviated revisions" {
     try std.testing.expectError(error.InvalidSemanticVersion, parse("latest"));
     try std.testing.expectError(error.InvalidSemanticVersion, parse("v1.2.3"));
     try std.testing.expectError(error.InvalidBuildRevision, parse("build:0123456"));
@@ -58,4 +72,11 @@ test "version selectors reject aliases and abbreviated revisions" {
         error.InvalidBuildRevision,
         parse("build:0123456789ABCDEF0123456789ABCDEF01234567"),
     );
+}
+
+test "release channels normalize the stable compatibility alias" {
+    try std.testing.expectEqualStrings("production", try normalizeChannel("production"));
+    try std.testing.expectEqualStrings("production", try normalizeChannel("stable"));
+    try std.testing.expectEqualStrings("canary", try normalizeChannel("canary"));
+    try std.testing.expectError(error.InvalidReleaseChannel, normalizeChannel("latest"));
 }

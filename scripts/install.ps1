@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("production", "canary")]
+  [ValidateSet("production", "stable", "canary")]
   [string]$Channel = "production",
   [string]$Version = "",
   [string]$Build = "",
@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($Channel -eq "stable") { $Channel = "production" }
 if ($Version -and $Build) {
   throw "Hutch installer: -Version and -Build are mutually exclusive"
 }
