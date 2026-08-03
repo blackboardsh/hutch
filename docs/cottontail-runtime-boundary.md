@@ -119,11 +119,12 @@ files; it does not relabel the old failures as regressions introduced by the
 move.
 
 Sixteen Cottontail-local project and package-manager regressions also moved to
-Hutch. Twelve pass and four preserve pre-split expected failures for bunx
-shebang routing, GitHub template authorization, isolated optional-peer
-contexts, and update-time alias range normalization. The exposed
-`bun:internal-for-testing` utility test remains in Cottontail because it tests a
-runtime module rather than a project command.
+Hutch. Thirteen pass and three preserve pre-split expected failures for GitHub
+template authorization, isolated optional-peer contexts, and update-time alias
+range normalization. Package executable shebang routing now passes by launching
+JavaScript and TypeScript bins through the selected Cottontail runtime. The
+exposed `bun:internal-for-testing` utility test remains in Cottontail because it
+tests a runtime module rather than a project command.
 
 Use these commands to inspect and execute Hutch's ownership:
 
