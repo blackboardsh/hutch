@@ -36,7 +36,14 @@ try {
 
   $archive = Join-Path $temporary "hutch.tar.gz"
   Invoke-WebRequest -UseBasicParsing -Uri $artifact.url -OutFile $archive
-  $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  $archiveStream = [System.IO.File]::OpenRead($archive)
+  try {
+    $actualHash = [System.BitConverter]::ToString($sha256.ComputeHash($archiveStream)).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $archiveStream.Dispose()
+    $sha256.Dispose()
+  }
   $actualSize = (Get-Item $archive).Length
   if ($actualHash -ne $artifact.sha256) {
     throw "Hutch installer: archive checksum mismatch"

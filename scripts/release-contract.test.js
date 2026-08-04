@@ -113,3 +113,9 @@ test("Windows packages from PowerShell so tar receives native paths", () => {
     /name: Package and smoke test Hutch release\s+if: matrix\.os == 'windows'\s+shell: pwsh/,
   );
 });
+
+test("Windows installer hashing does not require Get-FileHash", () => {
+  const installer = readFileSync(new URL("./install.ps1", import.meta.url), "utf8");
+  assert.match(installer, /Security\.Cryptography\.SHA256/);
+  assert.doesNotMatch(installer, /Get-FileHash/);
+});
