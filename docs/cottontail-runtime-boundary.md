@@ -108,23 +108,21 @@ that extraction is deferred.
 ## Compatibility Accounting
 
 The copied Bun 1.3.10 corpus contains 1,445 runnable files. The ownership index
-assigns 102 package-manager and project-command files to Hutch and the remaining
-1,343 runtime files to Cottontail, with no overlap or unclassified files.
+assigns 100 package-manager and project-command files to Hutch and the remaining
+1,345 runtime files to Cottontail, with no overlap or unclassified files. Hutch
+passes all 100 owned files and records zero expected failures.
 
-The old combined Cottontail binary actually passed 79 of those 102 files and
-failed 23 despite older status text claiming they were all enabled. After the
-move, Hutch passes 83 and records 19 inherited functional gaps as expected
-failures. The split therefore preserves the measured baseline and improves four
-files; it does not relabel the old failures as regressions introduced by the
-move.
+`test/cli/install/semver.test.ts` and
+`test/cli/run/shell-keepalive.test.ts` remain Cottontail-owned because they test
+`Bun.semver` and `Bun.$` runtime behavior rather than Hutch orchestration. The
+copied Hutch snapshot excludes those files and their exclusive fixtures while
+retaining their canonical Bun provenance in the shared ownership index.
 
-Sixteen Cottontail-local project and package-manager regressions also moved to
-Hutch. Thirteen pass and three preserve pre-split expected failures for GitHub
-template authorization, isolated optional-peer contexts, and update-time alias
-range normalization. Package executable shebang routing now passes by launching
-JavaScript and TypeScript bins through the selected Cottontail runtime. The
-exposed `bun:internal-for-testing` utility test remains in Cottontail because it
-tests a runtime module rather than a project command.
+Cottontail-local project and package-manager regressions that exercise the
+split live in Hutch's local regression suite. Package executable shebang routing
+launches JavaScript and TypeScript bins through the selected Cottontail runtime.
+The exposed `bun:internal-for-testing` utility test remains in Cottontail because
+it tests a runtime module rather than a project command.
 
 Use these commands to inspect and execute Hutch's ownership:
 

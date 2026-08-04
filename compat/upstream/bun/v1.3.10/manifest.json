@@ -6,12 +6,12 @@
   "tag": "bun-v1.3.10",
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "source": "https://github.com/oven-sh/bun",
-  "copiedAt": "2026-07-30",
+  "copiedAt": "2026-08-04",
   "canonicalRunnableFiles": 1445,
-  "ownedRunnableFiles": 102,
-  "copiedFiles": 833,
+  "ownedRunnableFiles": 100,
+  "copiedFiles": 827,
   "statusCounts": {
-    "enabled": 102
+    "enabled": 100
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -351,11 +351,6 @@
       "status": "enabled"
     },
     {
-      "path": "test/cli/install/semver.test.ts",
-      "sha256": "e6d6e054406dd28c51d3349d3b7a859db7501930d297ebb83f1d2ffd95a66008",
-      "status": "enabled"
-    },
-    {
       "path": "test/cli/install/shebang-normalize.test.ts",
       "sha256": "9405f826ba55106c17ebf89ba1d527be1aa4c0cfae312bbcfe82600916b174b2",
       "status": "enabled"
@@ -398,11 +393,6 @@
     {
       "path": "test/cli/run/run_command.test.ts",
       "sha256": "65f3d93d45a47616f7262a426da240bc9200f93cca78cb49219189284f401b4b",
-      "status": "enabled"
-    },
-    {
-      "path": "test/cli/run/shell-keepalive.test.ts",
-      "sha256": "aa6980fec954b9a8a5ed36e85218332af6d39dc886eb52cf1e98df55eda6d9b2",
       "status": "enabled"
     },
     {
@@ -541,9 +531,6 @@
     "test/cli/run/run-autoinstall.test.ts",
     "test/cli/run/run-shell.test.ts",
     "test/cli/run/run_command.test.ts",
-    "test/cli/run/shell-keepalive-fixture-1.js",
-    "test/cli/run/shell-keepalive-fixture-2.js",
-    "test/cli/run/shell-keepalive.test.ts",
     "test/cli/run/workspaces.test.ts",
     "test/cli/update_interactive_formatting.test.ts",
     "test/cli/update_interactive_install.test.ts",
@@ -599,7 +586,7 @@
       "reason": "Bun.build remains physically implemented by Cottontail in this cycle."
     },
     {
-      "pattern": "test/cli/run/** (except the eight owned files)",
+      "pattern": "test/cli/run/** (except the seven owned files)",
       "owner": "cottontail-runtime",
       "reason": "The remaining files primarily assert runtime loading, transforms, profiling, diagnostics, or process behavior."
     }

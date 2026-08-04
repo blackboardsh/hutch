@@ -464,11 +464,6 @@
       "reason": "Malformed bunfig.toml and .npmrc credentials use Bun's redacting diagnostics without exposing URL passwords, UUIDs, npm tokens, or invalid _auth values (11 bun:test cases, 44 assertions).",
       "owner": "hutch-package-manager"
     },
-    "test/cli/install/semver.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.semver order and satisfies use the vendored Bun Zig parser and pass all 22 copied upstream cases (1,762 assertions), including loose versions, ranges, prereleases, buffers, and error behavior.",
-      "owner": "hutch-package-manager"
-    },
     "test/cli/install/shebang-normalize.test.ts": {
       "status": "enabled",
       "reason": "Installed package binaries normalize CRLF shebangs and preserve non-shebang CRLF content across all 11 copied upstream assertions.",
@@ -516,11 +511,6 @@
     "test/cli/run/run_command.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 3 assertions).",
-      "owner": "hutch-package-manager"
-    },
-    "test/cli/run/shell-keepalive.test.ts": {
-      "status": "enabled",
-      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/run/workspaces.test.ts": {

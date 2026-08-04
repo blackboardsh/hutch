@@ -32,7 +32,18 @@ const suiteRoot = join(hutchRoot, "compat", "upstream", "bun", "v1.3.10");
 const ownershipPath = join(hutchRoot, "compat", "bun-v1.3.10-ownership.json");
 const runnablePattern = /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i;
 const canonicalRunnableCount = 1_445;
-const expectedOwnedCount = 102;
+const expectedOwnedCount = 100;
+
+const runtimeOnlyTests = new Set([
+  "test/cli/install/semver.test.ts",
+  "test/cli/run/shell-keepalive.test.ts",
+]);
+
+const runtimeOnlyInstallCopiedPaths = [
+  "test/cli/install/__snapshots__/semver.test.ts.snap",
+  "test/cli/install/semver-fixture.js",
+  "test/cli/install/semver.test.ts",
+];
 
 const orchestrationTests = [
   "test/cli/run/filter-workspace.test.ts",
@@ -41,7 +52,6 @@ const orchestrationTests = [
   "test/cli/run/run-autoinstall.test.ts",
   "test/cli/run/run-shell.test.ts",
   "test/cli/run/run_command.test.ts",
-  "test/cli/run/shell-keepalive.test.ts",
   "test/cli/run/workspaces.test.ts",
 ];
 
@@ -97,8 +107,6 @@ const directlyCopiedPaths = [
   "test/js/third_party/pnpm",
   ...projectMutationTests.filter(path => !path.startsWith("test/cli/create/") && !path.startsWith("test/cli/init/")),
   ...orchestrationTests,
-  "test/cli/run/shell-keepalive-fixture-1.js",
-  "test/cli/run/shell-keepalive-fixture-2.js",
   ...packageManagerRegressionTests,
   ...focusedPackageManagerTests,
 ];
@@ -207,6 +215,13 @@ function patternStatusForPath(status, path) {
 }
 
 function statusForPath(status, existingStatus, path) {
+  const existing = existingStatus?.tests?.[path];
+  if (existing) {
+    return {
+      ...existing,
+      owner: "hutch-package-manager",
+    };
+  }
   const pattern = patternStatusForPath(status, path);
   const result = {
     status: status.defaultStatus ?? "not-enabled",
@@ -218,7 +233,6 @@ function statusForPath(status, existingStatus, path) {
     result.status = "enabled";
     result.reason = "Imported into Hutch ownership; run the Hutch compatibility corpus and record the measured result here.";
   }
-  Object.assign(result, existingStatus?.tests?.[path] ?? {});
   result.owner = "hutch-package-manager";
   return result;
 }
@@ -273,10 +287,11 @@ function main() {
     );
   }
 
-  const installTests = canonicalTests.filter(path => path.startsWith("test/cli/install/"));
-  if (installTests.length !== 69) {
-    throw new Error(`expected 69 install tests, found ${installTests.length}`);
+  const canonicalInstallTests = canonicalTests.filter(path => path.startsWith("test/cli/install/"));
+  if (canonicalInstallTests.length !== 69) {
+    throw new Error(`expected 69 canonical install tests, found ${canonicalInstallTests.length}`);
   }
+  const installTests = canonicalInstallTests.filter(path => !runtimeOnlyTests.has(path));
 
   const ownedTests = [
     ...installTests,
@@ -289,6 +304,10 @@ function main() {
   if (uniqueOwnedTests.size !== ownedTests.length) {
     throw new Error("duplicate path in Hutch package-manager ownership list");
   }
+  for (const path of runtimeOnlyTests) {
+    if (!canonicalTests.includes(path)) throw new Error(`runtime-only test is not canonical: ${path}`);
+    if (uniqueOwnedTests.has(path)) throw new Error(`runtime-only test is still Hutch-owned: ${path}`);
+  }
   if (ownedTests.length !== expectedOwnedCount) {
     throw new Error(`expected ${expectedOwnedCount} owned tests, found ${ownedTests.length}`);
   }
@@ -298,6 +317,9 @@ function main() {
 
   rmSync(suiteRoot, { recursive: true, force: true });
   for (const path of directlyCopiedPaths) copyOwnedPath(sourceRoot, path);
+  for (const path of runtimeOnlyInstallCopiedPaths) {
+    rmSync(join(suiteRoot, path), { recursive: true, force: true });
+  }
 
   writeFileSync(
     join(suiteRoot, "test", "bunfig.toml"),
@@ -387,7 +409,7 @@ function main() {
         reason: "Bun.build remains physically implemented by Cottontail in this cycle.",
       },
       {
-        pattern: "test/cli/run/** (except the eight owned files)",
+        pattern: "test/cli/run/** (except the seven owned files)",
         owner: "cottontail-runtime",
         reason: "The remaining files primarily assert runtime loading, transforms, profiling, diagnostics, or process behavior.",
       },

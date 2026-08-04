@@ -10,6 +10,9 @@ The canonical ownership index is
 Bun v1.3.10's 1,445 runnable files to exactly one owner, so repository-local
 copies are never double-counted.
 
+Hutch owns and passes 100 files with zero expected failures. Cottontail owns
+the remaining 1,345 runtime files.
+
 ## Commands
 
 Validate ownership and copied-file accounting without running upstream tests:
