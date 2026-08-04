@@ -32,8 +32,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-add.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: adding a dependency alongside workspaces fails; the other copied add cases pass.",
+      "status": "enabled",
+      "reason": "Dependency addition, including workspace cases, passes the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager",
       "timeoutMs": 120000
     },
@@ -129,8 +129,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: 170 active cases pass; multi-dependency bin-linking output differs from Bun.",
+      "status": "enabled",
+      "reason": "All 170 active install cases, including multi-dependency bin linking, pass on current Hutch main.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -140,8 +140,8 @@
       "timeoutMs": 300000
     },
     "test/cli/install/bun-link.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: workspace package linking and dependency linking still differ from Bun.",
+      "status": "enabled",
+      "reason": "Workspace and dependency linking pass the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-lock.test.ts": {
@@ -214,8 +214,8 @@
       "timeoutMs": 180000
     },
     "test/cli/install/bun-remove.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: removing an existing package does not yet match Bun's complete behavior.",
+      "status": "enabled",
+      "reason": "Package removal passes the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-run-bunfig.test.ts": {

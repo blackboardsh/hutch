@@ -37,7 +37,6 @@ const defaultHutchEngine = join(hutchRoot, "zig-out", "bin", `hutch-engine${exec
 const defaultCottontailBinary = resolve(
   hutchRoot,
   "..",
-  "..",
   "cottontail",
   "zig-out",
   "bin",

@@ -11,8 +11,8 @@
   "ownedRunnableFiles": 102,
   "copiedFiles": 833,
   "statusCounts": {
-    "expected-failure": 19,
-    "enabled": 83
+    "expected-failure": 15,
+    "enabled": 87
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -44,7 +44,7 @@
     {
       "path": "test/cli/install/bun-add.test.ts",
       "sha256": "24b53d5d638168ddeca857eb06de3233c2d6444322950f9d946b4c533cafde4d",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-audit.test.ts",
@@ -114,12 +114,12 @@
     {
       "path": "test/cli/install/bun-install.test.ts",
       "sha256": "2cb075c777c1d883b1f88ca4c2e9566dd36a4cdf53e67bcb5b09949970821ccf",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-link.test.ts",
       "sha256": "8bd8e06216d5d0abbc0d0a3d0106ee17dddf680049aab97ec0300eae3ee65b02",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-lock.test.ts",
@@ -174,7 +174,7 @@
     {
       "path": "test/cli/install/bun-remove.test.ts",
       "sha256": "24ce9e3ec7e0b2834c2ff77c684d515857dcf6fc794477b29ac8ce94753498f9",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-run-bunfig.test.ts",
