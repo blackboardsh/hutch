@@ -3,8 +3,8 @@
   "defaultStatus": "not-enabled",
   "tests": {
     "test/cli/create/create-jsx.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the two React SPA Tailwind build cases fail.",
+      "status": "enabled",
+      "reason": "All four runnable cases pass against Cottontail's ESM lexical-path implementation; the eight cases marked TODO by upstream remain TODO (12 cases, 0 failures).",
       "env": {
         "CI": "1"
       },

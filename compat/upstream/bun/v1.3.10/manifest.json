@@ -11,15 +11,14 @@
   "ownedRunnableFiles": 102,
   "copiedFiles": 833,
   "statusCounts": {
-    "expected-failure": 1,
-    "enabled": 101
+    "enabled": 102
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
     {
       "path": "test/cli/create/create-jsx.test.ts",
       "sha256": "6e0c65dd3d9a43c0df275414b502fe227b7e32720639b2ccc9a0759b9e3b41c1",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/init/init.test.ts",
