@@ -41,6 +41,7 @@ const default_registry = "https://registry.npmjs.org/";
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_tarball_bytes = 512 * 1024 * 1024;
 const security_resolution_output_env = "COTTONTAIL_PM_SECURITY_RESOLUTION_OUTPUT";
+const bun_compat_output_env = "HUTCH_BUN_COMPAT";
 const global_link_copy_marker_name = ".cottontail-global-link-source";
 const global_link_copy_marker_prefix = "COTTONTAIL_GLOBAL_LINK_COPY_V1\n";
 const DirectoryLinkResult = enum { symbolic_link, copied };
@@ -48,6 +49,10 @@ const PathLinkStatus = enum { missing, not_link, symbolic_link, unknown };
 const all_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies", "peerDependencies" };
 const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies" };
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
+
+fn usesBunCompatOutput(init: std.process.Init) bool {
+    return init.environ_map.get(bun_compat_output_env) != null;
+}
 
 const Command = enum {
     audit,
@@ -1181,7 +1186,11 @@ fn runPublish(
         };
     }
     if (!options.silent) {
-        try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+        if (usesBunCompatOutput(init)) {
+            try stdout.print("bun publish v{s} (cottontail)\n", .{bun_compat_version});
+        } else {
+            try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+        }
         try stdout.flush();
     }
 
@@ -1817,7 +1826,10 @@ fn runPmWhoami(
         return 0;
     }
     if (manager.registry_authorization == null) {
-        try stderr.writeAll("error: missing authentication (run `hutch x npm login`)\n");
+        try stderr.writeAll(if (usesBunCompatOutput(init))
+            "error: missing authentication (run `bunx npm login`)\n"
+        else
+            "error: missing authentication (run `hutch x npm login`)\n");
         try stderr.flush();
         return 1;
     }
@@ -2578,7 +2590,11 @@ const Manager = struct {
             !internal_bunx_install and
             manager.options.command == .install;
         if (install_header_printed) {
-            try manager.stdout.print("hutch install v{s}\n\n", .{version});
+            if (usesBunCompatOutput(manager.init_data)) {
+                try manager.stdout.print("bun install v{s} (cottontail)\n\n", .{bun_compat_version});
+            } else {
+                try manager.stdout.print("hutch install v{s}\n\n", .{version});
+            }
             try manager.stdout.flush();
         }
 
@@ -2665,6 +2681,8 @@ const Manager = struct {
             manager.options.command == .install and
             ((manager.lock_graph == null and hasAnyDependencies(&root)) or
                 manager.patch_policy_changed);
+        const report_patch_resolution = manager.patch_policy_changed or
+            manager.manifest_policy.?.patched_dependencies.count() > 0;
         if (!manager.options.silent and !internal_bunx_install) {
             if (!install_header_printed) {
                 try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
@@ -2677,7 +2695,7 @@ const Manager = struct {
                 });
                 try manager.stdout.flush();
             }
-            if (report_resolution) {
+            if (report_resolution and report_patch_resolution) {
                 try manager.stderr.writeAll("Resolving dependencies\n");
             }
         }
@@ -2741,7 +2759,10 @@ const Manager = struct {
             .patch, .patch_commit, .publish => unreachable,
             .audit, .outdated, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
-        if (report_resolution) {
+        if (report_resolution and manager.deferred_install_error == null and
+            (report_patch_resolution or manager.network_task_count > 0))
+        {
+            if (!report_patch_resolution) try manager.stderr.writeAll("Resolving dependencies\n");
             try manager.stderr.print("Resolved, downloaded and extracted [{d}]\n", .{manager.network_task_count});
         }
 
@@ -2827,7 +2848,8 @@ const Manager = struct {
                 if (manager.shouldSaveTextLockfile()) "bun.lock" else "bun.lockb",
                 manager.lockfilePackageCount(),
             });
-        } else if (!manager.options.silent and !manager.options.no_summary and
+        } else if (manager.deferred_install_error == null and
+            !manager.options.silent and !manager.options.no_summary and
             !(manager.options.only_missing and manager.installed_count == 0))
         {
             const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
@@ -6661,12 +6683,14 @@ const Manager = struct {
                 try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
             } else {
                 try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
-                if (report.latest_version) |latest| {
-                    const record = manager.directRecord(report.alias);
-                    const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
-                    const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
-                    if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
-                        try manager.stdout.print(" (v{s} available)", .{latest});
+                if (!usesBunCompatOutput(manager.init_data)) {
+                    if (report.latest_version) |latest| {
+                        const record = manager.directRecord(report.alias);
+                        const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
+                        const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
+                        if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
+                            try manager.stdout.print(" (v{s} available)", .{latest});
+                        }
                     }
                 }
             }
@@ -10391,7 +10415,16 @@ const Manager = struct {
                 }
                 const bytes = fetch.bytes orelse continue;
                 defer std.heap.smp_allocator.free(bytes);
-                const parsed = (try manager.parseRegistryManifest(bytes)) orelse continue;
+                const parsed = (try manager.parseRegistryManifest(bytes)) orelse {
+                    // A successful HTTP response with an invalid npm manifest is
+                    // terminal. Retrying it in the synchronous resolver duplicates
+                    // the request and cannot produce a different document.
+                    try manager.registry_manifest_failures.put(
+                        try manager.allocator.dupe(u8, fetch.name),
+                        {},
+                    );
+                    continue;
+                };
                 _ = manager.registry_manifest_failures.remove(fetch.name);
                 try manager.registry_manifests.put(try manager.allocator.dupe(u8, fetch.name), parsed);
                 if (fetch.cache_path) |path| {
@@ -10845,6 +10878,7 @@ const Manager = struct {
 
     fn unlinkBin(manager: *Manager, bin_dir: []const u8, name: []const u8) void {
         const destination = std.fs.path.join(manager.allocator, &.{ bin_dir, name }) catch return;
+        _ = manager.linked_bins.remove(destination);
         deletePath(manager.init_data.io, destination);
         if (builtin.os.tag == .windows) {
             const command_path = std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination}) catch return;
@@ -10949,7 +10983,12 @@ const Manager = struct {
                 candidate.install_dir
             else
                 try packageDestination(manager.allocator, manager.root_dir, candidate.alias);
-            try manager.linkBins(main_record.alias, candidate_dir, metadata, true, manager.root_dir);
+            const bin_dir = if (manager.node_linker == .isolated)
+                try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bin" })
+            else
+                try manager.binDirectoryForPackage(main_record.install_dir);
+            try manager.unlinkBinsInDirectory(main_record.alias, metadata, bin_dir);
+            try manager.linkBinsInDirectory(main_record.alias, candidate_dir, metadata, false, bin_dir);
             return;
         }
     }

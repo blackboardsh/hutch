@@ -76,19 +76,19 @@
       "timeoutMs": 300000
     },
     "test/cli/install/bun-install-native-binlink.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: platform-specific native bin redirection fails for hoisted and isolated linkers.",
+      "status": "enabled",
+      "reason": "Platform-specific native dependency bins replace the generic package bin across fresh, locked, no-op, and deleted-bin reinstalls for both hoisted and isolated linkers (2 copied cases, 24 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-patch.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the failed patch-application retry case does not yet match Bun.",
+      "status": "enabled",
+      "reason": "Patch creation, application, mutation, removal, failure retry, workspaces, scoped packages, and isolated-linker reinstalls pass the complete copied file (17 cases, 4 snapshots, 63 assertions).",
       "owner": "hutch-package-manager",
       "timeoutMs": 180000
     },
     "test/cli/install/bun-install-pathname-trailing-slash.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: custom registry URL trailing-slash normalization differs from Bun.",
+      "status": "enabled",
+      "reason": "Custom registry URL normalization issues exactly one manifest request and preserves a single path separator (1 copied case, 3 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-proxy.test.ts": {
@@ -97,8 +97,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-registry.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: one binary-shape case serializes differently in the text lockfile; the remaining active registry cases pass.",
+      "status": "enabled",
+      "reason": "The complete registry, cache, CA, auth, lockfile, optional dependency, bin, semver, prerelease, hoisting, migration, and outdated matrix passes unchanged (220 active cases, 5 upstream TODOs, 18 snapshots, 5,402 assertions).",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -201,8 +201,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-publish.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: npm command and lifecycle-event environment values differ during publish.",
+      "status": "enabled",
+      "reason": "Registry publishing, OTP flows, tarballs, scoped packages, bins, workspaces, lifecycle ordering and environment, access, tags, dry runs, and republish handling pass the complete copied file (31 cases, 203 assertions).",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -641,8 +641,8 @@
       "owner": "hutch-package-manager"
     },
     "test/regression/issue/patch-bounds-check.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: two malformed patch bounds cases do not yet produce Bun-compatible behavior.",
+      "status": "enabled",
+      "reason": "Malformed addition and deletion bounds fail gracefully with Bun-compatible diagnostics, while a valid patch applies successfully (3 copied cases, 7 snapshots, 10 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/regression/issue/update-interactive-formatting.test.ts": {

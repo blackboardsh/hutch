@@ -559,6 +559,7 @@ function runEntry(entry, options, tempRoot, executionSuiteRoot) {
     HUTCH_COMPAT_CLI: options.hutch,
     HUTCH_COMPAT_COTTONTAIL: options.runtime,
     HUTCH_COMPAT_TEST_TIMEOUT_MS: String(perTestTimeoutMs),
+    HUTCH_BUN_COMPAT: "1",
     HUTCH_ENGINE_BINARY: options.engine,
     TEMP: runTemp,
     TEST_TMPDIR: runTemp,
