@@ -591,13 +591,6 @@ fn commandUsesSecurityScanner(command: Command) bool {
     };
 }
 
-fn packageManagerChildExitCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |code| @intCast(@min(code, 255)),
-        else => 1,
-    };
-}
-
 pub fn run(
     init: std.process.Init,
     args: []const [:0]const u8,
@@ -3388,7 +3381,7 @@ const Manager = struct {
         try manager.stdout.flush();
     }
 
-    fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) !void {
+    fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) anyerror!void {
         const payload_path = try manager.securityTempFile("json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
         const manifests_path = try manager.securityRegistryManifestsPath(payload_path);
@@ -3398,25 +3391,35 @@ const Manager = struct {
         defer resolver_environment.deinit();
         try resolver_environment.put(security_resolution_output_env, payload_path);
 
-        const original_args = manager.options.original_args;
-        const resolver_args = try manager.allocator.alloc([]const u8, original_args.len + 3);
-        for (original_args, 0..) |arg, index| resolver_args[index] = arg;
-        resolver_args[original_args.len] = "--dry-run";
-        resolver_args[original_args.len + 1] = "--silent";
-        resolver_args[original_args.len + 2] = "--no-summary";
+        var resolver_init = manager.init_data;
+        resolver_init.environ_map = &resolver_environment;
+        var resolver_options = manager.options;
+        resolver_options.dry_run = true;
+        resolver_options.no_save = true;
+        resolver_options.silent = true;
+        resolver_options.no_summary = true;
+        resolver_options.ignore_scripts = true;
 
-        var resolver = try std.process.spawn(manager.init_data.io, .{
-            .argv = resolver_args,
-            .cwd = .{ .path = manager.invocation_dir },
-            .environ_map = &resolver_environment,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .inherit,
-            .create_no_window = true,
-        });
-        defer resolver.kill(manager.init_data.io);
-        const resolver_result = try resolver.wait(manager.init_data.io);
-        if (packageManagerChildExitCode(resolver_result) != 0) return error.PackageManagerErrorReported;
+        // Keep resolution isolated from the install manager without forking a
+        // second Hutch process. Besides avoiding process startup, this ensures
+        // a timed-out caller cannot leave the resolver child running while the
+        // scanner command is being cancelled.
+        const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+            manager.init_data.io,
+            ".",
+            manager.allocator,
+        );
+        defer std.process.setCurrentPath(manager.init_data.io, previous_cwd) catch {};
+        try std.process.setCurrentPath(manager.init_data.io, manager.invocation_dir);
+
+        var resolver = Manager.init(
+            resolver_init,
+            resolver_options,
+            manager.stdout,
+            manager.stderr,
+        );
+        defer resolver.deinit();
+        if (try resolver.execute() != 0) return error.PackageManagerErrorReported;
         try manager.loadSecurityRegistryManifests(payload_path);
 
         const resolved_payload = try std.Io.Dir.cwd().readFileAlloc(
