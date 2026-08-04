@@ -6,6 +6,7 @@ const package_manager = @import("package_manager/root.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const runtime_autoinstall = @import("runtime_autoinstall.zig");
+const runtime_entrypoint = @import("runtime_entrypoint.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -349,7 +350,6 @@ fn prepareForwardedRuntimeAutoInstall(
     const input = runtimeAutoInstallInput(args) orelse return true;
     switch (input) {
         .entrypoint => |entrypoint| {
-            if (!pathExists(init.io, entrypoint)) return true;
             return try prepareRuntimeAutoInstall(init, entrypoint, .auto, stderr);
         },
         .source => |source| {
@@ -845,6 +845,64 @@ const PackageScriptInvocation = struct {
     silent: bool,
 };
 
+fn isExplicitRuntimePath(name: []const u8) bool {
+    return std.fs.path.isAbsolute(name) or
+        std.mem.startsWith(u8, name, "./") or
+        std.mem.startsWith(u8, name, ".\\") or
+        std.mem.startsWith(u8, name, "../") or
+        std.mem.startsWith(u8, name, "..\\") or
+        std.mem.indexOfAny(u8, name, "/\\") != null;
+}
+
+fn packageScriptEligible(name: []const u8) bool {
+    return !isExplicitRuntimePath(name);
+}
+
+fn runtimeDiagnosticEligible(name: []const u8) bool {
+    return isExplicitRuntimePath(name) or std.fs.path.extension(name).len > 0;
+}
+
+fn resolvedEntrypointIsRunnable(path: []const u8) bool {
+    return !std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json");
+}
+
+fn runCottontailInvocation(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    invocation: PackageScriptInvocation,
+) !u8 {
+    var command_args: std.ArrayList([:0]const u8) = .empty;
+    defer command_args.deinit(allocator);
+
+    if (invocation.force_runtime) try command_args.append(allocator, "--bun");
+    if (invocation.config_path) |config_path| {
+        try command_args.appendSlice(allocator, &.{
+            "--config",
+            try allocator.dupeZ(u8, config_path),
+        });
+    }
+    try command_args.append(allocator, try allocator.dupeZ(u8, invocation.name));
+    for (invocation.args) |arg| try command_args.append(allocator, arg);
+
+    const cottontail = try resolveCottontail(init, allocator, command_args.items);
+    return try runCottontailCommand(
+        init,
+        allocator,
+        cottontail.executable,
+        command_args.items,
+    );
+}
+
+fn prepareAndRunCottontailInvocation(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    invocation: PackageScriptInvocation,
+    stderr: *std.Io.Writer,
+) !u8 {
+    if (!try prepareRuntimeAutoInstall(init, invocation.name, .auto, stderr)) return 1;
+    return try runCottontailInvocation(init, allocator, invocation);
+}
+
 fn parsePackageScriptInvocation(
     init: std.process.Init,
     args: []const [:0]const u8,
@@ -1126,7 +1184,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (runtime_autoinstall.parseLeadingInvocation(args)) |invocation| {
         const entrypoint = args[invocation.entry_index];
-        if (pathExists(init.io, entrypoint)) {
+        if (try runtime_entrypoint.resolve(init.io, allocator, entrypoint) != null) {
             if (!try prepareRuntimeAutoInstall(init, entrypoint, invocation.mode, stderr)) {
                 std.process.exit(1);
             }
@@ -1285,57 +1343,97 @@ pub fn main(init: std.process.Init) !void {
                 invocation.silent,
                 invocation.force_runtime,
             );
-            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
-                try stderr.flush();
-                std.process.exit(1);
-            };
-            if (try runConfiguredScriptIfExists(
-                init,
-                allocator,
-                cottontail.executable,
-                invocation.name,
-                invocation.args,
-                stderr,
-            )) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-            if (try runPackageScriptIfExists(
-                init,
+            const resolved_entrypoint = try runtime_entrypoint.resolve(
+                init.io,
                 allocator,
                 invocation.name,
-                invocation.args,
-                stderr,
-                configured.silent,
-                configured.force_runtime,
-            )) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-            if (invocation.if_present) return;
-            if (pathExists(init.io, invocation.name)) {
-                if (!try prepareRuntimeAutoInstall(init, invocation.name, .auto, stderr)) {
+            );
+            const local_command_exists = package_manager.run.localCommandExists(
+                init,
+                invocation.name,
+            );
+
+            // Without an explicit `run`, a resolvable module wins over a
+            // same-named package script. `run` intentionally reverses that
+            // priority to match Bun's script runner.
+            if (!invocation.explicit_run and
+                resolved_entrypoint != null and
+                (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists))
+            {
+                const exit_code = prepareAndRunCottontailInvocation(
+                    init,
+                    allocator,
+                    invocation,
+                    stderr,
+                ) catch |err| {
+                    try stderr.print("hutch: could not run Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
                     std.process.exit(1);
-                }
-                const exit_code = try runCottontailScript(
+                };
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+
+            if (packageScriptEligible(invocation.name)) {
+                const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                    try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
+                if (try runConfiguredScriptIfExists(
                     init,
                     allocator,
                     cottontail.executable,
                     invocation.name,
                     invocation.args,
-                );
+                    stderr,
+                )) |exit_code| {
+                    try stderr.flush();
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                }
+                if (try runPackageScriptIfExists(
+                    init,
+                    allocator,
+                    invocation.name,
+                    invocation.args,
+                    stderr,
+                    configured.silent,
+                    configured.force_runtime,
+                )) |exit_code| {
+                    try stderr.flush();
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                }
+            }
+            if (invocation.if_present) return;
+            if (resolved_entrypoint != null and
+                (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists) or
+                resolved_entrypoint == null and runtimeDiagnosticEligible(invocation.name))
+            {
+                const exit_code = prepareAndRunCottontailInvocation(
+                    init,
+                    allocator,
+                    invocation,
+                    stderr,
+                ) catch |err| {
+                    try stderr.print("hutch: could not run Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
             }
-            if (package_manager.run.commandExists(init, invocation.name)) {
+            const command_exists = if (invocation.explicit_run)
+                local_command_exists or package_manager.run.commandExists(init, invocation.name)
+            else
+                local_command_exists;
+            if (command_exists) {
                 const exit_code = try package_manager.run.runSingleCommand(
                     init,
                     invocation.name,
                     invocation.args,
-                    configured.silent,
+                    true,
                 );
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
@@ -1500,7 +1598,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (try printBinaryLockfile(init, command, stdout)) return;
 
-    if (pathExists(init.io, command)) {
+    const resolved_entrypoint = try runtime_entrypoint.resolve(init.io, allocator, command);
+    const local_command_exists = package_manager.run.localCommandExists(init, command);
+    if (resolved_entrypoint != null and
+        (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists))
+    {
         if (!try prepareRuntimeAutoInstall(init, command, .auto, stderr)) {
             std.process.exit(1);
         }
@@ -1514,28 +1616,32 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (findDashConfig(init, allocator)) |_| {
-        const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        if (try runConfiguredScriptIfExists(init, allocator, cottontail.executable, command, args[2..], stderr)) |exit_code| {
+    if (packageScriptEligible(command)) {
+        if (findDashConfig(init, allocator)) |_| {
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            if (try runConfiguredScriptIfExists(init, allocator, cottontail.executable, command, args[2..], stderr)) |exit_code| {
+                try stderr.flush();
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+        } else |err| switch (err) {
+            error.DashConfigNotFound => {},
+            else => return err,
+        }
+    }
+
+    if (packageScriptEligible(command)) {
+        if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
             try stderr.flush();
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-    } else |err| switch (err) {
-        error.DashConfigNotFound => {},
-        else => return err,
     }
-
-    if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-    if (package_manager.run.commandExists(init, command)) {
+    if (local_command_exists) {
         const exit_code = try package_manager.run.runSingleCommand(
             init,
             command,
@@ -1545,9 +1651,7 @@ pub fn main(init: std.process.Init) !void {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
-    const path_like = std.mem.indexOfAny(u8, command, "/\\") != null or
-        std.fs.path.extension(command).len > 0;
-    if (!path_like) {
+    if (!runtimeDiagnosticEligible(command)) {
         try stderr.print("error: Script not found \"{s}\"\n", .{command});
         try stderr.flush();
         std.process.exit(1);

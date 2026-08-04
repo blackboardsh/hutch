@@ -1340,7 +1340,7 @@ pub fn runSingleIfExists(
     return try executeGroups(init, pointers, .sequential, false, &output);
 }
 
-pub fn commandExists(init: std.process.Init, name: []const u8) bool {
+pub fn localCommandExists(init: std.process.Init, name: []const u8) bool {
     if (std.mem.indexOfAny(u8, name, "/\\") != null) return runnableFile(init.io, name);
     const allocator = init.arena.allocator();
     var current: []const u8 = std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator) catch return false;
@@ -1354,6 +1354,15 @@ pub fn commandExists(init: std.process.Init, name: []const u8) bool {
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
+
+    return false;
+}
+
+pub fn commandExists(init: std.process.Init, name: []const u8) bool {
+    if (localCommandExists(init, name)) return true;
+    if (std.mem.indexOfAny(u8, name, "/\\") != null) return false;
+
+    const allocator = init.arena.allocator();
 
     const path = init.environ_map.get("PATH") orelse return false;
     var directories = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);

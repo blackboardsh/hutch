@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const package_manager = @import("package_manager/root.zig");
 const package_manager_options = @import("package_manager/support/options/root.zig");
+const runtime_entrypoint = @import("runtime_entrypoint.zig");
 
 pub const Mode = enum {
     auto,
@@ -61,13 +62,15 @@ pub fn prepare(
     mode: Mode,
     stderr: *std.Io.Writer,
 ) !void {
-    if (mode == .disable or !canContainPackageImports(entrypoint)) return;
+    if (mode == .disable) return;
 
     const allocator = init.arena.allocator();
-    const entry_absolute = if (std.fs.path.isAbsolute(entrypoint))
-        try std.fs.path.resolve(allocator, &.{entrypoint})
+    const resolved = (try runtime_entrypoint.resolve(init.io, allocator, entrypoint)) orelse return;
+    if (!canContainPackageImports(resolved)) return;
+    const entry_absolute = if (std.fs.path.isAbsolute(resolved))
+        try std.fs.path.resolve(allocator, &.{resolved})
     else
-        try std.Io.Dir.cwd().realPathFileAlloc(init.io, entrypoint, allocator);
+        try std.Io.Dir.cwd().realPathFileAlloc(init.io, resolved, allocator);
     const entry_dir = std.fs.path.dirname(entry_absolute) orelse ".";
 
     const cache_root = try autoInstallCacheRoot(init, allocator);
