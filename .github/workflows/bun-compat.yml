@@ -1,0 +1,86 @@
+name: Bun compatibility
+
+on:
+  push:
+    branches:
+      - "compat/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hutch-bun-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bun-package-manager-compat:
+    name: Complete Hutch-owned Bun package-manager tier
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out Hutch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Validate compatibility workflow contract
+        run: node --test scripts/bun-compat-workflow.test.js
+
+      - name: Validate Bun package-manager inventory
+        run: node scripts/run-bun-package-manager-tests.js --check
+
+      - name: Restore vendored Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendors/zig
+          key: hutch-bun-compat-zig-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('scripts/setup.sh') }}
+
+      - name: Set up Zig
+        run: bash scripts/setup.sh
+
+      - name: Build Hutch
+        run: ./vendors/zig/zig build -Doptimize=ReleaseSmall -Dcpu=baseline
+
+      - name: Restore pinned Cottontail build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .hutch-local-tools/upstream-cottontail
+          key: hutch-bun-compat-cottontail-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('compat/upstream/cottontail.json', 'scripts/setup-upstream-cottontail.js') }}
+
+      - name: Select Xcode 26.4
+        run: |
+          developer_dir=/Applications/Xcode_26.4.app/Contents/Developer
+          test -d "$developer_dir"
+          sudo xcode-select --switch "$developer_dir"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Install Cottontail build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew install libffi brotli
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+
+      - name: Build pinned Cottontail runtime
+        id: cottontail
+        run: |
+          cottontail="$(node scripts/setup-upstream-cottontail.js)"
+          test -x "$cottontail"
+          echo "binary=$cottontail" >> "$GITHUB_OUTPUT"
+
+      - name: Run complete Hutch-owned Bun package-manager tier
+        env:
+          COTTONTAIL: ${{ steps.cottontail.outputs.binary }}
+        run: >-
+          node scripts/run-bun-package-manager-tests.js
+          --all
+          --hutch ./zig-out/bin/hutch
+          --engine ./zig-out/bin/hutch-engine
+          --runtime "$COTTONTAIL"
