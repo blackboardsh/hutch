@@ -1433,7 +1433,7 @@ pub fn main(init: std.process.Init) !void {
                     init,
                     invocation.name,
                     invocation.args,
-                    true,
+                    configured.silent,
                 );
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
@@ -1646,7 +1646,7 @@ pub fn main(init: std.process.Init) !void {
             init,
             command,
             args[2..],
-            true,
+            false,
         );
         if (exit_code != 0) std.process.exit(exit_code);
         return;
