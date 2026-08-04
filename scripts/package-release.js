@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { releaseChannel } from "./release-contract.js";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repositoryRoot = dirname(hutchRoot);
+const repositoryRoot = hutchRoot;
 const packageJson = JSON.parse(readFileSync(join(hutchRoot, "package.json"), "utf8"));
 const zigVersionSource = readFileSync(join(hutchRoot, "src", "version.zig"), "utf8");
 

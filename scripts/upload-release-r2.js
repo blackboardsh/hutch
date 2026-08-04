@@ -22,7 +22,7 @@ import {
 import { r2Setting } from "./r2-settings.js";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repositoryRoot = dirname(hutchRoot);
+const repositoryRoot = hutchRoot;
 const packageJson = JSON.parse(readFileSync(join(hutchRoot, "package.json"), "utf8"));
 const dryRun = process.argv.includes("--dry-run") || process.env.HUTCH_R2_DRY_RUN === "1";
 const publishAll = process.argv.includes("--all");
@@ -52,7 +52,7 @@ function releaseTag() {
   if (process.env.CIRCLE_TAG) return process.env.CIRCLE_TAG;
   const argument = process.argv.find((value) => value.startsWith("--tag="));
   if (argument) return argument.slice("--tag=".length);
-  if (dryRun) return `hutch-v${packageJson.version}`;
+  if (dryRun) return `v${packageJson.version}`;
   return fail("publishing is only allowed from a Hutch release tag");
 }
 

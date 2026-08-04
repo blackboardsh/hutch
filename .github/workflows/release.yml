@@ -1,0 +1,209 @@
+name: Build and publish Hutch
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hutch-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out Hutch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Validate release contract and tag
+        run: |
+          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
+          node scripts/validate-release-tag.js
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-26
+            os: macos
+            target: ""
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            os: linux
+            target: x86_64-linux-gnu.2.35
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+            target: aarch64-linux-gnu.2.35
+          - platform: windows-x64
+            runner: windows-2025
+            os: windows
+            target: x86_64-windows-msvc
+
+    steps:
+      - name: Check out Hutch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Restore vendored Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendors/zig
+          key: hutch-zig-${{ matrix.platform }}-v1-${{ hashFiles('scripts/setup.sh') }}
+
+      - name: Set up Zig
+        if: matrix.os != 'windows'
+        run: bash scripts/setup.sh
+
+      - name: Set up Zig
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/setup.sh
+          if ($LASTEXITCODE -ne 0) { throw "Hutch Zig setup failed" }
+
+      - name: Build Hutch release executables
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          target='${{ matrix.target }}'
+          target_arg=()
+          if [[ -n "$target" ]]; then
+            target_arg=("-Dtarget=$target")
+          fi
+          ./vendors/zig/zig build -Doptimize=ReleaseSmall -Dcpu=baseline "${target_arg[@]}"
+          if [[ '${{ matrix.os }}' == 'linux' ]]; then
+            node scripts/verify-linux-glibc.js zig-out/bin/hutch-engine 2.35
+          fi
+
+      - name: Build Hutch release executables
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline
+          if ($LASTEXITCODE -ne 0) { throw "Hutch release build failed" }
+
+      - name: Run Hutch tests
+        if: matrix.os != 'windows'
+        run: |
+          ./vendors/zig/zig build test
+          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
+          node scripts/local-stack.test.js
+          node --test --test-concurrency=1 \
+            tests/electrobun/decorator-bundle.test.js \
+            tests/electrobun/init-scaffold.test.js \
+            tests/electrobun/non-index-main-entrypoint.test.js \
+            tests/electrobun/published-platform-artifact.test.js \
+            tests/electrobun/tsconfig-path-alias-bundle.test.js
+
+      - name: Run Hutch tests
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\vendors\zig\zig.exe build test
+          if ($LASTEXITCODE -ne 0) { throw "Hutch Zig tests failed" }
+          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
+          node scripts/local-stack.test.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }
+
+      - name: Smoke test Hutch release executables
+        if: matrix.os != 'windows'
+        run: |
+          expected="$(node -p "require('./package.json').version")"
+          test "$(./zig-out/bin/hutch --version)" = "$expected"
+          test "$(./zig-out/bin/hutch-engine --version)" = "$expected"
+
+      - name: Smoke test Hutch release executables
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $expected = (Get-Content package.json | ConvertFrom-Json).version
+          $launcher = (& .\zig-out\bin\hutch.exe --version).Trim()
+          $engine = (& .\zig-out\bin\hutch-engine.exe --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $launcher -ne $expected -or $engine -ne $expected) {
+            throw "Hutch smoke test failed: launcher=$launcher engine=$engine expected=$expected"
+          }
+
+      - name: Package and smoke test Hutch release
+        shell: bash
+        run: |
+          node scripts/package-release.js
+          node scripts/release-store-smoke.js
+          node scripts/installer-smoke.js
+
+      - name: Retain release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hutch-release-${{ matrix.platform }}
+          path: |
+            release/hutch-*.tar.gz
+            release/hutch-*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish complete release matrix to R2
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: hutch-r2-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out Hutch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Validate release tag
+        run: node scripts/validate-release-tag.js
+
+      - name: Download complete release matrix
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: hutch-release-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish complete release matrix
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node scripts/upload-release-r2.js --all

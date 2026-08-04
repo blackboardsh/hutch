@@ -13,9 +13,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const dashCloudRoot = dirname(hutchRoot);
 const projectsRoot = resolve(
-	process.env.DASH_LOCAL_PROJECTS_ROOT || dirname(dashCloudRoot),
+	process.env.DASH_LOCAL_PROJECTS_ROOT || dirname(hutchRoot),
 );
 const nodeBinary = process.env.NODE_BINARY || "node";
 const cottontailRoot = resolve(

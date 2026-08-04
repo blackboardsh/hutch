@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DASH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+HUTCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ZIG_VERSION="0.16.0"
 
@@ -36,7 +36,7 @@ vendor_zig() {
   arch="$(host_arch)"
   os="$(host_os)"
 
-  local zig_dir="$DASH_ROOT/vendors/zig"
+  local zig_dir="$HUTCH_ROOT/vendors/zig"
   local zig_bin="$zig_dir/$(zig_binary_name "$os")"
   local stamp="$zig_dir/.zig-version"
 
@@ -52,8 +52,8 @@ vendor_zig() {
   mkdir -p "$zig_dir"
 
   if [[ "$os" == "windows" ]]; then
-    local archive_path="$DASH_ROOT/vendors/zig.zip"
-    local extract_dir="$DASH_ROOT/vendors/zig-temp"
+    local archive_path="$HUTCH_ROOT/vendors/zig.zip"
+    local extract_dir="$HUTCH_ROOT/vendors/zig-temp"
     url="https://ziglang.org/download/${ZIG_VERSION}/${folder}.zip"
 
     rm -f "$archive_path"

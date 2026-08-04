@@ -79,8 +79,7 @@ also accepts an explicit selector.
 ## Development
 
 ```sh
-bash hutch/scripts/setup.sh
-cd hutch
+bash scripts/setup.sh
 ./vendors/zig/zig build test
 ./vendors/zig/zig build
 ./zig-out/bin/hutch --version
@@ -193,17 +192,17 @@ ELECTROBUN_DEVELOPER_ID=- ELECTROBUN_SKIP_NOTARIZATION=1 \
 
 ## Releases
 
-Hutch releases use product-scoped tags because this is a monorepo:
+Hutch releases use semantic-version tags in this standalone repository:
 
-- `hutch-vX.Y.Z` advances `hutch/channels/production.json`.
-- `hutch-vX.Y.Z-canary.N` advances `hutch/channels/canary.json`.
+- `vX.Y.Z` advances `hutch/channels/production.json`.
+- `vX.Y.Z-canary.N` advances `hutch/channels/canary.json`.
 
 Run `hutch push:canary` to propose the next `canary.N` release, or
 `hutch push:production` to propose a production version. Both commands allow
 editing the proposed semantic version before they commit, tag, and atomically
-push `main` and the product-scoped tag.
+push `main` and the release tag.
 
-The CircleCI matrix builds macOS ARM64, Linux x64/ARM64, and Windows x64.
+The GitHub Actions matrix builds macOS ARM64, Linux x64/ARM64, and Windows x64.
 It uploads one archive per revision and platform:
 
 ```text
@@ -220,12 +219,12 @@ mutable channel pointer is written after every immutable archive and manifest.
 Every published object remains under the `hutch/` bucket prefix. Tags are the
 only workflow trigger.
 
-The R2 publisher uses the Dash Cloud CircleCI project's shared `R2_ENDPOINT`,
-`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` settings. Those credentials must
-have object-write access to the `electrobun-artifacts` bucket. The account ID is
-derived from the endpoint unless `R2_ACCOUNT_ID` is set explicitly. The public
-URL defaults to `https://hutch.blackboard.sh` and can be overridden independently
-with `HUTCH_PUBLIC_BASE_URL`.
+The GitHub repository requires `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, and
+`R2_SECRET_ACCESS_KEY` Actions secrets. Those credentials must have object-write
+access to the `electrobun-artifacts` bucket. The public URL defaults to
+`https://hutch.blackboard.sh` and can be overridden independently with
+`HUTCH_PUBLIC_BASE_URL` for local publishing. No public-URL secret is required
+for the release workflow.
 
 ## Commands
 

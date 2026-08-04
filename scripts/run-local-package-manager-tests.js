@@ -20,7 +20,7 @@ const engine = resolve(
 );
 const cottontail = resolve(
   process.env.HUTCH_LOCAL_TEST_COTTONTAIL ??
-    join(hutchRoot, "..", "..", "cottontail", "zig-out", "bin", `cottontail${executableSuffix}`),
+    join(hutchRoot, "..", "cottontail", "zig-out", "bin", `cottontail${executableSuffix}`),
 );
 
 const tests = [

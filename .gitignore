@@ -1,1 +1,19 @@
-# Add files to ignore here
+.DS_Store
+.env
+.dev.vars
+node_modules/
+
+.cottontail-tmp/
+.cottontail-compat-*
+.cottontail-eval-*
+**/.cottontail-tmp/
+**/.cottontail-compat-*
+**/.cottontail-eval-*
+
+.zig-cache/
+zig-out/
+vendors/
+release/
+build/
+dist/
+*.zst

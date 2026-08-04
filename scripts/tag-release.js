@@ -14,14 +14,11 @@ import {
 } from "./release-version.js";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repositoryRoot = dirname(hutchRoot);
+const repositoryRoot = hutchRoot;
 const packageJsonPath = join(hutchRoot, "package.json");
 const versionZigPath = join(hutchRoot, "src", "version.zig");
-const dashConfigPaths = [
-  join(hutchRoot, "dash.config.ts"),
-  join(repositoryRoot, "dash.config.ts"),
-];
-const tagPrefix = "hutch-v";
+const dashConfigPath = join(hutchRoot, "dash.config.ts");
+const tagPrefix = "v";
 
 function fail(message) {
   console.error(`hutch release: ${message}`);
@@ -132,19 +129,16 @@ const updatedVersionZig = versionZig.replace(
 );
 if (updatedVersionZig === versionZig) fail("could not update src/version.zig");
 writeFileSync(versionZigPath, updatedVersionZig);
-for (const dashConfigPath of dashConfigPaths) {
-  updateDashPin(dashConfigPath, "cli", answer);
-}
+updateDashPin(dashConfigPath, "cli", answer);
 
 git([
   "add",
-  "hutch/package.json",
-  "hutch/src/version.zig",
-  "hutch/dash.config.ts",
+  "package.json",
+  "src/version.zig",
   "dash.config.ts",
 ], { inherit: true });
 git(["commit", "-m", tag], { inherit: true });
 git(["tag", "--annotate", tag, "--message", tag], { inherit: true });
 git(["push", "--atomic", "origin", "HEAD:main", `refs/tags/${tag}`], { inherit: true });
 
-console.log(`${tag} was pushed. CircleCI will publish its complete matrix.`);
+console.log(`${tag} was pushed. GitHub Actions will publish its complete matrix.`);

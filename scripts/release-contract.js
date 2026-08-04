@@ -28,7 +28,7 @@ export function releaseChannel(version) {
 
 export function validateReleaseTag(tag, version) {
   releaseChannel(version);
-  const expected = `hutch-v${version}`;
+  const expected = `v${version}`;
   if (tag !== expected) {
     throw new Error(`Release tag ${JSON.stringify(tag)} does not match ${expected}`);
   }

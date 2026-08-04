@@ -38,13 +38,13 @@ test("production and canary versions select separate targets", () => {
   assert.equal(releaseChannel("1.2.3-canary.4"), "canary");
 });
 
-test("Hutch tags are product-scoped in the monorepo", () => {
-  assert.deepEqual(validateReleaseTag("hutch-v1.2.3", "1.2.3"), {
-    tag: "hutch-v1.2.3",
+test("Hutch uses standalone semantic-version release tags", () => {
+  assert.deepEqual(validateReleaseTag("v1.2.3", "1.2.3"), {
+    tag: "v1.2.3",
     version: "1.2.3",
     channel: "production",
   });
-  assert.throws(() => validateReleaseTag("v1.2.3", "1.2.3"), /does not match/);
+  assert.throws(() => validateReleaseTag("hutch-v1.2.3", "1.2.3"), /does not match/);
 });
 
 test("installers remain inside the Hutch bucket prefix", () => {
@@ -70,35 +70,35 @@ test("complete platform matrices are required", () => {
   );
 });
 
-test("Unix release jobs build Hutch before integration tests", () => {
-  const config = readFileSync(
-    new URL("../../.circleci/config.yml", import.meta.url),
+test("release jobs build Hutch before integration tests", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
     "utf8",
   );
-  const start = config.indexOf("  build_hutch_unix:");
-  const end = config.indexOf("\njobs:", start);
-  const command = config.slice(start, end);
-  const build = command.indexOf("name: Build Hutch release executables");
-  const tests = command.indexOf("name: Run Hutch tests");
+  const build = workflow.indexOf("name: Build Hutch release executables");
+  const tests = workflow.indexOf("name: Run Hutch tests");
 
-  assert.ok(start >= 0 && end > start, "build_hutch_unix command exists");
   assert.ok(build >= 0 && tests >= 0, "build and test steps exist");
   assert.ok(build < tests, "Hutch executables are available to integration tests");
   const serializedTests = /node --test --test-concurrency=1 \\\r?\n/;
-  assert.match(command, serializedTests);
-  assert.match(command.replace(/\r?\n/g, "\r\n"), serializedTests);
+  assert.match(workflow, serializedTests);
+  assert.match(workflow.replace(/\r?\n/g, "\r\n"), serializedTests);
 });
 
 test("Linux ARM releases run on the Cottontail-compatible Ubuntu image", () => {
-  const config = readFileSync(
-    new URL("../../.circleci/config.yml", import.meta.url),
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
     "utf8",
   );
-  const start = config.indexOf("  build-hutch-linux-arm64:");
-  const end = config.indexOf("\n  build-hutch-macos-arm64:", start);
-  const job = config.slice(start, end);
+  assert.match(workflow, /platform: linux-arm64\s+runner: ubuntu-24\.04-arm/);
+});
 
-  assert.ok(start >= 0 && end > start, "Linux ARM release job exists");
-  assert.match(job, /image: ubuntu-2404:current/);
-  assert.match(job, /resource_class: arm\.medium/);
+test("publishing waits for the complete platform matrix", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /publish:\s+name: Publish complete release matrix to R2\s+needs: build/);
+  assert.match(workflow, /merge-multiple: true/);
+  assert.match(workflow, /node scripts\/upload-release-r2\.js --all/);
 });
