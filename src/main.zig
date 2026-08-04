@@ -75,6 +75,157 @@ fn runtimeCommandArguments(args: []const [:0]const u8) []const [:0]const u8 {
     return if (args.len > 1) args[1..] else args[0..0];
 }
 
+const RuntimeAutoInstallInput = union(enum) {
+    entrypoint: []const u8,
+    source: []const u8,
+};
+
+fn hutchLeadingOptionSpan(args: []const [:0]const u8, index: usize) ?usize {
+    const arg: []const u8 = args[index];
+    const boolean_options = [_][]const u8{
+        "--bun",
+        "-b",
+        "--if-present",
+        "--no-exit-on-error",
+        "--parallel",
+        "--sequential",
+        "--silent",
+        "--workspaces",
+    };
+    for (boolean_options) |option| {
+        if (std.mem.eql(u8, arg, option)) return 1;
+    }
+
+    const value_options = [_][]const u8{
+        "-c",
+        "--config",
+        "--cwd",
+        "--elide-lines",
+        "--filter",
+        "-F",
+        "--shell",
+    };
+    for (value_options) |option| {
+        if (std.mem.eql(u8, arg, option)) {
+            return if (index + 1 < args.len) 2 else 1;
+        }
+        if (std.mem.startsWith(u8, arg, option) and
+            arg.len > option.len and
+            arg[option.len] == '=')
+        {
+            return 1;
+        }
+    }
+    return null;
+}
+
+fn hasUnconsumedLeadingRuntimeOption(args: []const [:0]const u8) bool {
+    if (args.len < 2) return false;
+    var index: usize = 1;
+    var saw_run = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (!saw_run and std.mem.eql(u8, arg, "run")) {
+            saw_run = true;
+            index += 1;
+            continue;
+        }
+        if (hutchLeadingOptionSpan(args, index)) |span| {
+            index += span;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return true;
+        return false;
+    }
+    return false;
+}
+
+fn cottontailRuntimeOptionTakesValue(arg: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    const value_options = [_][]const u8{
+        "-r",
+        "--allow-fs-read",
+        "--allow-fs-write",
+        "--conditions",
+        "--console-depth",
+        "--cpu-prof-dir",
+        "--cpu-prof-interval",
+        "--cpu-prof-name",
+        "--cwd",
+        "--define",
+        "--diagnostic-dir",
+        "--elide-lines",
+        "--env-file",
+        "--env-file-if-exists",
+        "--experimental-default-type",
+        "--experimental-loader",
+        "--feature",
+        "--fetch-preconnect",
+        "--filter",
+        "--heap-prof-dir",
+        "--heap-prof-name",
+        "--icu-data-dir",
+        "--import",
+        "--input-type",
+        "--inspect-publish-uid",
+        "--loader",
+        "--port",
+        "--preload",
+        "--redirect-warnings",
+        "--require",
+        "--shell",
+        "--snapshot-blob",
+        "--test-name-pattern",
+        "--test-reporter",
+        "--test-reporter-destination",
+        "--test-shard",
+        "--tsconfig-override",
+        "--user-agent",
+    };
+    for (value_options) |option| {
+        if (std.mem.eql(u8, arg, option)) return true;
+    }
+    return false;
+}
+
+fn runtimeAutoInstallInput(args: []const [:0]const u8) ?RuntimeAutoInstallInput {
+    var index: usize = 1;
+    var saw_run = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            return if (index < args.len) .{ .entrypoint = args[index] } else null;
+        }
+        if (!saw_run and std.mem.eql(u8, arg, "run")) {
+            saw_run = true;
+            index += 1;
+            continue;
+        }
+        if (!saw_run and
+            (std.mem.eql(u8, arg, "-e") or
+                std.mem.eql(u8, arg, "--eval") or
+                std.mem.eql(u8, arg, "-p") or
+                std.mem.eql(u8, arg, "--print")))
+        {
+            return if (index + 1 < args.len) .{ .source = args[index + 1] } else null;
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--eval=")) {
+            return .{ .source = arg["--eval=".len..] };
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--print=")) {
+            return .{ .source = arg["--print=".len..] };
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            index += if (cottontailRuntimeOptionTakesValue(arg) and index + 1 < args.len) 2 else 1;
+            continue;
+        }
+        return .{ .entrypoint = arg };
+    }
+    return null;
+}
+
 fn termExitCode(term: std.process.Child.Term) u8 {
     return switch (term) {
         .exited => |code| @intCast(@min(code, 255)),
@@ -188,6 +339,30 @@ fn prepareRuntimeAutoInstall(
         return false;
     };
     return true;
+}
+
+fn prepareForwardedRuntimeAutoInstall(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    const input = runtimeAutoInstallInput(args) orelse return true;
+    switch (input) {
+        .entrypoint => |entrypoint| {
+            if (!pathExists(init.io, entrypoint)) return true;
+            return try prepareRuntimeAutoInstall(init, entrypoint, .auto, stderr);
+        },
+        .source => |source| {
+            runtime_autoinstall.prepareSource(init, source, .auto, stderr) catch |err| {
+                if (err != error.AutoInstallFailed) {
+                    try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+                }
+                try stderr.flush();
+                return false;
+            };
+            return true;
+        },
+    }
 }
 
 fn printBinaryLockfile(
@@ -1047,6 +1222,26 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (hasUnconsumedLeadingRuntimeOption(args)) {
+        if (!try prepareForwardedRuntimeAutoInstall(init, args, stderr)) {
+            std.process.exit(1);
+        }
+        const command_args = runtimeCommandArguments(args);
+        const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            command_args,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (isCottontailTestCommand(command)) {
         const command_args = runtimeCommandArguments(args);
         const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
@@ -1392,6 +1587,65 @@ test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expectEqual(@as(usize, args.len - 1), forwarded.len);
     for (args[1..], forwarded) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "unconsumed leading runtime options preserve Hutch-owned run options" {
+    const leading = [_][:0]const u8{
+        "hutch",
+        "--ignore-dce-annotations",
+        "run",
+        "index.ts",
+    };
+    const after_run = [_][:0]const u8{
+        "hutch",
+        "run",
+        "--ignore-dce-annotations",
+        "index.ts",
+    };
+    const hutch_silent = [_][:0]const u8{
+        "hutch",
+        "run",
+        "--silent",
+        "dev",
+    };
+    const hutch_workspace = [_][:0]const u8{
+        "hutch",
+        "--filter",
+        "packages/*",
+        "run",
+        "test",
+    };
+
+    try std.testing.expect(hasUnconsumedLeadingRuntimeOption(&leading));
+    try std.testing.expect(hasUnconsumedLeadingRuntimeOption(&after_run));
+    try std.testing.expect(!hasUnconsumedLeadingRuntimeOption(&hutch_silent));
+    try std.testing.expect(!hasUnconsumedLeadingRuntimeOption(&hutch_workspace));
+}
+
+test "forwarded runtime options retain an auto-install input" {
+    const entrypoint_args = [_][:0]const u8{
+        "hutch",
+        "--conditions",
+        "development",
+        "--ignore-dce-annotations",
+        "run",
+        "index.ts",
+    };
+    switch (runtimeAutoInstallInput(&entrypoint_args).?) {
+        .entrypoint => |entrypoint| try std.testing.expectEqualStrings("index.ts", entrypoint),
+        .source => return error.ExpectedEntrypoint,
+    }
+
+    const source_args = [_][:0]const u8{
+        "hutch",
+        "--ignore-dce-annotations",
+        "--eval",
+        "import 'left-pad'",
+    };
+    switch (runtimeAutoInstallInput(&source_args).?) {
+        .entrypoint => return error.ExpectedSource,
+        .source => |source| try std.testing.expectEqualStrings("import 'left-pad'", source),
     }
 }
 

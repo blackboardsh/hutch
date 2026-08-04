@@ -236,7 +236,7 @@
     },
     "test/cli/install/bun-run.test.ts": {
       "status": "expected-failure",
-      "reason": "Pre-split parity gap: 290 of 291 cases pass; Cottontail's transpiler does not yet honor the tested DCE annotation.",
+      "reason": "The DCE annotation cases now pass through Hutch, but the complete copied file exposes pre-existing Hutch run gaps: 136 of 291 cases pass, with directory auto-install, command/script priority, diagnostics, and output compatibility still incomplete.",
       "owner": "hutch-package-manager",
       "timeoutMs": 300000
     },
