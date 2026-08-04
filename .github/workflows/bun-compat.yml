@@ -15,9 +15,25 @@ concurrency:
 
 jobs:
   bun-package-manager-compat:
-    name: Complete Hutch-owned Bun package-manager tier
-    runs-on: macos-26
+    name: Complete Hutch-owned Bun package-manager tier (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-26
+            os: macos
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            os: linux
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            os: linux
+          - platform: windows-x64
+            runner: windows-2025
+            os: windows
 
     steps:
       - name: Check out Hutch
@@ -36,24 +52,50 @@ jobs:
         run: node scripts/run-bun-package-manager-tests.js --check
 
       - name: Restore vendored Zig
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: vendored-zig
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendors/zig
-          key: hutch-bun-compat-zig-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('scripts/setup.sh') }}
+          key: hutch-bun-compat-zig-${{ matrix.platform }}-v1-${{ hashFiles('scripts/setup.sh') }}
 
       - name: Set up Zig
+        if: matrix.os != 'windows'
         run: bash scripts/setup.sh
 
+      - name: Set up Zig
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/setup.sh
+          if ($LASTEXITCODE -ne 0) { throw "Hutch Zig setup failed" }
+
+      - name: Save vendored Zig
+        if: steps.vendored-zig.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendors/zig
+          key: hutch-bun-compat-zig-${{ matrix.platform }}-v1-${{ hashFiles('scripts/setup.sh') }}
+
       - name: Build Hutch
+        if: matrix.os != 'windows'
         run: ./vendors/zig/zig build -Doptimize=ReleaseSmall -Dcpu=baseline
 
+      - name: Build Hutch
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline
+          if ($LASTEXITCODE -ne 0) { throw "Hutch build failed" }
+
       - name: Restore pinned Cottontail build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: pinned-cottontail
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .hutch-local-tools/upstream-cottontail
-          key: hutch-bun-compat-cottontail-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('compat/upstream/cottontail.json', 'scripts/setup-upstream-cottontail.js') }}
+          key: hutch-bun-compat-cottontail-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/cottontail.json', 'scripts/setup-upstream-cottontail.js') }}
 
       - name: Select Xcode 26.4
+        if: matrix.os == 'macos'
         run: |
           developer_dir=/Applications/Xcode_26.4.app/Contents/Developer
           test -d "$developer_dir"
@@ -62,25 +104,43 @@ jobs:
           xcrun --sdk macosx --show-sdk-path
 
       - name: Install Cottontail build dependencies
+        if: matrix.os == 'macos'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
           brew install libffi brotli
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
 
+      - name: Install Cottontail build dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            g++ \
+            libbrotli-dev \
+            libffi-dev \
+            libssl-dev \
+            libzstd-dev \
+            zlib1g-dev
+
       - name: Build pinned Cottontail runtime
         id: cottontail
+        shell: bash
         run: |
           cottontail="$(node scripts/setup-upstream-cottontail.js)"
-          test -x "$cottontail"
-          echo "binary=$cottontail" >> "$GITHUB_OUTPUT"
+          node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$cottontail"
+          node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `binary=${process.argv[1]}\n`)' "$cottontail"
+
+      - name: Save pinned Cottontail build
+        if: steps.pinned-cottontail.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .hutch-local-tools/upstream-cottontail
+          key: hutch-bun-compat-cottontail-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/cottontail.json', 'scripts/setup-upstream-cottontail.js') }}
 
       - name: Run complete Hutch-owned Bun package-manager tier
         env:
-          COTTONTAIL: ${{ steps.cottontail.outputs.binary }}
-        run: >-
-          node scripts/run-bun-package-manager-tests.js
-          --all
-          --hutch ./zig-out/bin/hutch
-          --engine ./zig-out/bin/hutch-engine
-          --runtime "$COTTONTAIL"
+          HUTCH_COMPAT_COTTONTAIL: ${{ steps.cottontail.outputs.binary }}
+        shell: bash
+        run: node scripts/run-bun-package-manager-tests.js --all

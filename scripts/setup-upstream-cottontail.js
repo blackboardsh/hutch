@@ -68,9 +68,16 @@ if (!existsSync(binaryPath) || statSync(binaryPath).size === 0) {
   run(process.execPath, ["scripts/setup.js"], checkoutRoot);
   run(process.execPath, ["scripts/setup-zig-html-rewriter.js"], checkoutRoot);
   run(process.execPath, ["scripts/setup-jsc.js"], checkoutRoot);
+  const buildArgs = [
+    "scripts/zig.js",
+    "build",
+    "-Doptimize=ReleaseSmall",
+    ...(process.platform === "win32" ? ["-Dtarget=x86_64-windows-msvc"] : []),
+    "-Dcpu=baseline",
+  ];
   run(
     process.execPath,
-    ["scripts/zig.js", "build", "-Doptimize=ReleaseSmall", "-Dcpu=baseline"],
+    buildArgs,
     checkoutRoot,
   );
 }

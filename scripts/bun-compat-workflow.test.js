@@ -35,15 +35,24 @@ test("runs only for compat branches and manual dispatch", () => {
 });
 
 test("builds Hutch and runs the complete owned corpus without publishing", () => {
-  assert.match(workflow, /runs-on: macos-26/);
+  for (const platform of ["macos-arm64", "linux-x64", "linux-arm64", "windows-x64"]) {
+    assert.match(workflow, new RegExp(`platform: ${platform}`));
+  }
+  assert.match(workflow, /runner: macos-26/);
+  assert.match(workflow, /runner: ubuntu-24\.04/);
+  assert.match(workflow, /runner: ubuntu-24\.04-arm/);
+  assert.match(workflow, /runner: windows-2025/);
+  assert.match(workflow, /fail-fast: false/);
   assert.match(
     workflow,
     /run: \.\/vendors\/zig\/zig build -Doptimize=ReleaseSmall -Dcpu=baseline/,
   );
-  assert.match(workflow, /node scripts\/run-bun-package-manager-tests\.js\n          --all/);
-  assert.match(workflow, /--hutch \.\/zig-out\/bin\/hutch/);
-  assert.match(workflow, /--engine \.\/zig-out\/bin\/hutch-engine/);
-  assert.match(workflow, /--runtime "\$COTTONTAIL"/);
+  assert.match(
+    workflow,
+    /zig\.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
+  );
+  assert.match(workflow, /HUTCH_COMPAT_COTTONTAIL: \$\{\{ steps\.cottontail\.outputs\.binary \}\}/);
+  assert.match(workflow, /run: node scripts\/run-bun-package-manager-tests\.js --all/);
   assert.match(workflow, /run: node scripts\/run-bun-package-manager-tests\.js --check/);
   assert.doesNotMatch(
     workflow,
@@ -87,9 +96,8 @@ test("builds an exact Cottontail source revision", () => {
   assert.match(cottontailSetup, /"scripts\/setup\.js"/);
   assert.match(cottontailSetup, /"scripts\/setup-zig-html-rewriter\.js"/);
   assert.match(cottontailSetup, /"scripts\/setup-jsc\.js"/);
-  assert.match(
-    cottontailSetup,
-    /\["scripts\/zig\.js", "build", "-Doptimize=ReleaseSmall", "-Dcpu=baseline"\]/,
-  );
+  assert.match(cottontailSetup, /"-Doptimize=ReleaseSmall"/);
+  assert.match(cottontailSetup, /process\.platform === "win32" \? \["-Dtarget=x86_64-windows-msvc"\] : \[\]/);
+  assert.match(cottontailSetup, /"-Dcpu=baseline"/);
   assert.doesNotMatch(cottontailSetup, /command -v|which\(|["']PATH["']/);
 });
