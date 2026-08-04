@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { join, resolve } from "node:path";
+import { hutchSourceInputs } from "./build-local.js";
 import { forceEnvironment, parseArgs } from "./local-stack.js";
+
+const repository = resolve("fixture-repository");
+assert.equal(hutchSourceInputs(repository, repository)[0], "build.zig");
+assert.equal(
+	hutchSourceInputs(repository, join(repository, "hutch"))[0],
+	"hutch/build.zig",
+);
 
 assert.deepEqual(parseArgs([], {}), {
 	through: "electrobun",

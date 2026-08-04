@@ -66,20 +66,25 @@ function readJson(path) {
 	return JSON.parse(readFileSync(path, "utf8"));
 }
 
+export function hutchSourceInputs(repository, sourceRoot) {
+	const pathspec = relative(repository, sourceRoot).replaceAll("\\", "/");
+	const prefix = pathspec ? `${pathspec}/` : "";
+	return [
+		`${prefix}build.zig`,
+		`${prefix}src`,
+		`${prefix}scripts/build-local.js`,
+		`${prefix}scripts/build.sh`,
+		`${prefix}scripts/setup.sh`,
+		`${prefix}scripts/zig.sh`,
+	];
+}
+
 function addHutchSource(hash) {
 	const repository = run("git", ["rev-parse", "--show-toplevel"], {
 		cwd: hutchRoot,
 		capture: true,
 	});
-	const pathspec = relative(repository, hutchRoot).replaceAll("\\", "/");
-	const inputs = [
-		`${pathspec}/build.zig`,
-		`${pathspec}/src`,
-		`${pathspec}/scripts/build-local.js`,
-		`${pathspec}/scripts/build.sh`,
-		`${pathspec}/scripts/setup.sh`,
-		`${pathspec}/scripts/zig.sh`,
-	];
+	const inputs = hutchSourceInputs(repository, hutchRoot);
 	const tracked = run("git", ["ls-files", "-z", "--", ...inputs], {
 		cwd: repository,
 		capture: true,
@@ -220,9 +225,12 @@ function main() {
 	);
 }
 
-try {
-	main();
-} catch (error) {
-	console.error(error instanceof Error ? error.message : String(error));
-	process.exit(1);
+const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
+if (invokedPath === fileURLToPath(import.meta.url)) {
+	try {
+		main();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(1);
+	}
 }
