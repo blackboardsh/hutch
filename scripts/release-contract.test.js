@@ -102,3 +102,14 @@ test("publishing waits for the complete platform matrix", () => {
   assert.match(workflow, /merge-multiple: true/);
   assert.match(workflow, /node scripts\/upload-release-r2\.js --all/);
 });
+
+test("Windows packages from PowerShell so tar receives native paths", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /name: Package and smoke test Hutch release\s+if: matrix\.os == 'windows'\s+shell: pwsh/,
+  );
+});

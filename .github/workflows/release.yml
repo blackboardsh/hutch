@@ -153,11 +153,23 @@ jobs:
           }
 
       - name: Package and smoke test Hutch release
+        if: matrix.os != 'windows'
         shell: bash
         run: |
           node scripts/package-release.js
           node scripts/release-store-smoke.js
           node scripts/installer-smoke.js
+
+      - name: Package and smoke test Hutch release
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          node scripts/package-release.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch packaging failed" }
+          node scripts/release-store-smoke.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch release store smoke failed" }
+          node scripts/installer-smoke.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch installer smoke failed" }
 
       - name: Retain release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
