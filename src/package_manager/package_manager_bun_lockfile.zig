@@ -3,6 +3,7 @@ const Host = @import("package_manager_host.zig");
 const PackageHash = @import("support/package_hash.zig");
 
 const binary_header = "#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
+const config_version_tag = "cNfGvRsN";
 const lockfile_service = "--cottontail-lockfile-service";
 
 pub const lifecycle_script_names = [_][]const u8{
@@ -52,6 +53,15 @@ const WorkspaceLifecycleScriptsWire = struct {
 
 pub fn isBinaryLockfile(bytes: []const u8) bool {
     return std.mem.startsWith(u8, bytes, binary_header);
+}
+
+/// Binary lockfiles written before configVersion existed omit this trailer.
+/// Bun interprets that omission as config v0 rather than the current default.
+pub fn savedConfigVersion(bytes: []const u8) ?u64 {
+    const tag_index = std.mem.lastIndexOf(u8, bytes, config_version_tag) orelse return null;
+    const value_start = tag_index + config_version_tag.len;
+    if (bytes.len - value_start < @sizeOf(u64)) return null;
+    return std.mem.readInt(u64, bytes[value_start..][0..@sizeOf(u64)], .little);
 }
 
 pub fn textToBinary(
@@ -299,4 +309,13 @@ fn deinitWorkspaceLifecycleScripts(
 test "Bun binary lockfile detection remains local to Hutch" {
     try std.testing.expect(isBinaryLockfile(binary_header ++ "payload"));
     try std.testing.expect(!isBinaryLockfile("{\"lockfileVersion\":1}"));
+}
+
+test "Bun binary config version trailer preserves omitted v0 semantics" {
+    try std.testing.expectEqual(@as(?u64, null), savedConfigVersion(binary_header ++ "payload"));
+
+    const v0 = binary_header ++ "payload" ++ config_version_tag ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+    const v1 = binary_header ++ "payload" ++ config_version_tag ++ "\x01\x00\x00\x00\x00\x00\x00\x00";
+    try std.testing.expectEqual(@as(?u64, 0), savedConfigVersion(v0));
+    try std.testing.expectEqual(@as(?u64, 1), savedConfigVersion(v1));
 }

@@ -73,12 +73,12 @@ pub const Graph = struct {
     }
 
     pub fn rootMatchesPackageJSON(graph: *const Graph, package_json: *const Value) bool {
-        return workspaceValueMatches(graph.root_workspace, package_json);
+        return workspaceValueMatches(graph.root_workspace, package_json, false);
     }
 
     pub fn workspaceMatchesPackageJSON(graph: *const Graph, path: []const u8, package_json: *const Value) bool {
         const workspace = graph.workspaces.get(path) orelse return false;
-        return workspaceValueMatches(workspace, package_json);
+        return workspaceValueMatches(workspace, package_json, true);
     }
 
     pub fn rootDependencySpec(graph: *const Graph, name: []const u8) ?[]const u8 {
@@ -268,9 +268,9 @@ fn optionalLockStringMatchesManifest(left: *const Value, right: *const Value, ke
     return right_value != null and right_value.? == .string and std.mem.eql(u8, left_value.?.string, right_value.?.string);
 }
 
-fn workspaceValueMatches(workspace: *const Value, package_json: *const Value) bool {
+fn workspaceValueMatches(workspace: *const Value, package_json: *const Value, compare_name: bool) bool {
     if (package_json.* != .object or workspace.* != .object) return false;
-    if (!optionalLockStringMatchesManifest(workspace, package_json, "name")) return false;
+    if (compare_name and !optionalLockStringMatchesManifest(workspace, package_json, "name")) return false;
     for (dependency_sections) |section| {
         if (!stringObjectEqual(workspace, package_json, section)) return false;
     }
@@ -422,11 +422,15 @@ test "frozen root comparison is order independent and exact" {
     const changed = try std.json.parseFromSliceLeaky(Value, allocator,
         \\{"name":"app","dependencies":{"a":"^2","b":"2"}}
     , .{});
+    const renamed = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"name":"renamed-app","dependencies":{"a":"^1","b":"2"}}
+    , .{});
     var graph_without_locked_name = try parseText(allocator,
         \\{"lockfileVersion":1,"workspaces":{"":{"dependencies":{"a":"^1","b":"2"}}},"packages":{}}
     );
     defer graph_without_locked_name.deinit();
     try std.testing.expect(graph.rootMatchesPackageJSON(&matching));
+    try std.testing.expect(graph.rootMatchesPackageJSON(&renamed));
     try std.testing.expect(!graph.rootMatchesPackageJSON(&changed));
     try std.testing.expect(graph_without_locked_name.rootMatchesPackageJSON(&matching));
 }

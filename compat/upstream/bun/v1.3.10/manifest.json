@@ -11,8 +11,8 @@
   "ownedRunnableFiles": 102,
   "copiedFiles": 833,
   "statusCounts": {
-    "expected-failure": 6,
-    "enabled": 96
+    "expected-failure": 1,
+    "enabled": 101
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -124,7 +124,7 @@
     {
       "path": "test/cli/install/bun-lock.test.ts",
       "sha256": "c944cf19572075dce734a6755d7cd7290d6b4d47ea30bd46c355b9072f2c1329",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-lockb.test.ts",
@@ -279,7 +279,7 @@
     {
       "path": "test/cli/install/isolated-install.test.ts",
       "sha256": "f3cd3c1f6e6b9f527b0a9f2dd1a1c06fc49e56d683c950a094235e797ef63b54",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/lockfile-only.test.ts",
@@ -289,7 +289,7 @@
     {
       "path": "test/cli/install/migrate-bun-lockb-v2.test.ts",
       "sha256": "805ae063d6968690fddb8b3610de7966906dcfa34166b150d9378705ef8c8176",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/migration/complex-workspace.test.ts",
@@ -324,12 +324,12 @@
     {
       "path": "test/cli/install/migration/yarn-lock-migration.test.ts",
       "sha256": "cebbe4b579aff88a0731b6830ba102524c9999ee397f886a0848c1f59c7ff849",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/minimum-release-age.test.ts",
       "sha256": "7480e40af6d5713ea7e05ce2a5e35f1139600b791ad47ef968ba0787473ea0fb",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/npmrc.test.ts",
