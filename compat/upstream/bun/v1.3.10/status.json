@@ -235,8 +235,8 @@
       "serial": true
     },
     "test/cli/install/bun-run.test.ts": {
-      "status": "expected-failure",
-      "reason": "The DCE annotation cases now pass through Hutch, but the complete copied file exposes pre-existing Hutch run gaps: 136 of 291 cases pass, with directory auto-install, command/script priority, diagnostics, and output compatibility still incomplete.",
+      "status": "enabled",
+      "reason": "All 291 active copied Bun run cases pass with 416 assertions across entrypoint and script priority, directory and monorepo mains, auto-install, nested package-manager aliases, cwd handling, arguments, and process diagnostics.",
       "owner": "hutch-package-manager",
       "timeoutMs": 300000
     },

@@ -11,8 +11,8 @@
   "ownedRunnableFiles": 102,
   "copiedFiles": 833,
   "statusCounts": {
-    "expected-failure": 7,
-    "enabled": 95
+    "expected-failure": 6,
+    "enabled": 96
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -189,7 +189,7 @@
     {
       "path": "test/cli/install/bun-run.test.ts",
       "sha256": "b9bc4f20e24759f76ddc44becbc745be06e603665052fba587a583297d81ef37",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts",
