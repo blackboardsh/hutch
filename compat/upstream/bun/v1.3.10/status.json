@@ -63,8 +63,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: three lifecycle cases remain around trust reinstall and inherited root-script stdio.",
+      "status": "enabled",
+      "reason": "All 52 lifecycle cases pass, including trust transitions, deleted installations, inherited root-script stdio, script ordering, node-gyp fallback, and concurrency.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -254,8 +254,8 @@
       }
     },
     "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the upstream CI sampler still finds warning and TTY mismatches when scanning installs without an existing node_modules tree.",
+      "status": "enabled",
+      "reason": "The upstream CI matrix passes without an existing node_modules tree, including scanner installation, warning/fatal cancellation, TTY decisions, and preflight request boundaries.",
       "owner": "hutch-package-manager",
       "args": [
         "--timeout",

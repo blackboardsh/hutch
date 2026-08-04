@@ -11,8 +11,8 @@
   "ownedRunnableFiles": 102,
   "copiedFiles": 833,
   "statusCounts": {
-    "expected-failure": 9,
-    "enabled": 93
+    "expected-failure": 7,
+    "enabled": 95
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -69,7 +69,7 @@
     {
       "path": "test/cli/install/bun-install-lifecycle-scripts.test.ts",
       "sha256": "59c834409818adbf4ae0fa72dce658579b9516781bf6972580f5c3a48c3554dc",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-native-binlink.test.ts",
@@ -199,7 +199,7 @@
     {
       "path": "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts",
       "sha256": "20bbf197930ceb962ab50121b32571c451d2f504ebf599e9871bcebeca1a6ec2",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-security-scanner-workspaces.test.ts",

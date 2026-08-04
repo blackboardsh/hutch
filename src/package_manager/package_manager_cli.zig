@@ -2394,6 +2394,7 @@ const Manager = struct {
     resolution_only_records: std.StringHashMap(void),
     install_filter_active: bool = false,
     root_selected: bool = true,
+    root_lifecycle_output: bool = false,
     filter_resolution_only: bool = false,
     report_direct_installs: bool = false,
     refresh_direct_registry: bool = false,
@@ -2589,14 +2590,6 @@ const Manager = struct {
         const install_header_printed = !manager.options.silent and
             !internal_bunx_install and
             manager.options.command == .install;
-        if (install_header_printed) {
-            if (usesBunCompatOutput(manager.init_data)) {
-                try manager.stdout.print("bun install v{s} (cottontail)\n\n", .{bun_compat_version});
-            } else {
-                try manager.stdout.print("hutch install v{s}\n\n", .{version});
-            }
-            try manager.stdout.flush();
-        }
 
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
         const package_source = blk: {
@@ -2664,6 +2657,21 @@ const Manager = struct {
         }
         try manager.validateLockfileWorkspaces();
         try manager.configureInstallFilters(&root);
+        manager.root_lifecycle_output = install_header_printed and
+            !manager.options.ignore_scripts and
+            !manager.options.dry_run and
+            !manager.options.lockfile_only and
+            manager.root_selected and
+            Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
+        if (install_header_printed) {
+            if (usesBunCompatOutput(manager.init_data)) {
+                try manager.stdout.print("bun install v{s} (cottontail)", .{bun_compat_version});
+            } else {
+                try manager.stdout.print("hutch install v{s}", .{version});
+            }
+            try manager.stdout.writeAll(if (manager.root_lifecycle_output) "\n" else "\n\n");
+            try manager.stdout.flush();
+        }
         if (security_resolution_output == null and
             manager.security_scanner != null and
             !manager.options.dry_run and
@@ -6613,6 +6621,19 @@ const Manager = struct {
             if (optional_peer) continue;
             const edge_optional = optional;
             const edge_peer = std.mem.eql(u8, key, "peerDependencies");
+            const existing_direct_version = if (direct and
+                manager.node_linker == .hoisted and
+                manager.options.command == .install)
+            existing: {
+                const destination = try packageDestination(
+                    manager.allocator,
+                    manager.installParentDir(parent_dir),
+                    alias,
+                );
+                const installed = manager.readInstalledPackageJSON(destination) catch break :existing null;
+                const installed_version = jsonString(installed, "version") orelse break :existing null;
+                break :existing try manager.allocator.dupe(u8, installed_version);
+            } else null;
             const previous_suppressed_bin_edge = manager.suppressed_registry_bin_edge;
             defer manager.suppressed_registry_bin_edge = previous_suppressed_bin_edge;
             // COTTONTAIL-COMPAT: Bun replaces a required registry edge with its
@@ -6641,7 +6662,9 @@ const Manager = struct {
                 null;
             const should_report = manager.report_direct_installs and
                 std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
-                !manager.explicit_adds.contains(alias);
+                !manager.explicit_adds.contains(alias) and
+                !(existing_direct_version != null and
+                    std.mem.eql(u8, existing_direct_version.?, resolved_version));
             if (should_report and
                 (manager.options.dry_run or
                     manager.directDependencyChanged(alias, resolved_version, parent_dir) or
@@ -6670,6 +6693,7 @@ const Manager = struct {
 
     fn emitDirectInstallReports(manager: *Manager) !void {
         if (manager.direct_install_reports.items.len == 0) return;
+        if (manager.root_lifecycle_output) try manager.stdout.writeByte('\n');
         std.sort.pdq(DirectInstallReport, manager.direct_install_reports.items, {}, struct {
             fn lessThan(_: void, left: DirectInstallReport, right: DirectInstallReport) bool {
                 if (left.section_priority != right.section_priority) return left.section_priority < right.section_priority;
@@ -6700,7 +6724,8 @@ const Manager = struct {
 
     fn installSummarySeparator(manager: *const Manager) []const u8 {
         if (manager.options.command == .install and
-            manager.direct_install_reports.items.len == 0) return "";
+            manager.direct_install_reports.items.len == 0 and
+            !manager.root_lifecycle_output) return "";
         return "\n";
     }
 
@@ -6838,6 +6863,10 @@ const Manager = struct {
             // already fetched by scanner preflight.
             break :blk !manager.pathExists(locked.destination);
         };
+        const refresh_scanner_resolution_add = manager.isSecurityResolution() and
+            manager.options.command == .add and
+            direct and
+            manager.explicit_adds.contains(alias);
         const refresh_direct_registry = direct and
             !workspace_package and
             !isGitSpec(resolution_spec) and
@@ -6845,6 +6874,7 @@ const Manager = struct {
             !isLocalSpec(resolution_spec) and
             (manager.refresh_direct_registry or
                 refresh_unscanned_add or
+                refresh_scanner_resolution_add or
                 refresh_missing_scanned_lock_root);
         const refresh_direct_source = direct and manager.refresh_direct_source and
             (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or

@@ -260,6 +260,7 @@ fn parseMode(value: []const u8) ?Mode {
 fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
     if (specifier.len == 0 or
         std.fs.path.isAbsolute(specifier) or
+        isNodeBuiltinSpecifier(specifier) or
         std.mem.startsWith(u8, specifier, "./") or
         std.mem.startsWith(u8, specifier, "../") or
         std.mem.startsWith(u8, specifier, "node:") or
@@ -304,6 +305,71 @@ fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
         .package_name = package_name,
         .requested_version = requested_version,
     };
+}
+
+fn isNodeBuiltinSpecifier(specifier: []const u8) bool {
+    const root = specifier[0 .. std.mem.indexOfScalar(u8, specifier, '/') orelse specifier.len];
+    for ([_][]const u8{
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_duplex",
+        "_stream_passthrough",
+        "_stream_readable",
+        "_stream_transform",
+        "_stream_wrap",
+        "_stream_writable",
+        "_tls_common",
+        "_tls_wrap",
+        "assert",
+        "async_hooks",
+        "buffer",
+        "child_process",
+        "cluster",
+        "console",
+        "constants",
+        "crypto",
+        "dgram",
+        "diagnostics_channel",
+        "dns",
+        "domain",
+        "events",
+        "fs",
+        "http",
+        "http2",
+        "https",
+        "inspector",
+        "module",
+        "net",
+        "os",
+        "path",
+        "perf_hooks",
+        "process",
+        "punycode",
+        "querystring",
+        "readline",
+        "repl",
+        "stream",
+        "string_decoder",
+        "sys",
+        "timers",
+        "tls",
+        "trace_events",
+        "tty",
+        "url",
+        "util",
+        "v8",
+        "vm",
+        "wasi",
+        "worker_threads",
+        "zlib",
+    }) |builtin_name| {
+        if (std.mem.eql(u8, root, builtin_name)) return true;
+    }
+    return false;
 }
 
 fn autoInstallCacheRoot(
@@ -690,6 +756,9 @@ test "runtime auto-install ignores non-package module specifiers" {
         "",
         "./local.js",
         "../local.js",
+        "fs",
+        "fs/promises",
+        "assert/strict",
         "node:fs",
         "bun:test",
         "data:text/javascript,export default 1",
