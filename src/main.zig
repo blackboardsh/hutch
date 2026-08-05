@@ -33,7 +33,8 @@ const help_text_template =
     \\  hutch --version
     \\
     \\Config:
-    \\  Scripts are resolved from dash.config.ts first, then package.json.
+    \\  Scripts are resolved from hutch.config.ts first (dash.config.ts is the
+    \\  legacy name), then package.json.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\  Package-manager commands are implemented by Hutch.
     \\
@@ -1582,7 +1583,7 @@ pub fn main(init: std.process.Init) !void {
             const config = loadDashConfig(init, allocator, cottontail_path) catch |err| switch (err) {
                 error.DashConfigNotFound => null,
                 else => {
-                    try stderr.print("hutch: failed to load dash.config.ts\n", .{});
+                    try stderr.print("hutch: failed to load hutch.config.ts\n", .{});
                     try stderr.flush();
                     std.process.exit(1);
                 },
@@ -1793,6 +1794,7 @@ test "help text describes dash config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
 }

@@ -46,7 +46,8 @@ in the current terminal. Pass `--no-modify-path` to only print that command.
 
 ## Project Pins
 
-The first line of `dash.config.ts` can pin either layer:
+The first line of `hutch.config.ts` (or the legacy `dash.config.ts`) can pin
+either layer:
 
 ```ts
 // @dash cli=0.4.1 cottontail=0.2.3
@@ -238,8 +239,9 @@ for the release workflow.
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
 
-Scripts resolve from the nearest `dash.config.ts` first and then
-`package.json`. Hutch implements package management and project mutation
+Scripts resolve from the nearest `hutch.config.ts` first and then
+`package.json` as a fallback (`dash.config.ts` remains supported as the
+legacy config name; `package.json` is only needed for JavaScript projects). Hutch implements package management and project mutation
 directly. It invokes the selected Cottontail release for JavaScript execution,
 runtime compatibility APIs, and the compiler-backed build path retained during
 the current split.

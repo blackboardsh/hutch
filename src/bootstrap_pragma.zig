@@ -76,7 +76,12 @@ pub fn findNearestConfig(
 ) !?[]const u8 {
     var current: []const u8 = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     while (true) {
+        // hutch.config.* is the canonical name; dash.config.* remains
+        // supported as the legacy name.
         for ([_][]const u8{
+            "hutch.config.ts",
+            "hutch.config.js",
+            "hutch.config.mjs",
             "dash.config.ts",
             "dash.config.js",
             "dash.config.mjs",
