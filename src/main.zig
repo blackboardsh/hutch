@@ -1177,6 +1177,21 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (isVersionFlag(command)) {
+        // When Hutch acts as the Bun-CLI facade (an explicit Cottontail
+        // resolution is configured), --version must report the runtime's
+        // version, not Hutch's. Standalone `hutch --version` is unchanged.
+        const facade_mode = init.environ_map.get("DASH_COTTONTAIL") != null or
+            init.environ_map.get("COTTONTAIL_BINARY") != null;
+        if (facade_mode) {
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            const exit_code = try runCottontailCommand(init, allocator, cottontail.executable, args[1..]);
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         try stdout.print("{s}\n", .{version});
         try stdout.flush();
         return;
