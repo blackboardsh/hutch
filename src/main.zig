@@ -78,6 +78,12 @@ fn isCottontailTestCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "test");
 }
 
+// "exec" is likewise a runtime builtin (Bun shell execution), never a
+// package script; forward it like "test".
+fn isReservedRuntimeCommand(command: []const u8) bool {
+    return isCottontailTestCommand(command) or std.mem.eql(u8, command, "exec");
+}
+
 fn isFakeNodeInvocation(args: []const [:0]const u8) bool {
     var index: usize = 1;
     while (index < args.len and
@@ -1377,7 +1383,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (isCottontailTestCommand(command)) {
+    if (isReservedRuntimeCommand(command)) {
         const command_args = runtimeCommandArguments(args);
         const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
@@ -1794,6 +1800,8 @@ test "help text describes dash config scripts" {
 test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expect(isCottontailTestCommand("test"));
     try std.testing.expect(!isCottontailTestCommand("test:unit"));
+    try std.testing.expect(isReservedRuntimeCommand("exec"));
+    try std.testing.expect(!isReservedRuntimeCommand("execute"));
 
     const args = [_][:0]const u8{
         "hutch",
