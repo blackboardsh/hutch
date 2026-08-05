@@ -1344,7 +1344,10 @@ fn runPm(
         const cache_path = try packageCachePath(init, init.arena.allocator());
         if (options.positionals.len > 1 and std.mem.eql(u8, options.positionals[1], "rm")) {
             std.Io.Dir.cwd().deleteTree(init.io, cache_path) catch {};
-            try stdout.writeAll("Cleared 'hutch install' cache\n");
+            try stdout.writeAll(if (usesBunCompatOutput(init))
+                "Cleared 'bun install' cache\n"
+            else
+                "Cleared 'hutch install' cache\n");
         } else {
             try stdout.writeAll(cache_path);
         }
@@ -2370,8 +2373,16 @@ const Manager = struct {
     defer_registry_expansions: bool = false,
     registry_manifests: std.StringHashMap(*Value),
     registry_manifest_failures: std.StringHashMap(void),
+    // Names whose in-memory manifest came from the on-disk cache (and may be
+    // stale). Manifests fetched over the network during this run are fresh;
+    // a failed selection against them is terminal, not a reason to refetch.
+    registry_manifests_from_disk: std.StringHashMap(void),
     registry_archives: std.StringHashMap([]const u8),
     installed_registry_packages: std.StringHashMap(void),
+    // Aliases re-resolved because their lock entry was missing (e.g. dropped
+    // for malformed integrity). They count as newly planned even when
+    // node_modules already holds a satisfying version.
+    relocked_missing_entries: std.StringHashMap(void),
     installed_folder_packages: std.StringHashMap(void),
     linked_bins: std.StringHashMap(void),
     refreshed_update_manifests: std.StringHashMap(void),
@@ -2453,8 +2464,10 @@ const Manager = struct {
             .pending_registry_expansions = std.array_list.Managed(PendingRegistryExpansion).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
             .registry_manifest_failures = std.StringHashMap(void).init(allocator),
+            .registry_manifests_from_disk = std.StringHashMap(void).init(allocator),
             .registry_archives = std.StringHashMap([]const u8).init(allocator),
             .installed_registry_packages = std.StringHashMap(void).init(allocator),
+            .relocked_missing_entries = std.StringHashMap(void).init(allocator),
             .installed_folder_packages = std.StringHashMap(void).init(allocator),
             .linked_bins = std.StringHashMap(void).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
@@ -2584,6 +2597,17 @@ const Manager = struct {
             !internal_bunx_install and
             manager.options.command == .install;
 
+        if (install_header_printed) {
+            // The banner goes out before package.json is read: Bun reports the
+            // version even when the manifest itself fails to parse.
+            if (usesBunCompatOutput(manager.init_data)) {
+                try manager.stdout.print("bun install v{s} (cottontail)", .{bun_compat_version});
+            } else {
+                try manager.stdout.print("hutch install v{s}", .{version});
+            }
+            try manager.stdout.flush();
+        }
+
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
         const package_source = blk: {
             break :blk std.Io.Dir.cwd().readFileAlloc(
@@ -2616,15 +2640,6 @@ const Manager = struct {
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
         try manager.warnDuplicateDependencies(&root);
-        if (install_header_printed) {
-            const root_scripts_follow = Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
-            try manager.stdout.print("hutch install v{s}\n{s}", .{
-                version,
-                if (root_scripts_follow) "" else "\n",
-            });
-            try manager.stdout.flush();
-        }
-
         if (manager.options.frozen_lockfile) {
             if (manager.options.command != .install) return error.FrozenLockfileChanged;
         }
@@ -2652,6 +2667,9 @@ const Manager = struct {
 
         try manager.discoverWorkspaces(&root);
         try manager.discoverExplicitWorkspaceDependencies(&root, manager.root_dir);
+        if (manager.options.command == .link) {
+            return manager.linkPackagesIntoInvocationDir();
+        }
         var duplicate_warning_workspaces = manager.workspaces.iterator();
         while (duplicate_warning_workspaces.next()) |entry| {
             try manager.warnDuplicateDependencies(entry.value_ptr.package_json);
@@ -2665,11 +2683,6 @@ const Manager = struct {
             manager.root_selected and
             Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
         if (install_header_printed) {
-            if (usesBunCompatOutput(manager.init_data)) {
-                try manager.stdout.print("bun install v{s} (cottontail)", .{bun_compat_version});
-            } else {
-                try manager.stdout.print("hutch install v{s}", .{version});
-            }
             try manager.stdout.writeAll(if (manager.root_lifecycle_output) "\n" else "\n\n");
             try manager.stdout.flush();
         }
@@ -2696,8 +2709,12 @@ const Manager = struct {
             if (!install_header_printed) {
                 const root_scripts_follow = manager.options.command == .install and
                     Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
+                const command_name = if (manager.options.command == .update and manager.options.interactive)
+                    "update --interactive"
+                else
+                    @tagName(manager.options.command);
                 try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
-                    @tagName(manager.options.command),
+                    command_name,
                     bun_compat_version,
                     version,
                     if (manager.options.command == .link or
@@ -2928,12 +2945,21 @@ const Manager = struct {
                         elapsed_ms,
                     });
                 } else {
-                    try manager.stdout.print("Checked {d} install{s} across {d} packages (no changes) [{d:.2}ms]\n", .{
-                        checked_installs,
-                        if (checked_installs == 1) "" else "s",
-                        manager.lockfilePackageCount(),
-                        elapsed_ms,
-                    });
+                    const total_packages = manager.lockfilePackageCount();
+                    if (checked_installs == total_packages) {
+                        try manager.stdout.print("Done! Checked {d} package{s} (no changes) [{d:.2}ms]\n", .{
+                            checked_installs,
+                            if (checked_installs == 1) "" else "s",
+                            elapsed_ms,
+                        });
+                    } else {
+                        try manager.stdout.print("Checked {d} install{s} across {d} packages (no changes) [{d:.2}ms]\n", .{
+                            checked_installs,
+                            if (checked_installs == 1) "" else "s",
+                            total_packages,
+                            elapsed_ms,
+                        });
+                    }
                 }
             } else if (manager.options.command == .add and reported_installed_count == 0) {
                 try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
@@ -3009,7 +3035,10 @@ const Manager = struct {
 
         try manager.loadLockfile(&root);
         if (manager.lock_graph == null) {
-            try manager.stderr.writeAll("error: Lockfile not found. Run 'hutch install' first.\n");
+            try manager.stderr.writeAll(if (usesBunCompatOutput(manager.init_data))
+                "error: Lockfile not found. Run 'bun install' first.\n"
+            else
+                "error: Lockfile not found. Run 'hutch install' first.\n");
             return error.PackageManagerErrorReported;
         }
         try manager.discoverWorkspaces(&root);
@@ -3700,8 +3729,63 @@ const Manager = struct {
         return specs;
     }
 
-    fn registerGlobalLink(manager: *Manager) !u8 {
-        const package_json = try manager.readLinkPackageJSON();
+    // `bun link <name>` is a lightweight operation: it symlinks the package
+    // into the invoking package's node_modules and never touches package.json
+    // or the lockfile. Names resolve through the global link registry, falling
+    // back to a workspace package with the same name.
+    fn linkPackagesIntoInvocationDir(manager: *Manager) !u8 {
+        const allocator = manager.allocator;
+        if (!manager.options.silent) {
+            // Bun prints the banner with a single newline; the blank line
+            // before the summary only appears when packages were linked.
+            try manager.stdout.print("bun link v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+            try manager.stdout.flush();
+        }
+        var linked: usize = 0;
+        for (manager.options.positionals) |positional| {
+            const name = if (std.mem.indexOf(u8, positional, "@link:")) |index| positional[0..index] else positional;
+            const global_path = try std.fs.path.join(allocator, &.{
+                try globalLinkNodeModulesPath(manager.init_data, allocator),
+                name,
+            });
+            const global_package_json = try std.fs.path.join(allocator, &.{ global_path, "package.json" });
+            var target: ?[]const u8 = null;
+            if (std.Io.Dir.cwd().access(manager.init_data.io, global_package_json, .{})) |_| {
+                target = global_path;
+            } else |_| {
+                if (manager.workspaces.get(name)) |workspace| target = workspace.path;
+            }
+            const resolved = target orelse {
+                try manager.stderr.print("error: Package \"{s}\" is not linked\n", .{name});
+                try manager.stderr.flush();
+                return 1;
+            };
+            const destination = try std.fs.path.join(allocator, &.{
+                manager.invocation_package_dir,
+                "node_modules",
+                name,
+            });
+            try manager.linkRelativeDirectory(destination, resolved, true);
+            if (!manager.options.silent) {
+                if (linked == 0) try manager.stdout.writeByte('\n');
+                try manager.stdout.print("installed {s}@link:{s}\n", .{ name, name });
+            }
+            linked += 1;
+        }
+        if (!manager.options.silent) {
+            const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
+            const elapsed_ms = @as(f64, @floatFromInt(finished_ns - manager.started_ns)) / std.time.ns_per_ms;
+            try manager.stdout.print("\n{d} package{s} installed [{d:.2}ms]\n", .{
+                linked,
+                if (linked == 1) "" else "s",
+                elapsed_ms,
+            });
+            try manager.stdout.flush();
+        }
+        return 0;
+    }
+
+    fn registerGlobalLink(manager: *Manager) !u8 {        const package_json = try manager.readLinkPackageJSON();
         const name = jsonString(package_json, "name") orelse {
             try manager.stderr.writeAll("error: package.json missing \"name\"\n");
             return error.PackageManagerErrorReported;
@@ -3942,7 +4026,10 @@ const Manager = struct {
 
     fn selectPatchPackage(manager: *Manager, argument: []const u8) !PatchSelection {
         const graph = if (manager.lock_graph) |*value| value else {
-            try manager.stderr.writeAll("error: Cannot find lockfile. Install packages with `hutch install` before patching them.\n");
+            try manager.stderr.writeAll(if (usesBunCompatOutput(manager.init_data))
+                "error: Cannot find lockfile. Install packages with `bun install` before patching them.\n"
+            else
+                "error: Cannot find lockfile. Install packages with `hutch install` before patching them.\n");
             return error.PackageManagerErrorReported;
         };
 
@@ -4187,7 +4274,6 @@ const Manager = struct {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, install_cache);
         }
         const node_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
-        const node_modules_existed = manager.pathExists(node_modules);
         const uses_explicit_install_cache = manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") != null;
         if (manager.node_linker == .isolated) {
             // Bun establishes the project cache before converting an add to
@@ -4204,17 +4290,21 @@ const Manager = struct {
         } else {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
         }
-        const install_reuses_lockfile = manager.options.command == .install and
-            manager.lock_graph != null and
-            !manager.changed and
-            !(manager.options.production and manager.workspaces.count() > 0);
+        // Bun eagerly creates node_modules/.cache as its install cache when
+        // package caching is disabled (bunfig `[install] cache = false` or
+        // --no-cache) and the install (re)resolves — no lockfile or a stale
+        // one; unchanged lockfile-driven installs only fall back to it lazily
+        // (see ensureProjectInstallCache), and with a real cache directory it
+        // never appears.
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            !install_reuses_lockfile and
-                (manager.lock_graph == null or !node_modules_existed) and
-                (manager.options.command == .add or
-                    manager.options.cpu_overridden or manager.options.os_overridden);
+            manager.options.no_cache and
+                (manager.lock_graph == null or manager.changed or
+                    manager.options.command == .update or
+                    // --production re-resolves workspace graphs even when the
+                    // lockfile is unchanged.
+                    (manager.options.production and manager.workspaces.count() > 0));
         if (!uses_explicit_install_cache and create_project_cache) {
             const cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
@@ -5341,7 +5431,13 @@ const Manager = struct {
     ) !void {
         const expansion = try manager.expanded_lock_packages.getOrPut(expansion_key);
         if (expansion.found_existing) return;
-        if (manager.defer_registry_expansions and manager.node_linker == .hoisted) {
+        // Resolution-only passes (e.g. omitted dev dependencies under
+        // --production) must resolve inline: a queued expansion would be
+        // drained after the resolution-only flag is restored and the omitted
+        // subtree would be materialized.
+        if (manager.defer_registry_expansions and manager.node_linker == .hoisted and
+            !manager.options.lockfile_only)
+        {
             try manager.pending_registry_expansions.append(.{
                 .metadata = metadata,
                 .dependency_parent_dir = dependency_parent_dir,
@@ -6578,6 +6674,10 @@ const Manager = struct {
                 }
             }
         } else {
+            // The isolated linker's add summary counts linked workspace
+            // packages but does not list them.
+            if (manager.node_linker == .isolated and
+                std.mem.startsWith(u8, result.resolved_version, "workspace:")) return;
             try writer.print("+ {s}@{s}\n", .{ alias, result.resolved_version });
         }
     }
@@ -6692,12 +6792,22 @@ const Manager = struct {
                 std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
                 !manager.explicit_adds.contains(alias) and
                 !(existing_direct_version != null and
-                    std.mem.eql(u8, existing_direct_version.?, resolved_version));
+                    std.mem.eql(u8, existing_direct_version.?, resolved_version) and
+                    !manager.relocked_missing_entries.contains(alias) and
+                    // A transitive edge may have materialized the package
+                    // earlier in this run; that is still a new install.
+                    !try manager.registryPackageInstalledThisRun(alias, resolved_version)) and
+                // The isolated linker's add summary counts linked workspace
+                // packages but does not list them.
+                !(manager.node_linker == .isolated and workspace_display != null);
             if (should_report and
                 (manager.options.dry_run or
                     manager.directDependencyChanged(alias, resolved_version, parent_dir) or
                     manager.options.command == .remove or
-                    (workspace_display != null and manager.lock_graph == null)) and
+                    // Bun lists freshly linked workspace packages on a first
+                    // hoisted install/add, but not with the isolated linker.
+                    (workspace_display != null and manager.lock_graph == null and
+                        manager.node_linker == .hoisted)) and
                 !manager.options.silent)
             {
                 const display = if (isTarballSpec(spec_value.string))
@@ -6735,14 +6845,12 @@ const Manager = struct {
                 try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
             } else {
                 try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
-                if (!usesBunCompatOutput(manager.init_data)) {
-                    if (report.latest_version) |latest| {
-                        const record = manager.directRecord(report.alias);
-                        const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
-                        const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
-                        if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
-                            try manager.stdout.print(" (v{s} available)", .{latest});
-                        }
+                if (report.latest_version) |latest| {
+                    const record = manager.directRecord(report.alias);
+                    const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
+                    const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
+                    if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
+                        try manager.stdout.print(" (v{s} available)", .{latest});
                     }
                 }
             }
@@ -6822,6 +6930,18 @@ const Manager = struct {
         if (manager.directDependencyWasAdded(alias, parent_dir)) return true;
         const initial = manager.initial_root_versions.get(alias) orelse return true;
         return !std.mem.eql(u8, initial, resolved_version);
+    }
+
+    // True when a registry package was materialized during this run. A direct
+    // edge whose package was first pulled in by a transitive edge is still
+    // newly installed, not pre-existing.
+    fn registryPackageInstalledThisRun(manager: *const Manager, name: []const u8, version_value: []const u8) !bool {
+        const prefix = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00", .{ name, version_value });
+        var keys = manager.installed_registry_packages.keyIterator();
+        while (keys.next()) |key| {
+            if (std.mem.startsWith(u8, key.*, prefix)) return true;
+        }
+        return false;
     }
 
     fn rootLockResolutionIsCurrent(manager: *Manager, alias: []const u8) bool {
@@ -7106,8 +7226,18 @@ const Manager = struct {
         try manager.resolving.put(cycle_key, {});
         defer _ = manager.resolving.remove(cycle_key);
 
+        // A package dropped from the lock graph for malformed integrity must
+        // be re-resolved even when node_modules already satisfies the
+        // specifier.
+        const lock_entry_missing = manager.lock_graph != null and
+            manager.lock_graph.?.dropped_invalid_integrity and
+            (try manager.findLockedSelection(alias, parent_dir)) == null;
+        if (lock_entry_missing and direct) {
+            try manager.relocked_missing_entries.put(try manager.allocator.dupe(u8, alias), {});
+        }
         if (!manager.options.force and
             !refresh_direct_registry and
+            !lock_entry_missing and
             !manager.shouldRefreshInstalledSecurityRoot(parent_dir, direct))
         {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
@@ -7699,6 +7829,14 @@ const Manager = struct {
                 try manager.rememberPackageMetadata(local.path, install_metadata);
                 if (transitive_folder) {
                     try manager.countFolderInstall(alias, local.name, spec, parent_dir, newly_installed);
+                } else if (package.kind == .folder and
+                    manager.options.command == .remove and
+                    !manager.options.lockfile_only and
+                    !manager.options.dry_run)
+                {
+                    // Folder dependencies carry no integrity and are
+                    // re-materialized by a remove; Bun counts them as installed.
+                    manager.installed_count += 1;
                 }
                 if (lock_metadata) |metadata| {
                     const source_context = try manager.pushIsolatedSourceContext(local.path, selection.destination);
@@ -10124,7 +10262,9 @@ const Manager = struct {
                     if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                         if (try manager.parseRegistryManifest(cached)) |parsed| {
                             if (manager.cachedRegistryManifestIsUsable(parsed)) {
-                                try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                                const owned_name = try manager.allocator.dupe(u8, name);
+                                try manager.registry_manifests.put(owned_name, parsed);
+                                try manager.registry_manifests_from_disk.put(owned_name, {});
                                 manifest_was_cached = true;
                                 break :blk parsed;
                             }
@@ -10148,12 +10288,16 @@ const Manager = struct {
             }
             _ = manager.registry_manifest_failures.remove(name);
             try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+            _ = manager.registry_manifests_from_disk.remove(name);
             if (refresh_manifest) try manager.refreshed_update_manifests.put(try manager.allocator.dupe(u8, name), {});
             break :blk parsed;
         };
         if (manifest.* != .object) return error.InvalidRegistryManifest;
         const versions_value = manifest.object.get("versions") orelse {
-            if (manifest_was_cached and !force_manifest_refresh) {
+            if (manifest_was_cached and
+                manager.registry_manifests_from_disk.contains(name) and
+                !force_manifest_refresh)
+            {
                 return manager.resolveRegistryPackageWithLogLevelInternal(name, spec, fetch_log_level, true);
             }
             return error.PackageNotFound;
@@ -10179,7 +10323,11 @@ const Manager = struct {
             manager.minimum_release_age_excludes,
             manager.started_wall_ms,
         ) catch |err| {
-            if (err == error.NoMatchingVersion and manifest_was_cached and !force_manifest_refresh) {
+            if (err == error.NoMatchingVersion and
+                manifest_was_cached and
+                manager.registry_manifests_from_disk.contains(name) and
+                !force_manifest_refresh)
+            {
                 return manager.resolveRegistryPackageWithLogLevelInternal(name, spec, fetch_log_level, true);
             }
             return err;
@@ -10442,7 +10590,9 @@ const Manager = struct {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                     if (try manager.parseRegistryManifest(cached)) |parsed| {
                         if (manager.cachedRegistryManifestIsUsable(parsed)) {
-                            try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                            const owned_name = try manager.allocator.dupe(u8, name);
+                            try manager.registry_manifests.put(owned_name, parsed);
+                            try manager.registry_manifests_from_disk.put(owned_name, {});
                             continue;
                         }
                     }
@@ -10495,6 +10645,7 @@ const Manager = struct {
                 };
                 _ = manager.registry_manifest_failures.remove(fetch.name);
                 try manager.registry_manifests.put(try manager.allocator.dupe(u8, fetch.name), parsed);
+                _ = manager.registry_manifests_from_disk.remove(fetch.name);
                 if (fetch.cache_path) |path| {
                     std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes }) catch {};
                 }
@@ -10910,7 +11061,9 @@ const Manager = struct {
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
         while (try iterator.next(manager.init_data.io)) |entry| {
-            if (entry.kind != .file) continue;
+            // Folder dependencies materialize files as symlinks into the
+            // source tree; count those as bins too.
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
             const relative_target = try std.fs.path.join(manager.allocator, &.{ bin_directory, entry.name });
             if (try manager.linkBin(bin_dir, normalizedBinName(entry.name), package_dir, relative_target)) {
                 if (report_direct) try manager.direct_bins.append(normalizedBinName(entry.name));
@@ -10940,7 +11093,7 @@ const Manager = struct {
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
         while (try iterator.next(manager.init_data.io)) |entry| {
-            if (entry.kind == .file) manager.unlinkBin(bin_dir, normalizedBinName(entry.name));
+            if (entry.kind == .file or entry.kind == .sym_link) manager.unlinkBin(bin_dir, normalizedBinName(entry.name));
         }
     }
 
@@ -11554,6 +11707,13 @@ const Manager = struct {
                 !(pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false)))
         {
             manager.installed_count += 1;
+        } else if (!entry.found_existing and
+            manager.node_linker == .isolated and
+            manager.options.command == .add)
+        {
+            // Bun's isolated installer counts linked workspace packages in the
+            // add summary.
+            manager.installed_count += 1;
         }
     }
 
@@ -11834,11 +11994,20 @@ const Manager = struct {
                 try writeJSONString(writer, resolution);
             },
             .folder, .symlink => {
-                const relative = try manager.relativeLockPath(if (record.local_path.len > 0) record.local_path else record.resolution);
+                // Global registry links stay symbolic in the lockfile
+                // ("link:moo"); only path links are relativized.
+                const global_link = record.kind == .symlink and
+                    record.resolution.len > 0 and
+                    !std.mem.startsWith(u8, record.resolution, ".") and
+                    !std.fs.path.isAbsolute(record.resolution);
+                const source = if (global_link)
+                    record.resolution
+                else
+                    try manager.relativeLockPath(if (record.local_path.len > 0) record.local_path else record.resolution);
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@{s}:{s}", .{
                     record.name,
                     if (record.kind == .symlink) "link" else "file",
-                    relative,
+                    source,
                 });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");

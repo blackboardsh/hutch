@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Host = @import("package_manager_host.zig");
+const runtime_autoinstall = @import("../runtime_autoinstall.zig");
 const version = @import("../version.zig").version;
 const bun_compat_version = "1.3.10";
 const cache_valid_ns: i128 = 24 * std.time.ns_per_hour;
@@ -861,11 +862,39 @@ fn runBinary(
 ) !u8 {
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator) catch path;
     const executable_kind = classifyExecutable(init.io, resolved);
-    const is_script = executable_kind != .native;
-    _ = force_runtime;
-    const use_runtime = is_script;
+    // Bun executes bins with a node shebang directly (the kernel dispatches
+    // the shebang), so tools like yargs see the .bin path as their script
+    // name. Only bun scripts and shebang-less JS run through the runtime,
+    // unless --bun forces it.
+    const use_runtime = switch (executable_kind) {
+        .native => false,
+        .node_script => force_runtime or builtin.os.tag == .windows,
+        .bun_script, .javascript => true,
+    };
+    if (!use_runtime and executable_kind == .node_script) {
+        // Direct execution resolves the bin's `#!/usr/bin/env node` shebang
+        // through PATH. Discovery filtering (BUN_WHICH_IGNORE_CWD) removes the
+        // lifecycle shim directory that provides the node wrapper, so put it
+        // back for the child.
+        if (init.environ_map.get("BUN_WHICH_IGNORE_CWD")) |ignored| {
+            const existing = environment.get("PATH") orelse "";
+            var present = false;
+            var segments = std.mem.splitScalar(u8, existing, std.fs.path.delimiter);
+            while (segments.next()) |segment| {
+                if (std.mem.eql(u8, segment, ignored)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                try environment.put("PATH", try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ existing, std.fs.path.delimiter, ignored }));
+            }
+        }
+    }
     const executable = if (use_runtime)
-        try Host.runtimeExecutable(init, allocator)
+        try bunNamedRuntimeExecutable(init, allocator)
+    else if (executable_kind == .node_script and builtin.os.tag != .windows)
+        path
     else
         resolved;
     const extra = if (use_runtime) @as(usize, 1) else 0;
@@ -903,6 +932,30 @@ fn runBinary(
     });
     defer child.kill(init.io);
     return childExitCode(try child.wait(init.io));
+}
+
+// CLI tools like yargs derive their display name from argv[0] and only
+// recognize node/bun-style executable names, and the runtime reports its
+// canonical executable path. Run script bins through a "bun"-named hardlink
+// to the runtime so they report the right usage line.
+fn bunNamedRuntimeExecutable(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const runtime = try Host.runtimeExecutable(init, allocator);
+    if (builtin.os.tag == .windows) return runtime;
+    const basename = std.fs.path.basename(runtime);
+    if (std.mem.eql(u8, basename, "bun")) return runtime;
+    const cache_root = runtime_autoinstall.autoInstallCacheRoot(init, allocator) catch return runtime;
+    const shim_dir = try std.fs.path.join(allocator, &.{ cache_root, "bin" });
+    std.Io.Dir.cwd().createDirPath(init.io, shim_dir) catch return runtime;
+    const shim = try std.fs.path.join(allocator, &.{ shim_dir, "bun" });
+    const runtime_stat = std.Io.Dir.cwd().statFile(init.io, runtime, .{}) catch return runtime;
+    if (std.Io.Dir.cwd().statFile(init.io, shim, .{})) |shim_stat| {
+        if (shim_stat.inode == runtime_stat.inode and shim_stat.kind == .file) return shim;
+        std.Io.Dir.cwd().deleteFile(init.io, shim) catch return runtime;
+    } else |_| {}
+    std.Io.Dir.cwd().hardLink(runtime, std.Io.Dir.cwd(), shim, init.io, .{}) catch {
+        std.Io.Dir.copyFileAbsolute(runtime, shim, init.io, .{}) catch return runtime;
+    };
+    return shim;
 }
 
 fn classifyExecutable(io: std.Io, path: []const u8) ExecutableKind {

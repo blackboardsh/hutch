@@ -571,6 +571,8 @@ function runEntry(entry, options, tempRoot, executionSuiteRoot) {
   const args = [
     "--preload",
     preloadPath,
+    "test",
+    `--timeout=${perTestTimeoutMs}`,
     entry.path,
     ...(entry.args ?? []).map(String),
   ];

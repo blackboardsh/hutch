@@ -186,6 +186,7 @@ pub fn build(
         project_root,
         &manifest,
         stderr,
+        init.environ_map.get("HUTCH_BUN_COMPAT") != null,
     );
     var selection = try collectEntries(
         init.io,
@@ -262,6 +263,7 @@ fn editWorkspaceProtocols(
     project_root: []const u8,
     manifest: *Manifest,
     stderr: *std.Io.Writer,
+    bun_compat: bool,
 ) ![]const u8 {
     var root_manifest = manifest.value;
     const root_package_json = try std.fs.path.join(allocator, &.{ project_root, "package.json" });
@@ -284,17 +286,31 @@ fn editWorkspaceProtocols(
                 std.mem.eql(u8, requested, "~"))
             blk: {
                 if (!has_lockfile) {
-                    try stderr.print(
-                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
-                        .{ dependency_name, section_name },
-                    );
+                    if (bun_compat) {
+                        try stderr.print(
+                            "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `bun install` and try again.\n",
+                            .{ dependency_name, section_name },
+                        );
+                    } else {
+                        try stderr.print(
+                            "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
+                            .{ dependency_name, section_name },
+                        );
+                    }
                     return error.WorkspaceVersionUnresolved;
                 }
                 const version = workspaceVersion(discovery.entries, dependency_name) orelse {
-                    try stderr.print(
-                        "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
-                        .{ dependency_name, section_name },
-                    );
+                    if (bun_compat) {
+                        try stderr.print(
+                            "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `bun install` and try again.\n",
+                            .{ dependency_name, section_name },
+                        );
+                    } else {
+                        try stderr.print(
+                            "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `hutch install` and try again.\n",
+                            .{ dependency_name, section_name },
+                        );
+                    }
                     return error.WorkspaceVersionUnresolved;
                 };
                 if (std.mem.eql(u8, requested, "*")) break :blk version;
