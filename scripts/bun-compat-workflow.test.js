@@ -14,9 +14,9 @@ const suiteManifestPath = new URL(
   "../compat/upstream/bun/v1.3.10/manifest.json",
   import.meta.url,
 );
-const workflow = readFileSync(workflowPath, "utf8");
+const workflow = readFileSync(workflowPath, "utf8").replace(/\r\n/g, "\n");
 const cottontailManifest = JSON.parse(readFileSync(cottontailManifestPath, "utf8"));
-const cottontailSetup = readFileSync(cottontailSetupPath, "utf8");
+const cottontailSetup = readFileSync(cottontailSetupPath, "utf8").replace(/\r\n/g, "\n");
 const suiteManifest = JSON.parse(readFileSync(suiteManifestPath, "utf8"));
 
 function workflowTriggers(source) {
