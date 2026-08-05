@@ -5,8 +5,8 @@
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "canonicalRunnableFiles": 1445,
   "ownerCounts": {
-    "cottontail-runtime": 1343,
-    "hutch-package-manager": 102
+    "cottontail-runtime": 1345,
+    "hutch-package-manager": 100
   },
   "tests": [
     {
@@ -759,7 +759,7 @@
     },
     {
       "path": "test/cli/install/semver.test.ts",
-      "owner": "hutch-package-manager"
+      "owner": "cottontail-runtime"
     },
     {
       "path": "test/cli/install/shebang-normalize.test.ts",
@@ -899,7 +899,7 @@
     },
     {
       "path": "test/cli/run/shell-keepalive.test.ts",
-      "owner": "hutch-package-manager"
+      "owner": "cottontail-runtime"
     },
     {
       "path": "test/cli/run/sql-preconnect.test.ts",

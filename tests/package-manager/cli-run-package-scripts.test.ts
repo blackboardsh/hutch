@@ -154,6 +154,55 @@ test("single package scripts do not install the public bun package", () => {
   expect(existsSync(join(directory, "node_modules", "bun"))).toBe(false);
 });
 
+test("single-run diagnostics render rewritten commands and appended arguments", () => {
+  const directory = join(scratch, "single-run-display");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(
+    join(directory, "package.json"),
+    JSON.stringify({
+      scripts: {
+        inner: "bun probe.js",
+        outer: "   npm run inner   ",
+      },
+    }),
+  );
+  writeFileSync(
+    join(directory, "probe.js"),
+    "console.log(JSON.stringify(process.argv.slice(2)));\n",
+  );
+
+  const nested = run(directory, ["run", "outer"]);
+  expect(nested.exitCode, `${nested.stdout}\n${nested.stderr}`).toBe(0);
+  expect(nested.stderr).toBe("$    bun run inner   \n$ bun probe.js\n");
+
+  const withArguments = run(directory, ["run", "inner", "$HOME (!)", "argument two"]);
+  expect(withArguments.exitCode, `${withArguments.stdout}\n${withArguments.stderr}`).toBe(0);
+  expect(withArguments.stderr).toBe('$ bun probe.js "\\$HOME (!)" "argument two"\n');
+  expect(withArguments.stdout).toBe('["$HOME (!)","argument two"]\n');
+});
+
+test("single-run failures retain diagnostics when command echoing is disabled", () => {
+  const directory = join(scratch, "single-run-failure");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, "package.json"), JSON.stringify({ scripts: { fail: "bun missing.js" } }));
+
+  const script = run(directory, ["run", "fail"]);
+  expect(script.exitCode).toBe(1);
+  expect(script.stderr).toBe(
+    '$ bun missing.js\nerror: Module not found "missing.js"\nerror: script "fail" exited with code 1\n',
+  );
+});
+
+test("ordinary run applies --cwd exactly once", () => {
+  const directory = join(scratch, "single-run-cwd");
+  mkdirSync(join(directory, "subdir"), { recursive: true });
+  writeFileSync(join(directory, "subdir", "probe.js"), "console.log(process.cwd());\n");
+
+  const result = run(directory, ["run", "--cwd", "subdir", "probe.js"]);
+  expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+  expect(result.stdout).toContain(join(directory, "subdir"));
+});
+
 test("package scripts repair an incomplete node_modules tree", () => {
   const directory = join(scratch, "partial-install");
   const dependency = join(scratch, "local-dependency");

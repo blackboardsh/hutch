@@ -9,6 +9,7 @@ node_modules/
 **/.cottontail-tmp/
 **/.cottontail-compat-*
 **/.cottontail-eval-*
+.hutch-local-tools/
 
 .zig-cache/
 zig-out/

@@ -46,6 +46,7 @@ const RunMode = enum {
 
 const Invocation = struct {
     mode: RunMode,
+    cwd: ?[]const u8,
     filters: []const []const u8,
     scripts: []const []const u8,
     script_args: []const []const u8,
@@ -78,6 +79,7 @@ const Package = struct {
 const Stage = struct {
     name: []const u8,
     command: []const u8,
+    display_command: []const u8,
     original_command: []const u8,
 };
 
@@ -104,6 +106,7 @@ const Group = struct {
     color_index: usize = 0,
     force_runtime: bool = false,
     silent: bool = false,
+    print_command: bool = true,
     result: GroupResult = .{},
     output_lines: std.atomic.Value(usize) = .init(0),
 };
@@ -184,7 +187,32 @@ const SharedOutput = struct {
     }
 
     fn status(self: *SharedOutput, group: *Group, result: GroupResult, elapsed_ms: u64) void {
-        if (self.mode == .single) return;
+        if (self.mode == .single) {
+            if (group.silent) return;
+            if (result.signal_code) |signal_code| {
+                if (comptime builtin.os.tag != .windows) {
+                    const signal: std.posix.SIG = @enumFromInt(signal_code);
+                    const label = if (group.package_json.len > 0) "script" else "command";
+                    self.diagnostic(
+                        "error: {s} \"{s}\" was terminated by SIG{s}\n",
+                        .{ label, group.script_name, @tagName(signal) },
+                    );
+                }
+            } else if (result.code != 0) {
+                if (group.package_json.len > 0) {
+                    self.diagnostic(
+                        "error: script \"{s}\" exited with code {d}\n",
+                        .{ group.script_name, result.code },
+                    );
+                } else {
+                    self.diagnostic(
+                        "error: \"{s}\" exited with code {d}\n",
+                        .{ group.script_name, result.code },
+                    );
+                }
+            }
+            return;
+        }
         const stream: Stream = if (self.mode == .multi) .stderr else .stdout;
         const mutex = self.mutexFor(stream);
         mutex.lockUncancelable(self.io);
@@ -527,8 +555,8 @@ fn runStage(
     var env = try configureEnvironment(init, group, stage);
     defer env.deinit();
 
-    if (output.mode == .single and !group.silent) {
-        output.diagnostic("$ {s}\n", .{stage.original_command});
+    if (output.mode == .single and !group.silent and group.print_command) {
+        output.diagnostic("$ {s}\n", .{stage.display_command});
     }
 
     var windows_source: std.ArrayList(u8) = .empty;
@@ -735,7 +763,7 @@ fn parseUnsigned(value: []const u8) ?usize {
     return std.fmt.parseUnsigned(usize, value, 10) catch null;
 }
 
-fn parseInvocation(allocator: Allocator, io: std.Io, args: []const [:0]const u8) !?Invocation {
+fn parseInvocation(allocator: Allocator, args: []const [:0]const u8) !?Invocation {
     if (args.len < 2) return null;
     const explicit_run = std.mem.eql(u8, args[1], "run");
     var index: usize = if (explicit_run) 2 else 1;
@@ -745,6 +773,7 @@ fn parseInvocation(allocator: Allocator, io: std.Io, args: []const [:0]const u8)
     var if_present = false;
     var no_exit_on_error = false;
     var elide_lines: ?usize = null;
+    var cwd: ?[]const u8 = null;
     var triggered = false;
     var filters = std.array_list.Managed([]const u8).init(allocator);
 
@@ -815,12 +844,12 @@ fn parseInvocation(allocator: Allocator, io: std.Io, args: []const [:0]const u8)
             continue;
         }
         if (std.mem.eql(u8, arg, "--cwd") and index + 1 < args.len) {
-            try std.process.setCurrentPath(io, args[index + 1]);
+            cwd = args[index + 1];
             index += 2;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--cwd=")) {
-            try std.process.setCurrentPath(io, arg["--cwd=".len..]);
+            cwd = arg["--cwd=".len..];
             index += 1;
             continue;
         }
@@ -846,6 +875,7 @@ fn parseInvocation(allocator: Allocator, io: std.Io, args: []const [:0]const u8)
     const script_args = if (mode == .workspace and positionals.len > 0) positionals[1..] else &.{};
     return .{
         .mode = mode,
+        .cwd = cwd,
         .filters = try filters.toOwnedSlice(),
         .scripts = scripts,
         .script_args = script_args,
@@ -1107,6 +1137,38 @@ fn shellEscape(allocator: Allocator, value: []const u8) ![]const u8 {
     return result.items;
 }
 
+fn appendDisplayArgument(
+    command: *std.array_list.Managed(u8),
+    value: []const u8,
+) !void {
+    var plain = value.len > 0;
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '-', '_', '.', '/', ':', '=', '@', '%', '+', ',' => true,
+            else => false,
+        })) {
+            plain = false;
+            break;
+        }
+    }
+    if (plain) {
+        try command.appendSlice(value);
+        return;
+    }
+
+    try command.append('"');
+    for (value) |byte| switch (byte) {
+        '"', '\\', '$', '`' => {
+            try command.append('\\');
+            try command.append(byte);
+        },
+        '\n' => try command.appendSlice("\\n"),
+        '\r' => try command.appendSlice("\\r"),
+        else => try command.append(byte),
+    };
+    try command.append('"');
+}
+
 fn appendScriptStage(
     stages: *std.array_list.Managed(Stage),
     allocator: Allocator,
@@ -1114,9 +1176,11 @@ fn appendScriptStage(
     name: []const u8,
     command: []const u8,
 ) !void {
+    const executable_command = try script_command.replacePackageManagerRun(allocator, io, command);
     try stages.append(.{
         .name = name,
-        .command = try script_command.replacePackageManagerRun(allocator, io, command),
+        .command = executable_command,
+        .display_command = try script_command.displayPackageManagerRun(allocator, command),
         .original_command = command,
     });
 }
@@ -1137,11 +1201,16 @@ fn stagesForScript(
     if (script_args.len > 0) {
         var command = std.array_list.Managed(u8).init(allocator);
         try command.appendSlice(stages.items[stages.items.len - 1].command);
+        var display_command = std.array_list.Managed(u8).init(allocator);
+        try display_command.appendSlice(stages.items[stages.items.len - 1].display_command);
         for (script_args) |arg| {
             try command.append(' ');
             try command.appendSlice(try shellEscape(allocator, arg));
+            try display_command.append(' ');
+            try appendDisplayArgument(&display_command, arg);
         }
         stages.items[stages.items.len - 1].command = command.items;
+        stages.items[stages.items.len - 1].display_command = display_command.items;
     }
     if (scriptValue(package, post_name)) |command| try appendScriptStage(&stages, allocator, io, post_name, command);
     return try stages.toOwnedSlice();
@@ -1249,7 +1318,12 @@ fn appendRawGroup(
         try command.appendSlice(try shellEscape(allocator, arg));
     }
     const stages = try allocator.alloc(Stage, 1);
-    stages[0] = .{ .name = request, .command = command.items, .original_command = command.items };
+    stages[0] = .{
+        .name = request,
+        .command = command.items,
+        .display_command = command.items,
+        .original_command = command.items,
+    };
     try groups.append(.{
         .label = request,
         .package_label = request,
@@ -1340,7 +1414,7 @@ pub fn runSingleIfExists(
     return try executeGroups(init, pointers, .sequential, false, &output);
 }
 
-pub fn commandExists(init: std.process.Init, name: []const u8) bool {
+pub fn localCommandExists(init: std.process.Init, name: []const u8) bool {
     if (std.mem.indexOfAny(u8, name, "/\\") != null) return runnableFile(init.io, name);
     const allocator = init.arena.allocator();
     var current: []const u8 = std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator) catch return false;
@@ -1354,6 +1428,15 @@ pub fn commandExists(init: std.process.Init, name: []const u8) bool {
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
+
+    return false;
+}
+
+pub fn commandExists(init: std.process.Init, name: []const u8) bool {
+    if (localCommandExists(init, name)) return true;
+    if (std.mem.indexOfAny(u8, name, "/\\") != null) return false;
+
+    const allocator = init.arena.allocator();
 
     const path = init.environ_map.get("PATH") orelse return false;
     var directories = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
@@ -1402,6 +1485,7 @@ pub fn runSingleCommand(
     var groups = std.array_list.Managed(Group).init(allocator);
     try appendRawGroup(init, &groups, cwd, command, command_args);
     groups.items[0].silent = silent;
+    groups.items[0].print_command = false;
 
     var output = configureOutput(init, groups.items, .single, null);
     const pointers = try allocator.alloc(*Group, 1);
@@ -1517,7 +1601,8 @@ fn runWorkspaces(init: std.process.Init, invocation: Invocation, cwd: []const u8
 }
 
 pub fn tryRun(init: std.process.Init, args: []const [:0]const u8) !?u8 {
-    const invocation = (try parseInvocation(init.arena.allocator(), init.io, args)) orelse return null;
+    const invocation = (try parseInvocation(init.arena.allocator(), args)) orelse return null;
+    if (invocation.cwd) |cwd| try std.process.setCurrentPath(init.io, cwd);
     if (invocation.mode == .parallel and invocation.scripts.len == 0 or
         invocation.mode == .sequential and invocation.scripts.len == 0)
     {

@@ -6,6 +6,7 @@ const package_manager = @import("package_manager/root.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const runtime_autoinstall = @import("runtime_autoinstall.zig");
+const runtime_entrypoint = @import("runtime_entrypoint.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -56,8 +57,41 @@ fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
 }
 
+// When an explicit Cottontail resolution is configured, Hutch acts as the
+// Bun-CLI facade for that runtime (test harnesses, pinned-toolchain setups):
+// invocations must behave like the runtime's own CLI instead of Hutch's
+// workspace orchestrator.
+fn isBunCliFacade(environment: *const std.process.Environ.Map) bool {
+    return environment.get("DASH_COTTONTAIL") != null or
+        environment.get("COTTONTAIL_BINARY") != null;
+}
+
+// A facade invocation that reaches the engine binary directly (no Hutch
+// launcher in the loop, e.g. a compat harness spawning the engine as Bun's
+// CLI executable) leaves dependency installation to the runtime itself.
+fn isDirectRuntimeFacade(environment: *const std.process.Environ.Map) bool {
+    return isBunCliFacade(environment) and
+        environment.get("HUTCH_LAUNCHER_PATH") == null;
+}
+
 fn isCottontailTestCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "test");
+}
+
+// "exec" is likewise a runtime builtin (Bun shell execution), never a
+// package script; forward it like "test".
+fn isReservedRuntimeCommand(command: []const u8) bool {
+    return isCottontailTestCommand(command) or std.mem.eql(u8, command, "exec");
+}
+
+fn isFakeNodeInvocation(args: []const [:0]const u8) bool {
+    var index: usize = 1;
+    while (index < args.len and
+        (std.mem.eql(u8, args[index], "--bun") or std.mem.eql(u8, args[index], "-b")))
+    {
+        index += 1;
+    }
+    return index < args.len and std.mem.eql(u8, args[index], "node");
 }
 
 fn electrobunInitAliasArgs(args: []const [:0]const u8) ?[]const [:0]const u8 {
@@ -73,6 +107,157 @@ fn electrobunInitAliasArgs(args: []const [:0]const u8) ?[]const [:0]const u8 {
 
 fn runtimeCommandArguments(args: []const [:0]const u8) []const [:0]const u8 {
     return if (args.len > 1) args[1..] else args[0..0];
+}
+
+const RuntimeAutoInstallInput = union(enum) {
+    entrypoint: []const u8,
+    source: []const u8,
+};
+
+fn hutchLeadingOptionSpan(args: []const [:0]const u8, index: usize) ?usize {
+    const arg: []const u8 = args[index];
+    const boolean_options = [_][]const u8{
+        "--bun",
+        "-b",
+        "--if-present",
+        "--no-exit-on-error",
+        "--parallel",
+        "--sequential",
+        "--silent",
+        "--workspaces",
+    };
+    for (boolean_options) |option| {
+        if (std.mem.eql(u8, arg, option)) return 1;
+    }
+
+    const value_options = [_][]const u8{
+        "-c",
+        "--config",
+        "--cwd",
+        "--elide-lines",
+        "--filter",
+        "-F",
+        "--shell",
+    };
+    for (value_options) |option| {
+        if (std.mem.eql(u8, arg, option)) {
+            return if (index + 1 < args.len) 2 else 1;
+        }
+        if (std.mem.startsWith(u8, arg, option) and
+            arg.len > option.len and
+            arg[option.len] == '=')
+        {
+            return 1;
+        }
+    }
+    return null;
+}
+
+fn hasUnconsumedLeadingRuntimeOption(args: []const [:0]const u8) bool {
+    if (args.len < 2) return false;
+    var index: usize = 1;
+    var saw_run = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (!saw_run and std.mem.eql(u8, arg, "run")) {
+            saw_run = true;
+            index += 1;
+            continue;
+        }
+        if (hutchLeadingOptionSpan(args, index)) |span| {
+            index += span;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return true;
+        return false;
+    }
+    return false;
+}
+
+fn cottontailRuntimeOptionTakesValue(arg: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    const value_options = [_][]const u8{
+        "-r",
+        "--allow-fs-read",
+        "--allow-fs-write",
+        "--conditions",
+        "--console-depth",
+        "--cpu-prof-dir",
+        "--cpu-prof-interval",
+        "--cpu-prof-name",
+        "--cwd",
+        "--define",
+        "--diagnostic-dir",
+        "--elide-lines",
+        "--env-file",
+        "--env-file-if-exists",
+        "--experimental-default-type",
+        "--experimental-loader",
+        "--feature",
+        "--fetch-preconnect",
+        "--filter",
+        "--heap-prof-dir",
+        "--heap-prof-name",
+        "--icu-data-dir",
+        "--import",
+        "--input-type",
+        "--inspect-publish-uid",
+        "--loader",
+        "--port",
+        "--preload",
+        "--redirect-warnings",
+        "--require",
+        "--shell",
+        "--snapshot-blob",
+        "--test-name-pattern",
+        "--test-reporter",
+        "--test-reporter-destination",
+        "--test-shard",
+        "--tsconfig-override",
+        "--user-agent",
+    };
+    for (value_options) |option| {
+        if (std.mem.eql(u8, arg, option)) return true;
+    }
+    return false;
+}
+
+fn runtimeAutoInstallInput(args: []const [:0]const u8) ?RuntimeAutoInstallInput {
+    var index: usize = 1;
+    var saw_run = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            return if (index < args.len) .{ .entrypoint = args[index] } else null;
+        }
+        if (!saw_run and std.mem.eql(u8, arg, "run")) {
+            saw_run = true;
+            index += 1;
+            continue;
+        }
+        if (!saw_run and
+            (std.mem.eql(u8, arg, "-e") or
+                std.mem.eql(u8, arg, "--eval") or
+                std.mem.eql(u8, arg, "-p") or
+                std.mem.eql(u8, arg, "--print")))
+        {
+            return if (index + 1 < args.len) .{ .source = args[index + 1] } else null;
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--eval=")) {
+            return .{ .source = arg["--eval=".len..] };
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--print=")) {
+            return .{ .source = arg["--print=".len..] };
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            index += if (cottontailRuntimeOptionTakesValue(arg) and index + 1 < args.len) 2 else 1;
+            continue;
+        }
+        return .{ .entrypoint = arg };
+    }
+    return null;
 }
 
 fn termExitCode(term: std.process.Child.Term) u8 {
@@ -155,7 +340,9 @@ fn runCottontailCommand(
     defer env.deinit();
     const hutch_path = try package_manager.host.cliExecutableForInit(init, allocator);
     try env.put("COTTONTAIL_SPAWN_EXEC_PATH", hutch_path);
-    try env.put("COTTONTAIL_SPAWN_ARGV0", hutch_path);
+    // A custom argv[0] from the invoker (e.g. Bun.spawn's argv0 option)
+    // belongs to the runtime child, not to Hutch.
+    try env.put("COTTONTAIL_SPAWN_ARGV0", customInvocationArgv0(init, allocator) orelse hutch_path);
 
     if (comptime builtin.os.tag != .windows) {
         try process_replace.replace(allocator, cottontail_path, argv.items, &env);
@@ -174,12 +361,33 @@ fn runCottontailCommand(
     return termExitCode(try child.wait(init.io));
 }
 
+fn customInvocationArgv0(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) ?[]const u8 {
+    const argv = init.minimal.args.toSlice(allocator) catch return null;
+    if (argv.len == 0) return null;
+    const argv0: []const u8 = argv[0];
+    if (std.process.executablePathAlloc(init.io, allocator)) |self_exe| {
+        if (std.mem.eql(u8, argv0, self_exe)) return null;
+    } else |_| {}
+    // Normal invocations use the binary's own name or path; anything else is
+    // a deliberate argv[0] override from the caller.
+    if (std.mem.startsWith(u8, std.fs.path.basename(argv0), "hutch")) return null;
+    return argv0;
+}
+
 fn prepareRuntimeAutoInstall(
     init: std.process.Init,
     entrypoint: []const u8,
     mode: runtime_autoinstall.Mode,
     stderr: *std.Io.Writer,
 ) !bool {
+    // Direct facade mode (engine spawned as the runtime's CLI, no launcher):
+    // the runtime owns dependency installation; scanning here would reject
+    // entrypoints the runtime itself handles (non-package imports, syntax the
+    // scanner cannot parse) and mask its real errors.
+    if (isDirectRuntimeFacade(init.environ_map)) return true;
     runtime_autoinstall.prepare(init, entrypoint, mode, stderr) catch |err| {
         if (err != error.AutoInstallFailed) {
             try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
@@ -188,6 +396,30 @@ fn prepareRuntimeAutoInstall(
         return false;
     };
     return true;
+}
+
+fn prepareForwardedRuntimeAutoInstall(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    if (isDirectRuntimeFacade(init.environ_map)) return true;
+    const input = runtimeAutoInstallInput(args) orelse return true;
+    switch (input) {
+        .entrypoint => |entrypoint| {
+            return try prepareRuntimeAutoInstall(init, entrypoint, .auto, stderr);
+        },
+        .source => |source| {
+            runtime_autoinstall.prepareSource(init, source, .auto, stderr) catch |err| {
+                if (err != error.AutoInstallFailed) {
+                    try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+                }
+                try stderr.flush();
+                return false;
+            };
+            return true;
+        },
+    }
 }
 
 fn printBinaryLockfile(
@@ -670,6 +902,64 @@ const PackageScriptInvocation = struct {
     silent: bool,
 };
 
+fn isExplicitRuntimePath(name: []const u8) bool {
+    return std.fs.path.isAbsolute(name) or
+        std.mem.startsWith(u8, name, "./") or
+        std.mem.startsWith(u8, name, ".\\") or
+        std.mem.startsWith(u8, name, "../") or
+        std.mem.startsWith(u8, name, "..\\") or
+        std.mem.indexOfAny(u8, name, "/\\") != null;
+}
+
+fn packageScriptEligible(name: []const u8) bool {
+    return !isExplicitRuntimePath(name);
+}
+
+fn runtimeDiagnosticEligible(name: []const u8) bool {
+    return isExplicitRuntimePath(name) or std.fs.path.extension(name).len > 0;
+}
+
+fn resolvedEntrypointIsRunnable(path: []const u8) bool {
+    return !std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".json");
+}
+
+fn runCottontailInvocation(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    invocation: PackageScriptInvocation,
+) !u8 {
+    var command_args: std.ArrayList([:0]const u8) = .empty;
+    defer command_args.deinit(allocator);
+
+    if (invocation.force_runtime) try command_args.append(allocator, "--bun");
+    if (invocation.config_path) |config_path| {
+        try command_args.appendSlice(allocator, &.{
+            "--config",
+            try allocator.dupeZ(u8, config_path),
+        });
+    }
+    try command_args.append(allocator, try allocator.dupeZ(u8, invocation.name));
+    for (invocation.args) |arg| try command_args.append(allocator, arg);
+
+    const cottontail = try resolveCottontail(init, allocator, command_args.items);
+    return try runCottontailCommand(
+        init,
+        allocator,
+        cottontail.executable,
+        command_args.items,
+    );
+}
+
+fn prepareAndRunCottontailInvocation(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    invocation: PackageScriptInvocation,
+    stderr: *std.Io.Writer,
+) !u8 {
+    if (!try prepareRuntimeAutoInstall(init, invocation.name, .auto, stderr)) return 1;
+    return try runCottontailInvocation(init, allocator, invocation);
+}
+
 fn parsePackageScriptInvocation(
     init: std.process.Init,
     args: []const [:0]const u8,
@@ -930,6 +1220,18 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_writer.interface;
 
     if (args.len <= 1) {
+        if (isBunCliFacade(init.environ_map)) {
+            // Facade mode: a bare invocation belongs to the runtime, which
+            // honors BUN_OPTIONS and prints its own help when nothing applies.
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            const exit_code = try runCottontailCommand(init, allocator, cottontail.executable, args[1..]);
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         try printHelp(stdout);
         try stdout.flush();
         return;
@@ -944,6 +1246,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (isVersionFlag(command)) {
+        // When Hutch acts as the Bun-CLI facade (an explicit Cottontail
+        // resolution is configured), --version must report the runtime's
+        // version, not Hutch's. Standalone `hutch --version` is unchanged.
+        const facade_mode = isBunCliFacade(init.environ_map);
+        if (facade_mode) {
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            const exit_code = try runCottontailCommand(init, allocator, cottontail.executable, args[1..]);
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         try stdout.print("{s}\n", .{version});
         try stdout.flush();
         return;
@@ -951,7 +1267,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (runtime_autoinstall.parseLeadingInvocation(args)) |invocation| {
         const entrypoint = args[invocation.entry_index];
-        if (pathExists(init.io, entrypoint)) {
+        if (try runtime_entrypoint.resolve(init.io, allocator, entrypoint) != null) {
             if (!try prepareRuntimeAutoInstall(init, entrypoint, invocation.mode, stderr)) {
                 std.process.exit(1);
             }
@@ -1047,7 +1363,65 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (isCottontailTestCommand(command)) {
+    if (hasUnconsumedLeadingRuntimeOption(args)) {
+        if (!try prepareForwardedRuntimeAutoInstall(init, args, stderr)) {
+            std.process.exit(1);
+        }
+        const command_args = runtimeCommandArguments(args);
+        const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            command_args,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (isReservedRuntimeCommand(command)) {
+        const command_args = runtimeCommandArguments(args);
+        const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            command_args,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    // Hidden runtime builtins that Hutch does not own still reach Cottontail
+    // when Hutch acts as the Bun-CLI facade.
+    if (isBunCliFacade(init.environ_map) and std.mem.eql(u8, command, "getcompletes")) {
+        const command_args = runtimeCommandArguments(args);
+        const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
+            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        const exit_code = try runCottontailCommand(
+            init,
+            allocator,
+            cottontail.executable,
+            command_args,
+        );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    // `bun [--bun] node <file>` selects the runtime's Node-CLI emulation; the
+    // literal "node" positional is the runtime's marker, not a package script.
+    if (isBunCliFacade(init.environ_map) and isFakeNodeInvocation(args)) {
         const command_args = runtimeCommandArguments(args);
         const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
@@ -1090,52 +1464,92 @@ pub fn main(init: std.process.Init) !void {
                 invocation.silent,
                 invocation.force_runtime,
             );
-            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
-                try stderr.flush();
-                std.process.exit(1);
-            };
-            if (try runConfiguredScriptIfExists(
-                init,
-                allocator,
-                cottontail.executable,
-                invocation.name,
-                invocation.args,
-                stderr,
-            )) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-            if (try runPackageScriptIfExists(
-                init,
+            const resolved_entrypoint = try runtime_entrypoint.resolve(
+                init.io,
                 allocator,
                 invocation.name,
-                invocation.args,
-                stderr,
-                configured.silent,
-                configured.force_runtime,
-            )) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-            if (invocation.if_present) return;
-            if (pathExists(init.io, invocation.name)) {
-                if (!try prepareRuntimeAutoInstall(init, invocation.name, .auto, stderr)) {
+            );
+            const local_command_exists = package_manager.run.localCommandExists(
+                init,
+                invocation.name,
+            );
+
+            // Without an explicit `run`, a resolvable module wins over a
+            // same-named package script. `run` intentionally reverses that
+            // priority to match Bun's script runner.
+            if (!invocation.explicit_run and
+                resolved_entrypoint != null and
+                (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists))
+            {
+                const exit_code = prepareAndRunCottontailInvocation(
+                    init,
+                    allocator,
+                    invocation,
+                    stderr,
+                ) catch |err| {
+                    try stderr.print("hutch: could not run Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
                     std.process.exit(1);
-                }
-                const exit_code = try runCottontailScript(
+                };
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+
+            if (packageScriptEligible(invocation.name)) {
+                const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                    try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
+                if (try runConfiguredScriptIfExists(
                     init,
                     allocator,
                     cottontail.executable,
                     invocation.name,
                     invocation.args,
-                );
+                    stderr,
+                )) |exit_code| {
+                    try stderr.flush();
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                }
+                if (try runPackageScriptIfExists(
+                    init,
+                    allocator,
+                    invocation.name,
+                    invocation.args,
+                    stderr,
+                    configured.silent,
+                    configured.force_runtime,
+                )) |exit_code| {
+                    try stderr.flush();
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                }
+            }
+            if (invocation.if_present) return;
+            if (resolved_entrypoint != null and
+                (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists) or
+                resolved_entrypoint == null and runtimeDiagnosticEligible(invocation.name))
+            {
+                const exit_code = prepareAndRunCottontailInvocation(
+                    init,
+                    allocator,
+                    invocation,
+                    stderr,
+                ) catch |err| {
+                    try stderr.print("hutch: could not run Cottontail: {s}\n", .{@errorName(err)});
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
             }
-            if (package_manager.run.commandExists(init, invocation.name)) {
+            const command_exists = if (invocation.explicit_run)
+                local_command_exists or package_manager.run.commandExists(init, invocation.name)
+            else
+                local_command_exists;
+            if (command_exists) {
                 const exit_code = try package_manager.run.runSingleCommand(
                     init,
                     invocation.name,
@@ -1281,13 +1695,15 @@ pub fn main(init: std.process.Init) !void {
         std.mem.eql(u8, command, "-p") or
         std.mem.eql(u8, command, "--print")) and args.len > 2)
     {
-        runtime_autoinstall.prepareSource(init, args[2], .auto, stderr) catch |err| {
-            if (err != error.AutoInstallFailed) {
-                try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
-            }
-            try stderr.flush();
-            std.process.exit(1);
-        };
+        if (!isDirectRuntimeFacade(init.environ_map)) {
+            runtime_autoinstall.prepareSource(init, args[2], .auto, stderr) catch |err| {
+                if (err != error.AutoInstallFailed) {
+                    try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+                }
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        }
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -1305,7 +1721,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (try printBinaryLockfile(init, command, stdout)) return;
 
-    if (pathExists(init.io, command)) {
+    const resolved_entrypoint = try runtime_entrypoint.resolve(init.io, allocator, command);
+    const local_command_exists = package_manager.run.localCommandExists(init, command);
+    if (resolved_entrypoint != null and
+        (resolvedEntrypointIsRunnable(resolved_entrypoint.?) or !local_command_exists))
+    {
         if (!try prepareRuntimeAutoInstall(init, command, .auto, stderr)) {
             std.process.exit(1);
         }
@@ -1319,40 +1739,42 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (findDashConfig(init, allocator)) |_| {
-        const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        if (try runConfiguredScriptIfExists(init, allocator, cottontail.executable, command, args[2..], stderr)) |exit_code| {
+    if (packageScriptEligible(command)) {
+        if (findDashConfig(init, allocator)) |_| {
+            const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
+                try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            if (try runConfiguredScriptIfExists(init, allocator, cottontail.executable, command, args[2..], stderr)) |exit_code| {
+                try stderr.flush();
+                if (exit_code != 0) std.process.exit(exit_code);
+                return;
+            }
+        } else |err| switch (err) {
+            error.DashConfigNotFound => {},
+            else => return err,
+        }
+    }
+
+    if (packageScriptEligible(command)) {
+        if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
             try stderr.flush();
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-    } else |err| switch (err) {
-        error.DashConfigNotFound => {},
-        else => return err,
     }
-
-    if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-    if (package_manager.run.commandExists(init, command)) {
+    if (local_command_exists) {
         const exit_code = try package_manager.run.runSingleCommand(
             init,
             command,
             args[2..],
-            true,
+            false,
         );
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
-    const path_like = std.mem.indexOfAny(u8, command, "/\\") != null or
-        std.fs.path.extension(command).len > 0;
-    if (!path_like) {
+    if (!runtimeDiagnosticEligible(command)) {
         try stderr.print("error: Script not found \"{s}\"\n", .{command});
         try stderr.flush();
         std.process.exit(1);
@@ -1378,6 +1800,8 @@ test "help text describes dash config scripts" {
 test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expect(isCottontailTestCommand("test"));
     try std.testing.expect(!isCottontailTestCommand("test:unit"));
+    try std.testing.expect(isReservedRuntimeCommand("exec"));
+    try std.testing.expect(!isReservedRuntimeCommand("execute"));
 
     const args = [_][:0]const u8{
         "hutch",
@@ -1392,6 +1816,65 @@ test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expectEqual(@as(usize, args.len - 1), forwarded.len);
     for (args[1..], forwarded) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "unconsumed leading runtime options preserve Hutch-owned run options" {
+    const leading = [_][:0]const u8{
+        "hutch",
+        "--ignore-dce-annotations",
+        "run",
+        "index.ts",
+    };
+    const after_run = [_][:0]const u8{
+        "hutch",
+        "run",
+        "--ignore-dce-annotations",
+        "index.ts",
+    };
+    const hutch_silent = [_][:0]const u8{
+        "hutch",
+        "run",
+        "--silent",
+        "dev",
+    };
+    const hutch_workspace = [_][:0]const u8{
+        "hutch",
+        "--filter",
+        "packages/*",
+        "run",
+        "test",
+    };
+
+    try std.testing.expect(hasUnconsumedLeadingRuntimeOption(&leading));
+    try std.testing.expect(hasUnconsumedLeadingRuntimeOption(&after_run));
+    try std.testing.expect(!hasUnconsumedLeadingRuntimeOption(&hutch_silent));
+    try std.testing.expect(!hasUnconsumedLeadingRuntimeOption(&hutch_workspace));
+}
+
+test "forwarded runtime options retain an auto-install input" {
+    const entrypoint_args = [_][:0]const u8{
+        "hutch",
+        "--conditions",
+        "development",
+        "--ignore-dce-annotations",
+        "run",
+        "index.ts",
+    };
+    switch (runtimeAutoInstallInput(&entrypoint_args).?) {
+        .entrypoint => |entrypoint| try std.testing.expectEqualStrings("index.ts", entrypoint),
+        .source => return error.ExpectedEntrypoint,
+    }
+
+    const source_args = [_][:0]const u8{
+        "hutch",
+        "--ignore-dce-annotations",
+        "--eval",
+        "import 'left-pad'",
+    };
+    switch (runtimeAutoInstallInput(&source_args).?) {
+        .entrypoint => return error.ExpectedSource,
+        .source => |source| try std.testing.expectEqualStrings("import 'left-pad'", source),
     }
 }
 

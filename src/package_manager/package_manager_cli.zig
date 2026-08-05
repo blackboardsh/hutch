@@ -41,6 +41,7 @@ const default_registry = "https://registry.npmjs.org/";
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_tarball_bytes = 512 * 1024 * 1024;
 const security_resolution_output_env = "COTTONTAIL_PM_SECURITY_RESOLUTION_OUTPUT";
+const bun_compat_output_env = "HUTCH_BUN_COMPAT";
 const global_link_copy_marker_name = ".cottontail-global-link-source";
 const global_link_copy_marker_prefix = "COTTONTAIL_GLOBAL_LINK_COPY_V1\n";
 const DirectoryLinkResult = enum { symbolic_link, copied };
@@ -48,6 +49,10 @@ const PathLinkStatus = enum { missing, not_link, symbolic_link, unknown };
 const all_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies", "peerDependencies" };
 const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies" };
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
+
+fn usesBunCompatOutput(init: std.process.Init) bool {
+    return init.environ_map.get(bun_compat_output_env) != null;
+}
 
 const Command = enum {
     audit,
@@ -583,13 +588,6 @@ fn commandUsesSecurityScanner(command: Command) bool {
     return switch (command) {
         .install, .add, .remove, .update, .link => true,
         .audit, .outdated, .unlink, .patch, .patch_commit, .publish, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => false,
-    };
-}
-
-fn packageManagerChildExitCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |code| @intCast(@min(code, 255)),
-        else => 1,
     };
 }
 
@@ -1181,7 +1179,11 @@ fn runPublish(
         };
     }
     if (!options.silent) {
-        try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+        if (usesBunCompatOutput(init)) {
+            try stdout.print("bun publish v{s} (cottontail)\n", .{bun_compat_version});
+        } else {
+            try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+        }
         try stdout.flush();
     }
 
@@ -1817,7 +1819,10 @@ fn runPmWhoami(
         return 0;
     }
     if (manager.registry_authorization == null) {
-        try stderr.writeAll("error: missing authentication (run `hutch x npm login`)\n");
+        try stderr.writeAll(if (usesBunCompatOutput(init))
+            "error: missing authentication (run `bunx npm login`)\n"
+        else
+            "error: missing authentication (run `hutch x npm login`)\n");
         try stderr.flush();
         return 1;
     }
@@ -2382,6 +2387,7 @@ const Manager = struct {
     resolution_only_records: std.StringHashMap(void),
     install_filter_active: bool = false,
     root_selected: bool = true,
+    root_lifecycle_output: bool = false,
     filter_resolution_only: bool = false,
     report_direct_installs: bool = false,
     refresh_direct_registry: bool = false,
@@ -2577,10 +2583,6 @@ const Manager = struct {
         const install_header_printed = !manager.options.silent and
             !internal_bunx_install and
             manager.options.command == .install;
-        if (install_header_printed) {
-            try manager.stdout.print("hutch install v{s}\n\n", .{version});
-            try manager.stdout.flush();
-        }
 
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
         const package_source = blk: {
@@ -2614,6 +2616,14 @@ const Manager = struct {
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
         try manager.warnDuplicateDependencies(&root);
+        if (install_header_printed) {
+            const root_scripts_follow = Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
+            try manager.stdout.print("hutch install v{s}\n{s}", .{
+                version,
+                if (root_scripts_follow) "" else "\n",
+            });
+            try manager.stdout.flush();
+        }
 
         if (manager.options.frozen_lockfile) {
             if (manager.options.command != .install) return error.FrozenLockfileChanged;
@@ -2648,6 +2658,21 @@ const Manager = struct {
         }
         try manager.validateLockfileWorkspaces();
         try manager.configureInstallFilters(&root);
+        manager.root_lifecycle_output = install_header_printed and
+            !manager.options.ignore_scripts and
+            !manager.options.dry_run and
+            !manager.options.lockfile_only and
+            manager.root_selected and
+            Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
+        if (install_header_printed) {
+            if (usesBunCompatOutput(manager.init_data)) {
+                try manager.stdout.print("bun install v{s} (cottontail)", .{bun_compat_version});
+            } else {
+                try manager.stdout.print("hutch install v{s}", .{version});
+            }
+            try manager.stdout.writeAll(if (manager.root_lifecycle_output) "\n" else "\n\n");
+            try manager.stdout.flush();
+        }
         if (security_resolution_output == null and
             manager.security_scanner != null and
             !manager.options.dry_run and
@@ -2665,19 +2690,24 @@ const Manager = struct {
             manager.options.command == .install and
             ((manager.lock_graph == null and hasAnyDependencies(&root)) or
                 manager.patch_policy_changed);
+        const report_patch_resolution = manager.patch_policy_changed or
+            manager.manifest_policy.?.patched_dependencies.count() > 0;
         if (!manager.options.silent and !internal_bunx_install) {
             if (!install_header_printed) {
+                const root_scripts_follow = manager.options.command == .install and
+                    Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, &root);
                 try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
                     @tagName(manager.options.command),
                     bun_compat_version,
                     version,
                     if (manager.options.command == .link or
                         manager.options.command == .remove or
-                        manager.options.command == .outdated) "" else "\n",
+                        manager.options.command == .outdated or
+                        root_scripts_follow) "" else "\n",
                 });
                 try manager.stdout.flush();
             }
-            if (report_resolution) {
+            if (report_resolution and report_patch_resolution) {
                 try manager.stderr.writeAll("Resolving dependencies\n");
             }
         }
@@ -2741,7 +2771,10 @@ const Manager = struct {
             .patch, .patch_commit, .publish => unreachable,
             .audit, .outdated, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
-        if (report_resolution) {
+        if (report_resolution and manager.deferred_install_error == null and
+            (report_patch_resolution or manager.network_task_count > 0))
+        {
+            if (!report_patch_resolution) try manager.stderr.writeAll("Resolving dependencies\n");
             try manager.stderr.print("Resolved, downloaded and extracted [{d}]\n", .{manager.network_task_count});
         }
 
@@ -2808,7 +2841,10 @@ const Manager = struct {
                     try manager.stderr.writeAll("No packages! Deleted empty lockfile\n");
                 }
             } else {
-                const save_bun_lockfile = manager.changed or !manager.hasExistingLockfile() or manager.lockfileNeedsRewrite();
+                const save_bun_lockfile = manager.options.lockfile_only or
+                    manager.changed or
+                    !manager.hasExistingLockfile() or
+                    manager.lockfileNeedsRewrite();
                 if (save_bun_lockfile or manager.options.save_yarn_lockfile) {
                     try manager.writeTextLockfile(&root, save_bun_lockfile);
                 }
@@ -2827,7 +2863,8 @@ const Manager = struct {
                 if (manager.shouldSaveTextLockfile()) "bun.lock" else "bun.lockb",
                 manager.lockfilePackageCount(),
             });
-        } else if (!manager.options.silent and !manager.options.no_summary and
+        } else if (manager.deferred_install_error == null and
+            !manager.options.silent and !manager.options.no_summary and
             !(manager.options.only_missing and manager.installed_count == 0))
         {
             const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
@@ -3358,7 +3395,7 @@ const Manager = struct {
         try manager.stdout.flush();
     }
 
-    fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) !void {
+    fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) anyerror!void {
         const payload_path = try manager.securityTempFile("json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
         const manifests_path = try manager.securityRegistryManifestsPath(payload_path);
@@ -3368,25 +3405,35 @@ const Manager = struct {
         defer resolver_environment.deinit();
         try resolver_environment.put(security_resolution_output_env, payload_path);
 
-        const original_args = manager.options.original_args;
-        const resolver_args = try manager.allocator.alloc([]const u8, original_args.len + 3);
-        for (original_args, 0..) |arg, index| resolver_args[index] = arg;
-        resolver_args[original_args.len] = "--dry-run";
-        resolver_args[original_args.len + 1] = "--silent";
-        resolver_args[original_args.len + 2] = "--no-summary";
+        var resolver_init = manager.init_data;
+        resolver_init.environ_map = &resolver_environment;
+        var resolver_options = manager.options;
+        resolver_options.dry_run = true;
+        resolver_options.no_save = true;
+        resolver_options.silent = true;
+        resolver_options.no_summary = true;
+        resolver_options.ignore_scripts = true;
 
-        var resolver = try std.process.spawn(manager.init_data.io, .{
-            .argv = resolver_args,
-            .cwd = .{ .path = manager.invocation_dir },
-            .environ_map = &resolver_environment,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .inherit,
-            .create_no_window = true,
-        });
-        defer resolver.kill(manager.init_data.io);
-        const resolver_result = try resolver.wait(manager.init_data.io);
-        if (packageManagerChildExitCode(resolver_result) != 0) return error.PackageManagerErrorReported;
+        // Keep resolution isolated from the install manager without forking a
+        // second Hutch process. Besides avoiding process startup, this ensures
+        // a timed-out caller cannot leave the resolver child running while the
+        // scanner command is being cancelled.
+        const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+            manager.init_data.io,
+            ".",
+            manager.allocator,
+        );
+        defer std.process.setCurrentPath(manager.init_data.io, previous_cwd) catch {};
+        try std.process.setCurrentPath(manager.init_data.io, manager.invocation_dir);
+
+        var resolver = Manager.init(
+            resolver_init,
+            resolver_options,
+            manager.stdout,
+            manager.stderr,
+        );
+        defer resolver.deinit();
+        if (try resolver.execute() != 0) return error.PackageManagerErrorReported;
         try manager.loadSecurityRegistryManifests(payload_path);
 
         const resolved_payload = try std.Io.Dir.cwd().readFileAlloc(
@@ -4166,7 +4213,7 @@ const Manager = struct {
         else
             !install_reuses_lockfile and
                 (manager.lock_graph == null or !node_modules_existed) and
-                (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
+                (manager.options.command == .add or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
             const cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
@@ -4887,13 +4934,24 @@ const Manager = struct {
             manager.binary_lockfile_trusted_dependency_hashes = converted.trusted_dependency_hashes;
             manager.binary_lockfile_lifecycle_scripts = converted.lifecycle_scripts;
             manager.lock_graph = try Lockfile.parseText(manager.allocator, converted.text);
-            manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
+            manager.lockfile_config_version = if ((BunLockfile.savedConfigVersion(bytes) orelse 0) == 0)
+                .v0
+            else
+                .v1;
             if (manager.lock_graph.?.config_version == null) manager.changed = true;
             manager.patch_policy_changed = !manager.manifest_policy.?.patchesMatchLockDocument(&manager.lock_graph.?.document);
-            if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
-                !manager.binaryLockfileLifecycleScriptsMatch("", root) or
-                !manager.manifest_policy.?.matchesLockDocumentWithoutTrustedDependencies(&manager.lock_graph.?.document) or
-                !manager.manifest_policy.?.matchesTrustedDependencyHashes(converted.trusted_dependency_hashes))
+            const root_matches = manager.lock_graph.?.rootMatchesPackageJSON(root);
+            const lifecycle_scripts_match = manager.binaryLockfileLifecycleScriptsMatch("", root);
+            const policy_matches = manager.manifest_policy.?.matchesLockDocumentWithoutTrustedDependencies(
+                &manager.lock_graph.?.document,
+            );
+            const trusted_dependencies_match = manager.manifest_policy.?.matchesTrustedDependencyHashes(
+                converted.trusted_dependency_hashes,
+            );
+            if (!root_matches or
+                !lifecycle_scripts_match or
+                !policy_matches or
+                !trusted_dependencies_match)
             {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
                 manager.changed = true;
@@ -6591,6 +6649,19 @@ const Manager = struct {
             if (optional_peer) continue;
             const edge_optional = optional;
             const edge_peer = std.mem.eql(u8, key, "peerDependencies");
+            const existing_direct_version = if (direct and
+                manager.node_linker == .hoisted and
+                manager.options.command == .install)
+            existing: {
+                const destination = try packageDestination(
+                    manager.allocator,
+                    manager.installParentDir(parent_dir),
+                    alias,
+                );
+                const installed = manager.readInstalledPackageJSON(destination) catch break :existing null;
+                const installed_version = jsonString(installed, "version") orelse break :existing null;
+                break :existing try manager.allocator.dupe(u8, installed_version);
+            } else null;
             const previous_suppressed_bin_edge = manager.suppressed_registry_bin_edge;
             defer manager.suppressed_registry_bin_edge = previous_suppressed_bin_edge;
             // COTTONTAIL-COMPAT: Bun replaces a required registry edge with its
@@ -6619,7 +6690,9 @@ const Manager = struct {
                 null;
             const should_report = manager.report_direct_installs and
                 std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
-                !manager.explicit_adds.contains(alias);
+                !manager.explicit_adds.contains(alias) and
+                !(existing_direct_version != null and
+                    std.mem.eql(u8, existing_direct_version.?, resolved_version));
             if (should_report and
                 (manager.options.dry_run or
                     manager.directDependencyChanged(alias, resolved_version, parent_dir) or
@@ -6648,6 +6721,7 @@ const Manager = struct {
 
     fn emitDirectInstallReports(manager: *Manager) !void {
         if (manager.direct_install_reports.items.len == 0) return;
+        if (manager.root_lifecycle_output) try manager.stdout.writeByte('\n');
         std.sort.pdq(DirectInstallReport, manager.direct_install_reports.items, {}, struct {
             fn lessThan(_: void, left: DirectInstallReport, right: DirectInstallReport) bool {
                 if (left.section_priority != right.section_priority) return left.section_priority < right.section_priority;
@@ -6661,12 +6735,14 @@ const Manager = struct {
                 try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
             } else {
                 try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
-                if (report.latest_version) |latest| {
-                    const record = manager.directRecord(report.alias);
-                    const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
-                    const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
-                    if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
-                        try manager.stdout.print(" (v{s} available)", .{latest});
+                if (!usesBunCompatOutput(manager.init_data)) {
+                    if (report.latest_version) |latest| {
+                        const record = manager.directRecord(report.alias);
+                        const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
+                        const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
+                        if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
+                            try manager.stdout.print(" (v{s} available)", .{latest});
+                        }
                     }
                 }
             }
@@ -6676,7 +6752,8 @@ const Manager = struct {
 
     fn installSummarySeparator(manager: *const Manager) []const u8 {
         if (manager.options.command == .install and
-            manager.direct_install_reports.items.len == 0) return "";
+            manager.direct_install_reports.items.len == 0 and
+            !manager.root_lifecycle_output) return "";
         return "\n";
     }
 
@@ -6814,6 +6891,10 @@ const Manager = struct {
             // already fetched by scanner preflight.
             break :blk !manager.pathExists(locked.destination);
         };
+        const refresh_scanner_resolution_add = manager.isSecurityResolution() and
+            manager.options.command == .add and
+            direct and
+            manager.explicit_adds.contains(alias);
         const refresh_direct_registry = direct and
             !workspace_package and
             !isGitSpec(resolution_spec) and
@@ -6821,6 +6902,7 @@ const Manager = struct {
             !isLocalSpec(resolution_spec) and
             (manager.refresh_direct_registry or
                 refresh_unscanned_add or
+                refresh_scanner_resolution_add or
                 refresh_missing_scanned_lock_root);
         const refresh_direct_source = direct and manager.refresh_direct_source and
             (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
@@ -6992,7 +7074,8 @@ const Manager = struct {
         const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
         const selected_registry_spec = (try manager.selectedUpdateVersion(parent_dir, alias)) orelse if (!direct)
             if (manager.root_versions.get(alias)) |root_version|
-                if (!manager.rootVersionReservedForWorkspace(alias) and
+                if (!isRegistryDistTag(registry_spec) and
+                    !manager.rootVersionReservedForWorkspace(alias) and
                     semverSatisfies(manager.allocator, registry_spec, root_version)) root_version else registry_spec
             else
                 registry_spec
@@ -9316,7 +9399,8 @@ const Manager = struct {
         const metadata = try manager.allocator.create(Value);
         metadata.* = .{ .object = .empty };
         for (identity.object.keys(), identity.object.values()) |field, value| {
-            if (containsString(&all_dependency_sections, field)) continue;
+            if (containsString(&all_dependency_sections, field) and
+                !std.mem.eql(u8, field, "peerDependencies")) continue;
             try metadata.object.put(
                 manager.allocator,
                 try manager.allocator.dupe(u8, field),
@@ -9390,17 +9474,23 @@ const Manager = struct {
         if (dependencies.items.len > 0) {
             var dependency_object: Value = .{ .object = .empty };
             for (dependencies.items) |dependency| {
+                // COTTONTAIL-COMPAT: an isolated peer link records context;
+                // it does not turn a peer-only declaration into ownership.
+                if (peerDependencySpec(identity, dependency.alias) != null and
+                    !packageHasRuntimeDependency(identity, dependency.alias)) continue;
                 try dependency_object.object.put(
                     manager.allocator,
                     dependency.alias,
                     .{ .string = dependency.spec },
                 );
             }
-            try metadata.object.put(
-                manager.allocator,
-                try manager.allocator.dupe(u8, "dependencies"),
-                dependency_object,
-            );
+            if (dependency_object.object.count() > 0) {
+                try metadata.object.put(
+                    manager.allocator,
+                    try manager.allocator.dupe(u8, "dependencies"),
+                    dependency_object,
+                );
+            }
         }
         return metadata;
     }
@@ -9759,6 +9849,7 @@ const Manager = struct {
                         installed_path,
                         identity,
                     );
+                    const peer_context = try manager.peerContextForPackage(metadata, parent_dir, true);
 
                     const logical_key = try manager.dependencyLockKey(parent_dir, alias);
                     const package_parent = std.fs.path.dirname(installed_path) orelse return null;
@@ -9786,6 +9877,7 @@ const Manager = struct {
                         .version = installed_version,
                         .resolution = registry_spec,
                         .metadata = metadata,
+                        .peer_hash = peer_context.hash,
                         .install_dir = installed_path,
                     });
                     try manager.rememberPackageMetadata(installed_path, metadata);
@@ -10391,7 +10483,16 @@ const Manager = struct {
                 }
                 const bytes = fetch.bytes orelse continue;
                 defer std.heap.smp_allocator.free(bytes);
-                const parsed = (try manager.parseRegistryManifest(bytes)) orelse continue;
+                const parsed = (try manager.parseRegistryManifest(bytes)) orelse {
+                    // A successful HTTP response with an invalid npm manifest is
+                    // terminal. Retrying it in the synchronous resolver duplicates
+                    // the request and cannot produce a different document.
+                    try manager.registry_manifest_failures.put(
+                        try manager.allocator.dupe(u8, fetch.name),
+                        {},
+                    );
+                    continue;
+                };
                 _ = manager.registry_manifest_failures.remove(fetch.name);
                 try manager.registry_manifests.put(try manager.allocator.dupe(u8, fetch.name), parsed);
                 if (fetch.cache_path) |path| {
@@ -10845,6 +10946,7 @@ const Manager = struct {
 
     fn unlinkBin(manager: *Manager, bin_dir: []const u8, name: []const u8) void {
         const destination = std.fs.path.join(manager.allocator, &.{ bin_dir, name }) catch return;
+        _ = manager.linked_bins.remove(destination);
         deletePath(manager.init_data.io, destination);
         if (builtin.os.tag == .windows) {
             const command_path = std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination}) catch return;
@@ -10949,7 +11051,12 @@ const Manager = struct {
                 candidate.install_dir
             else
                 try packageDestination(manager.allocator, manager.root_dir, candidate.alias);
-            try manager.linkBins(main_record.alias, candidate_dir, metadata, true, manager.root_dir);
+            const bin_dir = if (manager.node_linker == .isolated)
+                try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bin" })
+            else
+                try manager.binDirectoryForPackage(main_record.install_dir);
+            try manager.unlinkBinsInDirectory(main_record.alias, metadata, bin_dir);
+            try manager.linkBinsInDirectory(main_record.alias, candidate_dir, metadata, false, bin_dir);
             return;
         }
     }
@@ -12098,11 +12205,17 @@ const Manager = struct {
                 if (section != .object or section.object.count() == 0) continue;
                 try writer.print("\n      \"{s}\": {{", .{section_name});
                 const keys = try manager.allocator.dupe([]const u8, section.object.keys());
-                std.mem.sort([]const u8, keys, {}, struct {
-                    fn lessThan(_: void, left: []const u8, right: []const u8) bool {
-                        return std.mem.order(u8, left, right) == .lt;
-                    }
-                }.lessThan);
+                const preserve_manifest_order = if (manager.lock_graph) |*graph|
+                    graph.provenance == .yarn
+                else
+                    false;
+                if (!preserve_manifest_order) {
+                    std.mem.sort([]const u8, keys, {}, struct {
+                        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                            return std.mem.order(u8, left, right) == .lt;
+                        }
+                    }.lessThan);
+                }
                 for (keys) |key| {
                     const value = section.object.get(key) orelse continue;
                     if (value != .string) continue;

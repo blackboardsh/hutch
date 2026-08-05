@@ -10,6 +10,9 @@ The canonical ownership index is
 Bun v1.3.10's 1,445 runnable files to exactly one owner, so repository-local
 copies are never double-counted.
 
+Hutch owns and passes 100 files with zero expected failures. Cottontail owns
+the remaining 1,345 runtime files.
+
 ## Commands
 
 Validate ownership and copied-file accounting without running upstream tests:
@@ -41,6 +44,21 @@ node scripts/run-bun-package-manager-tests.js \
 The complete suite requires an explicit `--all`. Override binaries with
 `HUTCH_COMPAT_BINARY` and `HUTCH_COMPAT_COTTONTAIL` when they are not in the
 default local build locations.
+
+## Branch CI
+
+Pushes to `compat/**` branches and manual dispatches run the complete
+Hutch-owned corpus on macOS. The workflow builds Hutch from the branch and
+builds Cottontail from the full Git commit recorded in
+[`upstream/cottontail.json`](./upstream/cottontail.json). It does not resolve a
+moving branch, channel, or release alias, and it never publishes artifacts.
+
+The pinned Cottontail commit must be reachable from the public
+`blackboardsh/cottontail` repository before the Hutch compatibility workflow
+runs. When a Hutch test depends on unreleased Cottontail work, push the
+Cottontail `compat/**` branch first, then update the full commit in the Hutch
+manifest. Keep the pin on a Cottontail revision targeting the same Bun fork
+point recorded by Hutch's copied suite.
 
 ## Refreshing
 

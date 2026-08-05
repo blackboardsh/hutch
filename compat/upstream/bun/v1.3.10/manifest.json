@@ -6,20 +6,19 @@
   "tag": "bun-v1.3.10",
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "source": "https://github.com/oven-sh/bun",
-  "copiedAt": "2026-07-30",
+  "copiedAt": "2026-08-04",
   "canonicalRunnableFiles": 1445,
-  "ownedRunnableFiles": 102,
-  "copiedFiles": 833,
+  "ownedRunnableFiles": 100,
+  "copiedFiles": 827,
   "statusCounts": {
-    "expected-failure": 19,
-    "enabled": 83
+    "enabled": 100
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
     {
       "path": "test/cli/create/create-jsx.test.ts",
       "sha256": "6e0c65dd3d9a43c0df275414b502fe227b7e32720639b2ccc9a0759b9e3b41c1",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/init/init.test.ts",
@@ -44,7 +43,7 @@
     {
       "path": "test/cli/install/bun-add.test.ts",
       "sha256": "24b53d5d638168ddeca857eb06de3233c2d6444322950f9d946b4c533cafde4d",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-audit.test.ts",
@@ -69,22 +68,22 @@
     {
       "path": "test/cli/install/bun-install-lifecycle-scripts.test.ts",
       "sha256": "59c834409818adbf4ae0fa72dce658579b9516781bf6972580f5c3a48c3554dc",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-native-binlink.test.ts",
       "sha256": "4ca05881cb8116a5670fdfb8940558e0c2d1c79c4be352dd484767bafe9d07dd",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-patch.test.ts",
       "sha256": "48d7d52a5d994f59948442eba7ab179dde35457ab00d51199f8538f6a8bb0d91",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-pathname-trailing-slash.test.ts",
       "sha256": "22000dc3bb9e6bf327dca837e18369c53f6c1fe95ef8eab980e533f92c4a0d5e",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-proxy.test.ts",
@@ -94,7 +93,7 @@
     {
       "path": "test/cli/install/bun-install-registry.test.ts",
       "sha256": "3c33d45f1c55e37aed86e93551e5117232cd48a169d8fa8f7579a89833381dce",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-install-retry.test.ts",
@@ -114,17 +113,17 @@
     {
       "path": "test/cli/install/bun-install.test.ts",
       "sha256": "2cb075c777c1d883b1f88ca4c2e9566dd36a4cdf53e67bcb5b09949970821ccf",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-link.test.ts",
       "sha256": "8bd8e06216d5d0abbc0d0a3d0106ee17dddf680049aab97ec0300eae3ee65b02",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-lock.test.ts",
       "sha256": "c944cf19572075dce734a6755d7cd7290d6b4d47ea30bd46c355b9072f2c1329",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-lockb.test.ts",
@@ -169,12 +168,12 @@
     {
       "path": "test/cli/install/bun-publish.test.ts",
       "sha256": "10989bb0405101ae3744894fd75258b8f77067471f9853d88f6d12074de75a14",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-remove.test.ts",
       "sha256": "24ce9e3ec7e0b2834c2ff77c684d515857dcf6fc794477b29ac8ce94753498f9",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-run-bunfig.test.ts",
@@ -189,7 +188,7 @@
     {
       "path": "test/cli/install/bun-run.test.ts",
       "sha256": "b9bc4f20e24759f76ddc44becbc745be06e603665052fba587a583297d81ef37",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts",
@@ -199,7 +198,7 @@
     {
       "path": "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts",
       "sha256": "20bbf197930ceb962ab50121b32571c451d2f504ebf599e9871bcebeca1a6ec2",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/bun-security-scanner-workspaces.test.ts",
@@ -279,7 +278,7 @@
     {
       "path": "test/cli/install/isolated-install.test.ts",
       "sha256": "f3cd3c1f6e6b9f527b0a9f2dd1a1c06fc49e56d683c950a094235e797ef63b54",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/lockfile-only.test.ts",
@@ -289,7 +288,7 @@
     {
       "path": "test/cli/install/migrate-bun-lockb-v2.test.ts",
       "sha256": "805ae063d6968690fddb8b3610de7966906dcfa34166b150d9378705ef8c8176",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/migration/complex-workspace.test.ts",
@@ -324,12 +323,12 @@
     {
       "path": "test/cli/install/migration/yarn-lock-migration.test.ts",
       "sha256": "cebbe4b579aff88a0731b6830ba102524c9999ee397f886a0848c1f59c7ff849",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/minimum-release-age.test.ts",
       "sha256": "7480e40af6d5713ea7e05ce2a5e35f1139600b791ad47ef968ba0787473ea0fb",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/cli/install/npmrc.test.ts",
@@ -349,11 +348,6 @@
     {
       "path": "test/cli/install/redacted-config-logs.test.ts",
       "sha256": "0f524f7e53db8ab04da7ddf8e068b3f2282117bb608e27e49309d8234e80b38b",
-      "status": "enabled"
-    },
-    {
-      "path": "test/cli/install/semver.test.ts",
-      "sha256": "e6d6e054406dd28c51d3349d3b7a859db7501930d297ebb83f1d2ffd95a66008",
       "status": "enabled"
     },
     {
@@ -399,11 +393,6 @@
     {
       "path": "test/cli/run/run_command.test.ts",
       "sha256": "65f3d93d45a47616f7262a426da240bc9200f93cca78cb49219189284f401b4b",
-      "status": "enabled"
-    },
-    {
-      "path": "test/cli/run/shell-keepalive.test.ts",
-      "sha256": "aa6980fec954b9a8a5ed36e85218332af6d39dc886eb52cf1e98df55eda6d9b2",
       "status": "enabled"
     },
     {
@@ -519,7 +508,7 @@
     {
       "path": "test/regression/issue/patch-bounds-check.test.ts",
       "sha256": "277c3d768cbe38277c4c25eca7ccd141dcf873abeeedfe03e81e07ee6f494c5b",
-      "status": "expected-failure"
+      "status": "enabled"
     },
     {
       "path": "test/regression/issue/update-interactive-formatting.test.ts",
@@ -542,9 +531,6 @@
     "test/cli/run/run-autoinstall.test.ts",
     "test/cli/run/run-shell.test.ts",
     "test/cli/run/run_command.test.ts",
-    "test/cli/run/shell-keepalive-fixture-1.js",
-    "test/cli/run/shell-keepalive-fixture-2.js",
-    "test/cli/run/shell-keepalive.test.ts",
     "test/cli/run/workspaces.test.ts",
     "test/cli/update_interactive_formatting.test.ts",
     "test/cli/update_interactive_install.test.ts",
@@ -600,7 +586,7 @@
       "reason": "Bun.build remains physically implemented by Cottontail in this cycle."
     },
     {
-      "pattern": "test/cli/run/** (except the eight owned files)",
+      "pattern": "test/cli/run/** (except the seven owned files)",
       "owner": "cottontail-runtime",
       "reason": "The remaining files primarily assert runtime loading, transforms, profiling, diagnostics, or process behavior."
     }

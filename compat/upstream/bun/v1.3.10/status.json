@@ -3,8 +3,8 @@
   "defaultStatus": "not-enabled",
   "tests": {
     "test/cli/create/create-jsx.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the two React SPA Tailwind build cases fail.",
+      "status": "enabled",
+      "reason": "All four runnable cases pass against Cottontail's ESM lexical-path implementation; the eight cases marked TODO by upstream remain TODO (12 cases, 0 failures).",
       "env": {
         "CI": "1"
       },
@@ -32,8 +32,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-add.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: adding a dependency alongside workspaces fails; the other copied add cases pass.",
+      "status": "enabled",
+      "reason": "Dependency addition, including workspace cases, passes the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager",
       "timeoutMs": 120000
     },
@@ -63,8 +63,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: three lifecycle cases remain around trust reinstall and inherited root-script stdio.",
+      "status": "enabled",
+      "reason": "All 52 lifecycle cases pass, including trust transitions, deleted installations, inherited root-script stdio, script ordering, node-gyp fallback, and concurrency.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -76,19 +76,19 @@
       "timeoutMs": 300000
     },
     "test/cli/install/bun-install-native-binlink.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: platform-specific native bin redirection fails for hoisted and isolated linkers.",
+      "status": "enabled",
+      "reason": "Platform-specific native dependency bins replace the generic package bin across fresh, locked, no-op, and deleted-bin reinstalls for both hoisted and isolated linkers (2 copied cases, 24 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-patch.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the failed patch-application retry case does not yet match Bun.",
+      "status": "enabled",
+      "reason": "Patch creation, application, mutation, removal, failure retry, workspaces, scoped packages, and isolated-linker reinstalls pass the complete copied file (17 cases, 4 snapshots, 63 assertions).",
       "owner": "hutch-package-manager",
       "timeoutMs": 180000
     },
     "test/cli/install/bun-install-pathname-trailing-slash.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: custom registry URL trailing-slash normalization differs from Bun.",
+      "status": "enabled",
+      "reason": "Custom registry URL normalization issues exactly one manifest request and preserves a single path separator (1 copied case, 3 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-proxy.test.ts": {
@@ -97,8 +97,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install-registry.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: one binary-shape case serializes differently in the text lockfile; the remaining active registry cases pass.",
+      "status": "enabled",
+      "reason": "The complete registry, cache, CA, auth, lockfile, optional dependency, bin, semver, prerelease, hoisting, migration, and outdated matrix passes unchanged (220 active cases, 5 upstream TODOs, 18 snapshots, 5,402 assertions).",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -129,8 +129,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-install.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: 170 active cases pass; multi-dependency bin-linking output differs from Bun.",
+      "status": "enabled",
+      "reason": "All 170 active install cases, including multi-dependency bin linking, pass on current Hutch main.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -140,13 +140,13 @@
       "timeoutMs": 300000
     },
     "test/cli/install/bun-link.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: workspace package linking and dependency linking still differ from Bun.",
+      "status": "enabled",
+      "reason": "Workspace and dependency linking pass the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-lock.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: optional-peer conversion, bundled-package identity, and canonical formatting remain incomplete.",
+      "status": "enabled",
+      "reason": "Binary lock conversion, config-version preservation, bundled-package identity, lifecycle output, and canonical formatting pass all 9 copied Bun v1.3.10 cases and 14 snapshots.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-lockb.test.ts": {
@@ -201,8 +201,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-publish.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: npm command and lifecycle-event environment values differ during publish.",
+      "status": "enabled",
+      "reason": "Registry publishing, OTP flows, tarballs, scoped packages, bins, workspaces, lifecycle ordering and environment, access, tags, dry runs, and republish handling pass the complete copied file (31 cases, 203 assertions).",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
@@ -214,8 +214,8 @@
       "timeoutMs": 180000
     },
     "test/cli/install/bun-remove.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: removing an existing package does not yet match Bun's complete behavior.",
+      "status": "enabled",
+      "reason": "Package removal passes the complete copied Bun v1.3.10 file on current Hutch main.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/bun-run-bunfig.test.ts": {
@@ -235,8 +235,8 @@
       "serial": true
     },
     "test/cli/install/bun-run.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: 290 of 291 cases pass; Cottontail's transpiler does not yet honor the tested DCE annotation.",
+      "status": "enabled",
+      "reason": "All 291 active copied Bun run cases pass with 416 assertions across entrypoint and script priority, directory and monorepo mains, auto-install, nested package-manager aliases, cwd handling, arguments, and process diagnostics.",
       "owner": "hutch-package-manager",
       "timeoutMs": 300000
     },
@@ -254,8 +254,8 @@
       }
     },
     "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the upstream CI sampler still finds warning and TTY mismatches when scanning installs without an existing node_modules tree.",
+      "status": "enabled",
+      "reason": "The upstream CI matrix passes without an existing node_modules tree, including scanner installation, warning/fatal cancellation, TTY decisions, and preflight request boundaries.",
       "owner": "hutch-package-manager",
       "args": [
         "--timeout",
@@ -376,8 +376,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/isolated-install.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: five isolated-linker optional-peer resolution cases remain.",
+      "status": "enabled",
+      "reason": "Isolated installs preserve Bun store layouts, workspace and cyclic links, peer-context hashes, optional and auto-installed peers, lockless installed-tree reconstruction, backends, pruning, aliases, and lifecycle scripts across all 28 copied cases.",
       "owner": "hutch-package-manager",
       "args": [
         "--timeout",
@@ -391,8 +391,8 @@
       "owner": "hutch-package-manager"
     },
     "test/cli/install/migrate-bun-lockb-v2.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: the most-features Bun v2 binary lockfile migration case remains incomplete.",
+      "status": "enabled",
+      "reason": "Direct v2-to-v3 binary migration preserves the complete simple and feature-rich lockfile graphs across both copied Bun v1.3.10 snapshots.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/migration/complex-workspace.test.ts": {
@@ -429,14 +429,14 @@
       "timeoutMs": 30000
     },
     "test/cli/install/migration/yarn-lock-migration.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: complex Yarn v1 migration and OS/CPU-constrained package migration remain incomplete.",
+      "status": "enabled",
+      "reason": "Yarn v1 migration preserves manifest order, aliases, resolutions, workspaces, build tags, platform constraints, and all six copied fixture graphs across 16 cases and 14 snapshots.",
       "owner": "hutch-package-manager",
       "timeoutMs": 120000
     },
     "test/cli/install/minimum-release-age.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: monorepo minimum-release-age installation differs under both linker modes.",
+      "status": "enabled",
+      "reason": "Minimum release age filters registry versions, preserves transitive and special dependencies, handles dist-tags and stability windows, integrates with scanners, and resolves multi-version workspaces under both linker modes across all 48 copied cases.",
       "owner": "hutch-package-manager",
       "args": [
         "--max-concurrency=1"
@@ -462,11 +462,6 @@
     "test/cli/install/redacted-config-logs.test.ts": {
       "status": "enabled",
       "reason": "Malformed bunfig.toml and .npmrc credentials use Bun's redacting diagnostics without exposing URL passwords, UUIDs, npm tokens, or invalid _auth values (11 bun:test cases, 44 assertions).",
-      "owner": "hutch-package-manager"
-    },
-    "test/cli/install/semver.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.semver order and satisfies use the vendored Bun Zig parser and pass all 22 copied upstream cases (1,762 assertions), including loose versions, ranges, prereleases, buffers, and error behavior.",
       "owner": "hutch-package-manager"
     },
     "test/cli/install/shebang-normalize.test.ts": {
@@ -516,11 +511,6 @@
     "test/cli/run/run_command.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 3 assertions).",
-      "owner": "hutch-package-manager"
-    },
-    "test/cli/run/shell-keepalive.test.ts": {
-      "status": "enabled",
-      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/cli/run/workspaces.test.ts": {
@@ -641,8 +631,8 @@
       "owner": "hutch-package-manager"
     },
     "test/regression/issue/patch-bounds-check.test.ts": {
-      "status": "expected-failure",
-      "reason": "Pre-split parity gap: two malformed patch bounds cases do not yet produce Bun-compatible behavior.",
+      "status": "enabled",
+      "reason": "Malformed addition and deletion bounds fail gracefully with Bun-compatible diagnostics, while a valid patch applies successfully (3 copied cases, 7 snapshots, 10 assertions).",
       "owner": "hutch-package-manager"
     },
     "test/regression/issue/update-interactive-formatting.test.ts": {
