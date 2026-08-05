@@ -313,11 +313,21 @@ fn zigArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8
         "aarch64"
     else
         "x86_64";
-    return std.fmt.allocPrint(
-        allocator,
-        "zig-{s}-{s}-{s}.{s}",
-        .{ os, arch, version, if (builtin.os.tag == .windows) "zip" else "tar.xz" },
-    );
+    const ext = if (builtin.os.tag == .windows) "zip" else "tar.xz";
+    // ziglang.org flipped archive naming from zig-<os>-<arch>-<version> to
+    // zig-<arch>-<os>-<version> starting with 0.14.1 (verified: 0.14.0 only
+    // serves the old form, 0.14.1 only the new form). Older electrobun
+    // packages still pin 0.13.0, so both forms must resolve.
+    if (zigLegacyArchiveNaming(version)) {
+        return std.fmt.allocPrint(allocator, "zig-{s}-{s}-{s}.{s}", .{ os, arch, version, ext });
+    }
+    return std.fmt.allocPrint(allocator, "zig-{s}-{s}-{s}.{s}", .{ arch, os, version, ext });
+}
+
+fn zigLegacyArchiveNaming(version: []const u8) bool {
+    const parsed = std.SemanticVersion.parse(version) catch return false;
+    const flip = std.SemanticVersion{ .major = 0, .minor = 14, .patch = 1 };
+    return parsed.order(flip) == .lt;
 }
 
 fn odinArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -494,4 +504,32 @@ test "toolchain archive URLs follow upstream release naming" {
     defer std.testing.allocator.free(archive.url);
     defer std.testing.allocator.free(archive.filename);
     try std.testing.expect(std.mem.indexOf(u8, archive.url, "/dev-2026-07a/odin-") != null);
+}
+
+test "zig archive naming flips at 0.14.1" {
+    // Old pins (<= 0.14.0) use zig-<os>-<arch>-<version>; 0.14.1+ uses
+    // zig-<arch>-<os>-<version>. Both must resolve so older electrobun
+    // packages keep working.
+    try std.testing.expect(zigLegacyArchiveNaming("0.13.0"));
+    try std.testing.expect(zigLegacyArchiveNaming("0.14.0"));
+    try std.testing.expect(!zigLegacyArchiveNaming("0.14.1"));
+    try std.testing.expect(!zigLegacyArchiveNaming("0.16.0"));
+
+    const legacy = try zigArchiveName(std.testing.allocator, "0.13.0");
+    defer std.testing.allocator.free(legacy);
+    const modern = try zigArchiveName(std.testing.allocator, "0.16.0");
+    defer std.testing.allocator.free(modern);
+    const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
+        "aarch64"
+    else
+        "x86_64";
+    try std.testing.expect(std.mem.startsWith(u8, legacy, "zig-") and
+        std.mem.indexOf(u8, legacy, arch) != null);
+    try std.testing.expect(std.mem.indexOf(u8, modern, "-0.16.0.") != null);
+    // Modern names lead with the arch segment.
+    var prefix_buf: [32]u8 = undefined;
+    const modern_prefix = try std.fmt.bufPrint(&prefix_buf, "zig-{s}-", .{arch});
+    try std.testing.expect(std.mem.startsWith(u8, modern, modern_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, legacy, modern_prefix) or
+        builtin.os.tag == .windows);
 }
