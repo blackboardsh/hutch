@@ -53,6 +53,8 @@ if (!existsSync(join(checkoutRoot, ".git"))) {
   mkdirSync(checkoutRoot, { recursive: true });
   run("git", ["init", "--quiet"], checkoutRoot);
   run("git", ["remote", "add", "origin", manifest.repository], checkoutRoot);
+  // The node corpus contains fixture paths beyond Windows' MAX_PATH.
+  run("git", ["config", "core.longpaths", "true"], checkoutRoot);
   run("git", ["fetch", "--quiet", "--depth", "1", "origin", manifest.commit], checkoutRoot);
   run("git", ["checkout", "--quiet", "--detach", "FETCH_HEAD"], checkoutRoot);
 }
