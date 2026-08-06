@@ -1,0 +1,3 @@
+# The copied upstream corpus is hash-checked against its manifest; CRLF
+# checkouts would break the hashes (and snapshot text) on Windows.
+compat/upstream/** text eol=lf
