@@ -200,6 +200,31 @@ pub fn upgradeBinaryFormat(
     return call(init, allocator, "upgrade-binary", binary, &.{});
 }
 
+/// Returns a copy of `binary` whose config version trailer records `version`.
+/// Bun preserves the source lockfile's config version across a binary format
+/// upgrade: a v2 lockfile predates the trailer and stays on v0 semantics
+/// (hoisted linker default), it is not promoted to v1. When the trailer is
+/// absent it is appended so the version survives the next load.
+pub fn withSavedConfigVersion(
+    allocator: std.mem.Allocator,
+    binary: []const u8,
+    version: u64,
+) ![]u8 {
+    if (std.mem.lastIndexOf(u8, binary, config_version_tag)) |tag_index| {
+        const value_start = tag_index + config_version_tag.len;
+        if (binary.len - value_start >= @sizeOf(u64)) {
+            const copy = try allocator.dupe(u8, binary);
+            std.mem.writeInt(u64, copy[value_start..][0..@sizeOf(u64)], version, .little);
+            return copy;
+        }
+    }
+    const copy = try allocator.alloc(u8, binary.len + config_version_tag.len + @sizeOf(u64));
+    @memcpy(copy[0..binary.len], binary);
+    @memcpy(copy[binary.len..][0..config_version_tag.len], config_version_tag);
+    std.mem.writeInt(u64, copy[binary.len + config_version_tag.len ..][0..@sizeOf(u64)], version, .little);
+    return copy;
+}
+
 pub fn updateBinaryTrustedDependencies(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -318,4 +343,23 @@ test "Bun binary config version trailer preserves omitted v0 semantics" {
     const v1 = binary_header ++ "payload" ++ config_version_tag ++ "\x01\x00\x00\x00\x00\x00\x00\x00";
     try std.testing.expectEqual(@as(?u64, 0), savedConfigVersion(v0));
     try std.testing.expectEqual(@as(?u64, 1), savedConfigVersion(v1));
+}
+
+test "withSavedConfigVersion rewrites an existing trailer in place" {
+    const allocator = std.testing.allocator;
+    const v1 = binary_header ++ "payload" ++ config_version_tag ++ "\x01\x00\x00\x00\x00\x00\x00\x00" ++ "trailing-metadata";
+    const rewritten = try withSavedConfigVersion(allocator, v1, 0);
+    defer allocator.free(rewritten);
+    try std.testing.expectEqual(v1.len, rewritten.len);
+    try std.testing.expectEqual(@as(?u64, 0), savedConfigVersion(rewritten));
+    try std.testing.expect(std.mem.endsWith(u8, rewritten, "trailing-metadata"));
+}
+
+test "withSavedConfigVersion appends a missing trailer" {
+    const allocator = std.testing.allocator;
+    const bare = binary_header ++ "payload";
+    const rewritten = try withSavedConfigVersion(allocator, bare, 1);
+    defer allocator.free(rewritten);
+    try std.testing.expectEqual(@as(?u64, 1), savedConfigVersion(rewritten));
+    try std.testing.expect(std.mem.startsWith(u8, rewritten, bare));
 }

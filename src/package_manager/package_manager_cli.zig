@@ -12160,7 +12160,18 @@ const Manager = struct {
                 .limited(256 * 1024 * 1024),
             );
             const upgraded = try BunLockfile.upgradeBinaryFormat(manager.init_data, manager.allocator, previous);
-            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = upgraded });
+            defer manager.allocator.free(upgraded);
+            // The runtime's format upgrade always stamps the current config
+            // version, but Bun keeps the source lockfile's version: a v2
+            // lockfile has no trailer and must retain v0 semantics (notably
+            // the hoisted linker default) after migration.
+            const migrated = try BunLockfile.withSavedConfigVersion(
+                manager.allocator,
+                upgraded,
+                BunLockfile.savedConfigVersion(previous) orelse 0,
+            );
+            defer manager.allocator.free(migrated);
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = migrated });
             if (builtin.os.tag != .windows) {
                 const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
                 try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
