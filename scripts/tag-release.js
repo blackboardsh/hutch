@@ -17,7 +17,7 @@ const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repositoryRoot = hutchRoot;
 const packageJsonPath = join(hutchRoot, "package.json");
 const versionZigPath = join(hutchRoot, "src", "version.zig");
-const dashConfigPath = join(hutchRoot, "dash.config.ts");
+const dashConfigPath = join(hutchRoot, "hutch.config.ts");
 const tagPrefix = "v";
 
 function fail(message) {
@@ -135,7 +135,7 @@ git([
   "add",
   "package.json",
   "src/version.zig",
-  "dash.config.ts",
+  "hutch.config.ts",
 ], { inherit: true });
 git(["commit", "-m", tag], { inherit: true });
 git(["tag", "--annotate", tag, "--message", tag], { inherit: true });

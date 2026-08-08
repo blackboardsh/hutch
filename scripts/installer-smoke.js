@@ -323,7 +323,7 @@ try {
   const pinHome = join(temporary, "pin-home");
   mkdirSync(pinProject, { recursive: true });
   writeFileSync(
-    join(pinProject, "dash.config.ts"),
+    join(pinProject, "hutch.config.ts"),
     `// @dash cli=build:${metadata.revision}\nexport default {};\n`,
   );
   const builtLauncher = join(
