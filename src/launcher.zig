@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
         return exitWithError(init.io, "invalid active release channel", err);
     };
     const pragma = bootstrap_pragma.discover(init, allocator, command_args) catch |err| {
-        return exitWithError(init.io, "invalid // @dash pragma", err);
+        return exitWithError(init.io, "invalid // @hutch pragma", err);
     };
     const selector = pragma.cli orelse version_selector.parse(channel) catch unreachable;
 

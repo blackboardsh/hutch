@@ -39,7 +39,7 @@ Hutch directly owns and implements:
   scripts, package caches, registry access, and package extraction.
 - `pm`, `audit`, `patch`, `pack`, `publish`, `bunx`, `init`, `create`, and
   package-manager upgrade behavior.
-- Discovery and orchestration of `hutch.config.ts` (legacy `dash.config.ts`) and `package.json` scripts.
+- Discovery and orchestration of `hutch.config.ts` and `package.json` scripts.
 - Bun-compatible launch-time auto-install before a project command, including
   the `auto`, `fallback`, `force`, and `disable` modes.
 - Build, test, development-server, watch, hot-reload, and Electrobun packaging

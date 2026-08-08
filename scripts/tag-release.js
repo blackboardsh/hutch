@@ -17,7 +17,7 @@ const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repositoryRoot = hutchRoot;
 const packageJsonPath = join(hutchRoot, "package.json");
 const versionZigPath = join(hutchRoot, "src", "version.zig");
-const dashConfigPath = join(hutchRoot, "hutch.config.ts");
+const hutchConfigPath = join(hutchRoot, "hutch.config.ts");
 const tagPrefix = "v";
 
 function fail(message) {
@@ -34,9 +34,9 @@ function git(args, options = {}) {
   return typeof output === "string" ? output.trim() : "";
 }
 
-function updateDashPin(path, field, version) {
+function updateHutchPin(path, field, version) {
   const source = readFileSync(path, "utf8");
-  const pattern = new RegExp(`^(// @dash .*\\b${field}=)[^\\s]+`, "m");
+  const pattern = new RegExp(`^(// @hutch .*\\b${field}=)[^\\s]+`, "m");
   const updated = source.replace(pattern, (_, prefix) => `${prefix}${version}`);
   if (updated === source) fail(`could not update ${field} in ${path}`);
   writeFileSync(path, updated);
@@ -129,7 +129,7 @@ const updatedVersionZig = versionZig.replace(
 );
 if (updatedVersionZig === versionZig) fail("could not update src/version.zig");
 writeFileSync(versionZigPath, updatedVersionZig);
-updateDashPin(dashConfigPath, "cli", answer);
+updateHutchPin(hutchConfigPath, "cli", answer);
 
 git([
   "add",

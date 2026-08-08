@@ -324,7 +324,7 @@ try {
   mkdirSync(pinProject, { recursive: true });
   writeFileSync(
     join(pinProject, "hutch.config.ts"),
-    `// @dash cli=build:${metadata.revision}\nexport default {};\n`,
+    `// @hutch cli=build:${metadata.revision}\nexport default {};\n`,
   );
   const builtLauncher = join(
     hutchRoot,
