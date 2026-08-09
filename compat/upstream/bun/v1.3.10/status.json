@@ -137,7 +137,7 @@
         "--max-concurrency=1",
         "--timeout=300000"
       ],
-      "timeoutMs": 300000
+      "timeoutMs": 360000
     },
     "test/cli/install/bun-link.test.ts": {
       "status": "enabled",

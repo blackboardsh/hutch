@@ -47,6 +47,18 @@ The complete suite requires an explicit `--all`. Override binaries with
 `HUTCH_COMPAT_BINARY` and `HUTCH_COMPAT_COTTONTAIL` when they are not in the
 default local build locations.
 
+Every execution writes a durable run record under
+`.hutch-local-tools/bun-compat-runs/`. The runner prints the exact directory at
+startup, appends checksummed `file-start`, heartbeat, and `file-end` records to
+`events.jsonl`, streams bounded per-file output into `logs/`, and writes
+`summary.json` at completion or on a handled interruption. Use
+`--report-dir <new-path>` (or `HUTCH_COMPAT_REPORT_DIR`) to choose an exact new
+directory, and `HUTCH_COMPAT_REPORTS_DIR` to move the default report parent.
+The `run.json` record fingerprints the runner sources, inventories, frozen
+harness dependency plan, selected files, and all three binaries used by the
+run. `harness-dependencies.json` records the validated content-addressed cache
+generation that was privately materialized for that execution.
+
 ## Branch CI
 
 Pushes to `compat/**` branches and manual dispatches run the complete

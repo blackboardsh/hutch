@@ -18,7 +18,9 @@ import {
   createHarnessDependencyCacheIdentity,
   createHarnessDependencyStagingRoot,
   findValidHarnessDependencyGeneration,
+  harnessDependencyGenerationIdentity,
   harnessDependencyInstallErrors,
+  harnessDependencyTreeIdentity,
   normalizeHarnessDependencyBinShims,
   publishHarnessDependencyGeneration,
   publishedHarnessDependencyInstallErrors,
@@ -230,6 +232,13 @@ test("published generations are content-addressed, reusable, and self-repairing"
   assert.equal(first.reused, false);
   assert.match(first.installRoot, /[\\/][0-9a-f]{32}[\\/]install$/);
   assert.deepEqual(publishedHarnessDependencyInstallErrors(first.installRoot, plan, identity), []);
+  const generation = harnessDependencyGenerationIdentity(first.installRoot, plan, identity);
+  assert.match(generation.generationFingerprint, /^[0-9a-f]{64}$/);
+  assert.match(generation.payloadFingerprint, /^[0-9a-f]{64}$/);
+  assert.deepEqual(
+    generation.nodeModules,
+    harnessDependencyTreeIdentity(join(first.installRoot, "node_modules")),
+  );
   assert.equal(
     findValidHarnessDependencyGeneration(cacheRoot, plan, identity),
     first.installRoot,
@@ -326,10 +335,15 @@ test("runner installs privately and materializes an exact published generation",
   assert.match(runner, /findValidHarnessDependencyGeneration\(/);
   assert.match(runner, /publishHarnessDependencyGeneration\(/);
   assert.match(runner, /"--frozen-lockfile"/);
-  assert.match(runner, /prepareExecutionSuite\(tempRoot, harnessDependencyInstallRoot\)/);
+  assert.match(runner, /const executionSuiteRoot = prepareExecutionSuite\(/);
+  assert.match(runner, /initialRunIdentity\.provenance\.suiteSnapshot/);
   assert.match(runner, /HUTCH_COMPAT_HARNESS_CACHE_DIR/);
   assert.match(runner, /join\(os\.tmpdir\(\), "hutch-js-deps"\)/);
   assert.match(runner, /COPYFILE_FICLONE/);
+  assert.match(
+    runner,
+    /cpSync\(suiteRoot, executionSuiteRoot,[\s\S]*?verbatimSymlinks: true/,
+  );
   assert.match(runner, /cpSync\(\s*join\(harnessDependencyInstallRoot, "node_modules"\)/);
   assert.doesNotMatch(runner, /symlinkSync\(\s*join\(harnessDependencyInstallRoot/);
   assert.doesNotMatch(runner, /removeRunnerOwnedPath\(harnessDependencyCacheRoot\)/);

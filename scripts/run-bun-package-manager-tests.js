@@ -4,29 +4,42 @@ import {
   constants as fsConstants,
   cpSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   createHarnessDependencyCacheIdentity,
   createHarnessDependencyStagingRoot,
   findValidHarnessDependencyGeneration,
+  harnessDependencyGenerationIdentity,
   harnessDependencyInstallErrors,
+  harnessDependencyTreeIdentity,
   normalizeHarnessDependencyBinShims,
   publishHarnessDependencyGeneration,
   readHarnessDependencyPlan,
 } from "./bun-harness-dependencies.js";
-import { waitForChildCompletion } from "./bun-compat-child-lifecycle.js";
+import {
+  startWindowsTaskkill,
+  waitForChildCompletion,
+} from "./bun-compat-child-lifecycle.js";
+import { HutchCompatReporter } from "./bun-compat-reporter.js";
+import {
+  createTestInvocation,
+  readGitHeadCommit,
+} from "./bun-compat-runner-contract.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const hutchRoot = resolve(scriptDir, "..");
@@ -34,6 +47,13 @@ const suiteRoot = join(hutchRoot, "compat", "upstream", "bun", "v1.3.10");
 const manifestPath = join(suiteRoot, "manifest.json");
 const statusPath = join(suiteRoot, "status.json");
 const ownershipPath = join(hutchRoot, "compat", "bun-v1.3.10-ownership.json");
+const cottontailManifestPath = join(hutchRoot, "compat", "upstream", "cottontail.json");
+const preloadPath = join(
+  hutchRoot,
+  "compat",
+  "upstream",
+  "hutch-package-manager-test-preload.ts",
+);
 const harnessDependencyCacheRoot = resolve(
   process.env.HUTCH_COMPAT_HARNESS_CACHE_DIR ??
   join(os.tmpdir(), "hutch-js-deps"),
@@ -63,21 +83,51 @@ const defaultCottontailBinary = resolve(
 const defaultJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
 const maxOutputBytes = Number(process.env.HUTCH_COMPAT_MAX_OUTPUT_BYTES ?? 64 * 1024 * 1024);
 const perTestTimeoutMs = Number(process.env.HUTCH_COMPAT_TEST_TIMEOUT_MS ?? 15_000);
+const defaultOuterTimeoutMarginMs = 15_000;
+const defaultOuterTimeoutMs = perTestTimeoutMs + defaultOuterTimeoutMarginMs;
+const overrideOuterTimeoutMarginMs = 60_000;
 const childTreeSettleDelayMs = process.platform === "win32" ? 1_000 : 250;
 const childHardSettleTimeoutMs = 5_000;
-const windowsTaskkillTimeoutMs = 10_000;
+const windowsTaskkillTimeoutMs = 4_000;
+const heartbeatMs = Number(process.env.HUTCH_COMPAT_HEARTBEAT_MS ?? 30_000);
+const reportsRoot = resolve(
+  process.env.HUTCH_COMPAT_REPORTS_DIR ??
+  join(hutchRoot, ".hutch-local-tools", "bun-compat-runs"),
+);
 const cleanupOptions = {
   recursive: true,
   force: true,
   maxRetries: 10,
   retryDelay: 100,
 };
-const activeChildren = new Set();
+const activeChildCompletions = new Set();
 const unprovenDeathTempRoots = new Set();
+let activeReporter = null;
+let activeAbortController = null;
 
 function fail(message) {
+  if (activeReporter != null) throw new Error(message);
   console.error(`hutch-package-manager-compat: ${message}`);
   process.exit(1);
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error(`Hutch compatibility execution aborted: ${String(signal.reason ?? "unknown")}`);
+}
+
+function hermeticChildEnvironment(overrides = {}) {
+  const environment = { ...process.env };
+  for (const name of [
+    "BUN_OPTIONS",
+    "COTTONTAIL_RUNTIME_MODULES_DIR",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+  ]) {
+    delete environment[name];
+  }
+  return Object.assign(environment, overrides);
 }
 
 function removeRunnerOwnedPath(path) {
@@ -93,8 +143,34 @@ function removeRunnerOwnedPath(path) {
   }
 }
 
-if (!Number.isFinite(perTestTimeoutMs) || perTestTimeoutMs < 1) {
-  fail("HUTCH_COMPAT_TEST_TIMEOUT_MS must be a positive number");
+if (
+  !Number.isSafeInteger(perTestTimeoutMs) ||
+  perTestTimeoutMs < 1 ||
+  perTestTimeoutMs > 2_147_483_647
+) {
+  fail(
+    "HUTCH_COMPAT_TEST_TIMEOUT_MS must be a positive safe integer " +
+    "no greater than 2147483647",
+  );
+}
+if (defaultOuterTimeoutMs > 2_147_483_647) {
+  fail(
+    "HUTCH_COMPAT_TEST_TIMEOUT_MS leaves no room for the required " +
+    `${defaultOuterTimeoutMarginMs}ms outer timeout margin`,
+  );
+}
+if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) {
+  fail("HUTCH_COMPAT_MAX_OUTPUT_BYTES must be a positive integer");
+}
+if (
+  !Number.isSafeInteger(heartbeatMs) ||
+  heartbeatMs < 1 ||
+  heartbeatMs > 2_147_483_647
+) {
+  fail(
+    "HUTCH_COMPAT_HEARTBEAT_MS must be a positive safe integer " +
+    "no greater than 2147483647",
+  );
 }
 
 function usage() {
@@ -116,12 +192,14 @@ function usage() {
     "  --runtime <path>    Cottontail JS test runtime (default: sibling checkout).",
     "  --jobs <n>          Parallel file workers (default: up to 4).",
     "  --max-tests <n>     Bound the selected file count.",
+    "  --report-dir <path> Write this run's durable events, logs, and summary here.",
     "  --keep-temp         Preserve the runner-owned temporary directory.",
     "",
     "Environment equivalents:",
     "  HUTCH_COMPAT_BINARY, HUTCH_COMPAT_ENGINE, HUTCH_COMPAT_COTTONTAIL,",
     "  COTTONTAIL_BINARY, HUTCH_COMPAT_HARNESS_CACHE_DIR,",
-    "  HUTCH_COMPAT_TEST_TIMEOUT_MS",
+    "  HUTCH_COMPAT_TEST_TIMEOUT_MS, HUTCH_COMPAT_REPORT_DIR,",
+    "  HUTCH_COMPAT_REPORTS_DIR, HUTCH_COMPAT_HEARTBEAT_MS",
   ].join("\n"));
 }
 
@@ -136,6 +214,7 @@ function parseArgs(argv) {
     list: false,
     match: null,
     maxTests: Infinity,
+    reportDir: process.env.HUTCH_COMPAT_REPORT_DIR ?? null,
     runtime:
       process.env.HUTCH_COMPAT_COTTONTAIL ??
       process.env.COTTONTAIL_BINARY ??
@@ -172,6 +251,8 @@ function parseArgs(argv) {
       const value = Number(args.shift() ?? fail("--max-tests requires a number"));
       if (!Number.isInteger(value) || value < 1) fail("--max-tests requires a positive integer");
       options.maxTests = value;
+    } else if (arg === "--report-dir") {
+      options.reportDir = args.shift() ?? fail("--report-dir requires a path");
     } else if (arg === "--runtime") {
       options.runtime = args.shift() ?? fail("--runtime requires a path");
     } else if (arg === "--test") {
@@ -186,6 +267,7 @@ function parseArgs(argv) {
   options.engine = resolve(options.engine);
   options.hutch = resolve(options.hutch);
   options.runtime = resolve(options.runtime);
+  if (options.reportDir != null) options.reportDir = resolve(options.reportDir);
   return options;
 }
 
@@ -199,6 +281,19 @@ function loadHarnessDependencyPlan() {
       harnessDependencySourceRoot,
       join(suiteRoot, "test", "package.json"),
     );
+  } catch (error) {
+    fail(error.message);
+  }
+}
+
+function entryInvocation(entry, preloadPath) {
+  try {
+    return createTestInvocation(entry, preloadPath, {
+      defaultInnerTimeoutMs: perTestTimeoutMs,
+      defaultOuterTimeoutMs,
+      defaultOuterMarginMs: defaultOuterTimeoutMarginMs,
+      overrideOuterMarginMs: overrideOuterTimeoutMarginMs,
+    });
   } catch (error) {
     fail(error.message);
   }
@@ -246,12 +341,119 @@ function listSnapshotFiles(root) {
   return files.sort();
 }
 
-function countSnapshotFiles(root) {
-  return listSnapshotFiles(root).length;
+function snapshotFingerprint(root) {
+  const files = listSnapshotFiles(root);
+  const hash = createHash("sha256");
+  for (const path of files) {
+    const absolutePath = join(root, ...path.split("/"));
+    const stat = lstatSync(absolutePath);
+    hash.update(path);
+    hash.update("\0");
+    hash.update(String(stat.mode & 0o7777));
+    hash.update("\0");
+    if (stat.isSymbolicLink()) {
+      hash.update("symlink\0");
+      hash.update(readlinkSync(absolutePath));
+    } else if (stat.isFile()) {
+      hash.update("file\0");
+      hash.update(readFileSync(absolutePath));
+    } else {
+      throw new Error(`snapshot contains unsupported entry: ${path}`);
+    }
+    hash.update("\0");
+  }
+  return { files: files.length, sha256: hash.digest("hex") };
 }
 
 function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function repositoryCommit() {
+  try {
+    return readGitHeadCommit(hutchRoot);
+  } catch (error) {
+    fail(`could not record Hutch repository commit: ${error.message}`);
+  }
+}
+
+function binaryIdentity(path) {
+  const record = { path };
+  try {
+    if (!existsSync(path)) return { ...record, missing: true };
+    if (!statSync(path).isFile()) return { ...record, notAFile: true };
+    return { ...record, sha256: sha256(path) };
+  } catch (error) {
+    return { ...record, identityError: error.message };
+  }
+}
+
+function runIdentity(validated, entries, options, { refreshMutableInputs = false } = {}) {
+  const scriptPaths = [
+    fileURLToPath(import.meta.url),
+    join(scriptDir, "bun-compat-child-lifecycle.js"),
+    join(scriptDir, "bun-compat-reporter.js"),
+    join(scriptDir, "bun-compat-runner-contract.js"),
+    join(scriptDir, "bun-harness-dependencies.js"),
+    preloadPath,
+  ];
+  return {
+    runner: {
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      hutchRepositoryCommit: repositoryCommit(),
+      sources: Object.fromEntries(
+        scriptPaths.map(path => [relative(hutchRoot, path), sha256(path)]),
+      ),
+    },
+    binaries: {
+      hutch: binaryIdentity(options.hutch),
+      engine: binaryIdentity(options.engine),
+      cottontail: binaryIdentity(options.runtime),
+    },
+    provenance: {
+      cottontail: readJson(cottontailManifestPath),
+      cottontailManifestSha256: sha256(cottontailManifestPath),
+      harnessDependencyPlanFingerprint: refreshMutableInputs
+        ? loadHarnessDependencyPlan().fingerprint
+        : validated.harnessDependencyPlan.fingerprint,
+      manifestSha256: sha256(manifestPath),
+      ownershipSha256: sha256(ownershipPath),
+      statusSha256: sha256(statusPath),
+      suiteSnapshot: refreshMutableInputs
+        ? snapshotFingerprint(suiteRoot)
+        : validated.suiteSnapshot,
+    },
+    inventory: {
+      canonicalRunnableFiles: validated.manifest.canonicalRunnableFiles,
+      ownedRunnableFiles: validated.manifest.ownedRunnableFiles,
+      ownerCounts: validated.ownership.ownerCounts,
+    },
+    selection: {
+      jobs: options.jobs,
+      files: entries.map(entry => {
+        const invocation = entryInvocation(entry, preloadPath);
+        return {
+          path: entry.path,
+          status: entry.status,
+          args: invocation.args,
+          env: entry.env ?? {},
+          innerTimeoutMs: invocation.innerTimeoutMs,
+          outerTimeoutMs: invocation.outerTimeoutMs,
+          serial: entry.serial === true,
+        };
+      }),
+    },
+    settings: {
+      defaultInnerTimeoutMs: perTestTimeoutMs,
+      defaultOuterTimeoutMs,
+      defaultOuterTimeoutMarginMs,
+      overrideOuterTimeoutMarginMs,
+      maxOutputBytes,
+      timezone: process.env.HUTCH_COMPAT_TZ ?? "Etc/UTC",
+    },
+  };
 }
 
 function removeGeneratedSuiteArtifacts() {
@@ -278,7 +480,7 @@ function removeGeneratedSuiteArtifacts() {
 }
 
 function validateSuite() {
-  loadHarnessDependencyPlan();
+  const harnessDependencyPlan = loadHarnessDependencyPlan();
   for (const path of [manifestPath, statusPath, ownershipPath]) {
     if (!existsSync(path)) fail(`missing ${relative(hutchRoot, path)}`);
   }
@@ -322,9 +524,9 @@ function validateSuite() {
   if (copiedTests.length !== manifest.ownedRunnableFiles) {
     fail(`copied test count mismatch: ${copiedTests.length} !== ${manifest.ownedRunnableFiles}`);
   }
-  const copiedFiles = countSnapshotFiles(suiteRoot);
-  if (copiedFiles !== manifest.copiedFiles) {
-    fail(`copied file count mismatch: ${copiedFiles} !== ${manifest.copiedFiles}`);
+  const suiteSnapshot = snapshotFingerprint(suiteRoot);
+  if (suiteSnapshot.files !== manifest.copiedFiles) {
+    fail(`copied file count mismatch: ${suiteSnapshot.files} !== ${manifest.copiedFiles}`);
   }
 
   if (manifest.fixtureTrees?.length !== 1) {
@@ -381,15 +583,14 @@ function validateSuite() {
     if (!["enabled", "expected-failure"].includes(status.tests[path].status)) {
       fail(`unsupported status for ${path}: ${status.tests[path].status}`);
     }
-    const invocationArgs = testInvocationArgs({ path, ...status.tests[path] }, "<preload>");
+    const invocation = entryInvocation({ path, ...status.tests[path] }, "<preload>");
+    const invocationArgs = invocation.args;
     const invocationTimeouts = invocationArgs.filter(arg => arg.startsWith("--timeout="));
     if (invocationTimeouts.length !== 1) {
       fail(`expected exactly one effective test timeout for ${path}`);
     }
     if (path.startsWith(`${nextPagesFixtureRoot}/test/`)) {
-      const innerTimeoutMs = Number(invocationTimeouts[0].slice("--timeout=".length));
-      const outerTimeoutMs = Number(status.tests[path].timeoutMs);
-      if (!Number.isFinite(outerTimeoutMs) || outerTimeoutMs - innerTimeoutMs < 60_000) {
+      if (invocation.outerTimeoutMs - invocation.innerTimeoutMs < 60_000) {
         fail(`Next Pages outer timeout must exceed its inner timeout by at least 60000ms: ${path}`);
       }
     }
@@ -430,7 +631,14 @@ function validateSuite() {
     }
   }
 
-  return { manifest, status, ownership, copiedTests };
+  return {
+    manifest,
+    status,
+    ownership,
+    copiedTests,
+    harnessDependencyPlan,
+    suiteSnapshot,
+  };
 }
 
 function selectedEntries(validated, options) {
@@ -450,17 +658,74 @@ function selectedEntries(validated, options) {
   }));
 }
 
-function preflightBinary(path, label, args, environment = process.env) {
+async function runCapturedChild(command, args, options) {
+  throwIfAborted(options.signal);
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    detached: process.platform !== "win32",
+  });
+  const output = {
+    stdout: { bytes: 0, chunks: [] },
+    stderr: { bytes: 0, chunks: [] },
+  };
+  const capture = (stream, chunk) => {
+    const state = output[stream];
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    const remaining = Math.max(0, options.maxOutputBytes - state.bytes);
+    if (remaining === 0) return;
+    const written = bytes.subarray(0, remaining);
+    state.chunks.push(written);
+    state.bytes += written.length;
+  };
+  child.stdout?.on("data", chunk => capture("stdout", chunk));
+  child.stderr?.on("data", chunk => capture("stderr", chunk));
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: options.timeoutMs,
+    hardSettleTimeoutMs: childHardSettleTimeoutMs,
+    naturalCloseProvesTreeDeath: process.platform !== "win32",
+    requireTerminationProof: process.platform === "win32",
+    signal: options.signal,
+    settleDelayMs: childTreeSettleDelayMs,
+    terminate: killProcessTree,
+    terminateOnExit: process.platform !== "win32",
+  });
+  activeChildCompletions.add(completion);
+  let result;
+  try {
+    result = await completion;
+  } finally {
+    activeChildCompletions.delete(completion);
+  }
+  return {
+    ...result,
+    status: result.code,
+    stdout: Buffer.concat(output.stdout.chunks).toString("utf8"),
+    stderr: Buffer.concat(output.stderr.chunks).toString("utf8"),
+  };
+}
+
+async function preflightBinary(
+  path,
+  label,
+  args,
+  environment = process.env,
+  signal = null,
+) {
+  throwIfAborted(signal);
   if (!existsSync(path)) fail(`${label} not found: ${path}`);
   if (!statSync(path).isFile()) fail(`${label} is not a file: ${path}`);
-  const result = spawnSync(path, args, {
+  const result = await runCapturedChild(path, args, {
     cwd: hutchRoot,
     env: environment,
-    encoding: "utf8",
-    timeout: 15_000,
-    maxBuffer: 1024 * 1024,
+    timeoutMs: 15_000,
+    maxOutputBytes: 1024 * 1024,
+    signal,
   });
+  throwIfAborted(signal);
   if (result.error) fail(`${label} failed to start: ${result.error.message}`);
+  if (result.timedOut) fail(`${label} preflight timed out`);
+  if (result.teardownIncomplete) fail(`${label} preflight process teardown did not complete`);
   if (result.status !== 0) {
     fail(
       `${label} preflight exited ${result.status ?? 1}\n` +
@@ -470,11 +735,11 @@ function preflightBinary(path, label, args, environment = process.env) {
   return result;
 }
 
-function preflight(options) {
-  const runtime = preflightBinary(options.runtime, "Cottontail runtime", [
+async function preflight(options, signal) {
+  const runtime = await preflightBinary(options.runtime, "Cottontail runtime", [
     "-e",
     'console.log("HUTCH_COTTONTAIL_PREFLIGHT:" + JSON.stringify({ version: process.versions?.cottontail, execPath: process.execPath }))',
-  ]);
+  ], hermeticChildEnvironment(), signal);
   const identityLine = String(runtime.stdout)
     .split(/\r?\n/)
     .find(line => line.startsWith("HUTCH_COTTONTAIL_PREFLIGHT:"));
@@ -491,21 +756,14 @@ function preflight(options) {
   if (!existsSync(options.engine) || !statSync(options.engine).isFile()) {
     fail(`Hutch engine not found: ${options.engine}`);
   }
-  preflightBinary(options.hutch, "Hutch CLI", ["--version"], {
-    ...process.env,
+  await preflightBinary(options.hutch, "Hutch CLI", ["--version"], hermeticChildEnvironment({
     HUTCH_ENGINE_BINARY: options.engine,
-  });
+  }), signal);
   if (options.runtime === options.hutch) {
     fail("Hutch child CLI and Cottontail test runtime must be distinct executables");
   }
 
-  const preloadPath = join(
-    hutchRoot,
-    "compat",
-    "upstream",
-    "hutch-package-manager-test-preload.ts",
-  );
-  const preload = preflightBinary(
+  const preload = await preflightBinary(
     options.runtime,
     "Hutch package-manager preload",
     [
@@ -514,14 +772,14 @@ function preflight(options) {
       "-e",
       'console.log("HUTCH_CHILD_CLI_PREFLIGHT:" + process.execPath)',
     ],
-    {
-      ...process.env,
+    hermeticChildEnvironment({
       COTTONTAIL_BINARY: options.runtime,
       DASH_COTTONTAIL: options.runtime,
       HUTCH_COMPAT_CLI: options.hutch,
       HUTCH_COMPAT_COTTONTAIL: options.runtime,
       HUTCH_ENGINE_BINARY: options.engine,
-    },
+    }),
+    signal,
   );
   const childCliLine = String(preload.stdout)
     .split(/\r?\n/)
@@ -533,15 +791,21 @@ function preflight(options) {
   }
 }
 
-function prepareHarnessDependencies(options) {
-  const plan = loadHarnessDependencyPlan();
+async function prepareHarnessDependencies(options, signal, plan) {
+  throwIfAborted(signal);
   const identity = createHarnessDependencyCacheIdentity();
   const cachedRoot = findValidHarnessDependencyGeneration(
     harnessDependencyCacheRoot,
     plan,
     identity,
   );
-  if (cachedRoot) return cachedRoot;
+  if (cachedRoot) {
+    return {
+      cacheIdentity: identity,
+      generation: harnessDependencyGenerationIdentity(cachedRoot, plan, identity),
+      installRoot: cachedRoot,
+    };
+  }
 
   const stagingRoot = createHarnessDependencyStagingRoot(
     harnessDependencyCacheRoot,
@@ -555,7 +819,7 @@ function prepareHarnessDependencies(options) {
     writeFileSync(join(stagingRoot, "bun.lock"), plan.lockBytes);
 
     console.log(`  installing frozen Bun test-harness dependencies (${plan.fingerprint.slice(0, 12)})...`);
-    const result = spawnSync(
+    const result = await runCapturedChild(
       options.hutch,
       [
         "install",
@@ -566,20 +830,24 @@ function prepareHarnessDependencies(options) {
       ],
       {
         cwd: hutchRoot,
-        env: {
-          ...process.env,
+        env: hermeticChildEnvironment({
           COTTONTAIL_BINARY: options.runtime,
           DASH_COTTONTAIL: options.runtime,
           HUTCH_ENGINE_BINARY: options.engine,
           HUTCH_NO_UPDATE_CHECK: "1",
-        },
-        encoding: "utf8",
-        timeout: 10 * 60_000,
-        maxBuffer: 64 * 1024 * 1024,
+        }),
+        timeoutMs: 10 * 60_000,
+        maxOutputBytes: 64 * 1024 * 1024,
+        signal,
       },
     );
+    throwIfAborted(signal);
     if (result.error) {
       failureMessage = `could not install test-harness dependencies: ${result.error.message}`;
+    } else if (result.timedOut) {
+      failureMessage = "could not install test-harness dependencies: install timed out";
+    } else if (result.teardownIncomplete) {
+      failureMessage = "could not install test-harness dependencies: process teardown did not complete";
     } else {
       normalizeHarnessDependencyBinShims(stagingRoot, plan);
       const installErrors = harnessDependencyInstallErrors(stagingRoot, plan);
@@ -608,38 +876,62 @@ function prepareHarnessDependencies(options) {
   if (published.reused) {
     console.log("  reused the immutable dependency generation published by another run");
   }
-  return published.installRoot;
+  return {
+    cacheIdentity: identity,
+    generation: harnessDependencyGenerationIdentity(published.installRoot, plan, identity),
+    installRoot: published.installRoot,
+  };
 }
 
 function killProcessTree(child) {
-  if (!child.pid) return;
+  if (!child.pid) return true;
   if (process.platform === "win32") {
-    // taskkill /t is best-effort rather than Job Object containment. Waiting for
-    // it, then delaying temp removal, gives Chromium/server descendants a bounded
-    // opportunity to exit and release files even after their direct parent exits.
-    spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-      stdio: "ignore",
-      timeout: windowsTaskkillTimeoutMs,
-      windowsHide: true,
+    // taskkill /t is best-effort rather than Job Object containment. Launch it
+    // without blocking the runner's independent hard-settlement deadline.
+    return startWindowsTaskkill(child, {
+      spawnProcess: spawn,
+      timeoutMs: windowsTaskkillTimeoutMs,
     });
-    return;
   }
   try {
     process.kill(-child.pid, "SIGKILL");
-  } catch {
+    return true;
+  } catch (groupError) {
+    if (groupError?.code === "ESRCH") return true;
     try {
       child.kill("SIGKILL");
     } catch {}
+    throw new Error(
+      `could not terminate POSIX process group ${child.pid}: ` +
+      `${groupError?.message ?? String(groupError)}`,
+      { cause: groupError },
+    );
   }
 }
 
-function prepareExecutionSuite(tempRoot, harnessDependencyInstallRoot) {
+function prepareExecutionSuite(
+  tempRoot,
+  harnessDependencyInstallRoot,
+  expectedSnapshotFingerprint,
+  expectedHarnessDependencies,
+  harnessDependencyPlan,
+  harnessDependencyCacheIdentity,
+) {
   const executionSuiteRoot = join(tempRoot, "suite");
   cpSync(suiteRoot, executionSuiteRoot, {
     recursive: true,
     dereference: false,
     preserveTimestamps: true,
+    verbatimSymlinks: true,
   });
+  const copiedSnapshotFingerprint = snapshotFingerprint(executionSuiteRoot);
+  if (!isDeepStrictEqual(copiedSnapshotFingerprint, expectedSnapshotFingerprint)) {
+    fail(
+      "copied compatibility suite changed after run identity was recorded: " +
+      `${JSON.stringify(copiedSnapshotFingerprint)} !== ` +
+      `${JSON.stringify(expectedSnapshotFingerprint)}`,
+    );
+  }
 
   const preloadPath = join(
     hutchRoot,
@@ -670,6 +962,20 @@ function prepareExecutionSuite(tempRoot, harnessDependencyInstallRoot) {
       verbatimSymlinks: true,
     },
   );
+  const materializedDependencies = harnessDependencyTreeIdentity(
+    join(executionSuiteRoot, "test", "node_modules"),
+  );
+  if (!isDeepStrictEqual(materializedDependencies, expectedHarnessDependencies.nodeModules)) {
+    fail("private harness dependency materialization differs from its validated generation");
+  }
+  const sourceDependencies = harnessDependencyGenerationIdentity(
+    harnessDependencyInstallRoot,
+    harnessDependencyPlan,
+    harnessDependencyCacheIdentity,
+  );
+  if (!isDeepStrictEqual(sourceDependencies, expectedHarnessDependencies)) {
+    fail("immutable harness dependency generation changed while it was being materialized");
+  }
   applyHermeticExecutionOverrides(executionSuiteRoot);
   return executionSuiteRoot;
 }
@@ -686,58 +992,17 @@ function applyHermeticExecutionOverrides(executionSuiteRoot) {
   writeFileSync(bunxPath, source.replace(liveSpecifier, pinnedSpecifier));
 }
 
-function testInvocationArgs(entry, preloadPath) {
-  const entryArgs = (entry.args ?? []).map(String);
-  const argsWithoutTimeout = [];
-  let timeoutMs = null;
-  for (let index = 0; index < entryArgs.length; index += 1) {
-    const arg = entryArgs[index];
-    let timeoutValue = null;
-    if (arg === "--timeout") {
-      timeoutValue = entryArgs[index + 1];
-      index += 1;
-    } else if (arg.startsWith("--timeout=")) {
-      timeoutValue = arg.slice("--timeout=".length);
-    } else {
-      argsWithoutTimeout.push(arg);
-      continue;
-    }
-
-    const parsedTimeout = Number(timeoutValue);
-    if (!Number.isInteger(parsedTimeout) || parsedTimeout < 1) {
-      fail(`invalid test timeout for ${entry.path}: ${String(timeoutValue)}`);
-    }
-    if (timeoutMs != null) fail(`multiple test timeouts configured for ${entry.path}`);
-    timeoutMs = parsedTimeout;
-  }
-
-  return [
-    "--preload",
-    preloadPath,
-    "test",
-    `--timeout=${timeoutMs ?? perTestTimeoutMs}`,
-    entry.path,
-    ...argsWithoutTimeout,
-  ];
-}
-
-function runEntry(entry, options, tempRoot, executionSuiteRoot) {
-  const timeout = Number(entry.timeoutMs ?? 30_000);
-  if (!Number.isFinite(timeout) || timeout <= 0) {
-    fail(`invalid outer timeout for ${entry.path}: ${String(entry.timeoutMs)}`);
-  }
+function runEntry(
+  entry,
+  options,
+  tempRoot,
+  executionSuiteRoot,
+  reporter,
+  reportToken,
+  abortController,
+) {
   const runTemp = mkdtempSync(join(tempRoot, "run-"));
-  const preloadPath = join(
-    hutchRoot,
-    "compat",
-    "upstream",
-    "hutch-package-manager-test-preload.ts",
-  );
-  const childEnv = { ...process.env };
-  delete childEnv.NODE_OPTIONS;
-  delete childEnv.BUN_OPTIONS;
-  delete childEnv.NODE_PATH;
-  Object.assign(childEnv, {
+  const childEnv = hermeticChildEnvironment({
     ...(entry.env ?? {}),
     BUN_TMPDIR: runTemp,
     COTTONTAIL_BINARY: options.runtime,
@@ -758,40 +1023,61 @@ function runEntry(entry, options, tempRoot, executionSuiteRoot) {
     TZ: process.env.HUTCH_COMPAT_TZ ?? "Etc/UTC",
   });
 
-  const args = testInvocationArgs(entry, preloadPath);
-  const child = spawn(options.runtime, args, {
+  const invocation = entryInvocation(entry, preloadPath);
+  const child = spawn(options.runtime, invocation.args, {
     cwd: executionSuiteRoot,
     env: childEnv,
     detached: process.platform !== "win32",
   });
-  activeChildren.add(child);
   let stdout = "";
   let stderr = "";
+  let outputError = null;
   child.stdout.on("data", chunk => {
+    try {
+      reporter.appendOutput(reportToken, "stdout", chunk);
+    } catch (error) {
+      outputError ??= error;
+      abortController.abort(error);
+    }
     if (stdout.length < maxOutputBytes) stdout += chunk;
   });
   child.stderr.on("data", chunk => {
+    try {
+      reporter.appendOutput(reportToken, "stderr", chunk);
+    } catch (error) {
+      outputError ??= error;
+      abortController.abort(error);
+    }
     if (stderr.length < maxOutputBytes) stderr += chunk;
   });
 
-  return waitForChildCompletion(child, {
-    timeoutMs: timeout,
+  const lifecycleCompletion = waitForChildCompletion(child, {
+    timeoutMs: invocation.outerTimeoutMs,
     hardSettleTimeoutMs: childHardSettleTimeoutMs,
+    naturalCloseProvesTreeDeath: process.platform !== "win32",
+    requireTerminationProof: process.platform === "win32",
+    signal: abortController.signal,
     settleDelayMs: childTreeSettleDelayMs,
     terminate: killProcessTree,
-  }).then(result => {
-    activeChildren.delete(child);
+    terminateOnExit: process.platform !== "win32",
+  });
+  activeChildCompletions.add(lifecycleCompletion);
+  return lifecycleCompletion.then(result => {
     if (result.processDeathProven) {
       if (!options.keepTemp) removeRunnerOwnedPath(runTemp);
     } else {
       unprovenDeathTempRoots.add(tempRoot);
     }
-    return {
+    const completed = {
       ...result,
       stdout,
       stderr,
       ...(!result.processDeathProven ? { retainedTempRoot: tempRoot } : {}),
     };
+    if (outputError) throw outputError;
+    return completed;
+  }).finally(() => {
+    activeChildCompletions.delete(lifecycleCompletion);
   });
 }
 
@@ -807,6 +1093,14 @@ function capturedDiagnostics(result) {
 }
 
 function classify(entry, result) {
+  if (result.aborted) {
+    return {
+      ok: false,
+      outcome: "unexpected-failure",
+      message: `FAIL ${entry.path} canceled after a peer runner error`,
+      diagnostics: capturedDiagnostics(result),
+    };
+  }
   if (result.teardownIncomplete) {
     return {
       ok: false,
@@ -849,7 +1143,15 @@ function classify(entry, result) {
   };
 }
 
-async function runEntries(entries, options, tempRoot, executionSuiteRoot) {
+async function runEntries(
+  entries,
+  options,
+  tempRoot,
+  executionSuiteRoot,
+  reporter,
+  abortController,
+) {
+  throwIfAborted(abortController.signal);
   const outcomeCounts = {
     passed: 0,
     "expected-failure": 0,
@@ -868,13 +1170,50 @@ async function runEntries(entries, options, tempRoot, executionSuiteRoot) {
     console.log(
       `START [${started}/${entries.length}; running ${started - completed}] ${entry.path}`,
     );
-    const result = classify(
+    const reportToken = reporter.startEntry(entry, {
+      started,
+      completed,
+      running: started - completed,
+    });
+    const executionResult = await runEntry(
       entry,
-      await runEntry(entry, options, tempRoot, executionSuiteRoot),
+      options,
+      tempRoot,
+      executionSuiteRoot,
+      reporter,
+      reportToken,
+      abortController,
     );
+    const result = classify(entry, executionResult);
     outcomeCounts[result.outcome] += 1;
     completed += 1;
     const unexpected = outcomeCounts["unexpected-pass"] + outcomeCounts["unexpected-failure"];
+    const execution = {
+      code: executionResult.code,
+      signal: executionResult.signal,
+      timedOut: executionResult.timedOut,
+      processDeathProven: executionResult.processDeathProven,
+      teardownIncomplete: executionResult.teardownIncomplete,
+      ...(executionResult.error
+        ? { error: executionResult.error.message ?? String(executionResult.error) }
+        : {}),
+      ...(executionResult.teardownError
+        ? { teardownError: executionResult.teardownError.message ?? String(executionResult.teardownError) }
+        : {}),
+      ...(executionResult.retainedTempRoot
+        ? { retainedTempRoot: executionResult.retainedTempRoot }
+        : {}),
+    };
+    const reportLog = reporter.finishEntry(
+      reportToken,
+      { ...result, execution },
+      {
+        started,
+        completed,
+        running: started - completed,
+        outcomeCounts,
+      },
+    );
     console.log(
       `DONE [${completed}/${entries.length}; running ${started - completed}] ${result.message}`,
     );
@@ -883,30 +1222,67 @@ async function runEntries(entries, options, tempRoot, executionSuiteRoot) {
       `expected failures ${outcomeCounts["expected-failure"]}; unexpected ${unexpected}`,
     );
     if (result.diagnostics) console.log(result.diagnostics);
+    if (!result.ok) console.log(`  durable log: ${join(reporter.reportDir, reportLog)}`);
+    if (executionResult.teardownIncomplete) {
+      const error = new Error(
+        `unsafe process teardown for ${entry.path}; stopped before reusing the execution suite`,
+      );
+      abortController.abort(error);
+      throw error;
+    }
+    throwIfAborted(abortController.signal);
   };
 
   const queue = entries
     .map((entry, index) => ({ entry, index }))
     .filter(item => !serialIndexes.has(item.index));
   let cursor = 0;
+  let firstError = null;
+  const recordWorkerError = error => {
+    firstError ??= error;
+    abortController.abort(error);
+  };
   const worker = async () => {
-    for (;;) {
+    while (!abortController.signal.aborted) {
       const item = queue[cursor++];
       if (!item) return;
-      await runOne(item.entry);
+      try {
+        await runOne(item.entry);
+      } catch (error) {
+        recordWorkerError(error);
+        return;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(options.jobs, queue.length) || 1 }, worker));
+  throwIfAborted(abortController.signal);
+  if (firstError) throw firstError;
 
   for (const index of serialIndexes) {
-    await runOne(entries[index]);
+    try {
+      await runOne(entries[index]);
+    } catch (error) {
+      recordWorkerError(error);
+      break;
+    }
   }
+  throwIfAborted(abortController.signal);
+  if (firstError) throw firstError;
   return outcomeCounts;
 }
 
+let handlingSignal = false;
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => {
-    for (const child of activeChildren) killProcessTree(child);
+  process.on(signal, async () => {
+    if (handlingSignal) process.exit(signal === "SIGINT" ? 130 : 143);
+    handlingSignal = true;
+    activeAbortController?.abort(new Error(`runner interrupted by ${signal}`));
+    try {
+      activeReporter?.interrupt(signal);
+    } catch (error) {
+      console.error(`hutch-package-manager-compat: warning: could not record ${signal}: ${error.message}`);
+    }
+    await Promise.allSettled([...activeChildCompletions]);
     process.exit(signal === "SIGINT" ? 130 : 143);
   });
 }
@@ -950,20 +1326,81 @@ if (!options.all && options.tests.length === 0 && options.match == null) {
 }
 if (entries.length === 0) fail("no owned tests matched the requested selection");
 
-preflight(options);
-const harnessDependencyInstallRoot = prepareHarnessDependencies(options);
-const tempRoot = mkdtempSync(join(os.tmpdir(), "hutch-package-manager-compat-"));
+const initialRunIdentity = runIdentity(validated, entries, options);
+const executionAbortController = new AbortController();
+activeAbortController = executionAbortController;
+activeReporter = new HutchCompatReporter({
+  forbiddenRoots: [suiteRoot],
+  heartbeatMs,
+  identity: initialRunIdentity,
+  maxOutputBytes,
+  onError(error) { executionAbortController.abort(error); },
+  planned: entries.length,
+  reportDir: options.reportDir,
+  reportsRoot,
+});
+let tempRoot = null;
 try {
-  const executionSuiteRoot = prepareExecutionSuite(tempRoot, harnessDependencyInstallRoot);
-  const outcomeCounts = await runEntries(entries, options, tempRoot, executionSuiteRoot);
+  activeReporter.setPhase("preflight");
+  await preflight(options, executionAbortController.signal);
+  throwIfAborted(executionAbortController.signal);
+  activeReporter.setPhase("harness-dependencies");
+  const harnessDependencies = await prepareHarnessDependencies(
+    options,
+    executionAbortController.signal,
+    validated.harnessDependencyPlan,
+  );
+  throwIfAborted(executionAbortController.signal);
+  activeReporter.recordHarnessDependencies(harnessDependencies.generation);
+  tempRoot = mkdtempSync(join(os.tmpdir(), "hutch-package-manager-compat-"));
+  const executionSuiteRoot = prepareExecutionSuite(
+    tempRoot,
+    harnessDependencies.installRoot,
+    initialRunIdentity.provenance.suiteSnapshot,
+    harnessDependencies.generation,
+    validated.harnessDependencyPlan,
+    harnessDependencies.cacheIdentity,
+  );
+  activeReporter.setPhase("test-files");
+  const outcomeCounts = await runEntries(
+    entries,
+    options,
+    tempRoot,
+    executionSuiteRoot,
+    activeReporter,
+    executionAbortController,
+  );
+  throwIfAborted(executionAbortController.signal);
   const unexpected = outcomeCounts["unexpected-pass"] + outcomeCounts["unexpected-failure"];
   console.log(
     `  files: ${entries.length}; passed: ${outcomeCounts.passed}; ` +
     `expected failures: ${outcomeCounts["expected-failure"]}; unexpected: ${unexpected}`,
   );
+  const finalRunIdentity = runIdentity(validated, entries, options, {
+    refreshMutableInputs: true,
+  });
+  if (!isDeepStrictEqual(finalRunIdentity, initialRunIdentity)) {
+    throw new Error("run identity inputs changed while the compatibility suite was executing");
+  }
+  activeReporter.finish({
+    files: entries.length,
+    harnessDependencies: harnessDependencies.generation,
+    outcomeCounts,
+  });
   if (unexpected > 0) process.exitCode = 1;
+} catch (error) {
+  try {
+    activeReporter.fatal(error);
+  } catch (reportError) {
+    console.error(
+      `hutch-package-manager-compat: warning: could not finalize failed report: ${reportError.message}`,
+    );
+  }
+  throw error;
 } finally {
-  if (options.keepTemp || unprovenDeathTempRoots.has(tempRoot)) {
+  if (tempRoot == null) {
+    // Dependency preparation failed before an execution suite was created.
+  } else if (options.keepTemp || unprovenDeathTempRoots.has(tempRoot)) {
     const reason = unprovenDeathTempRoots.has(tempRoot)
       ? " because at least one child process death was not observed"
       : "";
@@ -972,4 +1409,6 @@ try {
     removeRunnerOwnedPath(tempRoot);
     removeGeneratedSuiteArtifacts();
   }
+  activeReporter = null;
+  activeAbortController = null;
 }

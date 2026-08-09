@@ -472,6 +472,28 @@ function payloadEntries(installRoot) {
   return entries;
 }
 
+export function harnessDependencyTreeIdentity(root) {
+  const entries = payloadEntries(root);
+  return {
+    entries: entries.length,
+    payloadFingerprint: sha256Bytes(Buffer.from(canonicalJson(entries))),
+  };
+}
+
+export function harnessDependencyGenerationIdentity(installRoot, plan, identity) {
+  const errors = publishedHarnessDependencyInstallErrors(installRoot, plan, identity);
+  if (errors.length > 0) {
+    throw new Error(`invalid immutable harness dependency generation:\n${errors.join("\n")}`);
+  }
+  const markerBytes = readFileSync(join(installRoot, harnessDependencyCacheMarker));
+  const marker = JSON.parse(markerBytes.toString("utf8"));
+  return {
+    generationFingerprint: sha256Bytes(markerBytes),
+    payloadFingerprint: marker.payloadFingerprint,
+    nodeModules: harnessDependencyTreeIdentity(join(installRoot, "node_modules")),
+  };
+}
+
 export function createHarnessDependencyCacheIdentity({
   arch = process.arch,
   platform = process.platform,

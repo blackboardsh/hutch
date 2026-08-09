@@ -17,4 +17,8 @@ node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/electrobun/non-index-main-entrypoint.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/published-platform-artifact.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/tsconfig-path-alias-bundle.test.js"
+node --test \
+  "$SCRIPT_DIR/bun-compat-workflow.test.js" \
+  "$SCRIPT_DIR/bun-harness-dependencies.test.js" \
+  "$SCRIPT_DIR/bun-compat-reporter.test.js"
 node "$SCRIPT_DIR/run-bun-package-manager-tests.js" --check

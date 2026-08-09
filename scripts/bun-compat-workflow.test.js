@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
-import { waitForChildCompletion } from "./bun-compat-child-lifecycle.js";
+import {
+  startWindowsTaskkill,
+  waitForChildCompletion,
+} from "./bun-compat-child-lifecycle.js";
+import {
+  createTestInvocation,
+  readGitHeadCommit,
+} from "./bun-compat-runner-contract.js";
 
 const root = new URL("..", import.meta.url);
 const workflowPath = new URL("../.github/workflows/bun-compat.yml", import.meta.url);
@@ -61,7 +76,7 @@ test("builds Hutch and runs the complete owned JavaScript compatibility suite wi
   assert.match(workflow, /fail-fast: false/);
   assert.match(
     workflow,
-    /run: node --test scripts\/bun-compat-workflow\.test\.js scripts\/bun-harness-dependencies\.test\.js/,
+    /run: node --test scripts\/bun-compat-workflow\.test\.js scripts\/bun-harness-dependencies\.test\.js scripts\/bun-compat-reporter\.test\.js/,
   );
   assert.match(
     workflow,
@@ -92,6 +107,38 @@ test("builds Hutch and runs the complete owned JavaScript compatibility suite wi
     ),
   );
   assert.match(checkOutput, /ownership and copied-inventory checks passed/);
+});
+
+test("rejects an oversized heartbeat before Node can clamp it to one millisecond", () => {
+  assert.throws(
+    () => execFileSync(
+      process.execPath,
+      ["scripts/run-bun-package-manager-tests.js", "--check"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: { ...process.env, HUTCH_COMPAT_HEARTBEAT_MS: "2147483648" },
+      },
+    ),
+    error => {
+      assert.match(
+        error.stderr ?? "",
+        /HUTCH_COMPAT_HEARTBEAT_MS must be a positive safe integer no greater than 2147483647/,
+      );
+      return true;
+    },
+  );
+
+  const configuredTimeoutCheck = execFileSync(
+    process.execPath,
+    ["scripts/run-bun-package-manager-tests.js", "--check"],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, HUTCH_COMPAT_TEST_TIMEOUT_MS: "15001" },
+    },
+  );
+  assert.match(configuredTimeoutCheck, /ownership and copied-inventory checks passed/);
 });
 
 test("builds an exact Cottontail source revision", () => {
@@ -161,7 +208,7 @@ test("owns the complete canonical Next Pages fixture without generated state", (
   assert.equal(fixture.files.some(entry => entry.path === "src/Counter.tsx"), false);
 });
 
-test("reports live per-file progress and preserves failure diagnostics", () => {
+test("reports live per-file progress durably and preserves failure diagnostics", () => {
   assert.match(
     compatRunner,
     /`START \[\$\{started\}\/\$\{entries\.length\}; running \$\{started - completed\}\] \$\{entry\.path\}`/,
@@ -173,34 +220,126 @@ test("reports live per-file progress and preserves failure diagnostics", () => {
   assert.match(compatRunner, /`  progress: passed \$\{outcomeCounts\.passed\}; `/);
   assert.equal(
     [...compatRunner.matchAll(/diagnostics: capturedDiagnostics\(result\),/g)].length,
-    4,
-    "unsafe teardown, start errors, timeouts, and unexpected results retain diagnostics",
+    5,
+    "cancellation, unsafe teardown, start errors, timeouts, and unexpected results retain diagnostics",
   );
   assert.match(compatRunner, /if \(result\.diagnostics\) console\.log\(result\.diagnostics\);/);
+  assert.match(compatRunner, /reporter\.startEntry\(entry,/);
+  assert.match(compatRunner, /reporter\.appendOutput\(reportToken, "stdout", chunk\)/);
+  assert.match(compatRunner, /reporter\.finishEntry\(/);
+  assert.match(compatRunner, /HUTCH_COMPAT_REPORTS_DIR/);
+  assert.match(compatRunner, /HUTCH_COMPAT_REPORT_DIR/);
+  assert.match(compatRunner, /activeReporter\.setPhase\("preflight"\)/);
+  assert.match(compatRunner, /await preflight\(options, executionAbortController\.signal\)/);
+  assert.match(compatRunner, /const harnessDependencies = await prepareHarnessDependencies\(/);
+  assert.match(compatRunner, /signal: options\.signal/);
+  assert.match(compatRunner, /onError\(error\) \{ executionAbortController\.abort\(error\); \}/);
+  assert.doesNotMatch(compatRunner, /spawnSync/);
   assert.match(compatRunner, /const outcomeCounts = await runEntries\(/);
   assert.doesNotMatch(compatRunner, /const results = (?:new Array|await runEntries)/);
 });
 
-test("constructs one effective inner timeout for each test invocation", () => {
-  assert.match(compatRunner, /function testInvocationArgs\(entry, preloadPath\)/);
-  assert.match(compatRunner, /if \(arg === "--timeout"\)/);
-  assert.match(compatRunner, /else if \(arg\.startsWith\("--timeout="\)\)/);
-  assert.match(compatRunner, /multiple test timeouts configured for \$\{entry\.path\}/);
-  assert.match(compatRunner, /`--timeout=\$\{timeoutMs \?\? perTestTimeoutMs\}`/);
+test("constructs one effective inner timeout with an independent outer margin", () => {
+  const invocationOptions = {
+    defaultInnerTimeoutMs: 15_000,
+    defaultOuterTimeoutMs: 30_000,
+    defaultOuterMarginMs: 15_000,
+    overrideOuterMarginMs: 60_000,
+  };
+  for (const [path, status] of Object.entries(suiteStatus.tests)) {
+    const invocation = createTestInvocation(
+      { path, ...status },
+      "/absolute/preload.ts",
+      invocationOptions,
+    );
+    assert.equal(invocation.args.filter(arg => arg.startsWith("--timeout=")).length, 1);
+    assert.ok(
+      invocation.outerTimeoutMs - invocation.innerTimeoutMs >=
+        (invocation.hasInnerOverride ? 60_000 : 15_000),
+      path,
+    );
+  }
 
-  const runEntrySource = compatRunner.slice(
-    compatRunner.indexOf("function runEntry("),
-    compatRunner.indexOf("function capturedDiagnostics("),
+  const install = createTestInvocation(
+    {
+      path: "test/cli/install/bun-install.test.ts",
+      ...suiteStatus.tests["test/cli/install/bun-install.test.ts"],
+    },
+    "/absolute/preload.ts",
+    invocationOptions,
   );
-  assert.match(runEntrySource, /const args = testInvocationArgs\(entry, preloadPath\);/);
-  assert.doesNotMatch(runEntrySource, /entry\.args|`--timeout=/);
+  assert.equal(install.innerTimeoutMs, 300_000);
+  assert.equal(install.outerTimeoutMs, 360_000);
+  assert.deepEqual(
+    install.args.filter(arg => arg.startsWith("--timeout=")),
+    ["--timeout=300000"],
+  );
+  assert.throws(
+    () => createTestInvocation(
+      { path: "test/example.test.ts", args: ["--timeout=1000"], timeoutMs: 60_999 },
+      "/absolute/preload.ts",
+      invocationOptions,
+    ),
+    /must exceed its overridden inner timeout by at least 60000ms/,
+  );
+  assert.throws(
+    () => createTestInvocation(
+      {
+        path: "test/example.test.ts",
+        args: ["--timeout", "1000", "--timeout=2000"],
+        timeoutMs: 100_000,
+      },
+      "/absolute/preload.ts",
+      invocationOptions,
+    ),
+    /multiple test timeouts/,
+  );
+  assert.throws(
+    () => createTestInvocation(
+      { path: "test/example.test.ts", timeoutMs: 2_147_483_648 },
+      "/absolute/preload.ts",
+      invocationOptions,
+    ),
+    /outer timeout.*positive safe integer no greater than 2147483647/,
+  );
+  const raisedDefault = createTestInvocation(
+    { path: "test/example.test.ts", timeoutMs: 30_000 },
+    "/absolute/preload.ts",
+    { ...invocationOptions, defaultInnerTimeoutMs: 15_001 },
+  );
+  assert.equal(raisedDefault.innerTimeoutMs, 15_001);
+  assert.equal(raisedDefault.outerTimeoutMs, 30_001);
+
+  assert.match(compatRunner, /const invocation = entryInvocation\(entry, preloadPath\);/);
+  assert.match(compatRunner, /timeoutMs: invocation\.outerTimeoutMs/);
+  assert.match(compatRunner, /spawn\(options\.runtime, invocation\.args,/);
+});
+
+test("reads a linked-worktree HEAD through its common Git directory", t => {
+  const temporary = mkdtempSync(join(os.tmpdir(), "hutch-linked-worktree-head-"));
+  t.after(() => rmSync(temporary, { recursive: true, force: true }));
+  const repositoryRoot = join(temporary, "checkout");
+  const commonGit = join(temporary, "common.git");
+  const worktreeGit = join(commonGit, "worktrees", "checkout");
+  mkdirSync(repositoryRoot, { recursive: true });
+  mkdirSync(worktreeGit, { recursive: true });
+  mkdirSync(join(commonGit, "refs", "heads"), { recursive: true });
+  writeFileSync(join(repositoryRoot, ".git"), `gitdir: ${worktreeGit}\n`);
+  writeFileSync(join(worktreeGit, "commondir"), "../..\n");
+  writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/compat\n");
+  writeFileSync(join(commonGit, "refs", "heads", "compat"), `${"a".repeat(40)}\n`);
+
+  assert.equal(readGitHeadCommit(repositoryRoot), "a".repeat(40));
 });
 
 test("bounds process-tree cleanup and retries runner-owned removal", () => {
   assert.match(compatRunner, /maxRetries: 10/);
   assert.match(compatRunner, /retryDelay: 100/);
-  assert.match(compatRunner, /timeout: windowsTaskkillTimeoutMs/);
+  assert.match(compatRunner, /startWindowsTaskkill\(child,/);
+  assert.match(compatRunner, /spawnProcess: spawn/);
+  assert.doesNotMatch(compatRunner, /spawnSync\("taskkill"/);
   assert.match(compatRunner, /hardSettleTimeoutMs: childHardSettleTimeoutMs/);
+  assert.match(compatRunner, /requireTerminationProof: process\.platform === "win32"/);
   assert.match(compatRunner, /unprovenDeathTempRoots\.add\(tempRoot\)/);
   assert.match(compatRunner, /options\.keepTemp \|\| unprovenDeathTempRoots\.has\(tempRoot\)/);
   assert.match(compatRunner, /retained temp root because process death was not observed/);
@@ -208,6 +347,101 @@ test("bounds process-tree cleanup and retries runner-owned removal", () => {
   assert.match(compatRunner, /outcome: "unexpected-failure"/);
   assert.match(compatRunner, /if \(!options\.keepTemp\) removeRunnerOwnedPath\(runTemp\);/);
   assert.match(compatRunner, /removeRunnerOwnedPath\(tempRoot\);/);
+  assert.match(compatRunner, /const executionAbortController = new AbortController\(\)/);
+  assert.doesNotMatch(compatRunner, /async function runEntries[\s\S]*?const abortController = new AbortController/);
+  assert.match(compatRunner, /unsafe process teardown for/);
+  assert.match(compatRunner, /await Promise\.all\(/);
+});
+
+test("a failed asynchronous Windows taskkill cannot extend the outer deadline", async () => {
+  const child = fakeChild();
+  const taskkill = new EventEmitter();
+  taskkill.unrefCalls = 0;
+  taskkill.unref = () => { taskkill.unrefCalls += 1; };
+  taskkill.kill = () => true;
+  let taskkillInvocation = null;
+  const started = Date.now();
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 5,
+    hardSettleTimeoutMs: 10,
+    requireTerminationProof: true,
+    settleDelayMs: 1,
+    terminate(target) {
+      return startWindowsTaskkill(target, {
+        timeoutMs: 1_000,
+        spawnProcess(command, args, options) {
+          taskkillInvocation = { command, args, options };
+          queueMicrotask(() => taskkill.emit("error", new Error("taskkill failed")));
+          return taskkill;
+        },
+      });
+    },
+  });
+  const result = await completion;
+
+  assert.deepEqual(taskkillInvocation, {
+    command: "taskkill",
+    args: ["/pid", "12345", "/t", "/f"],
+    options: { stdio: "ignore", windowsHide: true },
+  });
+  assert.equal(taskkill.unrefCalls, 0);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.teardownIncomplete, true);
+  assert.match(result.teardownError?.message ?? "", /taskkill failed to start: taskkill failed/);
+  assert.ok(Date.now() - started < 1_000, "taskkill failure must not delay hard settlement");
+});
+
+test("a hung taskkill helper is killed and unrefed by its own watchdog", async () => {
+  const target = fakeChild();
+  const taskkill = new EventEmitter();
+  let killCalls = 0;
+  let unrefCalls = 0;
+  taskkill.kill = () => { killCalls += 1; return true; };
+  taskkill.unref = () => { unrefCalls += 1; };
+  const started = Date.now();
+  await assert.rejects(
+    startWindowsTaskkill(target, {
+      timeoutMs: 10,
+      spawnProcess() { return taskkill; },
+    }),
+    /taskkill did not settle within 10ms/,
+  );
+
+  assert.equal(killCalls, 1);
+  assert.equal(unrefCalls, 1);
+  assert.ok(Date.now() - started < 1_000);
+});
+
+test("Windows close waits for bounded taskkill proof before allowing cleanup", async () => {
+  const child = fakeChild();
+  const taskkill = new EventEmitter();
+  taskkill.unref = () => {};
+  taskkill.kill = () => true;
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 5,
+    hardSettleTimeoutMs: 100,
+    naturalCloseProvesTreeDeath: false,
+    requireTerminationProof: true,
+    settleDelayMs: 50,
+    terminateOnExit: false,
+    terminate(target) {
+      return startWindowsTaskkill(target, {
+        timeoutMs: 1_000,
+        spawnProcess() { return taskkill; },
+      });
+    },
+  });
+  let completed = false;
+  completion.then(() => { completed = true; });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false, "direct close alone must not prove the Windows tree died");
+  taskkill.emit("close", 0);
+  const result = await completion;
+  assert.equal(result.processDeathProven, true);
+  assert.equal(result.teardownIncomplete, false);
 });
 
 function fakeChild(pid = 12_345) {
@@ -269,6 +503,158 @@ test("an observed child exit remains safe when close follows", async () => {
   assert.equal(child.unrefCalls, 0);
 });
 
+test("a natural Windows close retains temp state without falsely failing the file", async () => {
+  const child = fakeChild();
+  let terminateCalls = 0;
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 1_000,
+    hardSettleTimeoutMs: 100,
+    naturalCloseProvesTreeDeath: false,
+    requireTerminationProof: true,
+    settleDelayMs: 50,
+    terminate() { terminateCalls += 1; },
+    terminateOnExit: false,
+  });
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  const result = await completion;
+
+  assert.equal(result.code, 0);
+  assert.equal(result.processDeathProven, false);
+  assert.equal(result.teardownIncomplete, false);
+  assert.equal(terminateCalls, 0);
+  assert.equal(child.unrefCalls, 1);
+});
+
+test("cooperative abort starts bounded teardown immediately", async () => {
+  const child = fakeChild();
+  const controller = new AbortController();
+  let terminateCalls = 0;
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 10_000,
+    hardSettleTimeoutMs: 10,
+    signal: controller.signal,
+    settleDelayMs: 1,
+    terminate() { terminateCalls += 1; },
+  });
+  controller.abort(new Error("peer failed"));
+  const result = await completion;
+
+  assert.equal(result.aborted, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.teardownIncomplete, true);
+  assert.equal(terminateCalls, 1);
+});
+
+test(
+  "normal POSIX exit kills an independent-stdio descendant before cleanup",
+  { skip: process.platform === "win32" },
+  async t => {
+    const source = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], {
+        stdio: "ignore",
+      });
+      console.log(child.pid);
+      child.unref();
+    `;
+    const child = spawn(process.execPath, ["-e", source], {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    let terminateCalls = 0;
+    const result = await waitForChildCompletion(child, {
+      timeoutMs: 1_000,
+      hardSettleTimeoutMs: 100,
+      settleDelayMs: 50,
+      terminate(target) {
+        terminateCalls += 1;
+        try { process.kill(-target.pid, "SIGKILL"); } catch {}
+      },
+    });
+    const grandchildPid = Number(stdout.trim());
+    t.after(() => {
+      if (Number.isInteger(grandchildPid)) {
+        try { process.kill(grandchildPid, "SIGKILL"); } catch {}
+      }
+    });
+
+    assert.equal(result.processDeathProven, true);
+    assert.ok(terminateCalls >= 1);
+    assert.ok(Number.isInteger(grandchildPid));
+    let alive = true;
+    for (let attempt = 0; attempt < 50 && alive; attempt += 1) {
+      try {
+        process.kill(grandchildPid, 0);
+        await new Promise(resolve => setTimeout(resolve, 10));
+      } catch {
+        alive = false;
+      }
+    }
+    assert.equal(alive, false, `grandchild ${grandchildPid} survived process-group cleanup`);
+  },
+);
+
+test("exit without close is bounded but cannot prove inherited handles closed", async () => {
+  const child = fakeChild();
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 1_000,
+    hardSettleTimeoutMs: 100,
+    settleDelayMs: 5,
+    terminate() {},
+  });
+  child.emit("exit", 0, null);
+  const result = await completion;
+
+  assert.equal(result.code, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.processDeathProven, false);
+  assert.equal(result.teardownIncomplete, true);
+  assert.equal(child.unrefCalls, 1);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("a late exit cannot extend the original hard-settlement deadline", async () => {
+  const child = fakeChild();
+  const started = Date.now();
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 5,
+    hardSettleTimeoutMs: 30,
+    settleDelayMs: 2_000,
+    terminate() {},
+  });
+  setTimeout(() => child.emit("exit", null, "SIGKILL"), 20);
+  const result = await completion;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.processDeathProven, false);
+  assert.ok(
+    Date.now() - started < 1_000,
+    "an exit transition must not replace the original hard deadline",
+  );
+});
+
+test("a failed normal-exit cleanup cannot be reported as proven", async () => {
+  const child = fakeChild();
+  const completion = waitForChildCompletion(child, {
+    timeoutMs: 1_000,
+    hardSettleTimeoutMs: 100,
+    settleDelayMs: 50,
+    terminate() { throw new Error("injected process-group cleanup failure"); },
+  });
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  const result = await completion;
+
+  assert.equal(result.code, 0);
+  assert.equal(result.processDeathProven, false);
+  assert.equal(result.teardownIncomplete, true);
+  assert.match(result.teardownError?.message ?? "", /process-group cleanup failure/);
+});
+
 test("rejects invalid outer timeout values before starting lifecycle timers", () => {
   assert.throws(
     () => waitForChildCompletion(fakeChild(), {
@@ -278,5 +664,14 @@ test("rejects invalid outer timeout values before starting lifecycle timers", ()
       terminate() {},
     }),
     /timeoutMs must be positive/,
+  );
+  assert.throws(
+    () => waitForChildCompletion(fakeChild(), {
+      timeoutMs: 2_147_483_648,
+      hardSettleTimeoutMs: 10,
+      settleDelayMs: 0,
+      terminate() {},
+    }),
+    /timeoutMs must be positive safe integer no greater than 2147483647/,
   );
 });
