@@ -535,6 +535,36 @@
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 10 assertions).",
       "owner": "hutch-package-manager"
     },
+    "test/integration/next-pages/test/dev-server-ssr-100.test.ts": {
+      "status": "enabled",
+      "owner": "hutch-package-manager",
+      "reason": "Hutch owns dependency installation, lockfile/node_modules assertions, and public Next dev orchestration; the focused macOS strict result is pending after the prior serial run reached a lockfile snapshot mismatch.",
+      "timeoutMs": 360000,
+      "serial": true,
+      "args": [
+        "--timeout=300000"
+      ]
+    },
+    "test/integration/next-pages/test/dev-server.test.ts": {
+      "status": "enabled",
+      "owner": "hutch-package-manager",
+      "reason": "Hutch owns dependency installation and public Next dev orchestration; run serially with an extended inner hook timeout while the focused macOS strict result is pending.",
+      "timeoutMs": 300000,
+      "serial": true,
+      "args": [
+        "--timeout=180000"
+      ]
+    },
+    "test/integration/next-pages/test/next-build.test.ts": {
+      "status": "enabled",
+      "owner": "hutch-package-manager",
+      "reason": "Hutch owns both dependency installs, lockfile/node_modules assertions, and public Next build orchestration; the focused macOS strict result is pending after the prior serial run reached a lockfile snapshot mismatch.",
+      "timeoutMs": 960000,
+      "serial": true,
+      "args": [
+        "--timeout=900000"
+      ]
+    },
     "test/js/third_party/pnpm/pnpm.test.ts": {
       "status": "enabled",
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split.",

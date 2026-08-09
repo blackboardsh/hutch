@@ -1,7 +1,7 @@
 # Hutch Compatibility Tests
 
 Hutch owns the build-time and package-manager portion of the Bun v1.3.10
-compatibility corpus. Cottontail remains the JavaScript runtime that executes
+compatibility suite. Cottontail remains the JavaScript runtime that executes
 the copied `bun:test` files; a Hutch-owned preload redirects `bunExe()` and
 `process.execPath` child commands to the Hutch binary under test.
 
@@ -10,8 +10,10 @@ The canonical ownership index is
 Bun v1.3.10's 1,445 runnable files to exactly one owner, so repository-local
 copies are never double-counted.
 
-Hutch owns and passes 100 files with zero expected failures. Cottontail owns
-the remaining 1,345 runtime files.
+Hutch owns 103 Bun-derived JavaScript tests with zero expected failures, and
+Cottontail owns the remaining 1,342 runtime files. The previously owned 100
+files have a measured passing baseline; the three transferred Next Pages files
+remain enabled while their focused macOS strict result is established.
 
 ## Commands
 
@@ -21,10 +23,10 @@ Validate ownership and copied-file accounting without running upstream tests:
 node scripts/run-bun-package-manager-tests.js --check
 ```
 
-List the Hutch-owned corpus:
+List the Hutch-owned compatibility suite:
 
 ```sh
-node scripts/run-bun-package-manager-tests.js --list
+node scripts/run-bun-package-manager-tests.js --list --all
 ```
 
 Run one focused file:
@@ -48,7 +50,8 @@ default local build locations.
 ## Branch CI
 
 Pushes to `compat/**` branches and manual dispatches run the complete
-Hutch-owned corpus on macOS. The workflow builds Hutch from the branch and
+Hutch-owned compatibility suite on macOS arm64, Linux x64 and arm64, and
+Windows x64. The workflow builds Hutch from the branch and
 builds Cottontail from the full Git commit recorded in
 [`upstream/cottontail.json`](./upstream/cottontail.json). It does not resolve a
 moving branch, channel, or release alias, and it never publishes artifacts.
@@ -72,4 +75,7 @@ node scripts/import-bun-package-manager-tests.js
 ```
 
 Pass `--source` to use another copy of the pinned Bun v1.3.10 snapshot. The
-importer rejects a changed canonical denominator or ownership count.
+importer rejects a changed canonical denominator or ownership count. The Next
+Pages tree records hashes for its 28 tracked fixture files; each test recreates
+the ignored 29th file, `src/Counter.tsx`, from `src/Counter1.txt` in a
+test-owned temporary directory.

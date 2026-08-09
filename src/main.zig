@@ -78,10 +78,14 @@ fn isCottontailTestCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "test");
 }
 
-// "exec" is likewise a runtime builtin (Bun shell execution), never a
-// package script; forward it like "test".
+// These are runtime builtins, never package scripts; forward them like
+// "test". In particular, `repl` and `completions` must reach Cottontail when
+// Hutch is used as the Bun-compatible facade.
 fn isReservedRuntimeCommand(command: []const u8) bool {
-    return isCottontailTestCommand(command) or std.mem.eql(u8, command, "exec");
+    return isCottontailTestCommand(command) or
+        std.mem.eql(u8, command, "exec") or
+        std.mem.eql(u8, command, "repl") or
+        std.mem.eql(u8, command, "completions");
 }
 
 fn isFakeNodeInvocation(args: []const [:0]const u8) bool {
@@ -1802,6 +1806,8 @@ test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expect(isCottontailTestCommand("test"));
     try std.testing.expect(!isCottontailTestCommand("test:unit"));
     try std.testing.expect(isReservedRuntimeCommand("exec"));
+    try std.testing.expect(isReservedRuntimeCommand("repl"));
+    try std.testing.expect(isReservedRuntimeCommand("completions"));
     try std.testing.expect(!isReservedRuntimeCommand("execute"));
 
     const args = [_][:0]const u8{

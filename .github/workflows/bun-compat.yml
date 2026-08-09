@@ -46,7 +46,7 @@ jobs:
           package-manager-cache: false
 
       - name: Validate compatibility workflow contract
-        run: node --test scripts/bun-compat-workflow.test.js
+        run: node --test scripts/bun-compat-workflow.test.js scripts/bun-harness-dependencies.test.js
 
       - name: Validate Bun package-manager inventory
         run: node scripts/run-bun-package-manager-tests.js --check

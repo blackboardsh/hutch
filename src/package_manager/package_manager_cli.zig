@@ -8554,8 +8554,33 @@ const Manager = struct {
                 peerDependencyIsOptional(package_json, alias) or
                 packageHasRuntimeDependency(package_json, alias)) continue;
             if (try manager.findPeerProvider(alias, range_value.string, peer_parent_dir)) |provider| {
-                try manager.maybeWarnPeerConflict(range_value.string, provider);
-                continue;
+                const install_locked_nested_peer = blk: {
+                    if (manager.peerProviderSatisfies(provider.record, range_value.string) or
+                        manager.lock_graph == null) break :blk false;
+
+                    // A hoisted transitive provider can be visible at the root
+                    // while Bun's lock explicitly selects a satisfying peer at
+                    // the consumer. Only this call site knows that consumer
+                    // directory, so materialize its nested selection here.
+                    // Explicit root-owned providers remain authoritative and
+                    // retain Bun's peer-conflict warning behavior.
+                    if (manager.rootDependencySpec(alias) != null and
+                        std.mem.eql(u8, recordLogicalKey(provider.record), alias)) break :blk false;
+
+                    const selection = (try manager.findLockedSelection(alias, dependency_parent_dir)) orelse
+                        break :blk false;
+                    if (std.mem.eql(u8, selection.destination, provider.destination)) break :blk false;
+                    break :blk try manager.lockedPackageMatches(
+                        selection.package,
+                        alias,
+                        range_value.string,
+                        dependency_parent_dir,
+                    );
+                };
+                if (!install_locked_nested_peer) {
+                    try manager.maybeWarnPeerConflict(range_value.string, provider);
+                    continue;
+                }
             }
             _ = manager.installDependency(alias, range_value.string, dependency_parent_dir, false, false, true) catch |err| {
                 if (err == error.OutOfMemory) return err;

@@ -21,7 +21,6 @@ const hutchRoot = resolve(scriptDir, "..");
 const defaultSourceRoot = resolve(
   hutchRoot,
   "..",
-  "..",
   "cottontail",
   "compat",
   "upstream",
@@ -32,7 +31,49 @@ const suiteRoot = join(hutchRoot, "compat", "upstream", "bun", "v1.3.10");
 const ownershipPath = join(hutchRoot, "compat", "bun-v1.3.10-ownership.json");
 const runnablePattern = /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i;
 const canonicalRunnableCount = 1_445;
-const expectedOwnedCount = 100;
+const expectedOwnedCount = 103;
+
+const nextPagesFixtureRoot = "test/integration/next-pages";
+const nextPagesGeneratedCounter = `${nextPagesFixtureRoot}/src/Counter.tsx`;
+const nextPagesFixtureFiles = [
+  ".eslintrc.json",
+  ".gitignore",
+  "README.md",
+  "bun.lock",
+  "bunfig.toml",
+  "next.config.js",
+  "package.json",
+  "postcss.config.js",
+  "public/favicon.ico",
+  "public/next.svg",
+  "public/vercel.svg",
+  "src/Counter1.txt",
+  "src/Counter2.txt",
+  "src/pages/_app.tsx",
+  "src/pages/_document.tsx",
+  "src/pages/api/hello.ts",
+  "src/pages/index.tsx",
+  "src/styles/globals.css",
+  "tailwind.config.ts",
+  "test/__snapshots__/dev-server-ssr-100.test.ts.snap",
+  "test/__snapshots__/dev-server.test.ts.snap",
+  "test/__snapshots__/next-build.test.ts.snap",
+  "test/dev-server-puppeteer.ts",
+  "test/dev-server-ssr-100.test.ts",
+  "test/dev-server.test.ts",
+  "test/next-build.test.ts",
+  "tsconfig.json",
+  "tsconfig_for_build.json",
+].sort();
+const nextPagesFixturePaths = nextPagesFixtureFiles.map(
+  path => `${nextPagesFixtureRoot}/${path}`,
+);
+const nextPagesFixtureFileSet = new Set(nextPagesFixturePaths);
+const nextPagesTests = [
+  `${nextPagesFixtureRoot}/test/dev-server-ssr-100.test.ts`,
+  `${nextPagesFixtureRoot}/test/dev-server.test.ts`,
+  `${nextPagesFixtureRoot}/test/next-build.test.ts`,
+];
 
 const runtimeOnlyTests = new Set([
   "test/cli/install/semver.test.ts",
@@ -104,6 +145,8 @@ const directlyCopiedPaths = [
   "test/cli/install",
   "test/cli/create",
   "test/cli/init/init.test.ts",
+  "test/cli/__snapshots__/update_interactive_snapshots.test.ts.snap",
+  nextPagesFixtureRoot,
   "test/js/third_party/pnpm",
   ...projectMutationTests.filter(path => !path.startsWith("test/cli/create/") && !path.startsWith("test/cli/init/")),
   ...orchestrationTests,
@@ -173,6 +216,14 @@ function shouldSkipCopy(sourcePath) {
 }
 
 function copyOwnedPath(sourceRoot, relativePath) {
+  const normalizedRelativePath = toPosix(relativePath);
+  if (
+    normalizedRelativePath.startsWith(`${nextPagesFixtureRoot}/`) &&
+    !nextPagesFixtureFileSet.has(normalizedRelativePath) &&
+    !nextPagesFixturePaths.some(path => path.startsWith(`${normalizedRelativePath}/`))
+  ) {
+    return;
+  }
   const source = join(sourceRoot, relativePath);
   const destination = join(suiteRoot, relativePath);
   if (shouldSkipCopy(source)) return;
@@ -231,7 +282,7 @@ function statusForPath(status, existingStatus, path) {
   delete result.pattern;
   if (result.status === "skip" && result.owner === "hutch-package-manager") {
     result.status = "enabled";
-    result.reason = "Imported into Hutch ownership; run the Hutch compatibility corpus and record the measured result here.";
+    result.reason = "Imported into Hutch ownership; run the Hutch JavaScript compatibility suite and record the measured result here.";
   }
   result.owner = "hutch-package-manager";
   return result;
@@ -241,20 +292,78 @@ function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function countCopiedFiles(root) {
-  let count = 0;
+function listCopiedFiles(root) {
+  const files = [];
   const stack = [root];
   while (stack.length > 0) {
     const current = stack.pop();
     for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
-        stack.push(join(current, entry.name));
+        stack.push(path);
       } else {
-        count += 1;
+        files.push(toPosix(relative(root, path)));
       }
     }
   }
-  return count;
+  return files.sort();
+}
+
+function countCopiedFiles(root) {
+  return listCopiedFiles(root).length;
+}
+
+function assertExactPaths(actual, expected, label) {
+  if (
+    actual.length === expected.length &&
+    actual.every((path, index) => path === expected[index])
+  ) {
+    return;
+  }
+  const actualSet = new Set(actual);
+  const expectedSet = new Set(expected);
+  const missing = expected.filter(path => !actualSet.has(path));
+  const unexpected = actual.filter(path => !expectedSet.has(path));
+  throw new Error(
+    `${label} differs from the 28-file canonical inventory` +
+    `${missing.length > 0 ? `; missing: ${missing.join(", ")}` : ""}` +
+    `${unexpected.length > 0 ? `; unexpected: ${unexpected.join(", ")}` : ""}`,
+  );
+}
+
+function validateNextPagesSource(sourceRoot) {
+  const fixtureRoot = join(sourceRoot, nextPagesFixtureRoot);
+  const sourceFiles = listCopiedFiles(fixtureRoot)
+    .filter(path => path !== "src/Counter.tsx");
+  assertExactPaths(sourceFiles, nextPagesFixtureFiles, "Next Pages source fixture");
+
+  const generatedCounter = join(sourceRoot, nextPagesGeneratedCounter);
+  const counterTemplate = join(fixtureRoot, "src", "Counter1.txt");
+  if (existsSync(generatedCounter) && sha256(generatedCounter) !== sha256(counterTemplate)) {
+    throw new Error(
+      `${nextPagesGeneratedCounter} is runtime-generated but no longer matches src/Counter1.txt`,
+    );
+  }
+
+  const recreationSnippets = new Map([
+    [
+      `${nextPagesFixtureRoot}/test/dev-server.test.ts`,
+      'copyFileSync(join(root, "src/Counter1.txt"), join(root, "src/Counter.tsx"));',
+    ],
+    [
+      `${nextPagesFixtureRoot}/test/dev-server-ssr-100.test.ts`,
+      'copyFileSync(join(root, "src/Counter1.txt"), join(root, "src/Counter.tsx"));',
+    ],
+    [
+      `${nextPagesFixtureRoot}/test/next-build.test.ts`,
+      'cpSync(join(root, "src/Counter1.txt"), join(dir, "src/Counter.tsx"));',
+    ],
+  ]);
+  for (const [path, snippet] of recreationSnippets) {
+    if (!readFileSync(join(sourceRoot, path), "utf8").includes(snippet)) {
+      throw new Error(`${path} no longer recreates the ignored Counter.tsx fixture`);
+    }
+  }
 }
 
 function writeJson(path, value) {
@@ -279,6 +388,7 @@ function main() {
   if (sourceManifest.version !== "1.3.10") {
     throw new Error(`expected Bun 1.3.10, received ${String(sourceManifest.version)}`);
   }
+  validateNextPagesSource(sourceRoot);
 
   const canonicalTests = discoverRunnableFiles(sourceRoot);
   if (canonicalTests.length !== canonicalRunnableCount) {
@@ -299,6 +409,7 @@ function main() {
     ...orchestrationTests,
     ...packageManagerRegressionTests,
     ...focusedPackageManagerTests,
+    ...nextPagesTests,
   ].sort();
   const uniqueOwnedTests = new Set(ownedTests);
   if (uniqueOwnedTests.size !== ownedTests.length) {
@@ -319,6 +430,16 @@ function main() {
   for (const path of directlyCopiedPaths) copyOwnedPath(sourceRoot, path);
   for (const path of runtimeOnlyInstallCopiedPaths) {
     rmSync(join(suiteRoot, path), { recursive: true, force: true });
+  }
+
+  const importedNextPagesFiles = listCopiedFiles(join(suiteRoot, nextPagesFixtureRoot));
+  assertExactPaths(
+    importedNextPagesFiles,
+    nextPagesFixtureFiles,
+    "imported Next Pages fixture",
+  );
+  if (existsSync(join(suiteRoot, nextPagesGeneratedCounter))) {
+    throw new Error(`${nextPagesGeneratedCounter} must be recreated only inside test temp directories`);
   }
 
   writeFileSync(
@@ -369,6 +490,10 @@ function main() {
       status: statuses[path].status,
     };
   });
+  const nextPagesFixtureRecords = importedNextPagesFiles.map(path => ({
+    path,
+    sha256: sha256(join(suiteRoot, nextPagesFixtureRoot, path)),
+  }));
 
   writeJson(join(suiteRoot, "manifest.json"), {
     schema: 1,
@@ -386,10 +511,24 @@ function main() {
     ownershipManifest: "compat/bun-v1.3.10-ownership.json",
     testFiles: testRecords,
     copiedPaths: directlyCopiedPaths.map(toPosix).sort(),
+    fixtureTrees: [
+      {
+        path: nextPagesFixtureRoot,
+        copiedFiles: nextPagesFixtureRecords.length,
+        files: nextPagesFixtureRecords,
+        generatedAtRuntime: [
+          {
+            path: "src/Counter.tsx",
+            source: "src/Counter1.txt",
+          },
+        ],
+      },
+    ],
     notes: [
       "This is an owned Hutch compatibility-test snapshot copied from Bun v1.3.10.",
       "Cottontail is the JavaScript test runtime; the Hutch-specific preload redirects bunExe() and process.execPath child commands to Hutch.",
       "The snapshot excludes node_modules, generated test artifacts, and unrelated Bun runtime, bundler, benchmark, and integration fixtures.",
+      "The Next Pages fixture has 28 canonical files; each owned test recreates its ignored 29th file, src/Counter.tsx, from src/Counter1.txt in a test-owned temp directory.",
       "Copied upstream tests remain byte-identical. Hutch-owned runner and preload behavior lives outside the copied Bun test tree.",
     ],
     intentionallyDeferred: [

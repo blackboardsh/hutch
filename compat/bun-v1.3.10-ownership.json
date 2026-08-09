@@ -5,8 +5,8 @@
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "canonicalRunnableFiles": 1445,
   "ownerCounts": {
-    "cottontail-runtime": 1345,
-    "hutch-package-manager": 100
+    "cottontail-runtime": 1342,
+    "hutch-package-manager": 103
   },
   "tests": [
     {
@@ -1031,15 +1031,15 @@
     },
     {
       "path": "test/integration/next-pages/test/dev-server-ssr-100.test.ts",
-      "owner": "cottontail-runtime"
+      "owner": "hutch-package-manager"
     },
     {
       "path": "test/integration/next-pages/test/dev-server.test.ts",
-      "owner": "cottontail-runtime"
+      "owner": "hutch-package-manager"
     },
     {
       "path": "test/integration/next-pages/test/next-build.test.ts",
-      "owner": "cottontail-runtime"
+      "owner": "hutch-package-manager"
     },
     {
       "path": "test/integration/sass/sass.test.ts",

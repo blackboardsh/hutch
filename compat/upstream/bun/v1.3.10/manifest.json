@@ -6,12 +6,12 @@
   "tag": "bun-v1.3.10",
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "source": "https://github.com/oven-sh/bun",
-  "copiedAt": "2026-08-04",
+  "copiedAt": "2026-08-09",
   "canonicalRunnableFiles": 1445,
-  "ownedRunnableFiles": 100,
-  "copiedFiles": 828,
+  "ownedRunnableFiles": 103,
+  "copiedFiles": 856,
   "statusCounts": {
-    "enabled": 100
+    "enabled": 103
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -416,6 +416,21 @@
       "status": "enabled"
     },
     {
+      "path": "test/integration/next-pages/test/dev-server-ssr-100.test.ts",
+      "sha256": "f1a0da26e7d8cc3bcbf4b8e7af1db56b4c98e562f9922cc5fff6cc1b6e783531",
+      "status": "enabled"
+    },
+    {
+      "path": "test/integration/next-pages/test/dev-server.test.ts",
+      "sha256": "870ab426a7622b60c2189c44db90dfe21268148ad42ee5ae442dcc27c3ed0b5b",
+      "status": "enabled"
+    },
+    {
+      "path": "test/integration/next-pages/test/next-build.test.ts",
+      "sha256": "3171bf9fe795a86d9efab3be22e0376b2a248c6fe7eb61e1cfa96a56e6cf57f4",
+      "status": "enabled"
+    },
+    {
       "path": "test/js/third_party/pnpm/pnpm.test.ts",
       "sha256": "b279266f6cd3e160f58b4ddfd8914ab731fe6c9a2bcfa4212899ace127287fb0",
       "status": "enabled"
@@ -522,6 +537,7 @@
     "src/init/react-tailwind",
     "test/_util/numeric.ts",
     "test/bun.lock",
+    "test/cli/__snapshots__/update_interactive_snapshots.test.ts.snap",
     "test/cli/create",
     "test/cli/init/init.test.ts",
     "test/cli/install",
@@ -537,6 +553,7 @@
     "test/cli/update_interactive_snapshots.test.ts",
     "test/docker",
     "test/harness.ts",
+    "test/integration/next-pages",
     "test/js/third_party/pnpm",
     "test/js/third_party/pnpm/pnpm.test.ts",
     "test/package.json",
@@ -563,10 +580,137 @@
     "test/tsconfig.json",
     "tsconfig.base.json"
   ],
+  "fixtureTrees": [
+    {
+      "path": "test/integration/next-pages",
+      "copiedFiles": 28,
+      "files": [
+        {
+          "path": ".eslintrc.json",
+          "sha256": "1589a15e55fbebc6519c95d91d8f0a090618f20dc78e479858b9c27552484961"
+        },
+        {
+          "path": ".gitignore",
+          "sha256": "d71a129ee0b021d034c2929738ed67c83d2c594aa5f57aa8ca6c673ffd9eee72"
+        },
+        {
+          "path": "README.md",
+          "sha256": "66bf55397ba0dbf1096f6edc8fdc64c5544b57af79eeb13ad603b45d6d85fe20"
+        },
+        {
+          "path": "bun.lock",
+          "sha256": "1ba916d9558936b9dd3202e23e7072bbce9f562aea03e9389575f6c7c353e25a"
+        },
+        {
+          "path": "bunfig.toml",
+          "sha256": "31d5cc857e530acc104793aa805e2f0a5d3f7309487d0fb2955ffdf662ea971a"
+        },
+        {
+          "path": "next.config.js",
+          "sha256": "2cd4d4b3465a664bd54238487463a3d67d989947e69fae6a402517b4a2311e4b"
+        },
+        {
+          "path": "package.json",
+          "sha256": "c2f0d13e3699f7e35977da1ee27ba92dd900d294d6fad82d4666e049c7fcf863"
+        },
+        {
+          "path": "postcss.config.js",
+          "sha256": "fa650b380adfabb151a0b352f7135e107e6352345f899060f1c5c231228f94bf"
+        },
+        {
+          "path": "public/favicon.ico",
+          "sha256": "2b8ad2d33455a8f736fc3a8ebf8f0bdea8848ad4c0db48a2833bd0f9cd775932"
+        },
+        {
+          "path": "public/next.svg",
+          "sha256": "55995dfad6ecb4945a1e856ddca03c5e16aa5bf13fd21b4df6a74ae79357bcfc"
+        },
+        {
+          "path": "public/vercel.svg",
+          "sha256": "3fa5cd757b418e18afc68ddebad55f443206e410327921ddb2bf1be731658880"
+        },
+        {
+          "path": "src/Counter1.txt",
+          "sha256": "eabba8c681f69af3638c380f9d0c580f8bbd600879eed01a77035fefb84a57d9"
+        },
+        {
+          "path": "src/Counter2.txt",
+          "sha256": "6ddbcfb9701c7f0748bcf835d06f5b24f53146959ce61db38672ac790130d526"
+        },
+        {
+          "path": "src/pages/_app.tsx",
+          "sha256": "1f583617583bc241540c1867222e0d4bbc9ae2f1fbe0200c541d648990f75bea"
+        },
+        {
+          "path": "src/pages/_document.tsx",
+          "sha256": "9dbd2fdfe43a6b984b0f2726c786edce030cd5311e3fe92a89f7d031088af9dc"
+        },
+        {
+          "path": "src/pages/api/hello.ts",
+          "sha256": "13d23780b9992e6e94efc884d7dc5c587926b549ee4da98ed97cf88c28707b8b"
+        },
+        {
+          "path": "src/pages/index.tsx",
+          "sha256": "d4de2936cff45c18bfee93b69800ef1b5c92f73d0d5a0a4bb877e603a826641f"
+        },
+        {
+          "path": "src/styles/globals.css",
+          "sha256": "d1246d4d1de5db72e3b3e6f9dfccaac8f2d1cf5260f9a241bd56afe6e59d1538"
+        },
+        {
+          "path": "tailwind.config.ts",
+          "sha256": "90ce58625f774deb8445c870adb232cd6952d608e3bc231b50947748480b1d5d"
+        },
+        {
+          "path": "test/__snapshots__/dev-server-ssr-100.test.ts.snap",
+          "sha256": "58847949285510948865d7eb9dadaf1118edfb8a910637dd83d6f1ea396e2e36"
+        },
+        {
+          "path": "test/__snapshots__/dev-server.test.ts.snap",
+          "sha256": "6de635b01eb7523155c6ddb134fbadd43bcb1e41d94206fe473f4a996691e3e5"
+        },
+        {
+          "path": "test/__snapshots__/next-build.test.ts.snap",
+          "sha256": "548fb4bf3704eaed158818504f5becbea8090950cfb95f8ff96f307161987497"
+        },
+        {
+          "path": "test/dev-server-puppeteer.ts",
+          "sha256": "44023e2fa636012987925d911a6ba86e8e1ddafe83140cfcd61bd065ec2212f4"
+        },
+        {
+          "path": "test/dev-server-ssr-100.test.ts",
+          "sha256": "f1a0da26e7d8cc3bcbf4b8e7af1db56b4c98e562f9922cc5fff6cc1b6e783531"
+        },
+        {
+          "path": "test/dev-server.test.ts",
+          "sha256": "870ab426a7622b60c2189c44db90dfe21268148ad42ee5ae442dcc27c3ed0b5b"
+        },
+        {
+          "path": "test/next-build.test.ts",
+          "sha256": "3171bf9fe795a86d9efab3be22e0376b2a248c6fe7eb61e1cfa96a56e6cf57f4"
+        },
+        {
+          "path": "tsconfig.json",
+          "sha256": "f9843ac05afaae2bf4b3a04334c5196b7b0530d6ab8084d6e13f2bf792db9788"
+        },
+        {
+          "path": "tsconfig_for_build.json",
+          "sha256": "a62526e5327af5d9baa5c0f5d10bd1dd527df094c77ec4d37c25b010dc6def9a"
+        }
+      ],
+      "generatedAtRuntime": [
+        {
+          "path": "src/Counter.tsx",
+          "source": "src/Counter1.txt"
+        }
+      ]
+    }
+  ],
   "notes": [
     "This is an owned Hutch compatibility-test snapshot copied from Bun v1.3.10.",
     "Cottontail is the JavaScript test runtime; the Hutch-specific preload redirects bunExe() and process.execPath child commands to Hutch.",
     "The snapshot excludes node_modules, generated test artifacts, and unrelated Bun runtime, bundler, benchmark, and integration fixtures.",
+    "The Next Pages fixture has 28 canonical files; each owned test recreates its ignored 29th file, src/Counter.tsx, from src/Counter1.txt in a test-owned temp directory.",
     "Copied upstream tests remain byte-identical. Hutch-owned runner and preload behavior lives outside the copied Bun test tree."
   ],
   "intentionallyDeferred": [

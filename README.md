@@ -100,7 +100,7 @@ DASH_USE_LOCAL_COTTONTAIL=1 ./zig-out/bin/hutch examples/smoke.js
 the global store and must remain set when a non-default install root is used.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
 Run `node scripts/run-bun-package-manager-tests.js --all --jobs 4` for the
-complete 100-file copied compatibility corpus. The ownership boundary and
+complete 103-file copied compatibility suite. The ownership boundary and
 measured compatibility accounting are documented in
 [docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
 
