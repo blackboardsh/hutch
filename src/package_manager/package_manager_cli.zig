@@ -3785,7 +3785,8 @@ const Manager = struct {
         return 0;
     }
 
-    fn registerGlobalLink(manager: *Manager) !u8 {        const package_json = try manager.readLinkPackageJSON();
+    fn registerGlobalLink(manager: *Manager) !u8 {
+        const package_json = try manager.readLinkPackageJSON();
         const name = jsonString(package_json, "name") orelse {
             try manager.stderr.writeAll("error: package.json missing \"name\"\n");
             return error.PackageManagerErrorReported;
@@ -7011,10 +7012,21 @@ const Manager = struct {
             // already fetched by scanner preflight.
             break :blk !manager.pathExists(locked.destination);
         };
-        const refresh_scanner_resolution_add = manager.isSecurityResolution() and
-            manager.options.command == .add and
-            direct and
-            manager.explicit_adds.contains(alias);
+        const refresh_scanner_resolution_add = blk: {
+            if (!manager.isSecurityResolution() or
+                manager.options.command != .add or
+                !direct or
+                !manager.explicit_adds.contains(alias)) break :blk false;
+            const locked = (try manager.findLockedSelection(alias, parent_dir)) orelse break :blk false;
+            // A selected locked root only needs fresh metadata when its
+            // materialization is absent or no longer matches the lock. Bun
+            // reuses an unchanged installed root during scanner preflight.
+            break :blk !try manager.installedPackageMatches(
+                locked.destination,
+                locked.package.name,
+                locked.package.version,
+            );
+        };
         const refresh_direct_registry = direct and
             !workspace_package and
             !isGitSpec(resolution_spec) and

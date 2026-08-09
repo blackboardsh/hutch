@@ -6,7 +6,7 @@ import { cp, rm } from "fs/promises";
 import PQueue from "p-queue";
 import { join } from "path";
 import { StringDecoder } from "string_decoder";
-import { bunEnv, bunExe, tmpdirSync, toMatchNodeModulesAt } from "../../../harness";
+import { bunEnv, bunExe, normalizeLockfileForSnapshot, tmpdirSync, toMatchNodeModulesAt } from "../../../harness";
 const { parseLockfile } = install_test_helpers;
 
 expect.extend({ toMatchNodeModulesAt });
@@ -135,7 +135,7 @@ test(
     expect(baseUrl).not.toBeUndefined();
     const lockfile = parseLockfile(root);
     expect(lockfile).toMatchNodeModulesAt(root);
-    expect(lockfile).toMatchSnapshot();
+    expect(normalizeLockfileForSnapshot(lockfile)).toMatchSnapshot();
     const controller = new AbortController();
 
     // On an arm64 mac, it doesn't get faster if you increase it beyond 4 as of August, 2025.

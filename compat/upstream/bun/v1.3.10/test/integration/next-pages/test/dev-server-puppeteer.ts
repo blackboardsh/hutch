@@ -1,8 +1,7 @@
 import assert from "assert";
 import { copyFileSync } from "fs";
 import { join } from "path";
-import type { ConsoleMessage, Page } from "puppeteer";
-import { launch } from "puppeteer";
+import puppeteer, { type ConsoleMessage, type Page } from "puppeteer";
 import { which } from "bun";
 const root = join(import.meta.dir, "../");
 
@@ -13,12 +12,9 @@ if (process.argv.length > 2) {
   url = process.argv[2];
 }
 
-const browserPath = which("chromium-browser") || which("chromium") || which("chrome") || undefined;
-if (!browserPath) {
-  console.warn("Since a Chromium browser was not found, it will be downloaded by Puppeteer.");
-}
+const browserPath = which("chromium-browser") || which("chromium") || which("chrome") || puppeteer.executablePath();
 
-const b = await launch({
+const b = await puppeteer.launch({
   // On macOS, there are issues using the new headless mode.
   // "TargetCloseError: Protocol error (Target.setAutoAttach): Target closed"
   headless: process.platform === "darwin" ? "shell" : true,

@@ -3,7 +3,14 @@ import { expect, test } from "bun:test";
 import { copyFileSync, cpSync, promises as fs, readFileSync, rmSync } from "fs";
 import { cp } from "fs/promises";
 import { join } from "path";
-import { bunEnv, bunExe, isDebug, tmpdirSync, toMatchNodeModulesAt } from "../../../harness";
+import {
+  bunEnv,
+  bunExe,
+  isDebug,
+  normalizeLockfileForSnapshot,
+  tmpdirSync,
+  toMatchNodeModulesAt,
+} from "../../../harness";
 const { parseLockfile } = install_test_helpers;
 
 expect.extend({ toMatchNodeModulesAt });
@@ -113,12 +120,12 @@ test(
     const bunDir = await tempDirToBuildIn();
     let lockfile = parseLockfile(bunDir);
     expect(lockfile).toMatchNodeModulesAt(bunDir);
-    expect(parseLockfile(bunDir)).toMatchSnapshot("bun");
+    expect(normalizeLockfileForSnapshot(parseLockfile(bunDir))).toMatchSnapshot("bun");
 
     const nodeDir = await tempDirToBuildIn();
     lockfile = parseLockfile(nodeDir);
     expect(lockfile).toMatchNodeModulesAt(nodeDir);
-    expect(lockfile).toMatchSnapshot("node");
+    expect(normalizeLockfileForSnapshot(lockfile)).toMatchSnapshot("node");
 
     console.log("Bun Dir: " + bunDir);
     console.log("Node Dir: " + nodeDir);

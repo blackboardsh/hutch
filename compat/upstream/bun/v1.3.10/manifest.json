@@ -382,7 +382,7 @@
     },
     {
       "path": "test/cli/run/run-autoinstall.test.ts",
-      "sha256": "330d42fad4084b61b5bc7e5fbdaa6d1584ced6a68388327e42d4a6e88396616a",
+      "sha256": "877d30fa1b901439a1e2cff7589c7eff8aa2df0a49a7d7c866cb28f84eb52d9b",
       "status": "enabled"
     },
     {
@@ -417,17 +417,17 @@
     },
     {
       "path": "test/integration/next-pages/test/dev-server-ssr-100.test.ts",
-      "sha256": "f1a0da26e7d8cc3bcbf4b8e7af1db56b4c98e562f9922cc5fff6cc1b6e783531",
+      "sha256": "21f9436c69f502ab89e8f5b6862a1c2e79bb7ef1930de82de8b567076478cf18",
       "status": "enabled"
     },
     {
       "path": "test/integration/next-pages/test/dev-server.test.ts",
-      "sha256": "870ab426a7622b60c2189c44db90dfe21268148ad42ee5ae442dcc27c3ed0b5b",
+      "sha256": "645bb50a2178730b19a0abeb57cae3f5f735c44d7e9913316f9ed9429d2f3e4c",
       "status": "enabled"
     },
     {
       "path": "test/integration/next-pages/test/next-build.test.ts",
-      "sha256": "3171bf9fe795a86d9efab3be22e0376b2a248c6fe7eb61e1cfa96a56e6cf57f4",
+      "sha256": "db718354dea1cdebe1a7dbb69461d2eca5f2bbc358df62e0cdd493e65a6cea82",
       "status": "enabled"
     },
     {
@@ -651,7 +651,7 @@
         },
         {
           "path": "src/pages/index.tsx",
-          "sha256": "d4de2936cff45c18bfee93b69800ef1b5c92f73d0d5a0a4bb877e603a826641f"
+          "sha256": "c6343206b9ae195328fd79fadff46a614bda4b65274e09dda00dfa20f7c66dbf"
         },
         {
           "path": "src/styles/globals.css",
@@ -675,19 +675,19 @@
         },
         {
           "path": "test/dev-server-puppeteer.ts",
-          "sha256": "44023e2fa636012987925d911a6ba86e8e1ddafe83140cfcd61bd065ec2212f4"
+          "sha256": "7f783a171cee19c17f7b5b0102ba6cbcb9a74c5b87d25cd27c4551bbe569640f"
         },
         {
           "path": "test/dev-server-ssr-100.test.ts",
-          "sha256": "f1a0da26e7d8cc3bcbf4b8e7af1db56b4c98e562f9922cc5fff6cc1b6e783531"
+          "sha256": "21f9436c69f502ab89e8f5b6862a1c2e79bb7ef1930de82de8b567076478cf18"
         },
         {
           "path": "test/dev-server.test.ts",
-          "sha256": "870ab426a7622b60c2189c44db90dfe21268148ad42ee5ae442dcc27c3ed0b5b"
+          "sha256": "645bb50a2178730b19a0abeb57cae3f5f735c44d7e9913316f9ed9429d2f3e4c"
         },
         {
           "path": "test/next-build.test.ts",
-          "sha256": "3171bf9fe795a86d9efab3be22e0376b2a248c6fe7eb61e1cfa96a56e6cf57f4"
+          "sha256": "db718354dea1cdebe1a7dbb69461d2eca5f2bbc358df62e0cdd493e65a6cea82"
         },
         {
           "path": "tsconfig.json",
@@ -711,7 +711,7 @@
     "Cottontail is the JavaScript test runtime; the Hutch-specific preload redirects bunExe() and process.execPath child commands to Hutch.",
     "The snapshot excludes node_modules, generated test artifacts, and unrelated Bun runtime, bundler, benchmark, and integration fixtures.",
     "The Next Pages fixture has 28 canonical files; each owned test recreates its ignored 29th file, src/Counter.tsx, from src/Counter1.txt in a test-owned temp directory.",
-    "Copied upstream tests remain byte-identical. Hutch-owned runner and preload behavior lives outside the copied Bun test tree."
+    "Except for the four lockfile snapshot callsites and two environment-facing fixtures in the three owned Next Pages tests, copied upstream tests remain byte-identical. The snapshot callsites normalize only Cottontail's semantically equivalent pure-optional dependency ordering before comparing the unchanged Bun snapshots. The SSR fixture still prefers process.versions.bun and otherwise reads Hutch's Bun user-agent token when Next executes under Node; the browser driver uses Puppeteer's installed executable resolver when no system Chromium is present. Functional lockfile, node_modules, server, build, browser-HMR, and request assertions remain unchanged."
   ],
   "intentionallyDeferred": [
     {

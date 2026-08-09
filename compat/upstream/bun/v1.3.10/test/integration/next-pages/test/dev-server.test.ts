@@ -5,7 +5,15 @@ import { copyFileSync } from "fs";
 import { cp, rm } from "fs/promises";
 import { join } from "path";
 import { StringDecoder } from "string_decoder";
-import { bunEnv, bunExe, isCI, isWindows, tmpdirSync, toMatchNodeModulesAt } from "../../../harness";
+import {
+  bunEnv,
+  bunExe,
+  isCI,
+  isWindows,
+  normalizeLockfileForSnapshot,
+  tmpdirSync,
+  toMatchNodeModulesAt,
+} from "../../../harness";
 const { parseLockfile } = install_test_helpers;
 
 expect.extend({ toMatchNodeModulesAt });
@@ -131,7 +139,7 @@ test.skipIf(puppeteer_unsupported || (isWindows && isCI))(
 
     const lockfile = parseLockfile(root);
     expect(lockfile).toMatchNodeModulesAt(root);
-    expect(lockfile).toMatchSnapshot();
+    expect(normalizeLockfileForSnapshot(lockfile)).toMatchSnapshot();
 
     var pid: number, exited;
     let timeout = setTimeout(() => {

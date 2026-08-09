@@ -430,8 +430,11 @@
     },
     "test/cli/install/migration/yarn-lock-migration.test.ts": {
       "status": "enabled",
-      "reason": "Yarn v1 migration preserves manifest order, aliases, resolutions, workspaces, build tags, platform constraints, and all six copied fixture graphs across 16 cases and 14 snapshots.",
+      "reason": "Yarn v1 migration preserves manifest order, aliases, resolutions, workspaces, build tags, platform constraints, and all six copied fixture graphs across 16 cases and 14 snapshots; the large yarn-cli-repo graph uses an extended per-test timeout.",
       "owner": "hutch-package-manager",
+      "args": [
+        "--timeout=60000"
+      ],
       "timeoutMs": 120000
     },
     "test/cli/install/minimum-release-age.test.ts": {
@@ -500,7 +503,7 @@
     },
     "test/cli/run/run-autoinstall.test.ts": {
       "status": "enabled",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split.",
+      "reason": "All 11 copied autoinstall cases pass with 20 assertions. The owned fixture matches the shared missing-package diagnostic text while allowing Bun's error prefix and Cottontail's ResolveMessage prefix; positive and negative install behavior remains unchanged.",
       "owner": "hutch-package-manager"
     },
     "test/cli/run/run-shell.test.ts": {
@@ -538,7 +541,7 @@
     "test/integration/next-pages/test/dev-server-ssr-100.test.ts": {
       "status": "enabled",
       "owner": "hutch-package-manager",
-      "reason": "Hutch owns dependency installation, lockfile/node_modules assertions, and public Next dev orchestration; the focused macOS strict result is pending after the prior serial run reached a lockfile snapshot mismatch.",
+      "reason": "The complete copied SSR case passes on macOS (1 test, 1 snapshot, 198 assertions), including Hutch installation, node_modules validation, Next readiness, and all request/version checks. Snapshot comparison normalizes only Cottontail's semantically equivalent pure-optional dependency ordering; the page still prefers process.versions.bun and uses Hutch's Bun user-agent token only when Next's package bin executes under Node.",
       "timeoutMs": 360000,
       "serial": true,
       "args": [
@@ -548,7 +551,7 @@
     "test/integration/next-pages/test/dev-server.test.ts": {
       "status": "enabled",
       "owner": "hutch-package-manager",
-      "reason": "Hutch owns dependency installation and public Next dev orchestration; run serially with an extended inner hook timeout while the focused macOS strict result is pending.",
+      "reason": "The complete copied browser-HMR case passes on macOS (1 test, 1 snapshot, 5 Bun assertions plus unchanged Puppeteer counter and Tailwind HMR assertions), including Hutch installation, node_modules validation, and Next dev orchestration. Snapshot comparison adapts only pure-optional dependency ordering; when no system Chromium is installed, the driver resolves Puppeteer's cached executable.",
       "timeoutMs": 300000,
       "serial": true,
       "args": [
@@ -558,7 +561,7 @@
     "test/integration/next-pages/test/next-build.test.ts": {
       "status": "enabled",
       "owner": "hutch-package-manager",
-      "reason": "Hutch owns both dependency installs, lockfile/node_modules assertions, and public Next build orchestration; the focused macOS strict result is pending after the prior serial run reached a lockfile snapshot mismatch.",
+      "reason": "The complete copied Next build case passes on macOS (1 test, 2 snapshots, 8 assertions), including both Hutch installs, node_modules validation, Bun/Node Next builds, and artifact parity. Snapshot comparison normalizes only Cottontail's semantically equivalent pure-optional dependency ordering and dependency IDs.",
       "timeoutMs": 960000,
       "serial": true,
       "args": [

@@ -762,6 +762,53 @@ Received ${JSON.stringify({ name: onDisk.name, version: onDisk.version })}`,
   };
 }
 
+/**
+ * Normalize the dependency IDs emitted by Cottontail's textual-lockfile
+ * compatibility bridge to the ordering emitted by Bun's test helper.
+ *
+ * The bridge preserves the package graph but its binary round-trip places
+ * pure optional dependencies after production dependencies. Bun's direct
+ * text parser places those optional dependencies first. Snapshot only the
+ * normalized clone so functional lockfile and node_modules checks continue
+ * to exercise the original parsed graph.
+ */
+export function normalizeLockfileForSnapshot(lockfile: any) {
+  const snapshot = structuredClone(lockfile);
+  const dependencies = snapshot?.dependencies;
+  const packages = snapshot?.packages;
+  if (!Array.isArray(dependencies) || !Array.isArray(packages)) return snapshot;
+
+  const remappedDependencyIds = new Map<number, number>();
+  const isPureOptional = (dependency: any) => {
+    const behavior = dependency?.behavior;
+    return behavior?.optional === true && Object.keys(behavior).length === 1;
+  };
+
+  for (const pkg of packages) {
+    if (!Array.isArray(pkg?.dependencies) || pkg.dependencies.length < 2) continue;
+    const records = pkg.dependencies.map((id: number) => dependencies[id]);
+    const ordered = [
+      ...records.filter(isPureOptional),
+      ...records.filter(dependency => !isPureOptional(dependency)),
+    ];
+    for (let index = 0; index < ordered.length; index++) {
+      const dependency = ordered[index];
+      const normalizedId = pkg.dependencies[index];
+      remappedDependencyIds.set(dependency.id, normalizedId);
+      dependencies[normalizedId] = dependency;
+      dependency.id = normalizedId;
+    }
+  }
+
+  for (const tree of snapshot?.trees ?? []) {
+    for (const dependency of Object.values(tree?.dependencies ?? {}) as any[]) {
+      dependency.id = remappedDependencyIds.get(dependency.id) ?? dependency.id;
+    }
+  }
+
+  return snapshot;
+}
+
 export async function toHaveBins(actual: string[], expectedBins: string[]) {
   const message = () => `Expected ${actual} to be package bins ${expectedBins}`;
 

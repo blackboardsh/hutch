@@ -198,7 +198,8 @@ fn fetchInsecure(
     const status: u16 = @intFromEnum(head.status);
     var transfer_buffer: [64]u8 = undefined;
     const body_reader = http_reader.bodyReader(&transfer_buffer, head.transfer_encoding, head.content_length);
-    var limited = body_reader.limited(.limited(max_release_metadata_bytes + 1), &.{});
+    var limited_buffer: [4096]u8 = undefined;
+    var limited = body_reader.limited(.limited(max_release_metadata_bytes + 1), &limited_buffer);
     var json_reader = std.json.Reader.init(allocator, &limited.interface);
     defer json_reader.deinit();
     const metadata = try std.json.Value.jsonParse(allocator, &json_reader, .{
