@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+
+const windowsJobMetadata = new WeakMap();
+
 function abandonChildHandles(child) {
   for (const stream of [child.stdin, child.stdout, child.stderr]) {
     try {
@@ -22,51 +26,120 @@ function validateDuration(name, value, allowZero = false) {
   }
 }
 
-export function startWindowsTaskkill(child, options) {
-  const { spawnProcess, timeoutMs } = options;
-  validateDuration("taskkill timeoutMs", timeoutMs);
+export function startWindowsJobChild(command, args, options) {
+  const {
+    jobLauncher,
+    parentPid = process.pid,
+    spawnOptions,
+    spawnProcess,
+  } = options;
+  if (typeof command !== "string" || command.length === 0) {
+    throw new TypeError("Windows job command must be a non-empty string");
+  }
+  if (!Array.isArray(args)) throw new TypeError("Windows job args must be an array");
+  if (typeof jobLauncher !== "string" || jobLauncher.length === 0) {
+    throw new TypeError("jobLauncher must be a non-empty string");
+  }
+  if (!Number.isSafeInteger(parentPid) || parentPid < 1 || parentPid > 0xffff_ffff) {
+    throw new TypeError("parentPid must be a positive 32-bit integer");
+  }
   if (typeof spawnProcess !== "function") {
     throw new TypeError("spawnProcess must be a function");
   }
-  if (!Number.isInteger(child.pid) || child.pid < 1) return null;
-
-  // Do not synchronously wait for taskkill. It is only a best-effort Windows
-  // process-tree signal; the child lifecycle's independent hard-settlement
-  // timer is the authority that bounds the outer test deadline.
-  const taskkill = spawnProcess(
-    "taskkill",
-    ["/pid", String(child.pid), "/t", "/f"],
-    { stdio: "ignore", windowsHide: true },
+  const jobName = `Local\\HutchBunCompat-${randomUUID()}`;
+  const child = spawnProcess(
+    jobLauncher,
+    ["run", jobName, String(parentPid), command, ...args.map(String)],
+    spawnOptions,
   );
+  windowsJobMetadata.set(child, { jobLauncher, jobName });
+  return child;
+}
+
+export function startWindowsJobTermination(child, options) {
+  const { spawnProcess, timeoutMs, watchdogMs } = options;
+  validateDuration("Windows job timeoutMs", timeoutMs);
+  validateDuration("Windows job watchdogMs", watchdogMs);
+  if (watchdogMs <= timeoutMs) {
+    throw new TypeError("Windows job watchdogMs must exceed timeoutMs");
+  }
+  if (typeof spawnProcess !== "function") {
+    throw new TypeError("spawnProcess must be a function");
+  }
+  const metadata = windowsJobMetadata.get(child);
+  if (metadata == null) {
+    throw new TypeError("child was not started by the Windows Job Object launcher");
+  }
+
   return new Promise((resolve, reject) => {
     let settled = false;
-    let taskkillTimer = setTimeout(() => {
-      taskkillTimer = null;
-      try {
-        taskkill.kill("SIGKILL");
-      } catch {}
-      // The watchdog has made its best-effort kill. Do not let a broken helper
-      // outlive the runner indefinitely if Windows refuses that final signal.
-      taskkill.unref?.();
-      finish(new Error(`taskkill did not settle within ${timeoutMs}ms`));
-    }, timeoutMs);
+    let retryTimer = null;
+    let terminator = null;
+    let watchdog = null;
+    let lastStatus = null;
+    const deadline = Date.now() + watchdogMs;
     const finish = error => {
       if (settled) return;
       settled = true;
-      if (taskkillTimer != null) clearTimeout(taskkillTimer);
-      taskkillTimer = null;
+      if (watchdog != null) clearTimeout(watchdog);
+      if (retryTimer != null) clearTimeout(retryTimer);
+      watchdog = null;
+      retryTimer = null;
       if (error) reject(error);
       else resolve(true);
     };
-    taskkill.once("error", error => {
+    const startAttempt = () => {
+      if (settled) return;
+      try {
+        terminator = spawnProcess(
+          metadata.jobLauncher,
+          ["terminate", metadata.jobName, String(timeoutMs)],
+          { stdio: "ignore", windowsHide: true },
+        );
+      } catch (error) {
+        finish(new Error(
+          `Windows Job Object terminator failed to start: ${error?.message ?? String(error)}`,
+          { cause: error },
+        ));
+        return;
+      }
+      terminator.once("error", error => {
+        finish(new Error(
+          `Windows Job Object terminator failed to start: ${error?.message ?? String(error)}`,
+          { cause: error },
+        ));
+      });
+      terminator.once("close", code => {
+        if (settled) return;
+        if (code === 0) {
+          finish(null);
+          return;
+        }
+        lastStatus = code;
+        // An interrupt can arrive after the launcher process is spawned but
+        // before it creates its named Job. OpenJobObject then fails quickly;
+        // retry inside the same overall watchdog instead of caching that
+        // startup race as a permanent failed proof.
+        if (Date.now() + 25 < deadline) {
+          retryTimer = setTimeout(startAttempt, 25);
+          return;
+        }
+        finish(new Error(
+          `Windows Job Object terminator exited with status ${lastStatus ?? "unknown"}`,
+        ));
+      });
+    };
+    watchdog = setTimeout(() => {
+      try {
+        terminator?.kill("SIGKILL");
+      } catch {}
+      terminator?.unref?.();
       finish(new Error(
-        `taskkill failed to start: ${error?.message ?? String(error)}`,
-        { cause: error },
+        `Windows Job Object terminator did not settle within ${watchdogMs}ms` +
+        (lastStatus == null ? "" : ` (last status ${lastStatus})`),
       ));
-    });
-    taskkill.once("close", code => {
-      finish(code === 0 ? null : new Error(`taskkill exited with status ${code ?? "unknown"}`));
-    });
+    }, watchdogMs);
+    startAttempt();
   });
 }
 

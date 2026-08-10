@@ -79,7 +79,10 @@ try {
     .map((name) => join(consumerDir, "node_modules", ".bin", name))
     .find(existsSync);
   assert(executablePath, "consumer bin link missing");
-  assert(readFileSync(join(consumerDir, "bun.lock"), "utf8").includes('"linked-pkg": "link:linked-pkg"'), "lockfile link spec missing");
+  assert(
+    !existsSync(join(consumerDir, "bun.lock")) && !existsSync(join(consumerDir, "bun.lockb")),
+    "bun link unexpectedly wrote a lockfile",
+  );
 
   const cli = spawnSync(executablePath, [], {
     encoding: "utf8",

@@ -3766,6 +3766,17 @@ const Manager = struct {
                 name,
             });
             try manager.linkRelativeDirectory(destination, resolved, true);
+            if (manager.readInstalledPackageJSON(resolved) catch null) |metadata| {
+                const bin_dir = try std.fs.path.join(allocator, &.{
+                    manager.invocation_package_dir,
+                    "node_modules",
+                    ".bin",
+                });
+                // `bun link <name>` also exposes the linked package's bins to
+                // the consumer. Point through the public package link so the
+                // shim remains valid if the global registration is replaced.
+                try manager.linkBinsInDirectory(name, destination, metadata, false, bin_dir);
+            }
             if (!manager.options.silent) {
                 if (linked == 0) try manager.stdout.writeByte('\n');
                 try manager.stdout.print("installed {s}@link:{s}\n", .{ name, name });
@@ -9875,17 +9886,42 @@ const Manager = struct {
             .file_name_buffer = &file_name_buffer,
             .link_name_buffer = &link_name_buffer,
         });
+        var package_json_source: ?[]const u8 = null;
+        var package_json_path: ?[]const u8 = null;
+        var package_json_depth: usize = std.math.maxInt(usize);
         while (try iterator.next()) |entry| {
             if (entry.kind != .file or !std.mem.eql(u8, std.fs.path.basename(entry.name), "package.json")) continue;
+
+            // COTTONTAIL-COMPAT: npm tarballs can contain nested package.json
+            // files before the package root. Svelte, for example, places
+            // package/compiler/package.json before package/package.json. The
+            // exact package/package.json entry is canonical for npm archives;
+            // otherwise retain the shallowest manifest as the generic tarball
+            // fallback. Accepting the first basename match can silently drop
+            // the package dependency graph.
+            var depth: usize = 0;
+            var components = std.mem.tokenizeAny(u8, entry.name, "/\\");
+            while (components.next()) |component| {
+                if (!std.mem.eql(u8, component, ".")) depth += 1;
+            }
+            const normalized_name = if (std.mem.startsWith(u8, entry.name, "./")) entry.name[2..] else entry.name;
+            const canonical_npm_manifest = std.mem.eql(u8, normalized_name, "package/package.json");
+            if (!canonical_npm_manifest and depth >= package_json_depth) continue;
             if (entry.size > 16 * 1024 * 1024) return error.PackageJSONTooLarge;
             var contents: std.Io.Writer.Allocating = .init(manager.allocator);
             try iterator.streamRemaining(entry, &contents.writer);
-            const package_json = try manager.allocator.create(Value);
-            package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, entry.name, contents.written());
-            if (package_json.* != .object) return error.InvalidPackageJSON;
-            return package_json;
+            if (package_json_source) |previous| manager.allocator.free(previous);
+            if (package_json_path) |previous| manager.allocator.free(previous);
+            package_json_source = try contents.toOwnedSlice();
+            package_json_path = try manager.allocator.dupe(u8, entry.name);
+            package_json_depth = depth;
+            if (canonical_npm_manifest) break;
         }
-        return error.MissingPackageJSON;
+        const source = package_json_source orelse return error.MissingPackageJSON;
+        const package_json = try manager.allocator.create(Value);
+        package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, package_json_path.?, source);
+        if (package_json.* != .object) return error.InvalidPackageJSON;
+        return package_json;
     }
 
     fn chooseDestination(
@@ -11151,7 +11187,20 @@ const Manager = struct {
         if (builtin.os.tag != .windows) try manager.preparePosixBin(target, stat);
         const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
         const seen = try manager.linked_bins.getOrPut(destination);
-        if (seen.found_existing) return false;
+        if (seen.found_existing) {
+            // Isolated peer-graph reconciliation rebuilds the live-link set
+            // before revisiting package bins. The bin itself is still valid,
+            // but linked_bins remembers that it was created earlier in this
+            // install. Re-mark it so finalization does not prune it as stale.
+            if (manager.node_linker == .isolated) {
+                const live_path = if (builtin.os.tag == .windows)
+                    try std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination})
+                else
+                    try manager.allocator.dupe(u8, destination);
+                try manager.isolated_live_links.put(live_path, {});
+            }
+            return false;
+        }
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, bin_dir);
         deletePath(manager.init_data.io, destination);
         const destination_parent = std.fs.path.dirname(destination) orelse bin_dir;

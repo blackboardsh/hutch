@@ -79,6 +79,7 @@ function populateSyntheticInstall(
   root,
   plan = syntheticPlan(),
   platform = process.platform,
+  { absoluteWindowsShim = false } = {},
 ) {
   writeFileSync(join(root, "package.json"), plan.packageBytes);
   writeFileSync(join(root, "bun.lock"), plan.lockBytes);
@@ -104,7 +105,9 @@ function populateSyntheticInstall(
   if (platform === "win32") {
     writeFileSync(
       join(binRoot, "tool.cmd"),
-      `@"C:\\staging\\cottontail.exe" "${join(topRoot, "bin", "tool.js")}" %*\r\n`,
+      absoluteWindowsShim
+        ? `@"C:\\staging\\cottontail.exe" "${join(topRoot, "bin", "tool.js")}" %*\r\n`
+        : windowsHarnessBinShim("../top/bin/tool.js"),
     );
   } else {
     symlinkSync("../top/bin/tool.js", join(binRoot, "tool"));
@@ -198,7 +201,7 @@ test("validation covers locked transitives, frozen inputs, and platform bin shim
 test("Windows bin shims are normalized and validated as relocatable", t => {
   const plan = syntheticPlan();
   const installRoot = temporaryRoot(t, "hutch-harness-deps-windows-shim-");
-  populateSyntheticInstall(installRoot, plan, "win32");
+  populateSyntheticInstall(installRoot, plan, "win32", { absoluteWindowsShim: true });
   assert.match(
     harnessDependencyInstallErrors(installRoot, plan, "win32").join("\n"),
     /non-relocatable content for top:tool/,

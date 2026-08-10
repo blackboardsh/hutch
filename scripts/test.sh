@@ -20,5 +20,6 @@ node --test --test-concurrency=1 \
 node --test \
   "$SCRIPT_DIR/bun-compat-workflow.test.js" \
   "$SCRIPT_DIR/bun-harness-dependencies.test.js" \
-  "$SCRIPT_DIR/bun-compat-reporter.test.js"
+  "$SCRIPT_DIR/bun-compat-reporter.test.js" \
+  "$SCRIPT_DIR/zig-hostname-connect-patch.test.js"
 node "$SCRIPT_DIR/run-bun-package-manager-tests.js" --check

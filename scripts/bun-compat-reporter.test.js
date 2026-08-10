@@ -212,7 +212,21 @@ test("refuses later files when the report directory pathname is rebound", t => {
   const reporter = new HutchCompatReporter(reporterOptions(root));
   const movedRun = join(root, "moved-run");
   const replacement = join(root, "replacement");
-  renameSync(join(root, "run"), movedRun);
+  try {
+    renameSync(join(root, "run"), movedRun);
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      ["EACCES", "EPERM"].includes(error?.code)
+    ) {
+      // An open report handle preventing the pathname swap is a stronger
+      // guarantee than detecting the replacement on the next write.
+      reporter.fatal(new Error("Windows refused report path rebind"));
+      assert.equal(existsSync(join(root, "run", "summary.json")), true);
+      return;
+    }
+    throw error;
+  }
   mkdirSync(replacement);
   symlinkSync(replacement, join(root, "run"), process.platform === "win32" ? "junction" : "dir");
 

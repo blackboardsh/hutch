@@ -59,6 +59,25 @@ harness dependency plan, selected files, and all three binaries used by the
 run. `harness-dependencies.json` records the validated content-addressed cache
 generation that was privately materialized for that execution.
 
+On Windows, every runner child is launched through
+`zig-out/bin/hutch-bun-compat-job.exe`. The native launcher creates the child
+suspended, assigns it to a non-breakaway Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumes it. Normal exit,
+timeouts, cancellation, reporter failure, and abrupt parent-runner death all
+terminate the job and wait for zero active processes before temp state is
+reused. Run the native lifecycle proof after building Hutch:
+
+```powershell
+node --test --test-concurrency=1 scripts/bun-compat-windows-job.test.js
+```
+
+The committed suite is canonically LF. On Windows, validation hashes copied
+text in LF-canonical form. Every runnable test and each of the 28 tracked Next
+Pages fixture files must reproduce its per-file manifest hash; other copied
+text participates in the canonical suite fingerprint but does not have an
+individual manifest hash. The runner normalizes non-binary text only in its
+private execution copy and never rewrites the committed suite.
+
 ## Branch CI
 
 Pushes to `compat/**` branches and manual dispatches run the complete
