@@ -11210,6 +11210,7 @@ const Manager = struct {
         const target = try std.fs.path.join(manager.allocator, &.{ package_dir, relative_target });
         const stat = std.Io.Dir.cwd().statFile(manager.init_data.io, target, .{}) catch return false;
         if (stat.kind != .file) return false;
+        const bun_shebang = builtin.os.tag != .windows and manager.posixBinHasBunShebang(target);
         if (builtin.os.tag != .windows) try manager.preparePosixBin(target, stat);
         const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
         const seen = try manager.linked_bins.getOrPut(destination);
@@ -11239,6 +11240,31 @@ const Manager = struct {
             if (manager.node_linker == .isolated) {
                 try manager.isolated_live_links.put(try manager.allocator.dupe(u8, command_path), {});
             }
+        } else if (bun_shebang and manager.options.global and
+            manager.global_bin_directory != null and
+            std.mem.eql(u8, bin_dir, manager.global_bin_directory.?))
+        {
+            // A global bin is commonly launched directly rather than through
+            // `hutch run`, so its `#!/usr/bin/env bun` shebang cannot see the
+            // per-process Bun shim that cli_run provides. Keep node and native
+            // bins untouched, but make Bun bins self-contained by routing the
+            // target through the Hutch launcher that performed the install.
+            const executable = try Host.cliExecutableForInit(manager.init_data, manager.allocator);
+            const quoted_executable = try posixShellQuote(manager.allocator, executable);
+            const quoted_target = try posixShellQuote(manager.allocator, target);
+            const command = try std.fmt.allocPrint(
+                manager.allocator,
+                "#!/bin/sh\nexec {s} {s} \"$@\"\n",
+                .{ quoted_executable, quoted_target },
+            );
+            const executable_permissions: std.Io.File.Permissions = @enumFromInt(
+                @intFromEnum(stat.permissions) | 0o111,
+            );
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
+                .sub_path = destination,
+                .data = command,
+                .flags = .{ .permissions = executable_permissions },
+            });
         } else {
             const bin_target = try std.fs.path.relative(
                 manager.allocator,
@@ -11253,6 +11279,20 @@ const Manager = struct {
             }
         }
         return true;
+    }
+
+    fn posixBinHasBunShebang(manager: *Manager, target: []const u8) bool {
+        const file = std.Io.Dir.cwd().openFile(manager.init_data.io, target, .{}) catch return false;
+        defer file.close(manager.init_data.io);
+        var reader_buffer: [256]u8 = undefined;
+        var source_buffer: [1024]u8 = undefined;
+        var reader = file.readerStreaming(manager.init_data.io, &reader_buffer);
+        const source_len = reader.interface.readSliceShort(&source_buffer) catch return false;
+        const source = source_buffer[0..source_len];
+        const newline = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
+        const first_line = source[0..newline];
+        return std.mem.startsWith(u8, first_line, "#!") and
+            std.mem.indexOf(u8, first_line, "bun") != null;
     }
 
     fn binDirectoryForPackage(manager: *Manager, package_dir: []const u8) ![]const u8 {
@@ -13314,6 +13354,20 @@ fn absolutePath(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]c
 fn absolutePathFrom(allocator: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(allocator, &.{path});
     return std.fs.path.resolve(allocator, &.{ base, path });
+}
+
+fn posixShellQuote(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    try output.writer.writeByte('\'');
+    for (value) |byte| {
+        if (byte == '\'') {
+            try output.writer.writeAll("'\\''");
+        } else {
+            try output.writer.writeByte(byte);
+        }
+    }
+    try output.writer.writeByte('\'');
+    return output.toOwnedSlice();
 }
 
 fn packageCachePath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
