@@ -23,6 +23,12 @@ import {
   createTestInvocation,
   readGitHeadCommit,
 } from "./bun-compat-runner-contract.js";
+import {
+  applyBunStatusEntryOverride,
+  bunStatusPlatformKey,
+  resolveBunStatusPlatform,
+  validateBunStatusPlatformOverrides,
+} from "./bun-status-platform.js";
 
 const root = new URL("..", import.meta.url);
 const workflowPath = new URL("../.github/workflows/bun-compat.yml", import.meta.url);
@@ -282,6 +288,116 @@ test("owns the complete canonical Next Pages fixture without generated state", (
     { path: "src/Counter.tsx", source: "src/Counter1.txt" },
   ]);
   assert.equal(fixture.files.some(entry => entry.path === "src/Counter.tsx"), false);
+});
+
+test("resolves only the exact Node platform-architecture status override", () => {
+  const status = {
+    tests: {
+      "test/example.test.ts": {
+        status: "enabled",
+        reason: "portable baseline",
+        args: ["--timeout=1000"],
+      },
+    },
+    platformOverrides: {
+      "linux-arm64": {
+        tests: {
+          "test/example.test.ts": {
+            status: "expected-failure",
+            reason: "Linux ARM64 gap",
+            args: ["--timeout=2000"],
+          },
+        },
+      },
+    },
+  };
+
+  assert.equal(bunStatusPlatformKey(), `${process.platform}-${process.arch}`);
+  const linuxArm64 = resolveBunStatusPlatform(status, "linux", "arm64");
+  assert.equal(linuxArm64.tests["test/example.test.ts"].status, "expected-failure");
+  assert.equal(linuxArm64.tests["test/example.test.ts"].reason, "Linux ARM64 gap");
+  assert.deepEqual(
+    linuxArm64.tests["test/example.test.ts"].args,
+    ["--timeout=2000"],
+  );
+
+  const linuxX64 = resolveBunStatusPlatform(status, "linux", "x64");
+  assert.strictEqual(linuxX64, status);
+  assert.equal(linuxX64.tests["test/example.test.ts"].status, "enabled");
+  assert.equal(linuxX64.tests["test/example.test.ts"].reason, "portable baseline");
+});
+
+test("platform status null deletion is immutable and override metadata is validated", () => {
+  const entry = {
+    status: "enabled",
+    args: ["--timeout=1000"],
+    serial: true,
+  };
+  const resolved = applyBunStatusEntryOverride(entry, {
+    args: null,
+    serial: null,
+    timeoutMs: 2000,
+  });
+  assert.deepEqual(resolved, { status: "enabled", timeoutMs: 2000 });
+  assert.deepEqual(entry, {
+    status: "enabled",
+    args: ["--timeout=1000"],
+    serial: true,
+  });
+
+  const status = {
+    tests: { "test/example.test.ts": entry },
+    platformOverrides: {
+      "linux-x64": {
+        tests: {
+          "test/example.test.ts": { status: "expected-failure" },
+        },
+      },
+    },
+  };
+  assert.deepEqual(validateBunStatusPlatformOverrides(status), []);
+
+  status.platformOverrides["linux-x64"].tests["test/example.test.ts"] = {
+    status: "skip",
+  };
+  assert.deepEqual(validateBunStatusPlatformOverrides(status), [
+    "status.platformOverrides.linux-x64.tests.test/example.test.ts resolves to unsupported status: skip",
+  ]);
+  status.platformOverrides["linux-x64"].tests["test/example.test.ts"] = {
+    status: "expected-failure",
+  };
+
+  status.platformOverrides["linux-amd64"] = {
+    tests: {
+      "test/stale.test.ts": { status: "skip" },
+      "test/example.test.ts": { status: null },
+    },
+  };
+  assert.deepEqual(validateBunStatusPlatformOverrides(status), [
+    "status.platformOverrides has invalid platform key linux-amd64",
+    "status.platformOverrides.linux-amd64.tests contains an unknown path: test/stale.test.ts",
+    "status.platformOverrides.linux-amd64.tests.test/example.test.ts resolves to unsupported status: undefined",
+  ]);
+});
+
+test("keeps base status accounting separate from host-effective selection", () => {
+  const counts = Object.values(suiteStatus.tests).reduce((result, entry) => {
+    result[entry.status] = (result[entry.status] ?? 0) + 1;
+    return result;
+  }, {});
+  assert.deepEqual(counts, { enabled: 103 });
+  assert.match(
+    compatRunner,
+    /const effectiveStatus = resolveBunStatusPlatform\(status\);/,
+  );
+  assert.match(
+    compatRunner,
+    /\.\.\.validated\.effectiveStatus\.tests\[path\]/,
+  );
+  assert.match(
+    compatRunner,
+    /const status = validated\.status\.tests\[path\]\.status;/,
+  );
 });
 
 test("reports live per-file progress durably and preserves failure diagnostics", () => {

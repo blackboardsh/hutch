@@ -41,6 +41,10 @@ import {
   createTestInvocation,
   readGitHeadCommit,
 } from "./bun-compat-runner-contract.js";
+import {
+  resolveBunStatusPlatform,
+  validateBunStatusPlatformOverrides,
+} from "./bun-status-platform.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const hutchRoot = resolve(scriptDir, "..");
@@ -448,6 +452,7 @@ function runIdentity(validated, entries, options, { refreshMutableInputs = false
     join(scriptDir, "bun-compat-child-lifecycle.js"),
     join(scriptDir, "bun-compat-reporter.js"),
     join(scriptDir, "bun-compat-runner-contract.js"),
+    join(scriptDir, "bun-status-platform.js"),
     join(scriptDir, "bun-harness-dependencies.js"),
     join(hutchRoot, "src", "bun_compat_job_launcher.zig"),
     preloadPath,
@@ -544,6 +549,9 @@ function validateSuite() {
   }
   const manifest = readJson(manifestPath);
   const status = readJson(statusPath);
+  const statusOverrideErrors = validateBunStatusPlatformOverrides(status);
+  if (statusOverrideErrors.length > 0) fail(statusOverrideErrors.join("\n"));
+  const effectiveStatus = resolveBunStatusPlatform(status);
   const ownership = readJson(ownershipPath);
   const copiedTests = discoverRunnableFiles(suiteRoot);
   const manifestTests = (manifest.testFiles ?? []).map(entry => entry.path).sort();
@@ -655,7 +663,11 @@ function validateSuite() {
     if (!["enabled", "expected-failure"].includes(status.tests[path].status)) {
       fail(`unsupported status for ${path}: ${status.tests[path].status}`);
     }
-    const invocation = entryInvocation({ path, ...status.tests[path] }, "<preload>");
+    const effectiveEntry = effectiveStatus.tests[path];
+    if (!["enabled", "expected-failure"].includes(effectiveEntry.status)) {
+      fail(`unsupported effective status for ${path}: ${effectiveEntry.status}`);
+    }
+    const invocation = entryInvocation({ path, ...effectiveEntry }, "<preload>");
     const invocationArgs = invocation.args;
     const invocationTimeouts = invocationArgs.filter(arg => arg.startsWith("--timeout="));
     if (invocationTimeouts.length !== 1) {
@@ -706,6 +718,7 @@ function validateSuite() {
   return {
     manifest,
     status,
+    effectiveStatus,
     ownership,
     copiedTests,
     harnessDependencyPlan,
@@ -726,7 +739,7 @@ function selectedEntries(validated, options) {
   paths = paths.slice(0, options.maxTests);
   return paths.map(path => ({
     path,
-    ...validated.status.tests[path],
+    ...validated.effectiveStatus.tests[path],
   }));
 }
 
