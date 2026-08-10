@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "repository": "https://github.com/blackboardsh/cottontail.git",
-  "commit": "07d48f51c96f694a4aaf8eeb0fc61a4f284eeee1",
+  "commit": "250454c433f1908ca9d397097df930ceeff74da7",
   "version": "0.3.0-canary.1",
   "bunCompatibilityVersion": "1.3.10"
 }
