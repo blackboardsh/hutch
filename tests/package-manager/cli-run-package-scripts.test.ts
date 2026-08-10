@@ -229,6 +229,18 @@ test("installed binaries with a Bun shebang resolve Hutch from an isolated PATH"
   expect(result.stderr).toBeEmpty();
 });
 
+test("explicit bun run resolves Hutch from an isolated PATH", () => {
+  const directory = join(scratch, "explicit-bun-run");
+  mkdirSync(directory, { recursive: true });
+
+  const result = run(directory, ["run", "bun", "doesnotexist"]);
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).toBeEmpty();
+  expect(result.stderr).toBe(
+    'error: Script not found "doesnotexist"\nerror: "bun" exited with code 1\n',
+  );
+});
+
 test("package scripts repair an incomplete node_modules tree", () => {
   const directory = join(scratch, "partial-install");
   const dependency = join(scratch, "local-dependency");

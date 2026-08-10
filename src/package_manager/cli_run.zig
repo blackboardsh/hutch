@@ -1441,6 +1441,10 @@ pub fn localCommandExists(init: std.process.Init, name: []const u8) bool {
 }
 
 pub fn commandExists(init: std.process.Init, name: []const u8) bool {
+    // `bun run bun ...` invokes the current Bun-compatible CLI even when the
+    // host has no separately installed Bun. runSingleCommand supplies the
+    // corresponding hermetic shim to the child environment.
+    if (std.mem.eql(u8, name, "bun")) return true;
     if (localCommandExists(init, name)) return true;
     if (std.mem.indexOfAny(u8, name, "/\\") != null) return false;
 
