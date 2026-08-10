@@ -39,8 +39,19 @@
     },
     "test/cli/install/bun-add.test.ts": {
       "status": "enabled",
-      "reason": "Dependency addition, including workspace cases, passes the complete copied Bun v1.3.10 file on current Hutch main.",
+      "reason": "All 50 CI-contained dependency-addition cases pass across registry packages, aliases, local paths and tarballs, workspaces, dependency sections, repeated adds, lockfiles, and analyze/only-missing behavior. The one live GitHub API case is excluded because unauthenticated hosted CI receives HTTP 403 from api.github.com.",
       "owner": "hutch-package-manager",
+      "args": [
+        "--test-name-pattern=^(?!should not save git urls twice$).*"
+      ],
+      "testNameExclusion": {
+        "pattern": "^(?!should not save git urls twice$).*",
+        "classification": "environment",
+        "testNames": [
+          "should not save git urls twice"
+        ],
+        "reason": "This live GitHub repository-metadata case receives HTTP 403 from api.github.com in unauthenticated hosted CI."
+      },
       "timeoutMs": 120000
     },
     "test/cli/install/bun-audit.test.ts": {
@@ -136,13 +147,25 @@
     },
     "test/cli/install/bun-install.test.ts": {
       "status": "enabled",
-      "reason": "All 170 active install cases, including multi-dependency bin linking, pass on current Hutch main.",
+      "reason": "All 167 CI-contained active install cases pass, including multi-dependency bin linking; four live GitHub API leaves are excluded because unauthenticated hosted CI receives HTTP 403 from api.github.com, and two upstream TODOs remain.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
         "--max-concurrency=1",
-        "--timeout=300000"
+        "--timeout=300000",
+        "--test-name-pattern=^(?!bun-install (?:should edit package json correctly with git dependencies|should handle GitHub URL in dependencies \\(user/repo\\)|should handle GitHub URL in dependencies \\(https://github\\.com/user/repo\\.git\\)|should handle GitHub URL in dependencies \\(git\\+https://github\\.com/user/repo\\.git\\))$).*"
       ],
+      "testNameExclusion": {
+        "pattern": "^(?!bun-install (?:should edit package json correctly with git dependencies|should handle GitHub URL in dependencies \\(user/repo\\)|should handle GitHub URL in dependencies \\(https://github\\.com/user/repo\\.git\\)|should handle GitHub URL in dependencies \\(git\\+https://github\\.com/user/repo\\.git\\))$).*",
+        "classification": "environment",
+        "testNames": [
+          "bun-install > should edit package json correctly with git dependencies",
+          "bun-install > should handle GitHub URL in dependencies (user/repo)",
+          "bun-install > should handle GitHub URL in dependencies (https://github.com/user/repo.git)",
+          "bun-install > should handle GitHub URL in dependencies (git+https://github.com/user/repo.git)"
+        ],
+        "reason": "These four live GitHub repository-metadata leaves receive HTTP 403 from api.github.com in unauthenticated hosted CI."
+      },
       "timeoutMs": 360000
     },
     "test/cli/install/bun-link.test.ts": {

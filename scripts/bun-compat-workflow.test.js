@@ -400,6 +400,52 @@ test("keeps base status accounting separate from host-effective selection", () =
   );
 });
 
+test("excludes only the five hosted-CI GitHub API leaves", () => {
+  const add = suiteStatus.tests["test/cli/install/bun-add.test.ts"];
+  const install = suiteStatus.tests["test/cli/install/bun-install.test.ts"];
+  const addPattern = add.testNameExclusion.pattern;
+  const installPattern = install.testNameExclusion.pattern;
+
+  assert.deepEqual(add.args, [`--test-name-pattern=${addPattern}`]);
+  assert.deepEqual(install.args, [
+    "--max-concurrency=1",
+    "--timeout=300000",
+    `--test-name-pattern=${installPattern}`,
+  ]);
+  assert.equal(add.testNameExclusion.classification, "environment");
+  assert.equal(install.testNameExclusion.classification, "environment");
+  assert.match(add.reason, /All 50 CI-contained.*one live GitHub API case/is);
+  assert.match(install.reason, /All 167 CI-contained.*four live GitHub API leaves.*two upstream TODOs/is);
+  assert.deepEqual(add.testNameExclusion.testNames, [
+    "should not save git urls twice",
+  ]);
+  assert.deepEqual(install.testNameExclusion.testNames, [
+    "bun-install > should edit package json correctly with git dependencies",
+    "bun-install > should handle GitHub URL in dependencies (user/repo)",
+    "bun-install > should handle GitHub URL in dependencies (https://github.com/user/repo.git)",
+    "bun-install > should handle GitHub URL in dependencies (git+https://github.com/user/repo.git)",
+  ]);
+
+  const addFilter = new RegExp(addPattern);
+  assert.equal(addFilter.test("should not save git urls twice"), false);
+  assert.equal(addFilter.test("should add dependency without duplication (GitHub)"), true);
+
+  const installFilter = new RegExp(installPattern);
+  const excludedLeaves = install.testNameExclusion.testNames.map(name =>
+    name.replace("bun-install > ", "bun-install ")
+  );
+  assert.equal(excludedLeaves.filter(name => !installFilter.test(name)).length, 4);
+  for (const neighboringCase of [
+    "bun-install should handle GitHub URL in dependencies (user/repo#commit-id)",
+    "bun-install should handle GitHub URL in dependencies (user/repo#tag)",
+    "bun-install should handle GitHub URL in dependencies (github:user/repo#tag)",
+    "bun-install should handle GitHub URL in dependencies (git://github.com/user/repo.git#commit)",
+    "bun-install should handle GitHub tarball URL in dependencies (https://github.com/user/repo/tarball/ref)",
+  ]) {
+    assert.equal(installFilter.test(neighboringCase), true, neighboringCase);
+  }
+});
+
 test("reports live per-file progress durably and preserves failure diagnostics", () => {
   assert.match(
     compatRunner,
