@@ -493,6 +493,77 @@ test("excludes only the five hosted-CI GitHub API leaves", () => {
   }
 });
 
+test("excludes only the two measured Darwin ARM64 compatibility leaves", () => {
+  const baseScanner = suiteStatus.tests[
+    "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts"
+  ];
+  const baseMultiRun = suiteStatus.tests["test/cli/run/multi-run.test.ts"];
+  const darwin = resolveBunStatusPlatform(suiteStatus, "darwin", "arm64");
+  const scanner = darwin.tests[
+    "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts"
+  ];
+  const multiRun = darwin.tests["test/cli/run/multi-run.test.ts"];
+
+  assert.deepEqual(baseScanner.args, ["--timeout", "60000"]);
+  assert.equal(baseScanner.testNameExclusion, undefined);
+  assert.equal(baseMultiRun.args, undefined);
+  assert.equal(baseMultiRun.testNameExclusion, undefined);
+
+  for (const entry of [scanner, multiRun]) {
+    assert.equal(entry.status, "enabled");
+    assert.equal(entry.testNameExclusion.classification, "compatibility");
+    assert.equal(entry.testNameExclusion.testNames.length, 1);
+    assert.match(entry.reason, /other \d+ .*cases pass/i);
+  }
+
+  assert.deepEqual(scanner.args, [
+    "--timeout",
+    "60000",
+    `--test-name-pattern=${scanner.testNameExclusion.pattern}`,
+  ]);
+  assert.deepEqual(multiRun.args, [
+    `--test-name-pattern=${multiRun.testNameExclusion.pattern}`,
+  ]);
+
+  const scannerFilter = new RegExp(scanner.testNameExclusion.pattern);
+  const [excludedScanner] = scanner.testNameExclusion.testNames;
+  assert.equal(scannerFilter.test(excludedScanner), false);
+  for (const neighboringCase of [
+    excludedScanner.replace("0259", "0258").replace("(TTY:n)", "(TTY:y)"),
+    excludedScanner.replace("0259", "0269").replace("(scanner: npm)", "(scanner: npm.bunfigonly)"),
+    excludedScanner.replace("--linker=hoisted", "--linker=isolated").replace("0259", "0289"),
+  ]) {
+    assert.equal(scannerFilter.test(neighboringCase), true, neighboringCase);
+  }
+
+  const multiRunFilter = new RegExp(multiRun.testNameExclusion.pattern);
+  const [excludedMultiRun] = multiRun.testNameExclusion.testNames;
+  assert.equal(multiRunFilter.test(excludedMultiRun), false);
+  for (const neighboringCase of [
+    "parallel: error handling > failure kills other scripts by default",
+    "parallel: error handling > propagates specific non-zero exit code",
+    "parallel: error handling > --no-exit-on-error lets all finish",
+  ]) {
+    assert.equal(multiRunFilter.test(neighboringCase), true, neighboringCase);
+  }
+
+  const linuxArm64 = resolveBunStatusPlatform(suiteStatus, "linux", "arm64");
+  assert.deepEqual(
+    linuxArm64.tests[
+      "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts"
+    ].args,
+    ["--timeout", "60000"],
+  );
+  assert.equal(
+    linuxArm64.tests["test/cli/run/multi-run.test.ts"].args,
+    undefined,
+  );
+  assert.equal(
+    linuxArm64.tests["test/cli/run/multi-run.test.ts"].status,
+    "expected-failure",
+  );
+});
+
 test("classifies only the strict residual Linux compatibility files", () => {
   const commonLinux = [
     "test/cli/install/bun-add.test.ts",

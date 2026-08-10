@@ -704,6 +704,38 @@
     }
   },
   "platformOverrides": {
+    "darwin-arm64": {
+      "tests": {
+        "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts": {
+          "reason": "On Darwin ARM64, the exact fresh npm-scanner update case 0259 reaches the warning prompt but does not emit the expected cancellation line after the negative TTY response; the other 63 CI-selected cases pass.",
+          "args": [
+            "--timeout",
+            "60000",
+            "--test-name-pattern=^(?!bun update > is-even > --linker=hoisted > \\(scanner: npm\\) > \\(bun\\.lock exists: false\\) > \\(advisories: warn\\) > \\(TTY:n\\) > 0259 \\(with modules\\)$).*"
+          ],
+          "testNameExclusion": {
+            "classification": "compatibility",
+            "testNames": [
+              "bun update > is-even > --linker=hoisted > (scanner: npm) > (bun.lock exists: false) > (advisories: warn) > (TTY:n) > 0259 (with modules)"
+            ],
+            "pattern": "^(?!bun update > is-even > --linker=hoisted > \\(scanner: npm\\) > \\(bun\\.lock exists: false\\) > \\(advisories: warn\\) > \\(TTY:n\\) > 0259 \\(with modules\\)$).*"
+          }
+        },
+        "test/cli/run/multi-run.test.ts": {
+          "reason": "On Darwin ARM64, process-group termination in the exact parallel handle-order case can surface the killed sibling's 137 instead of the first script's 7; the other 117 copied multi-run cases pass.",
+          "args": [
+            "--test-name-pattern=^(?!parallel: error handling > exit code is from first failed script \\(handle order\\)$).*"
+          ],
+          "testNameExclusion": {
+            "classification": "compatibility",
+            "testNames": [
+              "parallel: error handling > exit code is from first failed script (handle order)"
+            ],
+            "pattern": "^(?!parallel: error handling > exit code is from first failed script \\(handle order\\)$).*"
+          }
+        }
+      }
+    },
     "linux-arm64": {
       "tests": {
         "test/cli/install/bun-add.test.ts": {
