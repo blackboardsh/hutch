@@ -227,6 +227,54 @@ function testNodeGypLifecycle() {
   );
 }
 
+function testLifecycleBunShim() {
+  const root = path.join(scratch, "lifecycle-bun-shim");
+  const home = path.join(scratch, "lifecycle-bun-shim-home");
+  const hostileBin = path.join(scratch, "hostile-bun-bin");
+  const hostileMarker = path.join(root, "hostile-bun-ran");
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(hostileBin, { recursive: true });
+
+  const hostileBun = path.join(hostileBin, process.platform === "win32" ? "bun.cmd" : "bun");
+  if (process.platform === "win32") {
+    fs.writeFileSync(
+      hostileBun,
+      '@echo hostile> "%INIT_CWD%\\hostile-bun-ran"\r\n@exit /b 73\r\n',
+    );
+  } else {
+    fs.writeFileSync(
+      hostileBun,
+      '#!/bin/sh\n: > "$INIT_CWD/hostile-bun-ran"\nexit 73\n',
+      { mode: 0o755 },
+    );
+  }
+
+  fs.writeFileSync(
+    path.join(root, "record-runtime.cjs"),
+    [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'fs.appendFileSync("runtime-events", `${process.argv[2]}\\n`);',
+      "",
+    ].join("\n"),
+  );
+  writeJson(path.join(root, "package.json"), {
+    name: "lifecycle-bun-shim",
+    version: "1.0.0",
+    scripts: {
+      postinstall: "node record-runtime.cjs node && bun record-runtime.cjs bun",
+    },
+  });
+
+  const lifecyclePath = process.platform === "win32"
+    ? [hostileBin, path.join(process.env.SystemRoot || "C:\\Windows", "System32")].join(path.delimiter)
+    : hostileBin;
+  const result = runInstall(root, home, [], { PATH: lifecyclePath });
+  expectSuccess("lifecycle Bun self shim", result);
+  assert.equal(fs.readFileSync(path.join(root, "runtime-events"), "utf8"), "node\nbun\n");
+  assert.ok(!fs.existsSync(hostileMarker), "the inherited PATH Bun must not run");
+}
+
 function testPackLifecycleQuoting() {
   const root = path.join(scratch, "pack-lifecycle");
   const home = path.join(scratch, "pack-lifecycle-home");
@@ -522,6 +570,7 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
 
 try {
   testNodeGypLifecycle();
+  testLifecycleBunShim();
   testPackLifecycleQuoting();
   testRegistryAndMinimumAge();
   console.log("package-manager install edges: pass");

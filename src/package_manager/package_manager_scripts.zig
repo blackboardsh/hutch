@@ -523,8 +523,12 @@ fn configureEnvironment(
     try environment.put("BUN", executable);
 
     var path: std.Io.Writer.Allocating = .init(allocator);
-    var directory: ?[]const u8 = task.cwd;
     var first = true;
+    if (node_gyp_dir.len > 0) {
+        try path.writer.writeAll(try bunShimDirectory(allocator, node_gyp_dir));
+        first = false;
+    }
+    var directory: ?[]const u8 = task.cwd;
     while (directory) |current| {
         const bin = try std.fs.path.join(allocator, &.{ current, "node_modules", ".bin" });
         if (!first) try path.writer.writeByte(pathDelimiter());
@@ -598,6 +602,12 @@ const NodeGypWrapper = struct {
         else
             "#!/bin/sh\nexec \"$BUN\" \"$@\"\n";
         try writeExecutable(init.io, node_path, node_contents);
+
+        const bun_directory = try bunShimDirectory(allocator, directory);
+        try std.Io.Dir.cwd().createDir(init.io, bun_directory, .default_dir);
+        const bun_filename = if (builtin.os.tag == .windows) "bun.cmd" else "bun";
+        const bun_path = try std.fs.path.join(allocator, &.{ bun_directory, bun_filename });
+        try writeExecutable(init.io, bun_path, node_contents);
         return .{ .directory = directory };
     }
 
@@ -605,6 +615,10 @@ const NodeGypWrapper = struct {
         std.Io.Dir.cwd().deleteTree(io, wrapper.directory) catch {};
     }
 };
+
+fn bunShimDirectory(allocator: std.mem.Allocator, node_gyp_dir: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ node_gyp_dir, "bun-shim" });
+}
 
 fn writeExecutable(io: std.Io, path: []const u8, contents: []const u8) !void {
     const permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .executable_file;
@@ -708,6 +722,47 @@ test "lifecycle command replacement only changes the bun executable token" {
     const replaced = try replaceBunCommand(arena.allocator(), std.testing.io, "bun script.js");
     try std.testing.expect(std.mem.endsWith(u8, replaced, " script.js"));
     try std.testing.expect(!std.mem.eql(u8, replaced, "bun script.js"));
+}
+
+test "lifecycle PATH prioritizes the Bun self shim without shadowing host Node" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "host-bin");
+
+    const task: Task = .{
+        .name = "path-order",
+        .version = "1.0.0",
+        .cwd = try std.fs.path.join(allocator, &.{ "project", "package" }),
+        .kind = .npm,
+        .optional = false,
+    };
+    const node_gyp_dir = "node-gyp-wrapper";
+    try configureEnvironment(
+        &environment,
+        allocator,
+        std.testing.io,
+        "project",
+        task,
+        "postinstall",
+        "node first.js && bun second.js",
+        node_gyp_dir,
+    );
+
+    const expected = [_][]const u8{
+        try bunShimDirectory(allocator, node_gyp_dir),
+        try std.fs.path.join(allocator, &.{ "project", "package", "node_modules", ".bin" }),
+        try std.fs.path.join(allocator, &.{ "project", "node_modules", ".bin" }),
+        "host-bin",
+        node_gyp_dir,
+    };
+    var entries = std.mem.splitScalar(u8, environment.get("PATH").?, pathDelimiter());
+    for (expected) |entry| try std.testing.expectEqualStrings(entry, entries.next().?);
+    try std.testing.expect(entries.next() == null);
+    try std.testing.expectEqualStrings(node_gyp_dir, environment.get("BUN_WHICH_IGNORE_CWD").?);
 }
 
 test "lifecycle inspection applies Bun's binding.gyp fallback" {
