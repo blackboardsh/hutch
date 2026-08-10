@@ -13,6 +13,19 @@ export function bunStatusPlatformKey(
   return `${platform}-${arch}`;
 }
 
+export function createImportedBunStatus(existingStatus, tests) {
+  const imported = {
+    schema: 1,
+    defaultStatus: "not-enabled",
+  };
+  if (Array.isArray(existingStatus?.notes)) imported.notes = existingStatus.notes;
+  imported.tests = tests;
+  if (existingStatus?.platformOverrides != null) {
+    imported.platformOverrides = existingStatus.platformOverrides;
+  }
+  return imported;
+}
+
 export function applyBunStatusEntryOverride(entry, override) {
   const result = { ...(entry ?? {}) };
   for (const [key, value] of Object.entries(override ?? {})) {

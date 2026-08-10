@@ -26,6 +26,7 @@ import {
 import {
   applyBunStatusEntryOverride,
   bunStatusPlatformKey,
+  createImportedBunStatus,
   resolveBunStatusPlatform,
   validateBunStatusPlatformOverrides,
 } from "./bun-status-platform.js";
@@ -50,6 +51,7 @@ const ownershipPath = new URL(
   import.meta.url,
 );
 const compatRunnerPath = new URL("./run-bun-package-manager-tests.js", import.meta.url);
+const compatImporterPath = new URL("./import-bun-package-manager-tests.js", import.meta.url);
 const harnessPath = new URL(
   "../compat/upstream/bun/v1.3.10/test/harness.ts",
   import.meta.url,
@@ -58,6 +60,7 @@ const workflow = readFileSync(workflowPath, "utf8").replace(/\r\n/g, "\n");
 const cottontailManifest = JSON.parse(readFileSync(cottontailManifestPath, "utf8"));
 const cottontailSetup = readFileSync(cottontailSetupPath, "utf8").replace(/\r\n/g, "\n");
 const compatRunner = readFileSync(compatRunnerPath, "utf8").replace(/\r\n/g, "\n");
+const compatImporter = readFileSync(compatImporterPath, "utf8").replace(/\r\n/g, "\n");
 const harnessSource = readFileSync(harnessPath, "utf8").replace(/\r\n/g, "\n");
 const suiteManifest = JSON.parse(readFileSync(suiteManifestPath, "utf8"));
 const suiteStatus = JSON.parse(readFileSync(suiteStatusPath, "utf8"));
@@ -397,6 +400,50 @@ test("keeps base status accounting separate from host-effective selection", () =
   assert.match(
     compatRunner,
     /const status = validated\.status\.tests\[path\]\.status;/,
+  );
+});
+
+test("re-import preserves supported top-level Hutch status metadata", () => {
+  const notes = ["keep the Hutch-owned fixture-service note"];
+  const platformOverrides = {
+    "linux-x64": {
+      tests: {
+        "test/example.test.ts": {
+          status: "expected-failure",
+          reason: "measured Linux residual",
+        },
+      },
+    },
+  };
+  const tests = {
+    "test/example.test.ts": {
+      status: "enabled",
+      owner: "hutch-package-manager",
+    },
+  };
+  const imported = createImportedBunStatus(
+    {
+      schema: 99,
+      defaultStatus: "skip",
+      notes,
+      platformOverrides,
+      expectedCounts: { stale: true },
+      tests: { "test/stale.test.ts": { status: "enabled" } },
+    },
+    tests,
+  );
+
+  assert.deepEqual(imported, {
+    schema: 1,
+    defaultStatus: "not-enabled",
+    notes,
+    tests,
+    platformOverrides,
+  });
+  assert.doesNotMatch(compatImporter, /tests:\s*statuses,\s*\}\);/);
+  assert.match(
+    compatImporter,
+    /createImportedBunStatus\(existingStatus, statuses\)/,
   );
 });
 

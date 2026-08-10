@@ -16,6 +16,8 @@ import { createHash } from "node:crypto";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createImportedBunStatus } from "./bun-status-platform.js";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const hutchRoot = resolve(scriptDir, "..");
 const defaultSourceRoot = resolve(
@@ -472,11 +474,10 @@ function main() {
     return counts;
   }, {});
 
-  writeJson(join(suiteRoot, "status.json"), {
-    schema: 1,
-    defaultStatus: "not-enabled",
-    tests: statuses,
-  });
+  writeJson(
+    join(suiteRoot, "status.json"),
+    createImportedBunStatus(existingStatus, statuses),
+  );
 
   const testRecords = ownedTests.map(path => {
     const importedHash = sha256(join(suiteRoot, path));
