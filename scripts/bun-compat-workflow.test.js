@@ -350,6 +350,20 @@ test("constructs one effective inner timeout with an independent outer margin", 
     install.args.filter(arg => arg.startsWith("--timeout=")),
     ["--timeout=300000"],
   );
+  const createJsx = createTestInvocation(
+    {
+      path: "test/cli/create/create-jsx.test.ts",
+      ...suiteStatus.tests["test/cli/create/create-jsx.test.ts"],
+    },
+    "/absolute/preload.ts",
+    invocationOptions,
+  );
+  assert.equal(createJsx.innerTimeoutMs, 60_000);
+  assert.equal(createJsx.outerTimeoutMs, 240_000);
+  assert.deepEqual(
+    createJsx.args.filter(arg => arg.startsWith("--timeout=")),
+    ["--timeout=60000"],
+  );
   assert.throws(
     () => createTestInvocation(
       { path: "test/example.test.ts", args: ["--timeout=1000"], timeoutMs: 60_999 },

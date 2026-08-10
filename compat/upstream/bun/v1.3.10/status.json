@@ -7,10 +7,13 @@
   "tests": {
     "test/cli/create/create-jsx.test.ts": {
       "status": "enabled",
-      "reason": "All four runnable cases pass against Cottontail's ESM lexical-path implementation; the eight cases marked TODO by upstream remain TODO (12 cases, 0 failures).",
+      "reason": "All four runnable cases pass against Cottontail's ESM lexical-path implementation; the two Tailwind scaffolds can exceed Bun's default 15-second test timeout under Linux CI and use a 60-second per-test timeout, while the eight cases marked TODO by upstream remain TODO (12 cases, 0 failures).",
       "env": {
         "CI": "1"
       },
+      "args": [
+        "--timeout=60000"
+      ],
       "timeoutMs": 240000,
       "owner": "hutch-package-manager"
     },
