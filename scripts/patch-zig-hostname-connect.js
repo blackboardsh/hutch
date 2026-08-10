@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -29,7 +29,14 @@ export function sha256(bytes) {
 }
 
 function runGitApply(args, root, selectedPatchPath) {
-  const result = spawnSync("git", ["apply", "--unidiff-zero", ...args, selectedPatchPath], {
+  const result = spawnSync("git", [
+    "-c",
+    "core.autocrlf=false",
+    "apply",
+    "--unidiff-zero",
+    ...args,
+    selectedPatchPath,
+  ], {
     cwd: root,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -67,9 +74,22 @@ function classify(state) {
   throw new Error(`vendored Zig source drift; refusing to apply the hostname-connect patch:\n${detail}`);
 }
 
+async function normalizeKnownFileLineEndings(root) {
+  await Promise.all(knownFiles.map(async (file) => {
+    const filePath = path.join(root, file.path);
+    const bytes = await readFile(filePath);
+    const normalized = Buffer.from(bytes.toString("utf8").replace(/\r\n/g, "\n"));
+    if (!bytes.equals(normalized)) await writeFile(filePath, normalized);
+  }));
+}
+
 export async function ensureZigHostNameConnectPatch({ checkOnly = false, root = hutchRoot } = {}) {
   const selectedPatchPath = root === hutchRoot ?
     patchPath : path.join(root, "patches", path.basename(patchPath));
+  // Git for Windows can honor core.autocrlf while applying a patch to the
+  // untracked vendored tree. Canonicalize these known UTF-8 Zig sources so the
+  // byte hashes and reverse-check remain identical on every host.
+  await normalizeKnownFileLineEndings(root);
   const initialState = await readState(root);
   const initialKind = classify(initialState);
 
@@ -85,6 +105,7 @@ export async function ensureZigHostNameConnectPatch({ checkOnly = false, root = 
 
   runGitApply(["--check"], root, selectedPatchPath);
   runGitApply([], root, selectedPatchPath);
+  await normalizeKnownFileLineEndings(root);
 
   const finalState = await readState(root);
   if (classify(finalState) !== "patched") throw new Error("hostname-connect patch verification failed");

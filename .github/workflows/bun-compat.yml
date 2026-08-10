@@ -100,6 +100,10 @@ jobs:
           & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Hutch build failed" }
 
+      - name: Validate Windows Job Object containment
+        if: matrix.os == 'windows'
+        run: node --test --test-concurrency=1 scripts/bun-compat-windows-job.test.js
+
       - name: Restore pinned Cottontail build
         id: pinned-cottontail
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

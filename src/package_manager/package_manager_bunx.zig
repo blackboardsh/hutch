@@ -192,6 +192,24 @@ pub fn run(
 
     const can_use_unversioned_path = !request.explicit_version;
     if (can_use_unversioned_path) {
+        // Windows package-manager installs expose JavaScript bins through
+        // `.cmd` launchers. Prefer the manifest target when it is available so
+        // runBinary can honor the target's node/bun shebang instead of losing
+        // that information in the launcher.
+        if (builtin.os.tag == .windows) {
+            if (request.result_package_name) |package_name| {
+                if (try findLocalPackageBin(
+                    init.io,
+                    allocator,
+                    invocation_dir,
+                    package_name,
+                    request.initial_bin_name,
+                )) |bin| {
+                    return runBinary(init, allocator, &environment, invocation_dir, bin.path, options.passthrough, options.force_runtime);
+                }
+            }
+        }
+
         if (try findExecutableInDirectories(init.io, allocator, local_bin_dirs, request.initial_bin_name)) |path| {
             return runBinary(init, allocator, &environment, invocation_dir, path, options.passthrough, options.force_runtime);
         }
@@ -753,6 +771,14 @@ fn findCachedBin(
     package_name: ?[]const u8,
     desired_bin: ?[]const u8,
 ) !?ResolvedBin {
+    // The Windows `.cmd` link always launches its target through Cottontail,
+    // which hides whether the package requested node or bun in its shebang.
+    // Resolve the exact requested bin from the installed manifest first. Keep
+    // the launcher and first-manifest-bin fallbacks for unusual packages.
+    if (builtin.os.tag == .windows) {
+        if (try findInstalledBin(io, allocator, root, package_name, initial_bin_name)) |bin| return bin;
+    }
+
     const bin_dir = try std.fs.path.join(allocator, &.{ root, "node_modules", ".bin" });
     if (try executableInDirectory(io, allocator, bin_dir, initial_bin_name)) |path| {
         return .{ .name = initial_bin_name, .path = path };
@@ -862,13 +888,14 @@ fn runBinary(
 ) !u8 {
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(init.io, path, allocator) catch path;
     const executable_kind = classifyExecutable(init.io, resolved);
-    // Bun executes bins with a node shebang directly (the kernel dispatches
-    // the shebang), so tools like yargs see the .bin path as their script
-    // name. Only bun scripts and shebang-less JS run through the runtime,
+    // Bun executes bins with a node shebang through `node`, so tools like
+    // yargs see the bin path as their script name. POSIX kernels dispatch the
+    // shebang directly; Windows needs an explicit node executable and script
+    // argument. Only bun scripts and shebang-less JS run through Cottontail,
     // unless --bun forces it.
     const use_runtime = switch (executable_kind) {
         .native => false,
-        .node_script => force_runtime or builtin.os.tag == .windows,
+        .node_script => force_runtime,
         .bun_script, .javascript => true,
     };
     if (!use_runtime and executable_kind == .node_script) {
@@ -891,35 +918,26 @@ fn runBinary(
             }
         }
     }
+    const use_node = builtin.os.tag == .windows and executable_kind == .node_script and !use_runtime;
     const executable = if (use_runtime)
         try bunNamedRuntimeExecutable(init, allocator)
+    else if (use_node)
+        (try findExecutableInPath(
+            init.io,
+            allocator,
+            environment.get("PATH") orelse "",
+            "node",
+            null,
+        )) orelse "node"
     else if (executable_kind == .node_script and builtin.os.tag != .windows)
         path
     else
         resolved;
-    const extra = if (use_runtime) @as(usize, 1) else 0;
+    const extra = if (use_runtime or use_node) @as(usize, 1) else 0;
     var argv = try allocator.alloc([]const u8, passthrough.len + 1 + extra);
     argv[0] = executable;
-    if (use_runtime) argv[1] = path;
+    if (use_runtime or use_node) argv[1] = path;
     for (passthrough, 0..) |arg, index| argv[index + 1 + extra] = arg;
-
-    if (builtin.os.tag == .windows and !use_runtime and
-        (std.ascii.eqlIgnoreCase(std.fs.path.extension(resolved), ".cmd") or
-            std.ascii.eqlIgnoreCase(std.fs.path.extension(resolved), ".bat")))
-    {
-        var command = std.Io.Writer.Allocating.init(allocator);
-        try appendWindowsShellArg(&command.writer, resolved);
-        for (passthrough) |arg| {
-            try command.writer.writeByte(' ');
-            try appendWindowsShellArg(&command.writer, arg);
-        }
-        argv = try allocator.alloc([]const u8, 5);
-        argv[0] = "cmd.exe";
-        argv[1] = "/d";
-        argv[2] = "/s";
-        argv[3] = "/c";
-        argv[4] = try command.toOwnedSlice();
-    }
 
     var child = try std.process.spawn(init.io, .{
         .argv = argv,
@@ -981,15 +999,6 @@ fn classifyExecutable(io: std.Io, path: []const u8) ExecutableKind {
         if (std.ascii.eqlIgnoreCase(extension, candidate)) return .javascript;
     }
     return .native;
-}
-
-fn appendWindowsShellArg(writer: *std.Io.Writer, value: []const u8) !void {
-    try writer.writeByte('"');
-    for (value) |byte| {
-        if (byte == '"') try writer.writeByte('\\');
-        try writer.writeByte(byte);
-    }
-    try writer.writeByte('"');
 }
 
 fn childExitCode(term: std.process.Child.Term) u8 {

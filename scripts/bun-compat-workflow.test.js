@@ -14,7 +14,8 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
-  startWindowsTaskkill,
+  startWindowsJobChild,
+  startWindowsJobTermination,
   waitForChildCompletion,
 } from "./bun-compat-child-lifecycle.js";
 import {
@@ -109,6 +110,10 @@ test("builds Hutch and runs the complete owned JavaScript compatibility suite wi
   assert.match(
     workflow,
     /zig\.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
+  );
+  assert.match(
+    workflow,
+    /run: node --test --test-concurrency=1 scripts\/bun-compat-windows-job\.test\.js/,
   );
   assert.match(workflow, /HUTCH_COMPAT_COTTONTAIL: \$\{\{ steps\.cottontail\.outputs\.binary \}\}/);
   assert.match(workflow, /run: node scripts\/run-bun-package-manager-tests\.js --all/);
@@ -336,7 +341,7 @@ test("constructs one effective inner timeout with an independent outer margin", 
 
   assert.match(compatRunner, /const invocation = entryInvocation\(entry, preloadPath\);/);
   assert.match(compatRunner, /timeoutMs: invocation\.outerTimeoutMs/);
-  assert.match(compatRunner, /spawn\(options\.runtime, invocation\.args,/);
+  assert.match(compatRunner, /spawnContainedChild\(options\.runtime, invocation\.args,/);
 });
 
 test("reads a linked-worktree HEAD through its common Git directory", t => {
@@ -359,11 +364,13 @@ test("reads a linked-worktree HEAD through its common Git directory", t => {
 test("bounds process-tree cleanup and retries runner-owned removal", () => {
   assert.match(compatRunner, /maxRetries: 10/);
   assert.match(compatRunner, /retryDelay: 100/);
-  assert.match(compatRunner, /startWindowsTaskkill\(child,/);
+  assert.match(compatRunner, /startWindowsJobChild\(command, args,/);
+  assert.match(compatRunner, /startWindowsJobTermination\(child,/);
   assert.match(compatRunner, /spawnProcess: spawn/);
-  assert.doesNotMatch(compatRunner, /spawnSync\("taskkill"/);
+  assert.doesNotMatch(compatRunner, /taskkill|spawnSync/);
   assert.match(compatRunner, /hardSettleTimeoutMs: childHardSettleTimeoutMs/);
   assert.match(compatRunner, /requireTerminationProof: process\.platform === "win32"/);
+  assert.match(compatRunner, /naturalCloseProvesTreeDeath: true/);
   assert.match(compatRunner, /unprovenDeathTempRoots\.add\(tempRoot\)/);
   assert.match(compatRunner, /options\.keepTemp \|\| unprovenDeathTempRoots\.has\(tempRoot\)/);
   assert.match(compatRunner, /retained temp root because process death was not observed/);
@@ -377,13 +384,13 @@ test("bounds process-tree cleanup and retries runner-owned removal", () => {
   assert.match(compatRunner, /await Promise\.all\(/);
 });
 
-test("a failed asynchronous Windows taskkill cannot extend the outer deadline", async () => {
-  const child = fakeChild();
-  const taskkill = new EventEmitter();
-  taskkill.unrefCalls = 0;
-  taskkill.unref = () => { taskkill.unrefCalls += 1; };
-  taskkill.kill = () => true;
-  let taskkillInvocation = null;
+test("a failed asynchronous Windows Job Object terminator cannot extend the outer deadline", async () => {
+  const { child, launchInvocation } = fakeWindowsJobChild();
+  const terminator = new EventEmitter();
+  terminator.unrefCalls = 0;
+  terminator.unref = () => { terminator.unrefCalls += 1; };
+  terminator.kill = () => true;
+  let terminationInvocation = null;
   const started = Date.now();
   const completion = waitForChildCompletion(child, {
     timeoutMs: 5,
@@ -391,44 +398,53 @@ test("a failed asynchronous Windows taskkill cannot extend the outer deadline", 
     requireTerminationProof: true,
     settleDelayMs: 1,
     terminate(target) {
-      return startWindowsTaskkill(target, {
+      return startWindowsJobTermination(target, {
         timeoutMs: 1_000,
+        watchdogMs: 1_100,
         spawnProcess(command, args, options) {
-          taskkillInvocation = { command, args, options };
-          queueMicrotask(() => taskkill.emit("error", new Error("taskkill failed")));
-          return taskkill;
+          terminationInvocation = { command, args, options };
+          queueMicrotask(() => terminator.emit("error", new Error("terminator failed")));
+          return terminator;
         },
       });
     },
   });
   const result = await completion;
 
-  assert.deepEqual(taskkillInvocation, {
-    command: "taskkill",
-    args: ["/pid", "12345", "/t", "/f"],
+  assert.equal(launchInvocation.command, "job-launcher.exe");
+  assert.deepEqual(launchInvocation.args.slice(0, 3), [
+    "run",
+    launchInvocation.args[1],
+    "2468",
+  ]);
+  assert.match(launchInvocation.args[1], /^Local\\HutchBunCompat-[0-9a-f-]+$/);
+  assert.deepEqual(terminationInvocation, {
+    command: "job-launcher.exe",
+    args: ["terminate", launchInvocation.args[1], "1000"],
     options: { stdio: "ignore", windowsHide: true },
   });
-  assert.equal(taskkill.unrefCalls, 0);
+  assert.equal(terminator.unrefCalls, 0);
   assert.equal(result.timedOut, true);
   assert.equal(result.teardownIncomplete, true);
-  assert.match(result.teardownError?.message ?? "", /taskkill failed to start: taskkill failed/);
-  assert.ok(Date.now() - started < 1_000, "taskkill failure must not delay hard settlement");
+  assert.match(result.teardownError?.message ?? "", /terminator failed to start: terminator failed/);
+  assert.ok(Date.now() - started < 1_000, "terminator failure must not delay hard settlement");
 });
 
-test("a hung taskkill helper is killed and unrefed by its own watchdog", async () => {
-  const target = fakeChild();
-  const taskkill = new EventEmitter();
+test("a hung Job Object terminator is killed and unrefed by its own watchdog", async () => {
+  const { child } = fakeWindowsJobChild();
+  const terminator = new EventEmitter();
   let killCalls = 0;
   let unrefCalls = 0;
-  taskkill.kill = () => { killCalls += 1; return true; };
-  taskkill.unref = () => { unrefCalls += 1; };
+  terminator.kill = () => { killCalls += 1; return true; };
+  terminator.unref = () => { unrefCalls += 1; };
   const started = Date.now();
   await assert.rejects(
-    startWindowsTaskkill(target, {
-      timeoutMs: 10,
-      spawnProcess() { return taskkill; },
+    startWindowsJobTermination(child, {
+      timeoutMs: 5,
+      watchdogMs: 10,
+      spawnProcess() { return terminator; },
     }),
-    /taskkill did not settle within 10ms/,
+    /Job Object terminator did not settle within 10ms/,
   );
 
   assert.equal(killCalls, 1);
@@ -436,11 +452,11 @@ test("a hung taskkill helper is killed and unrefed by its own watchdog", async (
   assert.ok(Date.now() - started < 1_000);
 });
 
-test("Windows close waits for bounded taskkill proof before allowing cleanup", async () => {
-  const child = fakeChild();
-  const taskkill = new EventEmitter();
-  taskkill.unref = () => {};
-  taskkill.kill = () => true;
+test("Windows close waits for bounded Job Object proof before allowing cleanup", async () => {
+  const { child } = fakeWindowsJobChild();
+  const terminator = new EventEmitter();
+  terminator.unref = () => {};
+  terminator.kill = () => true;
   const completion = waitForChildCompletion(child, {
     timeoutMs: 5,
     hardSettleTimeoutMs: 100,
@@ -449,9 +465,10 @@ test("Windows close waits for bounded taskkill proof before allowing cleanup", a
     settleDelayMs: 50,
     terminateOnExit: false,
     terminate(target) {
-      return startWindowsTaskkill(target, {
+      return startWindowsJobTermination(target, {
         timeoutMs: 1_000,
-        spawnProcess() { return taskkill; },
+        watchdogMs: 1_100,
+        spawnProcess() { return terminator; },
       });
     },
   });
@@ -462,7 +479,7 @@ test("Windows close waits for bounded taskkill proof before allowing cleanup", a
   child.emit("close", 0, null);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(completed, false, "direct close alone must not prove the Windows tree died");
-  taskkill.emit("close", 0);
+  terminator.emit("close", 0);
   const result = await completion;
   assert.equal(result.processDeathProven, true);
   assert.equal(result.teardownIncomplete, false);
@@ -479,6 +496,22 @@ function fakeChild(pid = 12_345) {
     child.unrefCalls += 1;
   };
   return child;
+}
+
+function fakeWindowsJobChild() {
+  const child = fakeChild();
+  let launchInvocation = null;
+  const managed = startWindowsJobChild("runtime.exe", ["arg", "space value"], {
+    jobLauncher: "job-launcher.exe",
+    parentPid: 2_468,
+    spawnOptions: { cwd: "fixture", env: { TEST: "1" } },
+    spawnProcess(command, args, options) {
+      launchInvocation = { command, args, options };
+      return child;
+    },
+  });
+  assert.equal(managed, child);
+  return { child, launchInvocation };
 }
 
 test("hard-settles a timed-out child whose exit and close events never arrive", async () => {

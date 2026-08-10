@@ -9,6 +9,9 @@ const { spawn, spawnSync } = require("node:child_process");
 const { gzipSync } = require("node:zlib");
 
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
+const nodeProbe = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+assert.equal(nodeProbe.status, 0, `failed to resolve host Node executable: ${nodeProbe.stderr}`);
+const nodeRuntime = path.resolve(nodeProbe.stdout.trim());
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-lockfiles-"));
 const servers = [];
 
@@ -109,7 +112,7 @@ const server = http.createServer((request, response) => {
 server.listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(server.address().port)));
 `,
   );
-  const server = spawn(process.execPath, [serverFile, root, portFile, requestFile, integrity], {
+  const server = spawn(nodeRuntime, [serverFile, root, portFile, requestFile, integrity], {
     stdio: ["ignore", "ignore", "inherit"],
   });
   servers.push(server);

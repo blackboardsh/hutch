@@ -32,7 +32,8 @@ import {
   readHarnessDependencyPlan,
 } from "./bun-harness-dependencies.js";
 import {
-  startWindowsTaskkill,
+  startWindowsJobChild,
+  startWindowsJobTermination,
   waitForChildCompletion,
 } from "./bun-compat-child-lifecycle.js";
 import { HutchCompatReporter } from "./bun-compat-reporter.js";
@@ -69,9 +70,16 @@ const canonicalRunnableCount = 1_445;
 const expectedOwnedCount = 103;
 const nextPagesFixtureRoot = "test/integration/next-pages";
 const nextPagesGeneratedCounter = "src/Counter.tsx";
+const binarySuiteFilePattern = /\.(?:ico|lockb|tgz)$/i;
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const defaultHutchBinary = join(hutchRoot, "zig-out", "bin", `hutch${executableSuffix}`);
 const defaultHutchEngine = join(hutchRoot, "zig-out", "bin", `hutch-engine${executableSuffix}`);
+const defaultWindowsJobLauncher = join(
+  hutchRoot,
+  "zig-out",
+  "bin",
+  "hutch-bun-compat-job.exe",
+);
 const defaultCottontailBinary = resolve(
   hutchRoot,
   "..",
@@ -88,7 +96,8 @@ const defaultOuterTimeoutMs = perTestTimeoutMs + defaultOuterTimeoutMarginMs;
 const overrideOuterTimeoutMarginMs = 60_000;
 const childTreeSettleDelayMs = process.platform === "win32" ? 1_000 : 250;
 const childHardSettleTimeoutMs = 5_000;
-const windowsTaskkillTimeoutMs = 4_000;
+const windowsJobTerminationTimeoutMs = 3_500;
+const windowsJobTerminatorWatchdogMs = 4_000;
 const heartbeatMs = Number(process.env.HUTCH_COMPAT_HEARTBEAT_MS ?? 30_000);
 const reportsRoot = resolve(
   process.env.HUTCH_COMPAT_REPORTS_DIR ??
@@ -190,6 +199,7 @@ function usage() {
     "  --hutch <path>      Hutch child CLI (default: zig-out/bin/hutch).",
     "  --engine <path>     Hutch engine used by copied launchers.",
     "  --runtime <path>    Cottontail JS test runtime (default: sibling checkout).",
+    "  --job-launcher <path> Native Windows Job Object launcher.",
     "  --jobs <n>          Parallel file workers (default: up to 4).",
     "  --max-tests <n>     Bound the selected file count.",
     "  --report-dir <path> Write this run's durable events, logs, and summary here.",
@@ -197,7 +207,7 @@ function usage() {
     "",
     "Environment equivalents:",
     "  HUTCH_COMPAT_BINARY, HUTCH_COMPAT_ENGINE, HUTCH_COMPAT_COTTONTAIL,",
-    "  COTTONTAIL_BINARY, HUTCH_COMPAT_HARNESS_CACHE_DIR,",
+    "  COTTONTAIL_BINARY, HUTCH_COMPAT_JOB_LAUNCHER, HUTCH_COMPAT_HARNESS_CACHE_DIR,",
     "  HUTCH_COMPAT_TEST_TIMEOUT_MS, HUTCH_COMPAT_REPORT_DIR,",
     "  HUTCH_COMPAT_REPORTS_DIR, HUTCH_COMPAT_HEARTBEAT_MS",
   ].join("\n"));
@@ -209,6 +219,7 @@ function parseArgs(argv) {
     check: false,
     engine: process.env.HUTCH_COMPAT_ENGINE ?? defaultHutchEngine,
     hutch: process.env.HUTCH_COMPAT_BINARY ?? defaultHutchBinary,
+    jobLauncher: process.env.HUTCH_COMPAT_JOB_LAUNCHER ?? defaultWindowsJobLauncher,
     jobs: defaultJobs,
     keepTemp: process.env.HUTCH_COMPAT_KEEP_TEMP === "1",
     list: false,
@@ -236,6 +247,8 @@ function parseArgs(argv) {
       const value = Number(args.shift() ?? fail("--jobs requires a number"));
       if (!Number.isInteger(value) || value < 1) fail("--jobs requires a positive integer");
       options.jobs = value;
+    } else if (arg === "--job-launcher") {
+      options.jobLauncher = args.shift() ?? fail("--job-launcher requires a path");
     } else if (arg === "--keep-temp") {
       options.keepTemp = true;
     } else if (arg === "--list") {
@@ -266,6 +279,7 @@ function parseArgs(argv) {
   }
   options.engine = resolve(options.engine);
   options.hutch = resolve(options.hutch);
+  options.jobLauncher = resolve(options.jobLauncher);
   options.runtime = resolve(options.runtime);
   if (options.reportDir != null) options.reportDir = resolve(options.reportDir);
   return options;
@@ -341,7 +355,45 @@ function listSnapshotFiles(root) {
   return files.sort();
 }
 
-function snapshotFingerprint(root) {
+function normalizeCrLf(bytes) {
+  let crlfCount = 0;
+  for (let index = 0; index + 1 < bytes.length; index += 1) {
+    if (bytes[index] === 13 && bytes[index + 1] === 10) crlfCount += 1;
+  }
+  if (crlfCount === 0) return bytes;
+  const normalized = Buffer.allocUnsafe(bytes.length - crlfCount);
+  let outputIndex = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 13 && bytes[index + 1] === 10) continue;
+    normalized[outputIndex] = bytes[index];
+    outputIndex += 1;
+  }
+  return normalized;
+}
+
+function canonicalSuiteFileBytes(path, relativePath) {
+  const bytes = readFileSync(path);
+  return binarySuiteFilePattern.test(relativePath) ? bytes : normalizeCrLf(bytes);
+}
+
+function canonicalSuiteSha256(path, relativePath) {
+  return createHash("sha256")
+    .update(canonicalSuiteFileBytes(path, relativePath))
+    .digest("hex");
+}
+
+function normalizePrivateSuiteTextFiles(root) {
+  for (const path of listSnapshotFiles(root)) {
+    if (binarySuiteFilePattern.test(path)) continue;
+    const absolutePath = join(root, ...path.split("/"));
+    if (!lstatSync(absolutePath).isFile()) continue;
+    const bytes = readFileSync(absolutePath);
+    const normalized = normalizeCrLf(bytes);
+    if (normalized !== bytes) writeFileSync(absolutePath, normalized);
+  }
+}
+
+function snapshotFingerprint(root, { canonicalText = false } = {}) {
   const files = listSnapshotFiles(root);
   const hash = createHash("sha256");
   for (const path of files) {
@@ -356,7 +408,9 @@ function snapshotFingerprint(root) {
       hash.update(readlinkSync(absolutePath));
     } else if (stat.isFile()) {
       hash.update("file\0");
-      hash.update(readFileSync(absolutePath));
+      hash.update(canonicalText
+        ? canonicalSuiteFileBytes(absolutePath, path)
+        : readFileSync(absolutePath));
     } else {
       throw new Error(`snapshot contains unsupported entry: ${path}`);
     }
@@ -395,6 +449,7 @@ function runIdentity(validated, entries, options, { refreshMutableInputs = false
     join(scriptDir, "bun-compat-reporter.js"),
     join(scriptDir, "bun-compat-runner-contract.js"),
     join(scriptDir, "bun-harness-dependencies.js"),
+    join(hutchRoot, "src", "bun_compat_job_launcher.zig"),
     preloadPath,
   ];
   return {
@@ -411,6 +466,9 @@ function runIdentity(validated, entries, options, { refreshMutableInputs = false
       hutch: binaryIdentity(options.hutch),
       engine: binaryIdentity(options.engine),
       cottontail: binaryIdentity(options.runtime),
+      ...(process.platform === "win32"
+        ? { windowsJobLauncher: binaryIdentity(options.jobLauncher) }
+        : {}),
     },
     provenance: {
       cottontail: readJson(cottontailManifestPath),
@@ -422,7 +480,7 @@ function runIdentity(validated, entries, options, { refreshMutableInputs = false
       ownershipSha256: sha256(ownershipPath),
       statusSha256: sha256(statusPath),
       suiteSnapshot: refreshMutableInputs
-        ? snapshotFingerprint(suiteRoot)
+        ? snapshotFingerprint(suiteRoot, { canonicalText: true })
         : validated.suiteSnapshot,
     },
     inventory: {
@@ -524,7 +582,7 @@ function validateSuite() {
   if (copiedTests.length !== manifest.ownedRunnableFiles) {
     fail(`copied test count mismatch: ${copiedTests.length} !== ${manifest.ownedRunnableFiles}`);
   }
-  const suiteSnapshot = snapshotFingerprint(suiteRoot);
+  const suiteSnapshot = snapshotFingerprint(suiteRoot, { canonicalText: true });
   if (suiteSnapshot.files !== manifest.copiedFiles) {
     fail(`copied file count mismatch: ${suiteSnapshot.files} !== ${manifest.copiedFiles}`);
   }
@@ -563,7 +621,10 @@ function validateSuite() {
     fail("Next Pages fixture is missing the Counter.tsx source template");
   }
   for (const record of fixtureRecords) {
-    if (!record.sha256 || sha256(join(nextPagesRoot, record.path)) !== record.sha256) {
+    if (
+      !record.sha256 ||
+      canonicalSuiteSha256(join(nextPagesRoot, record.path), record.path) !== record.sha256
+    ) {
       fail(`Next Pages fixture hash does not match the manifest: ${record.path}`);
     }
   }
@@ -616,7 +677,7 @@ function validateSuite() {
     if (record?.status !== status.tests[path].status) {
       fail(`manifest status is stale for ${path}`);
     }
-    if (!record.sha256 || sha256(join(suiteRoot, path)) !== record.sha256) {
+    if (!record.sha256 || canonicalSuiteSha256(join(suiteRoot, path), path) !== record.sha256) {
       fail(`copied test hash does not match the manifest: ${path}`);
     }
   }
@@ -658,13 +719,36 @@ function selectedEntries(validated, options) {
   }));
 }
 
+function spawnContainedChild(command, args, spawnOptions, jobLauncher) {
+  if (process.platform !== "win32") return spawn(command, args, spawnOptions);
+  return startWindowsJobChild(command, args, {
+    jobLauncher,
+    spawnOptions,
+    spawnProcess: spawn,
+  });
+}
+
+function terminateDirectChild(child) {
+  if (child.pid == null) return true;
+  try {
+    return child.kill("SIGKILL");
+  } catch (error) {
+    if (error?.code === "ESRCH") return true;
+    throw error;
+  }
+}
+
 async function runCapturedChild(command, args, options) {
   throwIfAborted(options.signal);
-  const child = spawn(command, args, {
+  const containOnWindows = process.platform === "win32" && options.containOnWindows !== false;
+  const spawnOptions = {
     cwd: options.cwd,
     env: options.env,
     detached: process.platform !== "win32",
-  });
+  };
+  const child = containOnWindows
+    ? spawnContainedChild(command, args, spawnOptions, options.jobLauncher)
+    : spawn(command, args, spawnOptions);
   const output = {
     stdout: { bytes: 0, chunks: [] },
     stderr: { bytes: 0, chunks: [] },
@@ -683,12 +767,12 @@ async function runCapturedChild(command, args, options) {
   const completion = waitForChildCompletion(child, {
     timeoutMs: options.timeoutMs,
     hardSettleTimeoutMs: childHardSettleTimeoutMs,
-    naturalCloseProvesTreeDeath: process.platform !== "win32",
-    requireTerminationProof: process.platform === "win32",
+    naturalCloseProvesTreeDeath: !containOnWindows || process.platform === "win32",
+    requireTerminationProof: containOnWindows,
     signal: options.signal,
     settleDelayMs: childTreeSettleDelayMs,
-    terminate: killProcessTree,
-    terminateOnExit: process.platform !== "win32",
+    terminate: containOnWindows ? killProcessTree : terminateDirectChild,
+    terminateOnExit: !containOnWindows,
   });
   activeChildCompletions.add(completion);
   let result;
@@ -711,6 +795,8 @@ async function preflightBinary(
   args,
   environment = process.env,
   signal = null,
+  jobLauncher = null,
+  containOnWindows = true,
 ) {
   throwIfAborted(signal);
   if (!existsSync(path)) fail(`${label} not found: ${path}`);
@@ -721,6 +807,8 @@ async function preflightBinary(
     timeoutMs: 15_000,
     maxOutputBytes: 1024 * 1024,
     signal,
+    jobLauncher,
+    containOnWindows,
   });
   throwIfAborted(signal);
   if (result.error) fail(`${label} failed to start: ${result.error.message}`);
@@ -736,10 +824,21 @@ async function preflightBinary(
 }
 
 async function preflight(options, signal) {
+  if (process.platform === "win32") {
+    await preflightBinary(
+      options.jobLauncher,
+      "Windows Job Object launcher",
+      ["probe"],
+      hermeticChildEnvironment(),
+      signal,
+      null,
+      false,
+    );
+  }
   const runtime = await preflightBinary(options.runtime, "Cottontail runtime", [
     "-e",
     'console.log("HUTCH_COTTONTAIL_PREFLIGHT:" + JSON.stringify({ version: process.versions?.cottontail, execPath: process.execPath }))',
-  ], hermeticChildEnvironment(), signal);
+  ], hermeticChildEnvironment(), signal, options.jobLauncher);
   const identityLine = String(runtime.stdout)
     .split(/\r?\n/)
     .find(line => line.startsWith("HUTCH_COTTONTAIL_PREFLIGHT:"));
@@ -758,7 +857,7 @@ async function preflight(options, signal) {
   }
   await preflightBinary(options.hutch, "Hutch CLI", ["--version"], hermeticChildEnvironment({
     HUTCH_ENGINE_BINARY: options.engine,
-  }), signal);
+  }), signal, options.jobLauncher);
   if (options.runtime === options.hutch) {
     fail("Hutch child CLI and Cottontail test runtime must be distinct executables");
   }
@@ -780,6 +879,7 @@ async function preflight(options, signal) {
       HUTCH_ENGINE_BINARY: options.engine,
     }),
     signal,
+    options.jobLauncher,
   );
   const childCliLine = String(preload.stdout)
     .split(/\r?\n/)
@@ -839,6 +939,7 @@ async function prepareHarnessDependencies(options, signal, plan) {
         timeoutMs: 10 * 60_000,
         maxOutputBytes: 64 * 1024 * 1024,
         signal,
+        jobLauncher: options.jobLauncher,
       },
     );
     throwIfAborted(signal);
@@ -886,11 +987,10 @@ async function prepareHarnessDependencies(options, signal, plan) {
 function killProcessTree(child) {
   if (!child.pid) return true;
   if (process.platform === "win32") {
-    // taskkill /t is best-effort rather than Job Object containment. Launch it
-    // without blocking the runner's independent hard-settlement deadline.
-    return startWindowsTaskkill(child, {
+    return startWindowsJobTermination(child, {
       spawnProcess: spawn,
-      timeoutMs: windowsTaskkillTimeoutMs,
+      timeoutMs: windowsJobTerminationTimeoutMs,
+      watchdogMs: windowsJobTerminatorWatchdogMs,
     });
   }
   try {
@@ -924,6 +1024,10 @@ function prepareExecutionSuite(
     preserveTimestamps: true,
     verbatimSymlinks: true,
   });
+  // Existing Windows worktrees can predate this branch's eol=lf attributes.
+  // Accept CRLF only when its byte-for-byte LF form matches the immutable
+  // manifest, then materialize the private execution copy in canonical form.
+  normalizePrivateSuiteTextFiles(executionSuiteRoot);
   const copiedSnapshotFingerprint = snapshotFingerprint(executionSuiteRoot);
   if (!isDeepStrictEqual(copiedSnapshotFingerprint, expectedSnapshotFingerprint)) {
     fail(
@@ -1024,11 +1128,11 @@ function runEntry(
   });
 
   const invocation = entryInvocation(entry, preloadPath);
-  const child = spawn(options.runtime, invocation.args, {
+  const child = spawnContainedChild(options.runtime, invocation.args, {
     cwd: executionSuiteRoot,
     env: childEnv,
     detached: process.platform !== "win32",
-  });
+  }, options.jobLauncher);
   let stdout = "";
   let stderr = "";
   let outputError = null;
@@ -1054,7 +1158,7 @@ function runEntry(
   const lifecycleCompletion = waitForChildCompletion(child, {
     timeoutMs: invocation.outerTimeoutMs,
     hardSettleTimeoutMs: childHardSettleTimeoutMs,
-    naturalCloseProvesTreeDeath: process.platform !== "win32",
+    naturalCloseProvesTreeDeath: true,
     requireTerminationProof: process.platform === "win32",
     signal: abortController.signal,
     settleDelayMs: childTreeSettleDelayMs,

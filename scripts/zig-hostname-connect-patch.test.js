@@ -48,7 +48,14 @@ test("Zig HostName.connect patch is deterministic and idempotent", async (t) => 
   const { spawnSync } = await import("node:child_process");
   const reversed = spawnSync(
     "git",
-    ["apply", "--unidiff-zero", "--reverse", path.join(root, "patches", patchName)],
+    [
+      "-c",
+      "core.autocrlf=false",
+      "apply",
+      "--unidiff-zero",
+      "--reverse",
+      path.join(root, "patches", patchName),
+    ],
     { cwd: root, encoding: "utf8" },
   );
   assert.equal(reversed.status, 0, reversed.stderr);
@@ -72,6 +79,19 @@ test("Zig HostName.connect patch refuses source drift", async (t) => {
     ensureZigHostNameConnectPatch({ root }),
     /vendored Zig source drift/,
   );
+});
+
+test("Zig HostName.connect patch canonicalizes Git for Windows CRLF output", async (t) => {
+  const root = await makePatchedFixture(t);
+  for (const file of knownFiles) {
+    const target = path.join(root, file.path);
+    const source = await readFile(target, "utf8");
+    await writeFile(target, source.replace(/\n/g, "\r\n"));
+  }
+
+  const verified = await ensureZigHostNameConnectPatch({ root, checkOnly: true });
+  assert.equal(verified.changed, false);
+  await expectHashes(root, "patchedSha256");
 });
 
 test("setup always verifies the patch after vendoring", async () => {

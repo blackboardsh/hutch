@@ -11,6 +11,9 @@ const cottontail = path.resolve(
   process.argv[2] ||
     path.join("zig-out", "bin", process.platform === "win32" ? "cottontail.exe" : "cottontail"),
 );
+const nodeProbe = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+assert.equal(nodeProbe.status, 0, `failed to resolve host Node executable: ${nodeProbe.stderr}`);
+const nodeRuntime = path.resolve(nodeProbe.stdout.trim());
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-install-edges-"));
 const childTimeout = process.platform === "win32" ? 120_000 : 30_000;
 
@@ -376,7 +379,7 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
 `,
   );
 
-  const server = spawn(process.execPath, [serverFile, registryRoot, portFile, statsFile], {
+  const server = spawn(nodeRuntime, [serverFile, registryRoot, portFile, statsFile], {
     stdio: ["ignore", "ignore", "inherit"],
   });
   try {

@@ -10,6 +10,9 @@ const { spawn, spawnSync } = require("node:child_process");
 const { gzipSync } = require("node:zlib");
 
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
+const nodeProbe = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+assert.equal(nodeProbe.status, 0, `failed to resolve host Node executable: ${nodeProbe.stderr}`);
+const nodeRuntime = path.resolve(nodeProbe.stdout.trim());
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-cache-concurrency-"));
 const registryRoot = path.join(scratch, "registry");
 const projectRoot = path.join(scratch, "project");
@@ -183,7 +186,7 @@ server.listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(server.add
 );
 
 const server = spawn(
-  process.execPath,
+  nodeRuntime,
   [serverFile, registryRoot, portFile, statsFile, String(responseDelayMs)],
   { stdio: ["ignore", "ignore", "inherit"] },
 );

@@ -8,6 +8,9 @@ const { gzipSync } = require("node:zlib");
 const { spawn, spawnSync } = require("node:child_process");
 
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
+const nodeProbe = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+assert.equal(nodeProbe.status, 0, `failed to resolve host Node executable: ${nodeProbe.stderr}`);
+const nodeRuntime = path.resolve(nodeProbe.stdout.trim());
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-peer-conflict-"));
 const lockedPeerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-locked-peer-"));
 const legacyTarballRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-legacy-tarball-"));
@@ -170,7 +173,7 @@ server.listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(server.add
 `,
 );
 
-const server = spawn(process.execPath, [serverPath, registryRoot, portFile], {
+const server = spawn(nodeRuntime, [serverPath, registryRoot, portFile], {
   stdio: ["ignore", "ignore", "inherit"],
 });
 
