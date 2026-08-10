@@ -4,6 +4,9 @@ compat/upstream/** text eol=lf
 compat/upstream/**/*.ico binary
 compat/upstream/**/*.lockb binary
 compat/upstream/**/*.tgz binary
+# This copied Bun fixture is manifest-hashed byte-for-byte and intentionally
+# contains one whitespace-only line from upstream.
+compat/upstream/bun/v1.3.10/test/integration/next-pages/src/Counter1.txt whitespace=-blank-at-eol
 compat/harness-dependencies/** text eol=lf
 patches/*.patch text eol=lf
 *.sh text eol=lf
