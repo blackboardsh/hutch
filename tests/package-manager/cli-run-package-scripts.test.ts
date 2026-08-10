@@ -203,6 +203,32 @@ test("ordinary run applies --cwd exactly once", () => {
   expect(result.stdout).toContain(join(directory, "subdir"));
 });
 
+test("installed binaries with a Bun shebang resolve Hutch from an isolated PATH", () => {
+  const directory = join(scratch, "installed-bun-shebang");
+  const binDirectory = join(directory, "node_modules", ".bin");
+  mkdirSync(binDirectory, { recursive: true });
+
+  if (process.platform === "win32") {
+    const entrypoint = join(directory, "file-bin.js");
+    writeFileSync(entrypoint, 'console.log("file-bin");\n');
+    writeFileSync(
+      join(binDirectory, "file-bin.cmd"),
+      `@bun "${entrypoint}" %*\r\n`,
+    );
+  } else {
+    writeFileSync(
+      join(binDirectory, "file-bin"),
+      '#!/usr/bin/env bun\nconsole.log("file-bin");\n',
+      { mode: 0o755 },
+    );
+  }
+
+  const result = run(directory, ["file-bin"]);
+  expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+  expect(result.stdout).toBe("file-bin\n");
+  expect(result.stderr).toBeEmpty();
+});
+
 test("package scripts repair an incomplete node_modules tree", () => {
   const directory = join(scratch, "partial-install");
   const dependency = join(scratch, "local-dependency");

@@ -105,6 +105,7 @@ const Group = struct {
     package_index: usize = 0,
     color_index: usize = 0,
     force_runtime: bool = false,
+    provide_bun_runtime: bool = false,
     silent: bool = false,
     print_command: bool = true,
     result: GroupResult = .{},
@@ -432,10 +433,11 @@ fn platformTempDir(environment: *const std.process.Environ.Map) []const u8 {
     return if (builtin.os.tag == .windows) "." else "/tmp";
 }
 
-fn prependForcedRuntimePath(
+fn prependRuntimePath(
     init: std.process.Init,
     allocator: Allocator,
     environment: *std.process.Environ.Map,
+    include_node: bool,
 ) !void {
     const executable = try Host.cliExecutableForInit(init, allocator);
     defer allocator.free(executable);
@@ -443,20 +445,24 @@ fn prependForcedRuntimePath(
         platformTempDir(environment),
         try std.fmt.allocPrint(
             allocator,
-            "hutch-node-{x}",
-            .{std.hash.Wyhash.hash(0, executable)},
+            "hutch-{s}-{x}",
+            .{ if (include_node) "node" else "bun", std.hash.Wyhash.hash(0, executable) },
         ),
     });
     try std.Io.Dir.cwd().createDirPath(init.io, launcher_dir);
 
     if (builtin.os.tag == .windows) {
-        for ([_][]const u8{ "node.cmd", "bun.cmd" }) |name| {
+        const all_names = [_][]const u8{ "node.cmd", "bun.cmd" };
+        const names = if (include_node) all_names[0..] else all_names[1..];
+        for (names) |name| {
             const launcher = try std.fs.path.join(allocator, &.{ launcher_dir, name });
             const command = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{executable});
             try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = launcher, .data = command });
         }
     } else {
-        for ([_][]const u8{ "node", "bun" }) |name| {
+        const all_names = [_][]const u8{ "node", "bun" };
+        const names = if (include_node) all_names[0..] else all_names[1..];
+        for (names) |name| {
             const launcher = try std.fs.path.join(allocator, &.{ launcher_dir, name });
             std.Io.Dir.cwd().symLink(init.io, executable, launcher, .{}) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
@@ -523,7 +529,9 @@ fn configureEnvironment(
     const path = try std.mem.join(allocator, separator, path_parts.items);
     defer allocator.free(path);
     try env.put("PATH", path);
-    if (group.force_runtime) try prependForcedRuntimePath(init, allocator, &env);
+    if (group.force_runtime or group.provide_bun_runtime) {
+        try prependRuntimePath(init, allocator, &env, group.force_runtime);
+    }
     return env;
 }
 
@@ -1484,6 +1492,7 @@ pub fn runSingleCommand(
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
     var groups = std.array_list.Managed(Group).init(allocator);
     try appendRawGroup(init, &groups, cwd, command, command_args);
+    groups.items[0].provide_bun_runtime = true;
     groups.items[0].silent = silent;
     groups.items[0].print_command = false;
 

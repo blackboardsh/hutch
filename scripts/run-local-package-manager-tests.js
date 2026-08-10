@@ -29,7 +29,7 @@ const tests = [
     name: "cli-run-package-scripts",
     file: "cli-run-package-scripts.test.ts",
     mode: "test",
-    marker: "7 pass",
+    marker: "8 pass",
   },
   {
     name: "bun-package-manager-link",
