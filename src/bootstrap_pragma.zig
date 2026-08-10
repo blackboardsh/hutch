@@ -1,7 +1,7 @@
 const std = @import("std");
 const version_selector = @import("version_selector.zig");
 
-const prefix = "// @dash";
+const prefix = "// @hutch";
 const max_first_line_bytes = 4096;
 
 pub const Pragma = struct {
@@ -27,26 +27,26 @@ pub fn parseFirstLine(line_with_ending: []const u8) !?Pragma {
     var found = false;
     while (fields.next()) |field| {
         found = true;
-        const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidDashPragmaField;
-        if (equals == 0 or equals + 1 == field.len) return error.InvalidDashPragmaField;
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidHutchPragmaField;
+        if (equals == 0 or equals + 1 == field.len) return error.InvalidHutchPragmaField;
         if (std.mem.indexOfScalarPos(u8, field, equals + 1, '=') != null) {
-            return error.InvalidDashPragmaField;
+            return error.InvalidHutchPragmaField;
         }
         const key = field[0..equals];
         const value = field[equals + 1 ..];
         const selector = try version_selector.parse(value);
 
         if (std.mem.eql(u8, key, "cli")) {
-            if (pragma.cli != null) return error.DuplicateDashPragmaField;
+            if (pragma.cli != null) return error.DuplicateHutchPragmaField;
             pragma.cli = selector;
         } else if (std.mem.eql(u8, key, "cottontail")) {
-            if (pragma.cottontail != null) return error.DuplicateDashPragmaField;
+            if (pragma.cottontail != null) return error.DuplicateHutchPragmaField;
             pragma.cottontail = selector;
         } else {
-            return error.UnknownDashPragmaField;
+            return error.UnknownHutchPragmaField;
         }
     }
-    if (!found) return error.EmptyDashPragma;
+    if (!found) return error.EmptyHutchPragma;
     return pragma;
 }
 
@@ -64,7 +64,7 @@ pub fn parseFile(
     const count = try reader.interface.readSliceShort(&source_buffer);
     const source = source_buffer[0..count];
     if (source.len == max_first_line_bytes and std.mem.indexOfAny(u8, source, "\r\n") == null) {
-        return error.DashPragmaLineTooLong;
+        return error.HutchPragmaLineTooLong;
     }
     const owned = try allocator.dupe(u8, source);
     return parseFirstLine(owned);
@@ -76,10 +76,11 @@ pub fn findNearestConfig(
 ) !?[]const u8 {
     var current: []const u8 = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     while (true) {
+        // hutch.config.* is the only supported project config filename.
         for ([_][]const u8{
-            "dash.config.ts",
-            "dash.config.js",
-            "dash.config.mjs",
+            "hutch.config.ts",
+            "hutch.config.js",
+            "hutch.config.mjs",
         }) |name| {
             const candidate = try std.fs.path.join(allocator, &.{ current, name });
             if (absolutePathExists(io, candidate)) return candidate;
@@ -135,38 +136,38 @@ fn absolutePathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-test "strict dash pragma parses independent CLI and runtime selectors" {
+test "strict hutch pragma parses independent CLI and runtime selectors" {
     const pragma = (try parseFirstLine(
-        "// @dash cli=1.4.0 cottontail=build:0123456789abcdef0123456789abcdef01234567\r\n",
+        "// @hutch cli=1.4.0 cottontail=build:0123456789abcdef0123456789abcdef01234567\r\n",
     )).?;
     try std.testing.expectEqual(version_selector.Kind.version, pragma.cli.?.kind);
     try std.testing.expectEqual(version_selector.Kind.build, pragma.cottontail.?.kind);
 
     const stable = (try parseFirstLine(
-        "// @dash cli=stable cottontail=stable\n",
+        "// @hutch cli=stable cottontail=stable\n",
     )).?;
     try std.testing.expectEqual(version_selector.Kind.production, stable.cli.?.kind);
     try std.testing.expectEqualStrings("production", stable.cli.?.value);
     try std.testing.expectEqual(version_selector.Kind.production, stable.cottontail.?.kind);
 }
 
-test "ordinary comments are not dash pragmas" {
-    try std.testing.expect((try parseFirstLine("// @dashboard is unrelated\n")) == null);
+test "ordinary comments are not hutch pragmas" {
+    try std.testing.expect((try parseFirstLine("// @hutchboard is unrelated\n")) == null);
     try std.testing.expect((try parseFirstLine("// source file\n")) == null);
 }
 
-test "dash pragma rejects unknown, duplicate, and malformed fields" {
+test "hutch pragma rejects unknown, duplicate, and malformed fields" {
     try std.testing.expectError(
-        error.UnknownDashPragmaField,
-        parseFirstLine("// @dash runtime=production\n"),
+        error.UnknownHutchPragmaField,
+        parseFirstLine("// @hutch runtime=production\n"),
     );
     try std.testing.expectError(
-        error.DuplicateDashPragmaField,
-        parseFirstLine("// @dash cli=production cli=canary\n"),
+        error.DuplicateHutchPragmaField,
+        parseFirstLine("// @hutch cli=production cli=canary\n"),
     );
     try std.testing.expectError(
-        error.InvalidDashPragmaField,
-        parseFirstLine("// @dash cli\n"),
+        error.InvalidHutchPragmaField,
+        parseFirstLine("// @hutch cli\n"),
     );
-    try std.testing.expectError(error.EmptyDashPragma, parseFirstLine("// @dash\n"));
+    try std.testing.expectError(error.EmptyHutchPragma, parseFirstLine("// @hutch\n"));
 }

@@ -73,6 +73,11 @@ pub fn prepare(
         try std.Io.Dir.cwd().realPathFileAlloc(init.io, resolved, allocator);
     const entry_dir = std.fs.path.dirname(entry_absolute) orelse ".";
 
+    // --install=auto (the default) only auto-installs when there is no
+    // node_modules directory at or above the entrypoint; fallback/force
+    // install missing packages regardless.
+    if (mode == .auto and nodeModulesPresentNear(init.io, allocator, entry_dir)) return;
+
     const cache_root = try autoInstallCacheRoot(init, allocator);
     const staging_root = try std.fs.path.join(allocator, &.{
         cache_root,
@@ -375,7 +380,7 @@ fn isNodeBuiltinSpecifier(specifier: []const u8) bool {
     return false;
 }
 
-fn autoInstallCacheRoot(
+pub fn autoInstallCacheRoot(
     init: std.process.Init,
     allocator: std.mem.Allocator,
 ) ![]const u8 {
@@ -699,8 +704,23 @@ fn exposeInstalledPackage(
     }
 }
 
-fn packageIsInstalled(
+fn nodeModulesPresentNear(
     io: std.Io,
+    allocator: std.mem.Allocator,
+    start_dir: []const u8,
+) bool {
+    var current = start_dir;
+    while (true) {
+        const path = std.fs.path.join(allocator, &.{ current, "node_modules" }) catch return false;
+        if (pathIsDirectory(io, path)) return true;
+
+        const parent = std.fs.path.dirname(current) orelse return false;
+        if (std.mem.eql(u8, parent, current)) return false;
+        current = parent;
+    }
+}
+
+fn packageIsInstalled(    io: std.Io,
     allocator: std.mem.Allocator,
     start_dir: []const u8,
     package_name: []const u8,

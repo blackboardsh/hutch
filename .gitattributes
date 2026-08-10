@@ -1,0 +1,9 @@
+# The copied upstream compatibility suite is hash-checked against its manifest; CRLF
+# checkouts would break the hashes (and snapshot text) on Windows.
+compat/upstream/** text eol=lf
+compat/upstream/**/*.ico binary
+compat/upstream/**/*.lockb binary
+compat/upstream/**/*.tgz binary
+compat/harness-dependencies/** text eol=lf
+patches/*.patch text eol=lf
+*.sh text eol=lf

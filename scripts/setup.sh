@@ -77,3 +77,4 @@ vendor_zig() {
 }
 
 vendor_zig
+node "$SCRIPT_DIR/patch-zig-hostname-connect.js"

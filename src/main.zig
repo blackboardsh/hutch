@@ -33,7 +33,7 @@ const help_text_template =
     \\  hutch --version
     \\
     \\Config:
-    \\  Scripts are resolved from dash.config.ts first, then package.json.
+    \\  Scripts are resolved from hutch.config.ts, then package.json.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\  Package-manager commands are implemented by Hutch.
     \\
@@ -78,10 +78,14 @@ fn isCottontailTestCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "test");
 }
 
-// "exec" is likewise a runtime builtin (Bun shell execution), never a
-// package script; forward it like "test".
+// These are runtime builtins, never package scripts; forward them like
+// "test". In particular, `repl` and `completions` must reach Cottontail when
+// Hutch is used as the Bun-compatible facade.
 fn isReservedRuntimeCommand(command: []const u8) bool {
-    return isCottontailTestCommand(command) or std.mem.eql(u8, command, "exec");
+    return isCottontailTestCommand(command) or
+        std.mem.eql(u8, command, "exec") or
+        std.mem.eql(u8, command, "repl") or
+        std.mem.eql(u8, command, "completions");
 }
 
 fn isFakeNodeInvocation(args: []const [:0]const u8) bool {
@@ -510,9 +514,9 @@ fn makeConfigLoaderSource(allocator: std.mem.Allocator, config_path: []const u8)
     return try source.toOwnedSlice(allocator);
 }
 
-fn findDashConfig(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+fn findHutchConfig(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     return (try bootstrap_pragma.findNearestConfig(init.io, allocator)) orelse
-        error.DashConfigNotFound;
+        error.HutchConfigNotFound;
 }
 
 fn tempDir(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -534,21 +538,21 @@ fn currentProcessId() u64 {
     };
 }
 
-fn loadDashConfig(
+fn loadHutchConfig(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     cottontail_path: []const u8,
 ) !Config {
-    const config_path = try findDashConfig(init, allocator);
+    const config_path = try findHutchConfig(init, allocator);
     const loader_source = try makeConfigLoaderSource(allocator, config_path);
 
     const tmp_root = try tempDir(init, allocator);
-    const tmp_dir = try pathJoin(allocator, &.{ tmp_root, "dash" });
+    const tmp_dir = try pathJoin(allocator, &.{ tmp_root, "hutch" });
     try std.Io.Dir.cwd().createDirPath(init.io, tmp_dir);
 
     const loader_name = try std.fmt.allocPrint(
         allocator,
-        "dash-config-loader-{d}.mjs",
+        "hutch-config-loader-{d}.mjs",
         .{currentProcessId()},
     );
     const loader_path = try pathJoin(allocator, &.{ tmp_dir, loader_name });
@@ -573,7 +577,7 @@ fn loadDashConfig(
             try stderr.writeAll(result.stderr);
             try stderr.flush();
         }
-        return error.DashConfigLoadFailed;
+        return error.HutchConfigLoadFailed;
     }
 
     const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
@@ -753,8 +757,8 @@ fn runConfiguredScriptIfExists(
     script_args: []const [:0]const u8,
     stderr: anytype,
 ) !?u8 {
-    const config = loadDashConfig(init, allocator, cottontail_path) catch |err| switch (err) {
-        error.DashConfigNotFound => return null,
+    const config = loadHutchConfig(init, allocator, cottontail_path) catch |err| switch (err) {
+        error.HutchConfigNotFound => return null,
         else => return err,
     };
     const scripts = getObjectField(config.root, "scripts") orelse return null;
@@ -1579,10 +1583,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (args.len <= 2) {
-            const config = loadDashConfig(init, allocator, cottontail_path) catch |err| switch (err) {
-                error.DashConfigNotFound => null,
+            const config = loadHutchConfig(init, allocator, cottontail_path) catch |err| switch (err) {
+                error.HutchConfigNotFound => null,
                 else => {
-                    try stderr.print("hutch: failed to load dash.config.ts\n", .{});
+                    try stderr.print("hutch: failed to load hutch.config.ts\n", .{});
                     try stderr.flush();
                     std.process.exit(1);
                 },
@@ -1740,7 +1744,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (packageScriptEligible(command)) {
-        if (findDashConfig(init, allocator)) |_| {
+        if (findHutchConfig(init, allocator)) |_| {
             const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
                 try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
                 try stderr.flush();
@@ -1752,7 +1756,7 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         } else |err| switch (err) {
-            error.DashConfigNotFound => {},
+            error.HutchConfigNotFound => {},
             else => return err,
         }
     }
@@ -1788,12 +1792,13 @@ pub fn main(init: std.process.Init) !void {
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-test "help text describes dash config scripts" {
+test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch run") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
 }
 
@@ -1801,6 +1806,8 @@ test "test is a reserved Cottontail command and preserves every argument" {
     try std.testing.expect(isCottontailTestCommand("test"));
     try std.testing.expect(!isCottontailTestCommand("test:unit"));
     try std.testing.expect(isReservedRuntimeCommand("exec"));
+    try std.testing.expect(isReservedRuntimeCommand("repl"));
+    try std.testing.expect(isReservedRuntimeCommand("completions"));
     try std.testing.expect(!isReservedRuntimeCommand("execute"));
 
     const args = [_][:0]const u8{

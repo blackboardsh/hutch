@@ -79,6 +79,12 @@ const tests = [
     expectedFailure: "Pre-split gap: isolated installs do not create the two expected optional-peer context variants.",
   },
   {
+    name: "isolated-bins",
+    file: "package-manager-isolated-bins.cjs",
+    passHutch: true,
+    marker: "package-manager isolated bins: pass",
+  },
+  {
     name: "lockfiles",
     file: "package-manager-lockfiles.cjs",
     passHutch: true,

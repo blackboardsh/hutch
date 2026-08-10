@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendors/zig
-          key: hutch-zig-${{ matrix.platform }}-v1-${{ hashFiles('scripts/setup.sh') }}
+          key: hutch-zig-${{ matrix.platform }}-v1-${{ hashFiles('scripts/setup.sh', 'scripts/patch-zig-hostname-connect.js', 'patches/zig-0.16.0-hostname-connect.patch') }}
 
       - name: Set up Zig
         if: matrix.os != 'windows'

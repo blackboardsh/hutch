@@ -380,6 +380,29 @@ test "invalid package JSON retains source diagnostics" {
     , output.written());
 }
 
+test "package JSON accepts duplicate fields using the last value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "name": "duplicate-fields",
+        \\  "main": "index.js",
+        \\  "main": "src/index.js"
+        \\}
+    ;
+    const package_json = try parsePackageJSON(
+        arena.allocator(),
+        "package.json",
+        source,
+    );
+
+    try std.testing.expectEqualStrings(
+        "src/index.js",
+        package_json.object.get("main").?.string,
+    );
+}
+
 test "duplicate workspace names report both package locations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

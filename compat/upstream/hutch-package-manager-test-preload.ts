@@ -1,6 +1,5 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { setDefaultTimeout } from "bun:test";
 
 const hutchPath = process.env.HUTCH_COMPAT_CLI;
 const cottontailPath = process.env.HUTCH_COMPAT_COTTONTAIL ?? process.env.COTTONTAIL_BINARY;
@@ -43,7 +42,7 @@ Object.defineProperty(process, "execPath", {
 process.env.COTTONTAIL_BINARY = cottontailExecutable;
 process.env.DASH_COTTONTAIL = cottontailExecutable;
 
-const testTimeout = Number(process.env.HUTCH_COMPAT_TEST_TIMEOUT_MS);
-if (Number.isFinite(testTimeout) && testTimeout > 0) {
-  setDefaultTimeout(testTimeout);
-}
+// NOTE: the per-test timeout is applied by the runner via `test --timeout=...`.
+// Importing "bun:test" from a preload runs before Cottontail's test-token
+// bridge is installed and would break snapshot matchers used through the
+// global `expect` (e.g. the security-scanner matrix runner).

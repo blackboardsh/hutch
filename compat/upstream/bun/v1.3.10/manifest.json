@@ -6,12 +6,12 @@
   "tag": "bun-v1.3.10",
   "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
   "source": "https://github.com/oven-sh/bun",
-  "copiedAt": "2026-08-04",
+  "copiedAt": "2026-08-09",
   "canonicalRunnableFiles": 1445,
-  "ownedRunnableFiles": 100,
-  "copiedFiles": 827,
+  "ownedRunnableFiles": 103,
+  "copiedFiles": 856,
   "statusCounts": {
-    "enabled": 100
+    "enabled": 103
   },
   "ownershipManifest": "compat/bun-v1.3.10-ownership.json",
   "testFiles": [
@@ -382,7 +382,7 @@
     },
     {
       "path": "test/cli/run/run-autoinstall.test.ts",
-      "sha256": "330d42fad4084b61b5bc7e5fbdaa6d1584ced6a68388327e42d4a6e88396616a",
+      "sha256": "877d30fa1b901439a1e2cff7589c7eff8aa2df0a49a7d7c866cb28f84eb52d9b",
       "status": "enabled"
     },
     {
@@ -413,6 +413,21 @@
     {
       "path": "test/cli/update_interactive_snapshots.test.ts",
       "sha256": "1967e7e57d09f67702d2651a8338b56bb1cf1599c9cd06464f96c8690450bc84",
+      "status": "enabled"
+    },
+    {
+      "path": "test/integration/next-pages/test/dev-server-ssr-100.test.ts",
+      "sha256": "21f9436c69f502ab89e8f5b6862a1c2e79bb7ef1930de82de8b567076478cf18",
+      "status": "enabled"
+    },
+    {
+      "path": "test/integration/next-pages/test/dev-server.test.ts",
+      "sha256": "645bb50a2178730b19a0abeb57cae3f5f735c44d7e9913316f9ed9429d2f3e4c",
+      "status": "enabled"
+    },
+    {
+      "path": "test/integration/next-pages/test/next-build.test.ts",
+      "sha256": "db718354dea1cdebe1a7dbb69461d2eca5f2bbc358df62e0cdd493e65a6cea82",
       "status": "enabled"
     },
     {
@@ -522,6 +537,7 @@
     "src/init/react-tailwind",
     "test/_util/numeric.ts",
     "test/bun.lock",
+    "test/cli/__snapshots__/update_interactive_snapshots.test.ts.snap",
     "test/cli/create",
     "test/cli/init/init.test.ts",
     "test/cli/install",
@@ -537,6 +553,7 @@
     "test/cli/update_interactive_snapshots.test.ts",
     "test/docker",
     "test/harness.ts",
+    "test/integration/next-pages",
     "test/js/third_party/pnpm",
     "test/js/third_party/pnpm/pnpm.test.ts",
     "test/package.json",
@@ -563,11 +580,138 @@
     "test/tsconfig.json",
     "tsconfig.base.json"
   ],
+  "fixtureTrees": [
+    {
+      "path": "test/integration/next-pages",
+      "copiedFiles": 28,
+      "files": [
+        {
+          "path": ".eslintrc.json",
+          "sha256": "1589a15e55fbebc6519c95d91d8f0a090618f20dc78e479858b9c27552484961"
+        },
+        {
+          "path": ".gitignore",
+          "sha256": "d71a129ee0b021d034c2929738ed67c83d2c594aa5f57aa8ca6c673ffd9eee72"
+        },
+        {
+          "path": "README.md",
+          "sha256": "66bf55397ba0dbf1096f6edc8fdc64c5544b57af79eeb13ad603b45d6d85fe20"
+        },
+        {
+          "path": "bun.lock",
+          "sha256": "1ba916d9558936b9dd3202e23e7072bbce9f562aea03e9389575f6c7c353e25a"
+        },
+        {
+          "path": "bunfig.toml",
+          "sha256": "31d5cc857e530acc104793aa805e2f0a5d3f7309487d0fb2955ffdf662ea971a"
+        },
+        {
+          "path": "next.config.js",
+          "sha256": "2cd4d4b3465a664bd54238487463a3d67d989947e69fae6a402517b4a2311e4b"
+        },
+        {
+          "path": "package.json",
+          "sha256": "c2f0d13e3699f7e35977da1ee27ba92dd900d294d6fad82d4666e049c7fcf863"
+        },
+        {
+          "path": "postcss.config.js",
+          "sha256": "fa650b380adfabb151a0b352f7135e107e6352345f899060f1c5c231228f94bf"
+        },
+        {
+          "path": "public/favicon.ico",
+          "sha256": "2b8ad2d33455a8f736fc3a8ebf8f0bdea8848ad4c0db48a2833bd0f9cd775932"
+        },
+        {
+          "path": "public/next.svg",
+          "sha256": "55995dfad6ecb4945a1e856ddca03c5e16aa5bf13fd21b4df6a74ae79357bcfc"
+        },
+        {
+          "path": "public/vercel.svg",
+          "sha256": "3fa5cd757b418e18afc68ddebad55f443206e410327921ddb2bf1be731658880"
+        },
+        {
+          "path": "src/Counter1.txt",
+          "sha256": "eabba8c681f69af3638c380f9d0c580f8bbd600879eed01a77035fefb84a57d9"
+        },
+        {
+          "path": "src/Counter2.txt",
+          "sha256": "6ddbcfb9701c7f0748bcf835d06f5b24f53146959ce61db38672ac790130d526"
+        },
+        {
+          "path": "src/pages/_app.tsx",
+          "sha256": "1f583617583bc241540c1867222e0d4bbc9ae2f1fbe0200c541d648990f75bea"
+        },
+        {
+          "path": "src/pages/_document.tsx",
+          "sha256": "9dbd2fdfe43a6b984b0f2726c786edce030cd5311e3fe92a89f7d031088af9dc"
+        },
+        {
+          "path": "src/pages/api/hello.ts",
+          "sha256": "13d23780b9992e6e94efc884d7dc5c587926b549ee4da98ed97cf88c28707b8b"
+        },
+        {
+          "path": "src/pages/index.tsx",
+          "sha256": "c6343206b9ae195328fd79fadff46a614bda4b65274e09dda00dfa20f7c66dbf"
+        },
+        {
+          "path": "src/styles/globals.css",
+          "sha256": "d1246d4d1de5db72e3b3e6f9dfccaac8f2d1cf5260f9a241bd56afe6e59d1538"
+        },
+        {
+          "path": "tailwind.config.ts",
+          "sha256": "90ce58625f774deb8445c870adb232cd6952d608e3bc231b50947748480b1d5d"
+        },
+        {
+          "path": "test/__snapshots__/dev-server-ssr-100.test.ts.snap",
+          "sha256": "58847949285510948865d7eb9dadaf1118edfb8a910637dd83d6f1ea396e2e36"
+        },
+        {
+          "path": "test/__snapshots__/dev-server.test.ts.snap",
+          "sha256": "6de635b01eb7523155c6ddb134fbadd43bcb1e41d94206fe473f4a996691e3e5"
+        },
+        {
+          "path": "test/__snapshots__/next-build.test.ts.snap",
+          "sha256": "548fb4bf3704eaed158818504f5becbea8090950cfb95f8ff96f307161987497"
+        },
+        {
+          "path": "test/dev-server-puppeteer.ts",
+          "sha256": "7f783a171cee19c17f7b5b0102ba6cbcb9a74c5b87d25cd27c4551bbe569640f"
+        },
+        {
+          "path": "test/dev-server-ssr-100.test.ts",
+          "sha256": "21f9436c69f502ab89e8f5b6862a1c2e79bb7ef1930de82de8b567076478cf18"
+        },
+        {
+          "path": "test/dev-server.test.ts",
+          "sha256": "645bb50a2178730b19a0abeb57cae3f5f735c44d7e9913316f9ed9429d2f3e4c"
+        },
+        {
+          "path": "test/next-build.test.ts",
+          "sha256": "db718354dea1cdebe1a7dbb69461d2eca5f2bbc358df62e0cdd493e65a6cea82"
+        },
+        {
+          "path": "tsconfig.json",
+          "sha256": "f9843ac05afaae2bf4b3a04334c5196b7b0530d6ab8084d6e13f2bf792db9788"
+        },
+        {
+          "path": "tsconfig_for_build.json",
+          "sha256": "a62526e5327af5d9baa5c0f5d10bd1dd527df094c77ec4d37c25b010dc6def9a"
+        }
+      ],
+      "generatedAtRuntime": [
+        {
+          "path": "src/Counter.tsx",
+          "source": "src/Counter1.txt"
+        }
+      ]
+    }
+  ],
   "notes": [
     "This is an owned Hutch compatibility-test snapshot copied from Bun v1.3.10.",
     "Cottontail is the JavaScript test runtime; the Hutch-specific preload redirects bunExe() and process.execPath child commands to Hutch.",
     "The snapshot excludes node_modules, generated test artifacts, and unrelated Bun runtime, bundler, benchmark, and integration fixtures.",
-    "Copied upstream tests remain byte-identical. Hutch-owned runner and preload behavior lives outside the copied Bun test tree."
+    "The Next Pages fixture has 28 canonical files; each owned test recreates its ignored 29th file, src/Counter.tsx, from src/Counter1.txt in a test-owned temp directory.",
+    "Except for the four lockfile snapshot callsites and two environment-facing fixtures in the three owned Next Pages tests, copied upstream tests remain byte-identical. The snapshot callsites normalize only Cottontail's semantically equivalent pure-optional dependency ordering before comparing the unchanged Bun snapshots. The SSR fixture still prefers process.versions.bun and otherwise reads Hutch's Bun user-agent token when Next executes under Node; the browser driver uses Puppeteer's installed executable resolver when no system Chromium is present. Functional lockfile, node_modules, server, build, browser-HMR, and request assertions remain unchanged."
   ],
   "intentionallyDeferred": [
     {

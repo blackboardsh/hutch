@@ -1,0 +1,279 @@
+--- a/vendors/zig/lib/std/Io/net/HostName.zig
++++ b/vendors/zig/lib/std/Io/net/HostName.zig
+@@ -273,0 +274,10 @@
++// Keep hostname connection fan-out bounded. Apart from limiting resource use,
++// this makes the time to report an all-address failure deterministic even when
++// DNS returns a large answer set containing blackholed addresses.
++const connect_worker_count = 4;
++const max_connect_attempts = 32;
++const default_connect_timeout: Io.Timeout = .{ .duration = .{
++    .raw = .fromSeconds(10),
++    .clock = .awake,
++} };
++
+@@ -283 +293,5 @@
+-    var connect_many = io.async(connectMany, .{ host_name, io, port, &connect_many_queue, options });
++    // `Io.async` may run eagerly when its pool is saturated. That would hide a
++    // successful result until every loser finishes, recreating the hang this
++    // race is intended to avoid.
++    var connect_many = io.concurrent(connectMany, .{ host_name, io, port, &connect_many_queue, options }) catch
++        return error.SystemResources;
+@@ -323,2 +337,3 @@
+-/// Asynchronously establishes a connection to all IP addresses associated with
+-/// a host name, adding them to a results queue upon completion.
++/// Asynchronously establishes connections to at most 32 IP addresses associated
++/// with a host name, using at most four concurrent attempts and adding results
++/// to a queue upon completion.
+@@ -343,6 +357,0 @@
+-    var lookup_future = io.async(lookup, .{ host_name, io, &lookup_queue, .{
+-        .port = port,
+-        .canonical_name_buffer = &canonical_name_buffer,
+-    } });
+-    defer lookup_future.cancel(io) catch {};
+-
+@@ -350,0 +360,7 @@
++    var attempts_remaining: std.atomic.Value(usize) = .init(max_connect_attempts);
++    // A real concurrency assignment is required for each worker; Group.async's
++    // eager fallback would turn the address race back into a serial loop.
++    for (0..connect_worker_count) |_| {
++        group.concurrent(io, connectWorker, .{ io, &lookup_queue, results, &attempts_remaining, options }) catch
++            return error.SystemResources;
++    }
+@@ -352,8 +368,8 @@
+-    while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
+-        .address => |address| group.async(io, enqueueConnection, .{ address, io, results, options }),
+-        .canonical_name => continue,
+-    } else |err| switch (err) {
+-        error.Canceled => |e| return e,
+-        error.Closed => {
+-            try group.await(io);
+-            return lookup_future.await(io);
++    var lookup_error: ?LookupError = null;
++    lookup(host_name, io, &lookup_queue, .{
++        .port = port,
++        .canonical_name_buffer = &canonical_name_buffer,
++    }) catch |err| switch (err) {
++        error.Canceled => {
++            group.cancel(io);
++            return err;
+@@ -361 +377,4 @@
+-    }
++        else => lookup_error = err,
++    };
++    try group.await(io);
++    if (lookup_error) |err| return err;
+@@ -363,2 +382,2 @@
+-fn enqueueConnection(
+-    address: IpAddress,
++
++fn connectWorker(
+@@ -365,0 +385 @@
++    lookup_queue: *Io.Queue(LookupResult),
+@@ -366,0 +387 @@
++    attempts_remaining: *std.atomic.Value(usize),
+@@ -369,3 +390,10 @@
+-    const result = address.connect(io, options) catch |err| switch (err) {
+-        error.Canceled => |e| return e,
+-        else => |e| e, // other errors go in the result queue
++    const bounded_options: IpAddress.ConnectOptions = .{
++        .mode = options.mode,
++        .protocol = options.protocol,
++        .timeout = switch (options.timeout) {
++            // Threaded's Windows connector does not implement timeout options.
++            // Its AFD operation is cancelable, so retain the upstream default
++            // there while POSIX gets a deterministic per-attempt deadline.
++            .none => if (native_os == .windows) .none else default_connect_timeout,
++            else => options.timeout,
++        },
+@@ -373,2 +401,18 @@
+-    errdefer if (result) |s| s.close(io) else |_| {};
+-    queue.putOne(io, result) catch |err| switch (err) {
++
++    while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
++        .canonical_name => continue,
++        .address => |address| {
++            if (!claimConnectAttempt(attempts_remaining)) continue;
++            const result = address.connect(io, bounded_options) catch |err| switch (err) {
++                error.Canceled => |e| return e,
++                else => |e| e, // other errors go in the result queue
++            };
++            queue.putOne(io, result) catch |err| switch (err) {
++                error.Canceled => |e| {
++                    if (result) |s| s.close(io) else |_| {}
++                    return e;
++                },
++                error.Closed => unreachable, // `queue` must not be closed
++            };
++        },
++    } else |err| switch (err) {
+@@ -376,2 +420,14 @@
+-        error.Closed => unreachable, // `queue` must not be closed
+-    };
++        error.Closed => return,
++    }
++}
++
++fn claimConnectAttempt(attempts_remaining: *std.atomic.Value(usize)) bool {
++    var remaining = attempts_remaining.load(.monotonic);
++    while (remaining != 0) {
++        if (attempts_remaining.cmpxchgWeak(remaining, remaining - 1, .monotonic, .monotonic)) |actual| {
++            remaining = actual;
++        } else {
++            return true;
++        }
++    }
++    return false;
+--- a/vendors/zig/lib/std/Io/Threaded.zig
++++ b/vendors/zig/lib/std/Io/Threaded.zig
+@@ -12077 +12076,0 @@
+-    if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
+@@ -12079 +12077,0 @@
+-    _ = t;
+@@ -12085 +12083 @@
+-    try posixConnect(socket_fd, &storage.any, addr_len);
++    try posixConnectTimeout(t, socket_fd, &storage.any, addr_len, options.timeout);
+@@ -12087,0 +12086,144 @@
++}
++
++fn setSocketNonBlockingPosix(socket_fd: posix.socket_t, enabled: bool) !void {
++    var flags: usize = flags: {
++        const syscall: Syscall = try .start();
++        while (true) {
++            const rc = posix.system.fcntl(socket_fd, posix.F.GETFL, @as(usize, 0));
++            switch (posix.errno(rc)) {
++                .SUCCESS => {
++                    syscall.finish();
++                    break :flags @intCast(rc);
++                },
++                .INTR => {
++                    try syscall.checkCancel();
++                    continue;
++                },
++                else => |err| return syscall.unexpectedErrno(err),
++            }
++        }
++    };
++
++    const nonblock = @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
++    if (enabled) flags |= nonblock else flags &= ~nonblock;
++
++    const syscall: Syscall = try .start();
++    while (true) switch (posix.errno(posix.system.fcntl(socket_fd, posix.F.SETFL, flags))) {
++        .SUCCESS => return syscall.finish(),
++        .INTR => {
++            try syscall.checkCancel();
++            continue;
++        },
++        else => |err| return syscall.unexpectedErrno(err),
++    };
++}
++
++fn posixConnectTimeout(
++    t: *Threaded,
++    socket_fd: posix.socket_t,
++    addr: *const posix.sockaddr,
++    addr_len: posix.socklen_t,
++    timeout: Io.Timeout,
++) IpAddress.ConnectError!void {
++    try setSocketNonBlockingPosix(socket_fd, true);
++
++    const connect_syscall: Syscall = try .start();
++    connect: while (true) switch (posix.errno(posix.system.connect(socket_fd, addr, addr_len))) {
++        .SUCCESS, .ISCONN => {
++            connect_syscall.finish();
++            return setSocketNonBlockingPosix(socket_fd, false);
++        },
++        .INTR => {
++            try connect_syscall.checkCancel();
++            continue;
++        },
++        .AGAIN, .INPROGRESS, .ALREADY => {
++            connect_syscall.finish();
++            break :connect;
++        },
++        .ADDRNOTAVAIL => return connect_syscall.fail(error.AddressUnavailable),
++        .AFNOSUPPORT => return connect_syscall.fail(error.AddressFamilyUnsupported),
++        .CONNREFUSED => return connect_syscall.fail(error.ConnectionRefused),
++        .CONNRESET => return connect_syscall.fail(error.ConnectionResetByPeer),
++        .HOSTUNREACH => return connect_syscall.fail(error.HostUnreachable),
++        .NETUNREACH => return connect_syscall.fail(error.NetworkUnreachable),
++        .TIMEDOUT => return connect_syscall.fail(error.Timeout),
++        .ACCES => return connect_syscall.fail(error.AccessDenied),
++        .NETDOWN => return connect_syscall.fail(error.NetworkDown),
++        .BADF => |err| return connect_syscall.errnoBug(err),
++        .CONNABORTED => |err| return connect_syscall.errnoBug(err),
++        .FAULT => |err| return connect_syscall.errnoBug(err),
++        .NOENT => |err| return connect_syscall.errnoBug(err),
++        .NOTSOCK => |err| return connect_syscall.errnoBug(err),
++        .PERM => |err| return connect_syscall.errnoBug(err),
++        .PROTOTYPE => |err| return connect_syscall.errnoBug(err),
++        else => |err| return connect_syscall.unexpectedErrno(err),
++    };
++
++    const t_io = io(t);
++    const deadline = timeout.toTimestamp(t_io);
++    var poll_entry: posix.pollfd = .{
++        .fd = socket_fd,
++        .events = posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP,
++        .revents = 0,
++    };
++    while (true) {
++        try t_io.checkCancel();
++        const timeout_ms: i32 = timeout_ms: {
++            const remaining = (deadline orelse break :timeout_ms 100).durationFromNow(t_io);
++            if (remaining.raw.nanoseconds <= 0) return error.Timeout;
++            break :timeout_ms @intCast(@min(@as(i96, 100), @max(@as(i96, 1), remaining.raw.toMilliseconds())));
++        };
++
++        poll_entry.revents = 0;
++        const poll_syscall: Syscall = try .start();
++        const rc = posix.system.poll((&poll_entry)[0..1], 1, timeout_ms);
++        switch (posix.errno(rc)) {
++            .SUCCESS => {
++                poll_syscall.finish();
++                if (rc == 0) continue;
++                break;
++            },
++            .INTR => {
++                try poll_syscall.checkCancel();
++                continue;
++            },
++            else => |err| return poll_syscall.unexpectedErrno(err),
++        }
++    }
++
++    var socket_error: i32 = 0;
++    var socket_error_len: posix.socklen_t = @sizeOf(@TypeOf(socket_error));
++    const error_syscall: Syscall = try .start();
++    while (true) switch (posix.errno(posix.system.getsockopt(
++        socket_fd,
++        posix.SOL.SOCKET,
++        posix.SO.ERROR,
++        @ptrCast(&socket_error),
++        &socket_error_len,
++    ))) {
++        .SUCCESS => {
++            error_syscall.finish();
++            break;
++        },
++        .INTR => {
++            try error_syscall.checkCancel();
++            continue;
++        },
++        else => |err| return error_syscall.unexpectedErrno(err),
++    };
++
++    return switch (@as(posix.E, @enumFromInt(socket_error))) {
++        .SUCCESS => setSocketNonBlockingPosix(socket_fd, false),
++        .ADDRNOTAVAIL => error.AddressUnavailable,
++        .AFNOSUPPORT => error.AddressFamilyUnsupported,
++        .ALREADY, .INPROGRESS => error.ConnectionPending,
++        .CONNREFUSED => error.ConnectionRefused,
++        .CONNRESET => error.ConnectionResetByPeer,
++        .HOSTUNREACH => error.HostUnreachable,
++        .NETUNREACH => error.NetworkUnreachable,
++        .TIMEDOUT => error.Timeout,
++        .ACCES => error.AccessDenied,
++        .NETDOWN => error.NetworkDown,
++        else => error.Unexpected,
++    };

@@ -62,6 +62,9 @@ pub const Graph = struct {
     workspaces: std.StringHashMap(*const Value),
     packages: std.StringHashMap(Package),
     package_json_changed: bool = false,
+    // Set when at least one package entry was dropped because its integrity
+    // digest could not be parsed; such packages must be re-resolved.
+    dropped_invalid_integrity: bool = false,
 
     pub fn deinit(graph: *Graph) void {
         graph.workspaces.deinit();
@@ -152,11 +155,35 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
         if (packages_value.* != .object) return error.InvalidPackagesObject;
         for (packages_value.object.keys(), packages_value.object.values()) |key, *entry| {
             const package = try parsePackageEntry(key, entry);
+            // Bun validates lockfile integrity digests strictly; a package
+            // whose integrity cannot be parsed is re-resolved from scratch.
+            if (integrityIsMalformed(package.integrity)) {
+                graph.dropped_invalid_integrity = true;
+                continue;
+            }
             try graph.packages.put(key, package);
         }
     }
 
     return graph;
+}
+
+fn integrityIsMalformed(integrity: []const u8) bool {
+    if (integrity.len == 0) return false;
+    const dash = std.mem.indexOfScalar(u8, integrity, '-') orelse return true;
+    const digest_len: usize = if (std.mem.eql(u8, integrity[0..dash], "sha1"))
+        20
+    else if (std.mem.eql(u8, integrity[0..dash], "sha256"))
+        32
+    else if (std.mem.eql(u8, integrity[0..dash], "sha384"))
+        48
+    else if (std.mem.eql(u8, integrity[0..dash], "sha512"))
+        64
+    else
+        return true;
+    const encoded = integrity[dash + 1 ..];
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return true;
+    return decoded_len != digest_len;
 }
 
 fn parsePackageEntry(key: []const u8, entry: *const Value) !Package {

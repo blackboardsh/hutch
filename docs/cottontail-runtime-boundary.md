@@ -39,7 +39,7 @@ Hutch directly owns and implements:
   scripts, package caches, registry access, and package extraction.
 - `pm`, `audit`, `patch`, `pack`, `publish`, `bunx`, `init`, `create`, and
   package-manager upgrade behavior.
-- Discovery and orchestration of `dash.config.ts` and `package.json` scripts.
+- Discovery and orchestration of `hutch.config.ts` and `package.json` scripts.
 - Bun-compatible launch-time auto-install before a project command, including
   the `auto`, `fallback`, `force`, and `disable` modes.
 - Build, test, development-server, watch, hot-reload, and Electrobun packaging
@@ -107,16 +107,24 @@ that extraction is deferred.
 
 ## Compatibility Accounting
 
-The copied Bun 1.3.10 corpus contains 1,445 runnable files. The ownership index
-assigns 100 package-manager and project-command files to Hutch and the remaining
-1,345 runtime files to Cottontail, with no overlap or unclassified files. Hutch
-passes all 100 owned files and records zero expected failures.
+The copied Bun 1.3.10 compatibility suite contains 1,445 runnable files. The
+ownership index assigns 103 Bun-derived JavaScript tests to Hutch and the
+remaining 1,342 runtime files to Cottontail, with no overlap or unclassified
+files. Hutch records zero expected failures. Its previously owned 100 files
+have a measured passing baseline; the three transferred Next Pages files remain
+enabled pending a focused macOS strict result.
 
 `test/cli/install/semver.test.ts` and
 `test/cli/run/shell-keepalive.test.ts` remain Cottontail-owned because they test
 `Bun.semver` and `Bun.$` runtime behavior rather than Hutch orchestration. The
 copied Hutch snapshot excludes those files and their exclusive fixtures while
 retaining their canonical Bun provenance in the shared ownership index.
+
+The Next Pages tests are Hutch-owned because they install project dependencies,
+assert installed layout and lockfile state, and drive the public Next dev/build
+commands. Their copied fixture contains 28 tracked files. The ignored
+`src/Counter.tsx` is not vendored; each test recreates it from the tracked
+`src/Counter1.txt` template inside test-owned temporary state.
 
 Cottontail-local project and package-manager regressions that exercise the
 split live in Hutch's local regression suite. Package executable shebang routing
