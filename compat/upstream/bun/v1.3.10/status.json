@@ -702,5 +702,131 @@
       "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 18 assertions).",
       "owner": "hutch-package-manager"
     }
+  },
+  "platformOverrides": {
+    "linux-arm64": {
+      "tests": {
+        "test/cli/install/bun-add.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux ARM64 retains three registry-cache/bin residuals after authoritative metadata repair: a repeated add re-fetches the tarball, latest-tag installation creates an unexpected .bin directory, and a no-duplication add makes four requests instead of three (48/51 cases pass before the hosted-GitHub exclusion)."
+        },
+        "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux lifecycle scripts currently run through /bin/sh (dash), which rejects the four copied Bash [[ ... ]] ordering checks with '[[: not found'; the other 99 cases pass."
+        },
+        "test/cli/install/bun-install-registry.test.ts": {
+          "status": "expected-failure",
+          "reason": "After global Bun bins are self-contained, Linux ARM64 retains three registry install/update/reinstall assertions that report 18 packages rather than Bun's expected 19 or 20; the other copied registry coverage passes."
+        },
+        "test/cli/install/bun-lock.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux ARM64 reports 12 rather than 13 installed packages in the formatting-preservation fixture; the other eight lockfile cases and 11 of 12 snapshots pass."
+        },
+        "test/cli/install/bun-run-bunfig.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux /bin/sh reports missing commands as 'not found'; the six copied Bun-shell cases require the 'command not found' diagnostic (22/28 pass)."
+        },
+        "test/cli/install/bun-run.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux surfaces SIGILL from the child shell as exit 132 plus 'Illegal instruction (core dumped)' instead of Bun's silent or explicit SIGILL diagnostics; 287/291 cases pass."
+        },
+        "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux ARM64 CI-selected isolated-linker bun remove case 0521 exits 1 instead of the expected 0 after the registry-metadata cascade was repaired; the other 55 selected cases pass."
+        },
+        "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux ARM64 CI-selected isolated-linker bun remove case 0513 exits 1 instead of the expected 0 after the registry-metadata cascade was repaired; the other 51 selected cases pass."
+        },
+        "test/cli/install/bun-update.test.ts": {
+          "status": "expected-failure",
+          "reason": "Across five no-op updates, Linux preserves the byte-stable lockfile but fails Bun's exact five-request registry accounting assertion; the other four update cases pass."
+        },
+        "test/cli/install/migration/complex-workspace.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux npm-lock migration materializes an unexpected root node_modules/iconv-lite after the otherwise-correct 180-package workspace migration (20/21 cases pass)."
+        },
+        "test/cli/install/migration/pnpm-migration.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux pnpm folder-dependency migration resolves the root link to no-deps@1.1.0 instead of transitive-root-link-pkg; the other two active cases pass and 11 upstream cases remain TODO."
+        },
+        "test/cli/run/multi-run.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux ARM64 multi-run abort handling can return the killed sibling's 137 instead of the first failure's 7 and omits Bun's Signaled status for a terminated child; 116/118 cases pass."
+        },
+        "test/cli/run/run-shell.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux dash reports invalid shell syntax as 'Syntax error'; the copied Bun-shell assertion requires Unexpected ')'."
+        },
+        "test/regression/issue/ctrl-c.test.ts": {
+          "status": "expected-failure",
+          "reason": "One Linux signal-forwarding case receives SIGTERM instead of Bun's expected SIGKILL after SIGINT; the other seven copied signal cases pass."
+        }
+      }
+    },
+    "linux-x64": {
+      "tests": {
+        "test/cli/install/bun-add.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux x64 retains three registry-cache/bin residuals after authoritative metadata repair: a repeated add re-fetches the tarball, latest-tag installation creates an unexpected .bin directory, and a no-duplication add makes four requests instead of three (48/51 cases pass before the hosted-GitHub exclusion)."
+        },
+        "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux lifecycle scripts currently run through /bin/sh (dash), which rejects the four copied Bash [[ ... ]] ordering checks with '[[: not found'; the other 99 cases pass."
+        },
+        "test/cli/install/bun-install-proxy.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Docker-enabled Linux x64 proxy fixture starts, but Hutch fails to resolve all requested packages through the proxy; Linux ARM64 does not run this Docker-gated case."
+        },
+        "test/cli/install/bun-install-registry.test.ts": {
+          "status": "expected-failure",
+          "reason": "After global Bun bins are self-contained, Linux x64 retains three registry install/update/reinstall assertions that report 18 packages rather than Bun's expected 19 or 20; the other copied registry coverage passes."
+        },
+        "test/cli/install/bun-lock.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux x64 reports 12 rather than 13 installed packages in the formatting-preservation fixture; the other eight lockfile cases and 11 of 12 snapshots pass."
+        },
+        "test/cli/install/bun-run-bunfig.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux /bin/sh reports missing commands as 'not found'; the six copied Bun-shell cases require the 'command not found' diagnostic (22/28 pass)."
+        },
+        "test/cli/install/bun-run.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux surfaces SIGILL from the child shell as exit 132 plus 'Illegal instruction (core dumped)' instead of Bun's silent or explicit SIGILL diagnostics; 287/291 cases pass."
+        },
+        "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts": {
+          "status": "expected-failure",
+          "reason": "Three Linux x64 CI-selected isolated-linker update/remove cases exit 1 instead of the expected 0 after the registry-metadata cascade was repaired; the other 56 selected cases pass."
+        },
+        "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux x64 CI-selected hoisted-linker bun remove case 0553 exits 1 instead of the expected 0 after the registry-metadata cascade was repaired; the other 66 selected cases pass."
+        },
+        "test/cli/install/bun-update.test.ts": {
+          "status": "expected-failure",
+          "reason": "Across five no-op updates, Linux preserves the byte-stable lockfile but fails Bun's exact five-request registry accounting assertion; the other four update cases pass."
+        },
+        "test/cli/install/migration/complex-workspace.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux npm-lock migration materializes an unexpected root node_modules/iconv-lite after the otherwise-correct 180-package workspace migration (20/21 cases pass)."
+        },
+        "test/cli/install/migration/pnpm-migration.test.ts": {
+          "status": "expected-failure",
+          "reason": "The Linux pnpm folder-dependency migration resolves the root link to no-deps@1.1.0 instead of transitive-root-link-pkg; the other two active cases pass and 11 upstream cases remain TODO."
+        },
+        "test/cli/run/multi-run.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux x64 multi-run abort handling omits Bun's Signaled status for a terminated parallel child; 117/118 cases pass."
+        },
+        "test/cli/run/run-shell.test.ts": {
+          "status": "expected-failure",
+          "reason": "Linux dash reports invalid shell syntax as 'Syntax error'; the copied Bun-shell assertion requires Unexpected ')'."
+        },
+        "test/regression/issue/ctrl-c.test.ts": {
+          "status": "expected-failure",
+          "reason": "One Linux signal-forwarding case receives SIGTERM instead of Bun's expected SIGKILL after SIGINT; the other seven copied signal cases pass."
+        }
+      }
+    }
   }
 }

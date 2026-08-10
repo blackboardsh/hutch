@@ -446,6 +446,59 @@ test("excludes only the five hosted-CI GitHub API leaves", () => {
   }
 });
 
+test("classifies only the strict residual Linux compatibility files", () => {
+  const commonLinux = [
+    "test/cli/install/bun-add.test.ts",
+    "test/cli/install/bun-install-lifecycle-scripts.test.ts",
+    "test/cli/install/bun-install-registry.test.ts",
+    "test/cli/install/bun-lock.test.ts",
+    "test/cli/install/bun-run-bunfig.test.ts",
+    "test/cli/install/bun-run.test.ts",
+    "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts",
+    "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts",
+    "test/cli/install/bun-update.test.ts",
+    "test/cli/install/migration/complex-workspace.test.ts",
+    "test/cli/install/migration/pnpm-migration.test.ts",
+    "test/cli/run/multi-run.test.ts",
+    "test/cli/run/run-shell.test.ts",
+    "test/regression/issue/ctrl-c.test.ts",
+  ].sort();
+  const arm64Overrides = suiteStatus.platformOverrides["linux-arm64"].tests;
+  const x64Overrides = suiteStatus.platformOverrides["linux-x64"].tests;
+
+  assert.deepEqual(Object.keys(arm64Overrides).sort(), commonLinux);
+  assert.deepEqual(Object.keys(x64Overrides).sort(), [
+    ...commonLinux,
+    "test/cli/install/bun-install-proxy.test.ts",
+  ].sort());
+  for (const overrides of [arm64Overrides, x64Overrides]) {
+    for (const entry of Object.values(overrides)) {
+      assert.equal(entry.status, "expected-failure");
+      assert.ok(entry.reason.length >= 80);
+    }
+    assert.equal(overrides["test/cli/install/bun-install.test.ts"], undefined);
+  }
+
+  const effectiveCounts = (platform, arch) =>
+    Object.values(resolveBunStatusPlatform(suiteStatus, platform, arch).tests).reduce(
+      (counts, entry) => {
+        counts[entry.status] = (counts[entry.status] ?? 0) + 1;
+        return counts;
+      },
+      {},
+    );
+  assert.deepEqual(effectiveCounts("linux", "arm64"), {
+    enabled: 89,
+    "expected-failure": 14,
+  });
+  assert.deepEqual(effectiveCounts("linux", "x64"), {
+    enabled: 88,
+    "expected-failure": 15,
+  });
+  assert.deepEqual(effectiveCounts("darwin", "arm64"), { enabled: 103 });
+  assert.deepEqual(effectiveCounts("win32", "x64"), { enabled: 103 });
+});
+
 test("reports live per-file progress durably and preserves failure diagnostics", () => {
   assert.match(
     compatRunner,
