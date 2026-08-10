@@ -304,6 +304,33 @@ const RegistryPackage = struct {
     }
 };
 
+// Registry manifests are authoritative for install behavior. The package.json
+// inside an archive can contain platform discriminators omitted by npm's
+// compact manifest, but it must not replace dependency, bin, or script data.
+const RegistryMetadataViews = struct {
+    authoritative: *const Value,
+    platform: *const Value,
+
+    fn init(authoritative: *const Value) RegistryMetadataViews {
+        return .{
+            .authoritative = authoritative,
+            .platform = authoritative,
+        };
+    }
+
+    fn inspectArchive(views: *RegistryMetadataViews, archive: *const Value) void {
+        views.platform = archive;
+    }
+
+    fn supportsPlatform(
+        views: RegistryMetadataViews,
+        cpu_target: Npm.Architecture,
+        os_target: Npm.OperatingSystem,
+    ) bool {
+        return packageSupportsPlatform(views.platform, cpu_target, os_target);
+    }
+};
+
 const RegistryArchive = struct {
     name: []const u8,
     version: []const u8,
@@ -7333,10 +7360,10 @@ const Manager = struct {
             direct,
             peer_context,
         );
-        var package_metadata: *const Value = resolved.metadata;
+        var metadata_views = RegistryMetadataViews.init(resolved.metadata);
+        const package_metadata = metadata_views.authoritative;
         var prefetched_archive: ?[]const u8 = null;
-        var platform_matches = packageSupportsPlatform(
-            package_metadata,
+        var platform_matches = metadata_views.supportsPlatform(
             manager.options.cpu,
             manager.options.os,
         );
@@ -7349,9 +7376,8 @@ const Manager = struct {
         {
             const archive = try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
             prefetched_archive = archive;
-            package_metadata = try manager.readTarballPackageJSON(archive);
-            platform_matches = packageSupportsPlatform(
-                package_metadata,
+            metadata_views.inspectArchive(try manager.readTarballPackageJSON(archive));
+            platform_matches = metadata_views.supportsPlatform(
                 manager.options.cpu,
                 manager.options.os,
             );
@@ -14397,6 +14423,52 @@ test "package platform metadata includes libc" {
         try std.testing.expect(packageSupportsPlatform(&musl, .current, .current));
         try std.testing.expect(packageSupportsPlatform(&excluded_glibc, .current, .current));
     }
+}
+
+test "registry metadata stays authoritative when archive supplies platform constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var registry = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        \\{
+        \\  "bin":"registry-bin.js",
+        \\  "dependencies":{"registry-dependency":"^1.0.0"},
+        \\  "scripts":{"install":"registry-install"}
+        \\}
+    ,
+        .{},
+    );
+    var archive = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        \\{
+        \\  "bin":"archive-bin.js",
+        \\  "dependencies":{"archive-dependency":"^9.0.0"},
+        \\  "scripts":{"install":"archive-install"},
+        \\  "os":["linux"],
+        \\  "libc":["musl"]
+        \\}
+    ,
+        .{},
+    );
+
+    var views = RegistryMetadataViews.init(&registry);
+    views.inspectArchive(&archive);
+
+    try std.testing.expect(views.authoritative == &registry);
+    try std.testing.expect(views.platform == &archive);
+    try std.testing.expectEqualStrings("registry-bin.js", jsonString(views.authoritative, "bin").?);
+    try std.testing.expectEqualStrings(
+        "^1.0.0",
+        dependencySpecInSection(views.authoritative, "dependencies", "registry-dependency").?,
+    );
+    try std.testing.expectEqualStrings(
+        "registry-install",
+        dependencySpecInSection(views.authoritative, "scripts", "install").?,
+    );
+    try std.testing.expect(!views.supportsPlatform(.current, .current));
 }
 
 test "security scanner package metadata uses declared ranges" {
