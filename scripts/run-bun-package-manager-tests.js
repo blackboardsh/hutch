@@ -628,6 +628,17 @@ function validateSuite() {
       fail(`Next Pages fixture hash does not match the manifest: ${record.path}`);
     }
   }
+  for (const record of manifest.forkedFiles ?? []) {
+    const forkedPath = join(suiteRoot, ...String(record.path).split("/"));
+    if (
+      !/^[0-9a-f]{64}$/.test(record.upstreamSha256 ?? "") ||
+      !/^[0-9a-f]{64}$/.test(record.sha256 ?? "") ||
+      !existsSync(forkedPath) ||
+      canonicalSuiteSha256(forkedPath, record.path) !== record.sha256
+    ) {
+      fail(`forked copied-file hash does not match the manifest: ${record.path}`);
+    }
+  }
   for (const [label, paths] of [
     ["manifest", manifestTests],
     ["ownership index", ownedFromIndex],
@@ -1117,6 +1128,7 @@ function runEntry(
     DASH_COTTONTAIL: options.runtime,
     HUTCH_COMPAT_CLI: options.hutch,
     HUTCH_COMPAT_COTTONTAIL: options.runtime,
+    HUTCH_COMPAT_VERDACCIO_EXEC_PATH: process.execPath,
     HUTCH_COMPAT_TEST_TIMEOUT_MS: String(perTestTimeoutMs),
     HUTCH_BUN_COMPAT: "1",
     HUTCH_ENGINE_BINARY: options.engine,

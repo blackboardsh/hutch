@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   mkdtempSync,
@@ -43,10 +44,15 @@ const ownershipPath = new URL(
   import.meta.url,
 );
 const compatRunnerPath = new URL("./run-bun-package-manager-tests.js", import.meta.url);
+const harnessPath = new URL(
+  "../compat/upstream/bun/v1.3.10/test/harness.ts",
+  import.meta.url,
+);
 const workflow = readFileSync(workflowPath, "utf8").replace(/\r\n/g, "\n");
 const cottontailManifest = JSON.parse(readFileSync(cottontailManifestPath, "utf8"));
 const cottontailSetup = readFileSync(cottontailSetupPath, "utf8").replace(/\r\n/g, "\n");
 const compatRunner = readFileSync(compatRunnerPath, "utf8").replace(/\r\n/g, "\n");
+const harnessSource = readFileSync(harnessPath, "utf8").replace(/\r\n/g, "\n");
 const suiteManifest = JSON.parse(readFileSync(suiteManifestPath, "utf8"));
 const suiteStatus = JSON.parse(readFileSync(suiteStatusPath, "utf8"));
 const ownership = JSON.parse(readFileSync(ownershipPath, "utf8"));
@@ -196,6 +202,47 @@ test("builds an exact Cottontail source revision", () => {
   assert.match(cottontailSetup, /process\.platform === "win32" \? \["-Dtarget=x86_64-windows-msvc"\] : \[\]/);
   assert.match(cottontailSetup, /"-Dcpu=baseline"/);
   assert.doesNotMatch(cottontailSetup, /command -v|which\(|["']PATH["']/);
+});
+
+test("runs Verdaccio as a hermetic fixture service under the runner Node executable", () => {
+  assert.match(
+    compatRunner,
+    /HUTCH_COMPAT_VERDACCIO_EXEC_PATH: process\.execPath/,
+  );
+  assert.match(
+    harnessSource,
+    /execPath:\s+process\.env\.HUTCH_COMPAT_VERDACCIO_EXEC_PATH \|\| \(isCI \? bunExe\(\) : Bun\.which\("bun"\) \|\| bunExe\(\)\)/,
+  );
+
+  const [fork] = suiteManifest.forkedFiles;
+  assert.equal(fork.path, "test/harness.ts");
+  assert.equal(
+    fork.upstreamSha256,
+    "809970aeb38bfdd22fbd8d5958e9ab6457e45baa12174ce72e082f38256e955d",
+  );
+  assert.equal(
+    fork.sha256,
+    createHash("sha256").update(harnessSource).digest("hex"),
+  );
+  assert.match(suiteStatus.notes.join("\n"), /absolute Node executable/);
+
+  let fallbackCalls = 0;
+  const selectExecPath = (configured, ci, bunExe, whichBun) =>
+    configured || (ci ? bunExe() : whichBun() || bunExe());
+  const selected = selectExecPath(
+    process.execPath,
+    true,
+    () => {
+      fallbackCalls += 1;
+      return "/hostile/path/bun";
+    },
+    () => {
+      fallbackCalls += 1;
+      return null;
+    },
+  );
+  assert.equal(selected, process.execPath);
+  assert.equal(fallbackCalls, 0, "fixture service must not consult a global Bun path");
 });
 
 test("owns the complete canonical Next Pages fixture without generated state", () => {

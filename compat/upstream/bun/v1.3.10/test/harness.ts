@@ -1703,8 +1703,10 @@ export class VerdaccioRegistry {
     await rm(join(dirname(this.configPath), "htpasswd"), { force: true });
     this.process = fork(require.resolve("verdaccio/bin/verdaccio"), ["-c", this.configPath, "-l", `${this.port}`], {
       silent,
-      // Prefer using a release build of Bun since it's faster
-      execPath: isCI ? bunExe() : Bun.which("bun") || bunExe(),
+      // Hutch supplies host Node because its preload redirects bunExe() to the
+      // Hutch CLI; otherwise retain Bun's upstream executable preference.
+      execPath:
+        process.env.HUTCH_COMPAT_VERDACCIO_EXEC_PATH || (isCI ? bunExe() : Bun.which("bun") || bunExe()),
       env: {
         ...(bunEnv as any),
         NODE_NO_WARNINGS: "1",

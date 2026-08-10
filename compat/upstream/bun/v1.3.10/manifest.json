@@ -580,6 +580,14 @@
     "test/tsconfig.json",
     "tsconfig.base.json"
   ],
+  "forkedFiles": [
+    {
+      "path": "test/harness.ts",
+      "upstreamSha256": "809970aeb38bfdd22fbd8d5958e9ab6457e45baa12174ce72e082f38256e955d",
+      "sha256": "3f7137a1baa9dd9cc21356123eec7b8651333b7854343ed47ac1bc2b8a275e8c",
+      "reason": "The local harness centralizes the documented lockfile snapshot normalization and runs Verdaccio under Hutch's pinned absolute Node executable while Hutch and Cottontail remain the registry clients under test."
+    }
+  ],
   "fixtureTrees": [
     {
       "path": "test/integration/next-pages",
@@ -711,7 +719,7 @@
     "Cottontail is the JavaScript test runtime; the Hutch-specific preload redirects bunExe() and process.execPath child commands to Hutch.",
     "The snapshot excludes node_modules, generated test artifacts, and unrelated Bun runtime, bundler, benchmark, and integration fixtures.",
     "The Next Pages fixture has 28 canonical files; each owned test recreates its ignored 29th file, src/Counter.tsx, from src/Counter1.txt in a test-owned temp directory.",
-    "Except for the four lockfile snapshot callsites and two environment-facing fixtures in the three owned Next Pages tests, copied upstream tests remain byte-identical. The snapshot callsites normalize only Cottontail's semantically equivalent pure-optional dependency ordering before comparing the unchanged Bun snapshots. The SSR fixture still prefers process.versions.bun and otherwise reads Hutch's Bun user-agent token when Next executes under Node; the browser driver uses Puppeteer's installed executable resolver when no system Chromium is present. Functional lockfile, node_modules, server, build, browser-HMR, and request assertions remain unchanged."
+    "Except for the four lockfile snapshot callsites, two environment-facing fixtures in the three owned Next Pages tests, and the documented Verdaccio fixture-service executable selection in test/harness.ts, copied upstream tests remain byte-identical. The snapshot callsites normalize only Cottontail's semantically equivalent pure-optional dependency ordering before comparing the unchanged Bun snapshots. The SSR fixture still prefers process.versions.bun and otherwise reads Hutch's Bun user-agent token when Next executes under Node; the browser driver uses Puppeteer's installed executable resolver when no system Chromium is present. Verdaccio runs under the runner's pinned Node executable while Hutch and Cottontail remain the registry clients under test. Functional lockfile, node_modules, server, build, browser-HMR, and request assertions remain unchanged."
   ],
   "intentionallyDeferred": [
     {

@@ -1,6 +1,9 @@
 {
   "schema": 1,
   "defaultStatus": "not-enabled",
+  "notes": [
+    "Verdaccio registry fixture services run under the absolute Node executable supplied by Hutch's test runner; Hutch and Cottontail remain the package-manager clients under test."
+  ],
   "tests": {
     "test/cli/create/create-jsx.test.ts": {
       "status": "enabled",
@@ -98,7 +101,7 @@
     },
     "test/cli/install/bun-install-registry.test.ts": {
       "status": "enabled",
-      "reason": "The complete registry, cache, CA, auth, lockfile, optional dependency, bin, semver, prerelease, hoisting, migration, and outdated matrix passes unchanged (220 active cases, 5 upstream TODOs, 18 snapshots, 5,402 assertions).",
+      "reason": "The complete registry, cache, CA, auth, lockfile, optional dependency, bin, semver, prerelease, hoisting, migration, and outdated matrix passes (220 active cases, 5 upstream TODOs, 18 snapshots, 5,402 assertions). The shared Verdaccio fixture runs under the runner's absolute Node executable because Hutch's preload intentionally redirects process.execPath and bunExe() to the package-manager client under test.",
       "owner": "hutch-package-manager",
       "serial": true,
       "args": [
