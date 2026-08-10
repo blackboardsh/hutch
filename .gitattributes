@@ -5,3 +5,5 @@ compat/upstream/**/*.ico binary
 compat/upstream/**/*.lockb binary
 compat/upstream/**/*.tgz binary
 compat/harness-dependencies/** text eol=lf
+patches/*.patch text eol=lf
+*.sh text eol=lf

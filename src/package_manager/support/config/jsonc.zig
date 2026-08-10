@@ -79,7 +79,7 @@ pub fn parse(
         Value,
         allocator,
         &scanner,
-        .{},
+        .{ .duplicate_field_behavior = .use_last },
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
 

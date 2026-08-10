@@ -6,16 +6,31 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { gzipSync } = require("node:zlib");
 
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
 const expectedRuntime = path.resolve(process.env.COTTONTAIL_BINARY || process.execPath);
+const nodeProbe = spawnSync("node", ["-p", "process.execPath"], { encoding: "utf8" });
+assert.equal(nodeProbe.status, 0, `failed to resolve host Node executable: ${nodeProbe.stderr}`);
+const expectedNodeRuntime = path.resolve(nodeProbe.stdout.trim());
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-bunx-test-"));
 const workDir = path.join(scratch, "work");
 const tempDir = path.join(scratch, "temp");
 fs.mkdirSync(workDir, { recursive: true });
 fs.mkdirSync(tempDir, { recursive: true });
+
+function assertSameExecutable(actual, expected) {
+  const actualPath = fs.realpathSync(actual);
+  const expectedPath = fs.realpathSync(expected);
+  if (actualPath === expectedPath) return;
+  const actualStat = fs.statSync(actualPath);
+  const expectedStat = fs.statSync(expectedPath);
+  if (actualStat.dev === expectedStat.dev && actualStat.ino === expectedStat.ino) return;
+  assert.equal(actualStat.size, expectedStat.size, "runtime executable size mismatch");
+  const digest = filename => crypto.createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
+  assert.equal(digest(actualPath), digest(expectedPath), "runtime executable content mismatch");
+}
 
 function writeTarField(header, offset, width, value) {
   header.write(`${value.toString(8).padStart(width - 1, "0")}\0`, offset, width, "ascii");
@@ -195,7 +210,9 @@ async function main() {
   assert.equal(first.lifecycleEvent, "bunx");
   assert.equal(first.lifecycleScript, "fixture-tool");
   assert.match(first.userAgent, /^bun\/1\.3\.10 /);
-  assert.equal(fs.realpathSync(first.execPath), fs.realpathSync(expectedRuntime));
+  // Like Bun, non-forced bunx honors a `#!/usr/bin/env node` shebang. `--bun`
+  // below is the explicit request to run the same script with Cottontail.
+  assert.equal(fs.realpathSync(first.execPath), fs.realpathSync(expectedNodeRuntime));
 
   const requestsAfterInstall = requests.length;
   const cached = payload(await run(cottontail, ["x", "--silent", "--no-install", "fixture-tool", "cached"]));
@@ -230,7 +247,7 @@ async function main() {
   const forced = payload(await run(cottontail, ["--bun", "x", "--silent", "fixture-tool", "forced"]));
   assert.equal(forced.marker, "fixture-main");
   assert.deepEqual(forced.argv, ["forced"]);
-  assert.equal(fs.realpathSync(forced.execPath), fs.realpathSync(expectedRuntime));
+  assertSameExecutable(forced.execPath, expectedRuntime);
 
   const localRoot = path.join(workDir, "node_modules", "local-tool");
   fs.mkdirSync(localRoot, { recursive: true });

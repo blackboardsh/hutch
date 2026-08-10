@@ -10,6 +10,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-peer-conflict-"));
 const lockedPeerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-locked-peer-"));
+const legacyTarballRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-legacy-tarball-"));
 const registryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-peer-registry-"));
 const portFile = path.join(registryRoot, "port");
 
@@ -18,10 +19,10 @@ function writeTarField(header, offset, width, value) {
   header.write(encoded, offset, width, "ascii");
 }
 
-function packageArchive(packageJson) {
+function packageArchiveEntry(name, packageJson) {
   const body = Buffer.from(`${JSON.stringify(packageJson)}\n`);
   const header = Buffer.alloc(512);
-  header.write("package/package.json", 0, 100, "utf8");
+  header.write(name, 0, 100, "utf8");
   writeTarField(header, 100, 8, 0o644);
   writeTarField(header, 108, 8, 0);
   writeTarField(header, 116, 8, 0);
@@ -36,13 +37,34 @@ function packageArchive(packageJson) {
   header[154] = 0;
   header[155] = 0x20;
   const padding = Buffer.alloc((512 - (body.length % 512)) % 512);
-  return gzipSync(Buffer.concat([header, body, padding, Buffer.alloc(1024)]));
+  return Buffer.concat([header, body, padding]);
 }
 
-function writeRegistryPackage(name, version, extra = {}) {
+function packageArchive(
+  packageJson,
+  { rootPackageJson, leadingPackageJson, equalDepthPackageJson } = {},
+) {
+  const entries = [];
+  if (rootPackageJson) {
+    entries.push(packageArchiveEntry("package.json", rootPackageJson));
+  }
+  if (leadingPackageJson) {
+    entries.push(packageArchiveEntry("package/compiler/package.json", leadingPackageJson));
+  }
+  if (equalDepthPackageJson) {
+    entries.push(packageArchiveEntry("decoy/package.json", equalDepthPackageJson));
+  }
+  entries.push(packageArchiveEntry("package/package.json", packageJson));
+  return gzipSync(Buffer.concat([...entries, Buffer.alloc(1024)]));
+}
+
+function writeRegistryPackage(name, version, extra = {}, archiveOptions = {}) {
   const metadata = { name, version, ...extra };
   fs.writeFileSync(path.join(registryRoot, `${name}.json`), JSON.stringify(metadata));
-  fs.writeFileSync(path.join(registryRoot, `${name}-${version}.tgz`), packageArchive(metadata));
+  fs.writeFileSync(
+    path.join(registryRoot, `${name}-${version}.tgz`),
+    packageArchive(metadata, archiveOptions),
+  );
 }
 
 function waitForPort() {
@@ -83,6 +105,26 @@ writeRegistryPackage("ajv-keywords", "5.1.0", {
     ajv: "^8.8.2",
   },
 });
+writeRegistryPackage("aaa-tarball-peer-consumer", "1.0.0", {
+  peerDependencies: {
+    "tarball-metadata-root": ">=1",
+  },
+});
+writeRegistryPackage("tarball-metadata-child", "1.0.0");
+writeRegistryPackage(
+  "tarball-metadata-root",
+  "1.0.0",
+  {
+    dependencies: {
+      "tarball-metadata-child": "1.0.0",
+    },
+  },
+  {
+    rootPackageJson: { name: "root-decoy", version: "0.0.0", type: "commonjs" },
+    leadingPackageJson: { type: "commonjs" },
+    equalDepthPackageJson: { type: "commonjs" },
+  },
+);
 
 const serverPath = path.join(registryRoot, "server.cjs");
 fs.writeFileSync(
@@ -272,10 +314,81 @@ try {
   );
   assert.equal(fs.existsSync(path.join(consumerDir, "node_modules", "provider-npm")), false);
 
+  fs.writeFileSync(
+    path.join(legacyTarballRoot, "bunfig.toml"),
+    `[install]\nlinker = "hoisted"\nregistry = "http://127.0.0.1:${port}/"\n`,
+  );
+  const legacyTarballPackage = {
+    name: "legacy-tarball-root",
+    version: "1.0.0",
+    devDependencies: {
+      "aaa-tarball-peer-consumer": "1.0.0",
+      "tarball-metadata-root": "1.0.0",
+    },
+    peerDependencies: {
+      "tarball-metadata-root": "^1.0.0",
+    },
+  };
+  fs.writeFileSync(
+    path.join(legacyTarballRoot, "package.json"),
+    `${JSON.stringify(legacyTarballPackage, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(legacyTarballRoot, "bun.lock"),
+    `${JSON.stringify(
+      {
+        lockfileVersion: 1,
+        workspaces: {
+          "": legacyTarballPackage,
+        },
+        packages: {
+          "aaa-tarball-peer-consumer": [
+            "aaa-tarball-peer-consumer@1.0.0",
+            archiveURL("aaa-tarball-peer-consumer", "1.0.0"),
+            { peerDependencies: { "tarball-metadata-root": ">=1" } },
+            "",
+          ],
+          "tarball-metadata-child": [
+            "tarball-metadata-child@1.0.0",
+            archiveURL("tarball-metadata-child", "1.0.0"),
+            {},
+            "",
+          ],
+          "tarball-metadata-root": [
+            "tarball-metadata-root@1.0.0",
+            archiveURL("tarball-metadata-root", "1.0.0"),
+            { dependencies: { "tarball-metadata-child": "1.0.0" } },
+            "",
+          ],
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  result = runInstall(legacyTarballRoot);
+  assert.equal(
+    result.status,
+    0,
+    `legacy tarball install failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(
+    fs.existsSync(path.join(legacyTarballRoot, "node_modules", "tarball-metadata-child", "package.json")),
+    true,
+    "the first install must retain and materialize dependencies from the root package.json",
+  );
+  const savedLegacyLock = fs.readFileSync(path.join(legacyTarballRoot, "bun.lock"), "utf8");
+  const savedRootRecord = savedLegacyLock
+    .split("\n")
+    .find(line => line.includes('"tarball-metadata-root": ['));
+  assert.match(savedRootRecord ?? "", /"tarball-metadata-child"/);
+
   console.log("package-manager peer conflict diagnostics: pass");
 } finally {
   server.kill();
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   fs.rmSync(lockedPeerRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  fs.rmSync(legacyTarballRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   fs.rmSync(registryRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }

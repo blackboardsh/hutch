@@ -74,13 +74,37 @@ test("builds Hutch and runs the complete owned JavaScript compatibility suite wi
   assert.match(workflow, /runner: ubuntu-24\.04-arm/);
   assert.match(workflow, /runner: windows-2025/);
   assert.match(workflow, /fail-fast: false/);
+  assert.equal(
+    workflow.match(/hashFiles\('scripts\/setup\.sh', 'scripts\/patch-zig-hostname-connect\.js', 'patches\/zig-0\.16\.0-hostname-connect\.patch'\)/g)?.length,
+    2,
+  );
+  assert.match(
+    workflow,
+    /platform: macos-arm64\s+runner: macos-26\s+os: macos\s+target: ""/,
+  );
+  assert.match(
+    workflow,
+    /platform: linux-x64\s+runner: ubuntu-24\.04\s+os: linux\s+target: x86_64-linux-gnu\.2\.35/,
+  );
+  assert.match(
+    workflow,
+    /platform: linux-arm64\s+runner: ubuntu-24\.04-arm\s+os: linux\s+target: aarch64-linux-gnu\.2\.35/,
+  );
   assert.match(
     workflow,
     /run: node --test scripts\/bun-compat-workflow\.test\.js scripts\/bun-harness-dependencies\.test\.js scripts\/bun-compat-reporter\.test\.js/,
   );
   assert.match(
     workflow,
-    /run: \.\/vendors\/zig\/zig build -Doptimize=ReleaseSmall -Dcpu=baseline/,
+    /if \[\[ -n "\$target" \]\]; then\s+target_arg=\("-Dtarget=\$target"\)/,
+  );
+  assert.match(
+    workflow,
+    /\.\/vendors\/zig\/zig build -Doptimize=ReleaseSmall -Dcpu=baseline "\$\{target_arg\[@\]\}"/,
+  );
+  assert.match(
+    workflow,
+    /if \[\[ '\$\{\{ matrix\.os \}\}' == 'linux' \]\]; then\s+node scripts\/verify-linux-glibc\.js zig-out\/bin\/hutch-engine 2\.35/,
   );
   assert.match(
     workflow,
