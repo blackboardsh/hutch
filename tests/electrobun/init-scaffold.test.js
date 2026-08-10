@@ -64,11 +64,11 @@ test("hutch electrobun init lists and downloads the active remote template chann
 
   let baseUrl;
   const server = createServer((request, response) => {
-    if (request.url === "/channels/production.json") {
+    if (request.url === "/channels/stable.json") {
       const catalog = {
         schema: 1,
         kind: "electrobun-template-channel",
-        channel: "production",
+        channel: "stable",
         version: "2.0.0",
         revision: "a".repeat(40),
         tools: { hutch: "0.5.0", cottontail: "0.2.3" },
@@ -117,7 +117,7 @@ test("hutch electrobun init lists and downloads the active remote template chann
   try {
     const listed = await run(hutch, ["electrobun", "init"], { cwd: workspace, env });
     assert.equal(listed.status, 0, listed.stderr || listed.stdout);
-    assert.match(listed.stdout, /Electrobun 2\.0\.0 templates \(production\):/);
+    assert.match(listed.stdout, /Electrobun 2\.0\.0 templates \(stable\):/);
     assert.match(listed.stdout, /hello-world - A remote starter/);
 
     const result = await run(
@@ -130,7 +130,7 @@ test("hutch electrobun init lists and downloads the active remote template chann
     assert.equal(result.stderr, "");
     assert.equal(
       result.stdout,
-      "Downloading hello-world from Electrobun 2.0.0 (production)...\n" +
+      "Downloading hello-world from Electrobun 2.0.0 (stable)...\n" +
         `Created Electrobun project at ${projectRoot}\n` +
         "Next steps:\n" +
         `  cd ${projectName}\n` +

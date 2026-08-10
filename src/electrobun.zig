@@ -235,7 +235,7 @@ fn printHelp(writer: anytype) !void {
         \\Electrobun app build commands orchestrated by Hutch.
         \\
         \\Usage:
-        \\  hutch electrobun init [project-name] [--template=name] [--channel=production|stable|canary] [--offline]
+        \\  hutch electrobun init [project-name] [--template=name] [--beta] [--offline]
         \\  hutch electrobun config [--env=dev|canary|production|stable]
         \\  hutch electrobun build [--env=dev|canary|production|stable]
         \\  hutch electrobun run [--env=dev|canary|production|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
@@ -244,7 +244,7 @@ fn printHelp(writer: anytype) !void {
         \\Notes:
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
-        \\  - init downloads the latest template set for the active Hutch channel.
+        \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
         \\  - Main-process inspection supports Bun and Cottontail only.
         \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
         \\  - runtime.mainProcessInspector accepts { mode: "inspect" | "inspect-wait" | "inspect-brk", address?: string }.
@@ -2114,6 +2114,8 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--template=")) {
             template_name = arg["--template=".len..];
+        } else if (std.mem.eql(u8, arg, "--beta")) {
+            channel = .beta;
         } else if (std.mem.startsWith(u8, arg, "--channel=")) {
             channel = try electrobun_templates.parseChannel(arg["--channel=".len..]);
         } else if (std.mem.eql(u8, arg, "--offline")) {
@@ -2127,12 +2129,20 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         }
     }
 
-    const catalog = try electrobun_templates.load(
+    const catalog = electrobun_templates.load(
         ctx.init,
         ctx.allocator,
         channel,
         .{ .offline = offline },
-    );
+    ) catch |err| {
+        if (err == error.TemplateCatalogUnavailable and channel == .stable) {
+            ctx.writeStderr(
+                "no stable Electrobun templates published yet - run with --beta for the latest beta templates\n",
+                .{},
+            );
+        }
+        return err;
+    };
 
     if (template_name == null) {
         if (project_name) |name| {

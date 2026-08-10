@@ -8,8 +8,10 @@ const max_manifest_bytes = 1024 * 1024;
 const max_archive_bytes = 16 * 1024 * 1024;
 
 pub const Channel = enum {
-    production,
-    canary,
+    // Electrobun has exactly two channels. `name()` is used for the R2 path
+    // (electrobun/templates/channels/<name>.json) and the local cache path.
+    stable,
+    beta,
 
     pub fn name(self: Channel) []const u8 {
         return @tagName(self);
@@ -51,19 +53,22 @@ pub const LoadOptions = struct {
 };
 
 pub fn parseChannel(value: []const u8) !Channel {
-    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) return .production;
-    if (std.mem.eql(u8, value, "canary")) return .canary;
+    // Accept the new stable/beta names plus the legacy production/canary aliases
+    // so older callers and env values keep working.
+    if (std.mem.eql(u8, value, "stable") or std.mem.eql(u8, value, "production")) return .stable;
+    if (std.mem.eql(u8, value, "beta") or std.mem.eql(u8, value, "canary")) return .beta;
     return error.InvalidTemplateChannel;
 }
 
-test "stable template channel resolves to production" {
-    try std.testing.expectEqual(Channel.production, try parseChannel("stable"));
-    try std.testing.expectEqual(Channel.production, try parseChannel("production"));
-    try std.testing.expectEqual(Channel.canary, try parseChannel("canary"));
+test "template channel parsing accepts stable/beta and legacy aliases" {
+    try std.testing.expectEqual(Channel.stable, try parseChannel("stable"));
+    try std.testing.expectEqual(Channel.stable, try parseChannel("production"));
+    try std.testing.expectEqual(Channel.beta, try parseChannel("beta"));
+    try std.testing.expectEqual(Channel.beta, try parseChannel("canary"));
 }
 
 pub fn activeChannel(environment: *const std.process.Environ.Map) !Channel {
-    return parseChannel(environment.get("HUTCH_ACTIVE_CHANNEL") orelse "production");
+    return parseChannel(environment.get("HUTCH_ACTIVE_CHANNEL") orelse "stable");
 }
 
 pub fn load(
