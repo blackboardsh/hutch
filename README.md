@@ -97,10 +97,13 @@ pm`, an argv-form task such as `["npm", "run", "dev"]`, or a native executable.
 
 ## Managed Cache Lifecycle
 
-Successful Electrobun preparation records the exact cached core/devkit and
-native toolchains in the generated project `.hutch/dependencies.lock` and in
-Hutch's global project registry. `hutch cache prune --dry-run` previews cached
-objects that are unreachable and older than the 30-day grace period;
+Successful Electrobun preparation records the exact cached core/devkit,
+optional CEF payload, and native toolchains in the generated project
+`.hutch/dependencies.lock` and in Hutch's global project registry. Core and CEF
+are independent managed objects, so a project that stops using CEF no longer
+keeps that large payload reachable merely because it still uses the same core.
+`hutch cache prune --dry-run` previews cached objects that are unreachable and
+older than the 30-day grace period;
 `hutch cache prune` atomically detaches and removes those objects. Missing
 projects retain their last known dependencies for the same grace period.
 

@@ -606,10 +606,28 @@ fn writeMarker(
 }
 
 fn markerPath(allocator: std.mem.Allocator, root: []const u8, kind: Kind) ![]const u8 {
-    return std.fs.path.join(allocator, &.{
-        root,
-        if (kind == .core) ".core-complete" else ".cef-complete",
-    });
+    return switch (kind) {
+        .core => std.fs.path.join(allocator, &.{ root, ".core-complete" }),
+        // Keep the CEF identity inside its independently managed root. This
+        // lets cache pruning detach CEF without mutating or invalidating core.
+        .cef => std.fs.path.join(allocator, &.{ root, "cef", ".cef-complete" }),
+    };
+}
+
+test "CEF completion identity is stored inside its independently managed root" {
+    const allocator = std.testing.allocator;
+    const root = try std.fs.path.join(allocator, &.{ "cache", "electrobun", "2.0.0", "platform" });
+    defer allocator.free(root);
+    const core = try markerPath(allocator, root, .core);
+    defer allocator.free(core);
+    const cef = try markerPath(allocator, root, .cef);
+    defer allocator.free(cef);
+    const expected_core = try std.fs.path.join(allocator, &.{ root, ".core-complete" });
+    defer allocator.free(expected_core);
+    const expected_cef = try std.fs.path.join(allocator, &.{ root, "cef", ".cef-complete" });
+    defer allocator.free(expected_cef);
+    try std.testing.expectEqualStrings(expected_core, core);
+    try std.testing.expectEqualStrings(expected_cef, cef);
 }
 
 fn artifactIndexCachePath(

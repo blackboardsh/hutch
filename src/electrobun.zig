@@ -573,14 +573,17 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     var objects: std.ArrayList(cache_store.ManagedObject) = .empty;
     if (platform_paths.devkit) |devkit| {
-        if (try cache_store.managedElectrobunObject(
+        const managed = try cache_store.managedElectrobunObjects(
             ctx.init,
             ctx.allocator,
             devkit.root,
             devkit.version,
             devkit.source_manifest_sha256,
             bundleUsesCef(config.root),
-        )) |object| try objects.append(ctx.allocator, object);
+        );
+        for (managed) |object| {
+            if (object) |value| try objects.append(ctx.allocator, value);
+        }
     }
     switch (main_process) {
         .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)),
@@ -5254,8 +5257,9 @@ fn ensureRequiredPlatformArtifacts(
     config_root: std.json.Value,
     platform_paths: *PlatformPaths,
 ) !void {
-    if (!bundleUsesCef(config_root) or pathExists(ctx.io, platform_paths.cef_dir)) return;
+    if (!bundleUsesCef(config_root)) return;
     if (ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") != null) {
+        if (pathExists(ctx.io, platform_paths.cef_dir)) return;
         ctx.writeStderr(
             "hutch electrobun: local devkit root does not contain its required cef directory\n",
             .{},

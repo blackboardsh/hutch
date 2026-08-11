@@ -23,6 +23,7 @@ pub const ManagedObject = struct {
 
     pub const Kind = enum {
         electrobun,
+        electrobun_cef,
         toolchain,
     };
 };
@@ -58,10 +59,17 @@ pub const PruneResult = struct {
 const Candidate = struct {
     kind: ManagedObject.Kind,
     absolute_root: []const u8,
+    lock_root: []const u8,
     relative_root: []const u8,
     version: []const u8,
     platform: []const u8,
     toolchain_kind: ?[]const u8 = null,
+};
+
+const CandidateDisposition = enum {
+    reachable,
+    grace_kept,
+    eligible,
 };
 
 const RegistrationScan = struct {
@@ -110,16 +118,16 @@ fn initializePersistentFile(io: std.Io, path: []const u8) !void {
     if (initializer) |file| file.close(io);
 }
 
-pub fn managedElectrobunObject(
+pub fn managedElectrobunObjects(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     root: []const u8,
     version: []const u8,
     source_manifest_sha256: []const u8,
     uses_cef: bool,
-) !?ManagedObject {
+) ![2]?ManagedObject {
     const home = try release_store.dashHome(init, allocator);
-    return managedElectrobunObjectAt(
+    return managedElectrobunObjectsAt(
         init.io,
         allocator,
         home,
@@ -130,7 +138,7 @@ pub fn managedElectrobunObject(
     );
 }
 
-fn managedElectrobunObjectAt(
+fn managedElectrobunObjectsAt(
     io: std.Io,
     allocator: std.mem.Allocator,
     home: []const u8,
@@ -138,29 +146,35 @@ fn managedElectrobunObjectAt(
     version: []const u8,
     source_manifest_sha256: []const u8,
     uses_cef: bool,
-) !?ManagedObject {
+) ![2]?ManagedObject {
     try validateSegment(version);
     try validateSha256(source_manifest_sha256);
     const platform = std.fs.path.basename(root);
-    validateSegment(platform) catch return null;
+    validateSegment(platform) catch return .{ null, null };
     const expected = try std.fs.path.join(allocator, &.{ home, "products", "electrobun", version, platform });
-    if (!std.mem.eql(u8, expected, root)) return null;
+    if (!std.mem.eql(u8, expected, root)) return .{ null, null };
     try validatePlatform(platform);
 
     const core_sha256 = try readSha256Marker(io, allocator, root, ".core-complete");
-    const cef_sha256 = if (uses_cef)
-        try readSha256Marker(io, allocator, root, ".cef-complete")
-    else
-        null;
-    return .{
+    const core: ManagedObject = .{
         .kind = .electrobun,
         .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ version, platform }),
         .version = try allocator.dupe(u8, version),
         .platform = try allocator.dupe(u8, platform),
         .core_sha256 = core_sha256,
-        .cef_sha256 = cef_sha256,
         .source_manifest_sha256 = try allocator.dupe(u8, source_manifest_sha256),
     };
+    if (!uses_cef) return .{ core, null };
+
+    const cef_root = try std.fs.path.join(allocator, &.{ root, "cef" });
+    const cef: ManagedObject = .{
+        .kind = .electrobun_cef,
+        .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}/cef", .{ version, platform }),
+        .version = try allocator.dupe(u8, version),
+        .platform = try allocator.dupe(u8, platform),
+        .cef_sha256 = try readSha256Marker(io, allocator, cef_root, ".cef-complete"),
+    };
+    return .{ core, cef };
 }
 
 pub fn managedToolchainObject(
@@ -292,7 +306,11 @@ fn objectsJson(allocator: std.mem.Allocator, objects: []const ManagedObject) !st
 
 fn objectJson(allocator: std.mem.Allocator, object: ManagedObject) !std.json.Value {
     var value: std.json.ObjectMap = .empty;
-    try value.put(allocator, "type", .{ .string = @tagName(object.kind) });
+    try value.put(allocator, "type", .{ .string = switch (object.kind) {
+        .electrobun => "electrobun",
+        .electrobun_cef => "electrobun-cef",
+        .toolchain => "toolchain",
+    } });
     try value.put(allocator, "relativeRoot", .{ .string = object.relative_root });
     try value.put(allocator, "version", .{ .string = object.version });
     try value.put(allocator, "platform", .{ .string = object.platform });
@@ -301,7 +319,10 @@ fn objectJson(allocator: std.mem.Allocator, object: ManagedObject) !std.json.Val
             try value.put(allocator, "product", .{ .string = "electrobun" });
             try value.put(allocator, "coreSha256", .{ .string = object.core_sha256.? });
             try value.put(allocator, "sourceManifestSha256", .{ .string = object.source_manifest_sha256.? });
-            if (object.cef_sha256) |checksum| try value.put(allocator, "cefSha256", .{ .string = checksum });
+        },
+        .electrobun_cef => {
+            try value.put(allocator, "product", .{ .string = "electrobun" });
+            try value.put(allocator, "cefSha256", .{ .string = object.cef_sha256.? });
         },
         .toolchain => try value.put(allocator, "toolchain", .{ .string = object.toolchain_kind.? }),
     }
@@ -345,27 +366,52 @@ fn pruneAt(
         try collectToolchainCandidates(io, allocator, home, &candidates);
         std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
 
-        var eligible_actions: std.ArrayList(PruneAction) = .empty;
-        var reachable_count: usize = 0;
-        var grace_kept: usize = 0;
-        for (candidates.items) |candidate| {
-            if (containsPath(registrations.reachable.items, candidate.relative_root)) {
-                reachable_count += 1;
+        const dispositions = try allocator.alloc(CandidateDisposition, candidates.items.len);
+        for (candidates.items, 0..) |candidate, index| {
+            if (candidateIsReachable(registrations.reachable.items, candidate)) {
+                dispositions[index] = .reachable;
                 continue;
             }
             if (registrations.defer_unreachable_pruning) {
-                grace_kept += 1;
+                dispositions[index] = .grace_kept;
                 continue;
             }
             const last_used = try readLastUsed(io, allocator, home, candidate.relative_root);
             if (options.grace_seconds > 0 and (last_used == null or now < last_used.? or now - last_used.? < options.grace_seconds)) {
-                grace_kept += 1;
+                dispositions[index] = .grace_kept;
                 if (!options.dry_run and last_used == null) {
                     try touchLastUsed(io, allocator, home, candidate.relative_root, now);
                 }
                 continue;
             }
-            try eligible_actions.append(allocator, .{ .relative_root = try allocator.dupe(u8, candidate.relative_root) });
+            dispositions[index] = .eligible;
+        }
+
+        // A nested CEF payload can be detached without core, but detaching
+        // core necessarily removes CEF too. Preserve the parent whenever any
+        // independently managed descendant is still within its own grace.
+        for (candidates.items, 0..) |candidate, index| {
+            if (candidate.kind != .electrobun or dispositions[index] != .eligible) continue;
+            for (candidates.items, dispositions) |other, disposition| {
+                if (!candidateContains(candidate, other) or disposition == .eligible) continue;
+                dispositions[index] = disposition;
+                break;
+            }
+        }
+
+        var eligible_actions: std.ArrayList(PruneAction) = .empty;
+        var reachable_count: usize = 0;
+        var grace_kept: usize = 0;
+        for (candidates.items, dispositions, 0..) |candidate, disposition, index| {
+            switch (disposition) {
+                .reachable => reachable_count += 1,
+                .grace_kept => grace_kept += 1,
+                .eligible => if (!candidateHasEligibleAncestor(candidates.items, dispositions, index)) {
+                    try eligible_actions.append(allocator, .{
+                        .relative_root = try allocator.dupe(u8, candidate.relative_root),
+                    });
+                },
+            }
         }
 
         const eligible_count = eligible_actions.items.len;
@@ -392,7 +438,7 @@ fn pruneAt(
                 const candidate = findCandidate(candidates.items, action.relative_root) orelse continue;
                 if (!try candidateStillValid(io, allocator, candidate)) continue;
                 {
-                    const object_lock = try tryAcquireCandidateLock(io, allocator, candidate.absolute_root) orelse continue;
+                    const object_lock = try tryAcquireCandidateLock(io, allocator, candidate.lock_root) orelse continue;
                     defer object_lock.close(io);
                     const batch = trash_root orelse blk: {
                         const created = try createTrashRoot(io, allocator, home);
@@ -561,19 +607,27 @@ fn parseManagedObject(allocator: std.mem.Allocator, value: std.json.Value) !Mana
         const source_sha256 = try requiredString(object, "sourceManifestSha256");
         try validateSha256(core_sha256);
         try validateSha256(source_sha256);
-        const cef_sha256 = if (object.get("cefSha256")) |cef| blk: {
-            if (cef != .string) return error.InvalidCacheRegistration;
-            try validateSha256(cef.string);
-            break :blk cef.string;
-        } else null;
         return .{
             .kind = .electrobun,
             .relative_root = relative_root,
             .version = version,
             .platform = platform,
             .core_sha256 = core_sha256,
-            .cef_sha256 = cef_sha256,
             .source_manifest_sha256 = source_sha256,
+        };
+    }
+    if (std.mem.eql(u8, kind_name, "electrobun-cef")) {
+        if (!std.mem.eql(u8, try requiredString(object, "product"), "electrobun")) return error.InvalidCacheRegistration;
+        const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}/cef", .{ version, platform });
+        if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
+        const cef_sha256 = try requiredString(object, "cefSha256");
+        try validateSha256(cef_sha256);
+        return .{
+            .kind = .electrobun_cef,
+            .relative_root = relative_root,
+            .version = version,
+            .platform = platform,
+            .cef_sha256 = cef_sha256,
         };
     }
     if (std.mem.eql(u8, kind_name, "toolchain")) {
@@ -620,6 +674,7 @@ fn collectElectrobunCandidates(
             const candidate: Candidate = .{
                 .kind = .electrobun,
                 .absolute_root = absolute,
+                .lock_root = absolute,
                 .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ version_entry.name, platform_entry.name }),
                 .version = try allocator.dupe(u8, version_entry.name),
                 .platform = try allocator.dupe(u8, platform_entry.name),
@@ -628,6 +683,22 @@ fn collectElectrobunCandidates(
                 try candidateStillValid(io, allocator, candidate))
             {
                 try output.append(allocator, candidate);
+            }
+
+            const cef_absolute = try std.fs.path.join(allocator, &.{ absolute, "cef" });
+            const cef_candidate: Candidate = .{
+                .kind = .electrobun_cef,
+                .absolute_root = cef_absolute,
+                // Core and CEF publication share the platform-root lock.
+                .lock_root = absolute,
+                .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}/cef", .{ version_entry.name, platform_entry.name }),
+                .version = try allocator.dupe(u8, version_entry.name),
+                .platform = try allocator.dupe(u8, platform_entry.name),
+            };
+            if (try candidateStillValid(io, allocator, cef_candidate) and
+                try pathResolvesWithin(io, allocator, home, cef_absolute))
+            {
+                try output.append(allocator, cef_candidate);
             }
         }
     }
@@ -668,6 +739,7 @@ fn collectToolchainCandidates(
                 const candidate: Candidate = .{
                     .kind = .toolchain,
                     .absolute_root = absolute,
+                    .lock_root = absolute,
                     .relative_root = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ kind_entry.name, version_entry.name, platform_entry.name }),
                     .version = try allocator.dupe(u8, version_entry.name),
                     .platform = try allocator.dupe(u8, platform_entry.name),
@@ -696,6 +768,10 @@ fn candidateStillValid(io: std.Io, allocator: std.mem.Allocator, candidate: Cand
                 try std.fs.path.join(allocator, &.{ candidate.absolute_root, "native-devkit.json" }),
             );
         },
+        .electrobun_cef => {
+            _ = readSha256Marker(io, allocator, candidate.absolute_root, ".cef-complete") catch return false;
+            return true;
+        },
         .toolchain => {
             const marker = try std.fs.path.join(allocator, &.{ candidate.absolute_root, ".hutch-toolchain" });
             const value = readTrimmedFile(io, allocator, marker, 256) catch return false;
@@ -713,6 +789,38 @@ fn findCandidate(candidates: []const Candidate, relative_root: []const u8) ?Cand
 
 fn containsPath(paths: []const []const u8, needle: []const u8) bool {
     for (paths) |path| if (std.mem.eql(u8, path, needle)) return true;
+    return false;
+}
+
+fn candidateIsReachable(paths: []const []const u8, candidate: Candidate) bool {
+    if (containsPath(paths, candidate.relative_root)) return true;
+    if (candidate.kind != .electrobun) return false;
+    for (paths) |path| {
+        if (path.len > candidate.relative_root.len and
+            std.mem.startsWith(u8, path, candidate.relative_root) and
+            path[candidate.relative_root.len] == '/')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn candidateContains(parent: Candidate, child: Candidate) bool {
+    return child.relative_root.len > parent.relative_root.len and
+        std.mem.startsWith(u8, child.relative_root, parent.relative_root) and
+        child.relative_root[parent.relative_root.len] == '/';
+}
+
+fn candidateHasEligibleAncestor(
+    candidates: []const Candidate,
+    dispositions: []const CandidateDisposition,
+    child_index: usize,
+) bool {
+    for (candidates, dispositions, 0..) |candidate, disposition, index| {
+        if (index == child_index or disposition != .eligible) continue;
+        if (candidateContains(candidate, candidates[child_index])) return true;
+    }
     return false;
 }
 
@@ -873,8 +981,12 @@ fn validateManagedObject(allocator: std.mem.Allocator, object: ManagedObject) !v
         .electrobun => {
             try validateSha256(object.core_sha256 orelse return error.InvalidManagedObject);
             try validateSha256(object.source_manifest_sha256 orelse return error.InvalidManagedObject);
-            if (object.cef_sha256) |value| try validateSha256(value);
             const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ object.version, object.platform });
+            if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
+        },
+        .electrobun_cef => {
+            try validateSha256(object.cef_sha256 orelse return error.InvalidManagedObject);
+            const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}/cef", .{ object.version, object.platform });
             if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
         },
         .toolchain => {
@@ -1031,6 +1143,10 @@ fn createTestCandidate(
             .sub_path = try std.fs.path.join(allocator, &.{ root, ".core-complete" }),
             .data = try std.mem.concat(allocator, u8, &.{ object.core_sha256.?, "\n" }),
         }),
+        .electrobun_cef => try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ root, ".cef-complete" }),
+            .data = try std.mem.concat(allocator, u8, &.{ object.cef_sha256.?, "\n" }),
+        }),
         .toolchain => try std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" }),
             .data = object.version,
@@ -1042,7 +1158,11 @@ fn createTestCandidate(
             .data = "{}",
         });
     }
-    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
+    const lock_root = if (object.kind == .electrobun_cef)
+        std.fs.path.dirname(root) orelse return error.InvalidManagedObjectPath
+    else
+        root;
+    const lock_path = try std.mem.concat(allocator, u8, &.{ lock_root, ".lock" });
     const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .truncate = false });
     lock.close(io);
     return root;
@@ -1056,6 +1176,16 @@ fn testElectrobunObject() ManagedObject {
         .platform = "macos-arm64",
         .core_sha256 = test_core_sha256,
         .source_manifest_sha256 = test_manifest_sha256,
+    };
+}
+
+fn testElectrobunCefObject() ManagedObject {
+    return .{
+        .kind = .electrobun_cef,
+        .relative_root = "products/electrobun/2.0.0/macos-arm64/cef",
+        .version = "2.0.0",
+        .platform = "macos-arm64",
+        .cef_sha256 = test_cef_sha256,
     };
 }
 
@@ -1115,7 +1245,7 @@ test "resolver outputs become managed objects only inside DASH_HOME" {
     const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
     const electrobun_fixture = testElectrobunObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun_fixture);
-    const electrobun = (try managedElectrobunObjectAt(
+    const core_only = try managedElectrobunObjectsAt(
         io,
         allocator,
         home,
@@ -1123,14 +1253,13 @@ test "resolver outputs become managed objects only inside DASH_HOME" {
         electrobun_fixture.version,
         test_manifest_sha256,
         false,
-    )).?;
+    );
+    const electrobun = core_only[0].?;
+    try std.testing.expect(core_only[1] == null);
     try std.testing.expectEqualStrings(electrobun_fixture.relative_root, electrobun.relative_root);
     try std.testing.expectEqualStrings(test_core_sha256, electrobun.core_sha256.?);
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ electrobun_root, ".cef-complete" }),
-        .data = test_cef_sha256,
-    });
-    const with_cef = (try managedElectrobunObjectAt(
+    _ = try createTestCandidate(io, allocator, home, testElectrobunCefObject());
+    const with_cef = try managedElectrobunObjectsAt(
         io,
         allocator,
         home,
@@ -1138,12 +1267,14 @@ test "resolver outputs become managed objects only inside DASH_HOME" {
         electrobun_fixture.version,
         test_manifest_sha256,
         true,
-    )).?;
-    try std.testing.expectEqualStrings(test_cef_sha256, with_cef.cef_sha256.?);
+    );
+    try std.testing.expectEqualStrings(electrobun_fixture.relative_root, with_cef[0].?.relative_root);
+    try std.testing.expectEqualStrings(testElectrobunCefObject().relative_root, with_cef[1].?.relative_root);
+    try std.testing.expectEqualStrings(test_cef_sha256, with_cef[1].?.cef_sha256.?);
 
     const external_root = try std.fs.path.join(allocator, &.{ root, "local-devkit" });
     try std.Io.Dir.cwd().createDirPath(io, external_root);
-    try std.testing.expect((try managedElectrobunObjectAt(
+    const external = try managedElectrobunObjectsAt(
         io,
         allocator,
         home,
@@ -1151,7 +1282,9 @@ test "resolver outputs become managed objects only inside DASH_HOME" {
         electrobun_fixture.version,
         test_manifest_sha256,
         false,
-    )) == null);
+    );
+    try std.testing.expect(external[0] == null);
+    try std.testing.expect(external[1] == null);
 
     const toolchain_fixture = testToolchainObject();
     const toolchain_root = try createTestCandidate(io, allocator, home, toolchain_fixture);
@@ -1215,6 +1348,94 @@ test "prune removes only stale unreachable managed objects" {
     try std.testing.expect(!pathExists(io, toolchain_root));
     try std.testing.expect(pathExists(io, third_party_cache));
     try std.testing.expect(!pathExists(io, stale_trash));
+}
+
+test "removing the last CEF reference prunes only CEF while core remains" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const core_project = try std.fs.path.join(allocator, &.{ root, "core-project" });
+    const cef_project = try std.fs.path.join(allocator, &.{ root, "cef-project" });
+    try std.Io.Dir.cwd().createDirPath(io, core_project);
+    try std.Io.Dir.cwd().createDirPath(io, cef_project);
+
+    const core = testElectrobunObject();
+    const cef = testElectrobunCefObject();
+    const core_root = try createTestCandidate(io, allocator, home, core);
+    const cef_root = try createTestCandidate(io, allocator, home, cef);
+    try registerProjectAt(io, allocator, home, core_project, &.{core}, 70_000);
+    try registerProjectAt(io, allocator, home, cef_project, &.{ core, cef }, 70_000);
+
+    const cef_lock_path = try std.fs.path.join(allocator, &.{ cef_project, ".hutch", "dependencies.lock" });
+    const cef_lock = try std.Io.Dir.cwd().readFileAlloc(io, cef_lock_path, allocator, .limited(max_state_file_bytes));
+    try std.testing.expect(std.mem.indexOf(u8, cef_lock, "\"type\":\"electrobun-cef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cef_lock, test_cef_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cef_lock, test_core_sha256) != null);
+
+    const initially_reachable = try scanRegistrations(io, allocator, home, 70_001);
+    try std.testing.expectEqual(@as(usize, 2), initially_reachable.reachable.items.len);
+
+    // The CEF project disables CEF while another project continues to use the
+    // same exact core. Its new dependency graph drops only the CEF subobject.
+    try registerProjectAt(io, allocator, home, cef_project, &.{core}, 70_002);
+    const preview = try pruneAt(io, allocator, home, .{
+        .dry_run = true,
+        .grace_seconds = 0,
+        .now_unix_seconds = 70_003,
+    });
+    try std.testing.expectEqual(@as(usize, 2), preview.scanned);
+    try std.testing.expectEqual(@as(usize, 1), preview.reachable);
+    try std.testing.expectEqual(@as(usize, 1), preview.eligible);
+    try std.testing.expectEqualStrings(cef.relative_root, preview.actions[0].relative_root);
+
+    const pruned = try pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 70_003,
+    });
+    try std.testing.expectEqual(@as(usize, 1), pruned.pruned);
+    try std.testing.expectEqualStrings(cef.relative_root, pruned.actions[0].relative_root);
+    try std.testing.expect(pathExists(io, core_root));
+    try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ core_root, ".core-complete" })));
+    try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ core_root, "native-devkit.json" })));
+    try std.testing.expect(!pathExists(io, cef_root));
+}
+
+test "core pruning cannot bypass an independently recent CEF grace period" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const core = testElectrobunObject();
+    const cef = testElectrobunCefObject();
+    const core_root = try createTestCandidate(io, allocator, home, core);
+    const cef_root = try createTestCandidate(io, allocator, home, cef);
+    const now = default_grace_seconds + 90_000;
+    try touchLastUsed(io, allocator, home, core.relative_root, now - default_grace_seconds - 1);
+    try touchLastUsed(io, allocator, home, cef.relative_root, now - 1);
+
+    const retained = try pruneAt(io, allocator, home, .{ .now_unix_seconds = now });
+    try std.testing.expectEqual(@as(usize, 0), retained.pruned);
+    try std.testing.expectEqual(@as(usize, 2), retained.grace_kept);
+    try std.testing.expect(pathExists(io, core_root));
+    try std.testing.expect(pathExists(io, cef_root));
+
+    const expired = try pruneAt(io, allocator, home, .{
+        .now_unix_seconds = now + default_grace_seconds + 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), expired.eligible);
+    try std.testing.expectEqual(@as(usize, 1), expired.pruned);
+    try std.testing.expectEqualStrings(core.relative_root, expired.actions[0].relative_root);
+    try std.testing.expect(!pathExists(io, core_root));
+    try std.testing.expect(!pathExists(io, cef_root));
 }
 
 test "missing last-used state receives grace before an object can be pruned" {
