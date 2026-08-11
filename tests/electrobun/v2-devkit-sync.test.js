@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -61,6 +62,8 @@ test("v2 sync and build use only the cached devkit, without an npm package", { t
     createCoreFixture(coreFiles, version, host);
     const packed = spawnSync("tar", ["-czf", archive, "-C", coreFiles, "."], { encoding: "utf8" });
     assert.equal(packed.status, 0, packed.stderr || packed.stdout);
+    const archiveBytes = readFileSync(archive);
+    const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 
     writeFixtureFile(join(project, "src", "bun", "index.ts"), "import { devkitMarker } from 'electrobun/main';\nconsole.log(devkitMarker);\n");
     writeFixtureFile(join(project, "electrobun.config.ts"), `
@@ -81,10 +84,40 @@ export default {
     assert.equal(existsSync(join(project, "node_modules")), false);
 
     let requests = 0;
-    const server = createServer((_request, response) => {
+    const server = createServer((request, response) => {
       requests += 1;
-      response.writeHead(200, { "content-type": "application/gzip" });
-      response.end(readFileSync(archive));
+      const basePath = `/releases/download/v${version}`;
+      if (request.url === `${basePath}/electrobun-artifacts.json`) {
+        const origin = `http://127.0.0.1:${server.address().port}/releases/download`;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          schemaVersion: 1,
+          product: { name: "electrobun", version },
+          devkit: { manifest: "native-devkit.json", schemaVersion: 1 },
+          abi: {
+            core: { name: "electrobun-core", version: 1 },
+            sdk: { name: "electrobun-sdk", version: 1 },
+          },
+          platforms: {
+            [host.key]: {
+              target: { os: host.os, arch: host.arch },
+              core: {
+                url: `${origin}/v${version}/electrobun-core-${host.asset}.tar.gz`,
+                size: archiveBytes.length,
+                sha256: archiveSha256,
+              },
+            },
+          },
+        }));
+        return;
+      }
+      if (request.url === `${basePath}/electrobun-core-${host.asset}.tar.gz`) {
+        response.writeHead(200, { "content-type": "application/gzip" });
+        response.end(archiveBytes);
+        return;
+      }
+      response.writeHead(404);
+      response.end();
     });
     await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
     const address = server.address();
@@ -106,7 +139,7 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(first.status, 0, first.stderr || first.stdout);
-      assert.equal(requests, 1);
+      assert.equal(requests, 2);
       assert.match(first.stdout, /electrobun sync complete/);
 
       const cacheRoot = join(dashHome, "products", "electrobun", version, host.key);
@@ -121,7 +154,7 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(build.status, 0, build.stderr || build.stdout);
-      assert.equal(requests, 1, "build should reuse the exact core and projected devkit");
+      assert.equal(requests, 2, "build should reuse the exact index, core, and projected devkit");
       const bundledMain = process.platform === "darwin"
         ? join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev.app", "Contents", "Resources", "app", "bun", "index.js")
         : join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev", "Resources", "app", "bun", "index.js");
@@ -150,7 +183,7 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(localSync.status, 0, localSync.stderr || localSync.stdout);
-      assert.equal(requests, 1, "an explicit local devkit root must bypass release downloads");
+      assert.equal(requests, 2, "an explicit local devkit root must bypass release downloads");
       assert.ok(existsSync(join(project, ".hutch", "devkit", "projection.json")));
 
       writeFixtureFile(

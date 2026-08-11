@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -15,48 +13,14 @@ import os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import {
+  createCoreFixture,
+  executableName,
+  hostContract,
+  writeFixtureFile,
+} from "./v2-devkit-fixture.js";
 
 const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-
-function executableName(name) {
-  return process.platform === "win32" ? `${name}.exe` : name;
-}
-
-function write(path, contents = "") {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, contents);
-}
-
-function platformNames() {
-  if (process.platform === "darwin") {
-    return {
-      key: `macos-${process.arch === "arm64" ? "arm64" : "x64"}`,
-      target: { os: "macos", arch: process.arch === "arm64" ? "arm64" : "x64" },
-      asset: `darwin-${process.arch === "arm64" ? "arm64" : "x64"}`,
-      core: "libElectrobunCore.dylib",
-      native: "libNativeWrapper.dylib",
-      asar: "libasar.dylib",
-    };
-  }
-  if (process.platform === "win32") {
-    return {
-      key: "windows-x64",
-      target: { os: "win", arch: "x64" },
-      asset: "win-x64",
-      core: "ElectrobunCore.dll",
-      native: "libNativeWrapper.dll",
-      asar: "libasar.dll",
-    };
-  }
-  return {
-    key: `linux-${process.arch === "arm64" ? "arm64" : "x64"}`,
-    target: { os: "linux", arch: process.arch === "arm64" ? "arm64" : "x64" },
-    asset: `linux-${process.arch === "arm64" ? "arm64" : "x64"}`,
-    core: "libElectrobunCore.so",
-    native: "libNativeWrapper.so",
-    asar: "libasar.so",
-  };
-}
 
 function resolveCottontail() {
   const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
@@ -83,46 +47,27 @@ function run(command, args, options) {
   });
 }
 
-test("published npm packages download and reuse native Electrobun artifacts", { timeout: 120_000 }, async () => {
+test("exact Electrobun config pins download and reuse verified native artifacts", { timeout: 120_000 }, async () => {
   const fixture = mkdtempSync(join(os.tmpdir(), "hutch-published-electrobun-"));
   const project = join(fixture, "project");
-  const packageRoot = join(fixture, "electrobun-package");
-  const dist = join(packageRoot, "dist");
   const coreFiles = join(fixture, "core-files");
   const archive = join(fixture, "electrobun-core.tar.gz");
   const dashHome = join(fixture, "dash-home");
-  const names = platformNames();
+  const names = hostContract();
   const version = "9.8.7-test.1";
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
   const cottontail = resolveCottontail();
 
   try {
-    write(join(packageRoot, "package.json"), JSON.stringify({ name: "electrobun", version, type: "module" }));
-    write(join(dist, "main.js"));
-    write(join(dist, "preload-full.js"));
-    write(join(dist, "preload-sandboxed.js"));
-
-    for (const file of [executableName("launcher"), names.core, names.native, names.asar]) {
-      write(join(coreFiles, file), file);
-      if (process.platform !== "win32") chmodSync(join(coreFiles, file), 0o755);
-    }
-    write(join(coreFiles, "native-devkit.json"), JSON.stringify({
-      schemaVersion: 1,
-      product: { name: "electrobun", version },
-      target: names.target,
-      abi: {
-        core: { name: "electrobun-core", version: 1 },
-        sdk: { name: "electrobun-sdk", version: 1 },
-      },
-    }));
+    createCoreFixture(coreFiles, version, names);
     const packed = spawnSync("tar", ["-czf", archive, "-C", coreFiles, "."], { encoding: "utf8" });
     assert.equal(packed.status, 0, packed.stderr || packed.stdout);
     const archiveBytes = readFileSync(archive);
     const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 
-    write(join(project, "src", "bun", "index.ts"), "console.log('published artifact fixture');\n");
-    write(join(project, "electrobun.config.ts"), `
+    writeFixtureFile(join(project, "src", "bun", "index.ts"), "console.log('published artifact fixture');\n");
+    writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
   electrobun: { version: "${version}" },
   app: { name: "PublishedArtifact", identifier: "dev.electrobun.published-artifact", version: "0.0.0" },
@@ -135,6 +80,7 @@ export default {
   },
 };
 `);
+    assert.equal(existsSync(join(project, "package.json")), false);
 
     let indexRequests = 0;
     let coreRequests = 0;
@@ -164,7 +110,7 @@ export default {
           },
           platforms: {
             [names.key]: {
-              target: names.target,
+              target: { os: names.os, arch: names.arch },
               core: {
                 url: `${origin}/v${version}/electrobun-core-${names.asset}.tar.gz`,
                 size: archiveBytes.length,
@@ -197,7 +143,7 @@ export default {
       const env = {
         ...process.env,
         COTTONTAIL_BINARY: cottontail,
-        COTTONTAIL_ELECTROBUN_PACKAGE: packageRoot,
+        DASH_COTTONTAIL: cottontail,
         DASH_HOME: dashHome,
         ELECTROBUN_RELEASES_BASE_URL: `http://127.0.0.1:${address.port}/releases/download`,
         HUTCH_ENGINE_BINARY: engine,
