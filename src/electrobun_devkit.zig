@@ -669,7 +669,11 @@ fn validateAbi(object: std.json.ObjectMap, expected_name: []const u8, expected_v
 fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u8 {
     const toolchain = try requiredObjectField(toolchains, name);
     const version = try requiredString(toolchain, "defaultVersion");
-    try validateOpaqueVersion(version);
+    if (std.mem.eql(u8, name, "odin")) {
+        try validateOpaqueVersion(version);
+    } else {
+        _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunToolchainVersion;
+    }
     return version;
 }
 
@@ -978,6 +982,19 @@ test "present v2 config requires a string version" {
 
     const wrong_container = try parseTestJson(arena.allocator(), "{\"electrobun\":\"2.0.0\"}");
     try std.testing.expectError(error.InvalidElectrobunConfig, configuredVersion(wrong_container));
+}
+
+test "native compiler defaults use exact versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const toolchains = try parseTestJson(
+        arena.allocator(),
+        "{\"zig\":{\"defaultVersion\":\"0.16\"},\"go\":{\"defaultVersion\":\"stable\"},\"odin\":{\"defaultVersion\":\"dev-2026-07a\"}}",
+    );
+    try std.testing.expectError(error.InvalidElectrobunToolchainVersion, toolchainVersion(toolchains.object, "zig"));
+    try std.testing.expectError(error.InvalidElectrobunToolchainVersion, toolchainVersion(toolchains.object, "go"));
+    try std.testing.expectEqualStrings("dev-2026-07a", try toolchainVersion(toolchains.object, "odin"));
 }
 
 const test_manifest_template =

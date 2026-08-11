@@ -59,7 +59,7 @@ pub fn resolveVersion(
     kind: Kind,
     version: []const u8,
 ) !Resolution {
-    try validateVersion(version);
+    try validateVersion(kind, version);
     if (try executableMatchesVersion(init.io, allocator, kind.systemExecutable(), kind, version)) {
         return .{
             .binary = kind.systemExecutable(),
@@ -441,7 +441,7 @@ fn makeExecutable(io: std.Io, path: []const u8) !void {
     try file.setPermissions(io, .executable_file);
 }
 
-fn validateVersion(version: []const u8) !void {
+fn validateVersion(kind: Kind, version: []const u8) !void {
     if (version.len == 0 or version.len > 128 or
         std.mem.eql(u8, version, ".") or std.mem.eql(u8, version, ".."))
     {
@@ -451,6 +451,9 @@ fn validateVersion(version: []const u8) !void {
         if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-' and byte != '+') {
             return error.InvalidToolchainVersion;
         }
+    }
+    if (kind != .odin) {
+        _ = std.SemanticVersion.parse(version) catch return error.InvalidToolchainVersion;
     }
 }
 
@@ -469,11 +472,15 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 }
 
 test "toolchain versions cannot escape their cache path" {
-    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion("."));
-    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(".."));
-    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion("../0.16.0"));
-    try validateVersion("0.16.0");
-    try validateVersion("dev-2026-07a");
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.zig, "."));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, ".."));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.rust, "../1.88.0"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, "stable"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, "1.26"));
+    try validateVersion(.zig, "0.16.0");
+    try validateVersion(.rust, "1.88.0");
+    try validateVersion(.go, "1.26.4");
+    try validateVersion(.odin, "dev-2026-07a");
 }
 
 test "a mismatched toolchain executable is never published" {
