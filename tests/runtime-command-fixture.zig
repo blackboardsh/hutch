@@ -22,6 +22,11 @@ const expected_shell_args = [_][]const u8{
     "bang!value",
     "trail\\",
     "",
+    "--config",
+    "../../must-stay-an-argument",
+    "--conditions=hutch-shell-sentinel",
+    "--feature",
+    "hutch-shell-sentinel",
 };
 
 const expected_package_manager_adversarial_args = [_][]const u8{
@@ -92,13 +97,94 @@ fn expectPrivateTempDirectory(
     }
 }
 
-fn expectPrivateShellLauncher(init: std.process.Init) !void {
+fn expectPrivateFileInRoot(
+    init: std.process.Init,
+    private_root: []const u8,
+    path: []const u8,
+    expected_name: []const u8,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPrivateFilePath;
+    if (!std.mem.eql(u8, parent, private_root)) return error.PrivateFileOutsideRoot;
+    if (!std.mem.eql(u8, std.fs.path.basename(path), expected_name)) {
+        return error.UnexpectedPrivateFileName;
+    }
+    const stat = try std.Io.Dir.cwd().statFile(init.io, path, .{
+        .follow_symlinks = false,
+    });
+    if (stat.kind != .file) return error.PrivateFileMissing;
+    if (comptime builtin.os.tag != .windows) {
+        if (stat.permissions.toMode() & 0o777 != 0o600) {
+            return error.PrivateFilePermissionsTooBroad;
+        }
+    }
+}
+
+fn expectPrivateEmptyBunfig(init: std.process.Init, private_root: []const u8) !void {
+    const path = try std.fs.path.join(init.arena.allocator(), &.{ private_root, "bunfig.toml" });
+    try expectPrivateFileInRoot(init, private_root, path, "bunfig.toml");
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        path,
+        init.arena.allocator(),
+        .limited(1),
+    );
+    if (contents.len != 0) return error.PrivateBunfigWasNotEmpty;
+}
+
+fn expectPrivateShellTask(
+    init: std.process.Init,
+    wrapper_path: []const u8,
+    private_root: []const u8,
+) !void {
+    try expectPrivateTempDirectory(init, private_root, "hutch-shell-launcher-");
+    try expectPrivateFileInRoot(init, private_root, wrapper_path, "hutch-shell-wrapper.mjs");
+    try expectPrivateEmptyBunfig(init, private_root);
+    const wrapper_source = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        wrapper_path,
+        init.arena.allocator(),
+        .limited(16 * 1024),
+    );
+    for ([_][]const u8{
+        "__cottontailLoadDotenv",
+        "__cottontailLoadStandaloneBunfig",
+        "process.argv.slice(2)",
+        "Bun.argv",
+        "cottontail.argv.splice(1)",
+        "cottontail.args.splice(0)",
+        "process.execArgv.splice(0)",
+        "cottontail.execArgv.splice(0)",
+        "cottontail.internal.hutchShellTask",
+        "Bun.stdin.stream()",
+    }) |marker| {
+        if (std.mem.indexOf(u8, wrapper_source, marker) == null) {
+            return error.PrivateShellWrapperContractMissing;
+        }
+    }
+    const argv_snapshot = std.mem.indexOf(u8, wrapper_source, "process.argv.slice(2)") orelse
+        return error.PrivateShellWrapperContractMissing;
+    const dotenv_load = std.mem.indexOf(u8, wrapper_source, "__cottontailLoadDotenv") orelse
+        return error.PrivateShellWrapperContractMissing;
+    if (argv_snapshot > dotenv_load) return error.PrivateShellWrapperExposedProtocolArgv;
+    const bunfig_load = std.mem.indexOf(u8, wrapper_source, "__cottontailLoadStandaloneBunfig") orelse
+        return error.PrivateShellWrapperContractMissing;
+    const first_argv_scrub = std.mem.indexOf(u8, wrapper_source, "clearPrivateArgv();") orelse
+        return error.PrivateShellWrapperContractMissing;
+    if (first_argv_scrub >= dotenv_load) return error.PrivateShellWrapperExposedProtocolArgv;
+    const final_argv_scrub = std.mem.lastIndexOf(u8, wrapper_source, "clearPrivateArgv();") orelse
+        return error.PrivateShellWrapperContractMissing;
+    if (final_argv_scrub <= bunfig_load or final_argv_scrub == first_argv_scrub) {
+        return error.PrivateShellWrapperRetainedMutatedArgv;
+    }
+
     const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
     const path = init.environ_map.get(path_key) orelse
         init.environ_map.get("PATH") orelse return error.MissingPath;
     var entries = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
     const shim_dir = entries.first();
-    try expectPrivateTempDirectory(init, shim_dir, "hutch-shell-launcher-");
+    if (!std.mem.eql(u8, shim_dir, private_root)) {
+        return error.PrivateShellLauncherPathMismatch;
+    }
     const launcher = try std.fs.path.join(init.arena.allocator(), &.{
         shim_dir,
         if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
@@ -107,6 +193,15 @@ fn expectPrivateShellLauncher(init: std.process.Init) !void {
         .follow_symlinks = false,
     });
     if (stat.kind != .file) return error.PrivateShellLauncherMissing;
+
+    if (init.environ_map.get("HUTCH_TEST_EXPECTED_TASK_TMPDIR")) |expected| {
+        const actual = init.environ_map.get("TMPDIR") orelse return error.MissingExpectedTaskTmpdir;
+        if (!std.mem.eql(u8, actual, expected)) return error.TaskTmpdirWasChanged;
+    }
+    if (init.environ_map.get("HUTCH_TEST_EXPECTED_TASK_TEMP")) |expected| {
+        const actual = init.environ_map.get("TEMP") orelse return error.MissingExpectedTaskTemp;
+        if (!std.mem.eql(u8, actual, expected)) return error.TaskTempWasChanged;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -121,9 +216,14 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingFixtureMode;
 
     if (std.mem.startsWith(u8, mode, "config-")) {
-        if (args.len == 2 and std.mem.eql(u8, std.fs.path.basename(args[1]), "load.mjs")) {
-            const loader_dir = std.fs.path.dirname(args[1]) orelse return error.InvalidConfigLoaderPath;
+        if (args.len == 5 and
+            std.mem.eql(u8, args[1], "--hutch-config-file") and
+            std.mem.eql(u8, args[3], "--hutch-private-root"))
+        {
+            const loader_dir = args[4];
             try expectPrivateTempDirectory(init, loader_dir, "hutch-config-loader-");
+            try expectPrivateFileInRoot(init, loader_dir, args[2], "load.mjs");
+            try expectPrivateEmptyBunfig(init, loader_dir);
             const config_json = init.environ_map.get("HUTCH_TEST_CONFIG_JSON") orelse
                 return error.MissingConfigJson;
             if (std.mem.eql(u8, mode, "config-console-log")) {
@@ -132,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
 
             const loader_source = try std.Io.Dir.cwd().readFileAlloc(
                 init.io,
-                args[1],
+                args[2],
                 init.arena.allocator(),
                 .limited(1024 * 1024),
             );
@@ -140,6 +240,32 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.indexOf(u8, loader_source, result_marker) == null) {
                 return error.ConfigResultSideChannelMissing;
             }
+            if (std.mem.indexOf(u8, loader_source, "__hutchChmodConfig") == null or
+                std.mem.indexOf(u8, loader_source, "0o600") == null)
+            {
+                return error.ConfigResultPermissionsMissing;
+            }
+            const argv_scrub = std.mem.indexOf(u8, loader_source, "process.argv.splice(1)") orelse
+                return error.ConfigArgvScrubMissing;
+            const cottontail_argv_scrub = std.mem.indexOf(u8, loader_source, "cottontail.argv.splice(1)") orelse
+                return error.ConfigArgvScrubMissing;
+            for ([_][]const u8{
+                "Bun.argv",
+                "cottontail.args.splice(0)",
+                "process.execArgv.splice(0)",
+                "cottontail.execArgv.splice(0)",
+            }) |marker| {
+                if (std.mem.indexOf(u8, loader_source, marker) == null) {
+                    return error.ConfigArgvScrubMissing;
+                }
+            }
+            const config_import = std.mem.indexOf(u8, loader_source, "await import(") orelse
+                return error.ConfigDynamicImportMissing;
+            if (argv_scrub > config_import) return error.ConfigImportExposedPrivateArgv;
+            if (cottontail_argv_scrub > config_import) return error.ConfigImportExposedPrivateArgv;
+            const clear_call = std.mem.indexOf(u8, loader_source, "__hutchClearPrivateArgv();") orelse
+                return error.ConfigArgvScrubMissing;
+            if (clear_call > config_import) return error.ConfigImportExposedPrivateArgv;
             const result_path = try std.fs.path.join(init.arena.allocator(), &.{ loader_dir, result_marker });
             try std.Io.Dir.cwd().writeFile(init.io, .{
                 .sub_path = result_path,
@@ -148,11 +274,14 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
 
-        if (args.len >= 3 and std.mem.eql(u8, args[1], "--hutch-shell")) {
+        if (args.len >= 6 and
+            std.mem.eql(u8, args[1], "--hutch-shell-file") and
+            std.mem.eql(u8, args[3], "--hutch-private-root"))
+        {
             try expectConfiguredCwd(init);
-            try expectPrivateShellLauncher(init);
-            const command = args[2];
-            const appended = args[3..];
+            try expectPrivateShellTask(init, args[2], args[4]);
+            const command = args[5];
+            const appended = args[6..];
             if (std.mem.eql(u8, mode, "config-hutch-shell")) {
                 if (!std.mem.eql(u8, command, "hutch --version")) return error.UnexpectedShellCommand;
                 try expectArgs(appended, &.{});

@@ -550,6 +550,11 @@ pub fn main(init: std.process.Init) !void {
             "bang!value",
             "trail\\",
             "",
+            "--config",
+            "../../must-stay-an-argument",
+            "--conditions=hutch-shell-sentinel",
+            "--feature",
+            "hutch-shell-sentinel",
         },
     );
     try expectExit(shell_args_run.term, 0);
@@ -597,6 +602,60 @@ pub fn main(init: std.process.Init) !void {
         &.{"shell-fail"},
     );
     try expectExit(shell_fail_run.term, 37);
+
+    // Hutch-owned private files must stop Cottontail's ordinary nearest-bunfig
+    // walk inside their 0700 leaf. If either loader fell through to this
+    // attacker-controlled temp ancestor, its deliberately missing preload
+    // would abort before hutch.config.ts or the shell wrapper could run.
+    const hostile_temp_root = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}hutch-hostile-bunfig-{d}",
+        .{ temp_dir, std.fs.path.sep, std.Thread.getCurrentId() },
+    );
+    std.Io.Dir.cwd().deleteTree(init.io, hostile_temp_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, hostile_temp_root) catch {};
+    try std.Io.Dir.cwd().createDir(init.io, hostile_temp_root, if (builtin.os.tag == .windows)
+        .default_dir
+    else
+        @enumFromInt(0o700));
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ hostile_temp_root, "bunfig.toml" }),
+        .data = "preload = [\"./must-not-run.mjs\"]\n",
+    });
+    const hostile_temp_overrides = [_]EnvironmentOverride{
+        .{ .key = "TMPDIR", .value = hostile_temp_root },
+        .{ .key = "TEMP", .value = hostile_temp_root },
+        .{ .key = "HUTCH_TEST_EXPECTED_TASK_TMPDIR", .value = hostile_temp_root },
+        .{ .key = "HUTCH_TEST_EXPECTED_TASK_TEMP", .value = hostile_temp_root },
+    };
+    const hostile_config_run = try runConfigCommandWithOverrides(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        config_json,
+        &.{"run"},
+        &hostile_temp_overrides,
+    );
+    try expectExit(hostile_config_run.term, 0);
+    const hostile_shell_run = try runConfigCommandWithOverrides(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-bun-shell",
+        config_json,
+        &.{"bun-shell"},
+        &hostile_temp_overrides,
+    );
+    try expectExit(hostile_shell_run.term, 0);
 
     const pnpm_run = try runConfigCommand(
         init,
@@ -762,6 +821,8 @@ pub fn main(init: std.process.Init) !void {
     const poisoned_temp_overrides = [_]EnvironmentOverride{
         .{ .key = "TMPDIR", .value = poison_candidate },
         .{ .key = "TEMP", .value = hardened_project },
+        .{ .key = "HUTCH_TEST_EXPECTED_TASK_TMPDIR", .value = poison_candidate },
+        .{ .key = "HUTCH_TEST_EXPECTED_TASK_TEMP", .value = hardened_project },
     };
     const hardened_config = try runConfigCommandWithOverrides(
         init,

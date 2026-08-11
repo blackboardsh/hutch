@@ -222,16 +222,29 @@ fn makeConfigLoaderSource(
 
     try source.appendSlice(
         allocator,
-        "import { writeFileSync as __hutchWriteConfig } from \"node:fs\";\nimport * as configModule from ",
+        "import { chmodSync as __hutchChmodConfig, writeFileSync as __hutchWriteConfig } from \"node:fs\";\n" ++
+            "const __hutchClearPrivateArgv = () => {\n" ++
+            "  process.argv.splice(1);\n" ++
+            "  if (Array.isArray(Bun.argv) && Bun.argv !== process.argv) Bun.argv.splice(1);\n" ++
+            "  if (Array.isArray(cottontail.argv)) cottontail.argv.splice(1);\n" ++
+            "  if (Array.isArray(cottontail.args)) cottontail.args.splice(0);\n" ++
+            "  if (Array.isArray(process.execArgv)) process.execArgv.splice(0);\n" ++
+            "  if (Array.isArray(cottontail.execArgv)) cottontail.execArgv.splice(0);\n" ++
+            "};\n" ++
+            "__hutchClearPrivateArgv();\n" ++
+            "const configModule = await import(",
     );
     try appendJsStringLiteral(allocator, &source, config_path);
     try source.appendSlice(allocator,
-        \\;
+        \\);
         \\const loadedConfig = configModule.default ?? {};
         \\__hutchWriteConfig(
     );
     try appendJsStringLiteral(allocator, &source, result_path);
-    try source.appendSlice(allocator, ", JSON.stringify(loadedConfig));\n");
+    try source.appendSlice(allocator, ", JSON.stringify(loadedConfig), { mode: 0o600 });\n");
+    try source.appendSlice(allocator, "__hutchChmodConfig(");
+    try appendJsStringLiteral(allocator, &source, result_path);
+    try source.appendSlice(allocator, ", 0o600);\n");
 
     return try source.toOwnedSlice(allocator);
 }
@@ -250,6 +263,11 @@ const TrustedTempParent = struct {
     }
 };
 
+const PrivateTempLeaf = struct {
+    dir: std.Io.Dir,
+    inode: std.Io.File.INode,
+};
+
 const PrivateTempDirectory = struct {
     parent: std.Io.Dir,
     dir: std.Io.Dir,
@@ -262,28 +280,68 @@ const PrivateTempDirectory = struct {
         // remove only the original leaf entry, non-recursively: if another
         // same-user process replaced that entry, cleanup must never follow the
         // replacement into an unrelated tree.
-        var cleanup_pass: usize = 0;
-        while (cleanup_pass < 4) : (cleanup_pass += 1) {
-            var iterator = self.dir.iterate();
-            var found_entry = false;
-            while (iterator.next(io) catch null) |entry| {
-                found_entry = true;
-                self.dir.deleteTree(io, entry.name) catch {};
-            }
-            if (!found_entry) break;
-        }
-        self.dir.close(io);
-        const current = self.parent.statFile(io, self.name, .{
-            .follow_symlinks = false,
-        }) catch null;
-        if (current) |stat| {
-            if (stat.kind == .directory and stat.inode == self.inode) {
-                self.parent.deleteDir(io, self.name) catch {};
-            }
-        }
+        cleanupPrivateTempLeaf(io, self.parent, self.dir, self.name, self.inode);
         self.parent.close(io);
     }
 };
+
+fn deletePrivateDirectoryContents(io: std.Io, dir: std.Io.Dir) void {
+    var cleanup_pass: usize = 0;
+    while (cleanup_pass < 4) : (cleanup_pass += 1) {
+        var iterator = dir.iterate();
+        var found_entry = false;
+        while (iterator.next(io) catch null) |entry| {
+            found_entry = true;
+            dir.deleteTree(io, entry.name) catch {};
+        }
+        if (!found_entry) break;
+    }
+}
+
+fn cleanupPrivateTempLeaf(
+    io: std.Io,
+    parent: std.Io.Dir,
+    child: std.Io.Dir,
+    name: []const u8,
+    inode: std.Io.File.INode,
+) void {
+    deletePrivateDirectoryContents(io, child);
+    child.close(io);
+    deletePrivateTempLeafIfIdentity(io, parent, name, inode);
+}
+
+fn cleanupPrivateTempBeforeSignal(
+    io: std.Io,
+    term: std.process.Child.Term,
+    private: *PrivateTempDirectory,
+    private_live: *bool,
+) void {
+    switch (term) {
+        .signal => {
+            if (private_live.*) {
+                private.deinit(io);
+                private_live.* = false;
+            }
+        },
+        else => {},
+    }
+}
+
+fn deletePrivateTempLeafIfIdentity(
+    io: std.Io,
+    parent: std.Io.Dir,
+    name: []const u8,
+    inode: std.Io.File.INode,
+) void {
+    const current = parent.statFile(io, name, .{
+        .follow_symlinks = false,
+    }) catch null;
+    if (current) |stat| {
+        if (stat.kind == .directory and stat.inode == inode) {
+            parent.deleteDir(io, name) catch {};
+        }
+    }
+}
 
 const PosixDirectoryIdentity = struct {
     owner: u64,
@@ -460,28 +518,66 @@ fn createPrivateTempLeaf(
     io: std.Io,
     parent: std.Io.Dir,
     name: []const u8,
-) !std.Io.Dir {
+) !PrivateTempLeaf {
     const permissions: std.Io.Dir.Permissions = if (builtin.os.tag == .windows)
         .default_dir
     else
         @enumFromInt(0o700);
     try parent.createDir(io, name, permissions);
-    errdefer parent.deleteTree(io, name) catch {};
 
-    var child = try parent.openDir(io, name, .{
+    const created_stat = parent.statFile(io, name, .{
         .follow_symlinks = false,
-        .iterate = true,
-    });
-    errdefer child.close(io);
-    const stat = try child.stat(io);
-    if (stat.kind != .directory) return error.UnsafeTemporaryDirectory;
+    }) catch return error.TemporaryDirectoryMetadataUnavailable;
+    if (created_stat.kind != .directory) return error.UnsafeTemporaryDirectory;
     if (comptime builtin.os.tag != .windows) {
-        const identity = try posixDirectoryIdentity(child);
-        if (identity.owner != @as(u64, std.c.geteuid()) or identity.mode & 0o077 != 0) {
+        // mkdir honors the caller's umask. Force the protocol's exact private
+        // mode before opening the directory, then verify that the name still
+        // identifies the directory we created.
+        parent.setFilePermissions(io, name, @enumFromInt(0o700), .{
+            .follow_symlinks = false,
+        }) catch |err| {
+            deletePrivateTempLeafIfIdentity(io, parent, name, created_stat.inode);
+            return err;
+        };
+        const permission_stat = parent.statFile(io, name, .{
+            .follow_symlinks = false,
+        }) catch |err| {
+            deletePrivateTempLeafIfIdentity(io, parent, name, created_stat.inode);
+            return err;
+        };
+        if (permission_stat.kind != .directory or permission_stat.inode != created_stat.inode) {
             return error.UnsafeTemporaryDirectory;
         }
     }
-    return child;
+
+    var child = parent.openDir(io, name, .{
+        .follow_symlinks = false,
+        .iterate = true,
+    }) catch |err| {
+        // The newly created name may have been replaced before it could be
+        // opened. Only remove the exact empty directory identity we created.
+        deletePrivateTempLeafIfIdentity(io, parent, name, created_stat.inode);
+        return err;
+    };
+    const stat = child.stat(io) catch |err| {
+        child.close(io);
+        deletePrivateTempLeafIfIdentity(io, parent, name, created_stat.inode);
+        return err;
+    };
+    if (stat.inode != created_stat.inode) {
+        child.close(io);
+        return error.UnsafeTemporaryDirectory;
+    }
+    errdefer cleanupPrivateTempLeaf(io, parent, child, name, stat.inode);
+    if (stat.kind != .directory) return error.UnsafeTemporaryDirectory;
+    if (comptime builtin.os.tag != .windows) {
+        try child.setPermissions(io, @enumFromInt(0o700));
+        const identity = try posixDirectoryIdentity(child);
+        if (identity.owner != @as(u64, std.c.geteuid()) or identity.mode & 0o777 != 0o700) {
+            return error.UnsafeTemporaryDirectory;
+        }
+    }
+    return .{ .dir = child, .inode = stat.inode };
 }
 
 fn createPrivateTempDirectoryInParent(
@@ -503,17 +599,13 @@ fn createPrivateTempDirectoryInParent(
             error.PathAlreadyExists => continue,
             else => return err,
         };
-        errdefer {
-            child.close(init.io);
-            parent.dir.deleteTree(init.io, name) catch {};
-        }
-        const child_stat = try child.stat(init.io);
+        errdefer cleanupPrivateTempLeaf(init.io, parent.dir, child.dir, name, child.inode);
         return .{
             .parent = parent.dir,
-            .dir = child,
+            .dir = child.dir,
             .name = name,
             .path = path,
-            .inode = child_stat.inode,
+            .inode = child.inode,
         };
     }
     return error.TemporaryDirectoryCollision;
@@ -578,22 +670,28 @@ fn loadHutchConfig(
 ) !Config {
     const config_path = try findHutchConfig(init, allocator);
     var tmp_dir = try createPrivateTempDirectory(init, allocator, "hutch-config-loader-");
-    defer tmp_dir.deinit(init.io);
+    var tmp_dir_live = true;
+    defer if (tmp_dir_live) tmp_dir.deinit(init.io);
     const loader_path = try pathJoin(allocator, &.{ tmp_dir.path, "load.mjs" });
     const result_path = try pathJoin(allocator, &.{ tmp_dir.path, "config.json" });
     const loader_source = try makeConfigLoaderSource(allocator, config_path, result_path);
-    try tmp_dir.dir.writeFile(init.io, .{
-        .sub_path = "load.mjs",
-        .data = loader_source,
-    });
+    try writePrivateFileAtomic(init.io, tmp_dir.dir, "load.mjs", loader_source);
+    try writePrivateFileAtomic(init.io, tmp_dir.dir, hutch_private_bunfig_name, "");
 
     const execution = try std.process.run(allocator, init.io, .{
-        .argv = &[_][]const u8{ cottontail_path, loader_path },
+        .argv = &[_][]const u8{
+            cottontail_path,
+            "--hutch-config-file",
+            loader_path,
+            "--hutch-private-root",
+            tmp_dir.path,
+        },
         .create_no_window = true,
     });
     defer allocator.free(execution.stdout);
     defer allocator.free(execution.stderr);
 
+    cleanupPrivateTempBeforeSignal(init.io, execution.term, &tmp_dir, &tmp_dir_live);
     if (execution.stdout.len > 0) {
         var stdout_buffer: [2048]u8 = undefined;
         var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -661,17 +759,94 @@ fn configuredScriptEnvironment(
     return env;
 }
 
-fn createShellLauncherShim(
+const hutch_shell_wrapper_name = "hutch-shell-wrapper.mjs";
+const hutch_private_bunfig_name = "bunfig.toml";
+
+const hutch_shell_wrapper_source =
+    \\const [command, ...args] = process.argv.slice(2);
+    \\const clearPrivateArgv = () => {
+    \\  process.argv.splice(1);
+    \\  if (Array.isArray(Bun.argv) && Bun.argv !== process.argv) Bun.argv.splice(1);
+    \\  if (Array.isArray(cottontail.argv)) cottontail.argv.splice(1);
+    \\  if (Array.isArray(cottontail.args)) cottontail.args.splice(0);
+    \\  if (Array.isArray(process.execArgv)) process.execArgv.splice(0);
+    \\  if (Array.isArray(cottontail.execArgv)) cottontail.execArgv.splice(0);
+    \\};
+    \\clearPrivateArgv();
+    \\globalThis.__cottontailLoadDotenv?.();
+    \\const hadStandaloneFlags = Object.prototype.hasOwnProperty.call(globalThis, "__cottontailStandaloneFlags");
+    \\const previousStandaloneFlags = globalThis.__cottontailStandaloneFlags;
+    \\if (previousStandaloneFlags == null) globalThis.__cottontailStandaloneFlags = {};
+    \\try {
+    \\  await globalThis.__cottontailLoadStandaloneBunfig?.();
+    \\} finally {
+    \\  if (hadStandaloneFlags) globalThis.__cottontailStandaloneFlags = previousStandaloneFlags;
+    \\  else delete globalThis.__cottontailStandaloneFlags;
+    \\}
+    \\clearPrivateArgv();
+    \\const strings = [command];
+    \\for (let index = 0; index < args.length; index++) {
+    \\  strings[strings.length - 1] += " ";
+    \\  strings.push("");
+    \\}
+    \\strings.raw = strings;
+    \\const task = Bun.$(strings, ...args).nothrow();
+    \\task.options[Symbol.for("cottontail.internal.hutchShellTask")] = {
+    \\  input: () => Bun.stdin.stream(),
+    \\  passthrough: true,
+    \\};
+    \\const result = await task;
+    \\process.exitCode = result.exitCode;
+;
+
+fn writePrivateFileAtomic(
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    contents: []const u8,
+) !void {
+    const permissions: std.Io.Dir.Permissions = if (builtin.os.tag == .windows)
+        .default_file
+    else
+        @enumFromInt(0o600);
+    var atomic_file = try dir.createFileAtomic(io, name, .{
+        .permissions = permissions,
+        .replace = false,
+    });
+    defer atomic_file.deinit(io);
+    if (comptime builtin.os.tag != .windows) {
+        // File creation also honors umask; bind the exact mode to the already
+        // open descriptor before atomically publishing its name.
+        try atomic_file.file.setPermissions(io, @enumFromInt(0o600));
+    }
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = atomic_file.file.writer(io, &write_buffer);
+    try writer.interface.writeAll(contents);
+    try writer.interface.flush();
+    try atomic_file.file.sync(io);
+    try atomic_file.link(io);
+}
+
+fn createShellTaskDirectory(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-) !?PrivateTempDirectory {
-    const launcher = init.environ_map.get("HUTCH_LAUNCHER_PATH") orelse return null;
+) !PrivateTempDirectory {
+    var task_dir = try createPrivateTempDirectory(init, allocator, "hutch-shell-launcher-");
+    errdefer task_dir.deinit(init.io);
+
+    try writePrivateFileAtomic(
+        init.io,
+        task_dir.dir,
+        hutch_shell_wrapper_name,
+        hutch_shell_wrapper_source,
+    );
+    try writePrivateFileAtomic(init.io, task_dir.dir, hutch_private_bunfig_name, "");
+
+    const launcher = init.environ_map.get("HUTCH_LAUNCHER_PATH") orelse return task_dir;
     const stat = std.Io.Dir.cwd().statFile(init.io, launcher, .{}) catch
         return error.ConfiguredLauncherNotFound;
     if (stat.kind != .file) return error.ConfiguredLauncherIsNotAFile;
-
-    var shim_dir = try createPrivateTempDirectory(init, allocator, "hutch-shell-launcher-");
-    errdefer shim_dir.deinit(init.io);
 
     // String tasks resolve the literal command name `hutch`. A private PATH
     // entry containing the exact selected launcher preserves canary/custom
@@ -679,12 +854,17 @@ fn createShellLauncherShim(
     try std.Io.Dir.copyFile(
         std.Io.Dir.cwd(),
         launcher,
-        shim_dir.dir,
+        task_dir.dir,
         if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
         init.io,
         .{ .permissions = .executable_file },
     );
-    return shim_dir;
+    if (comptime builtin.os.tag != .windows) {
+        try task_dir.dir.setFilePermissions(init.io, "hutch", @enumFromInt(0o700), .{
+            .follow_symlinks = false,
+        });
+    }
+    return task_dir;
 }
 
 fn runCottontailShellScript(
@@ -694,20 +874,27 @@ fn runCottontailShellScript(
     script: []const u8,
     script_args: []const [:0]const u8,
 ) !u8 {
+    var task_dir = try createShellTaskDirectory(init, allocator);
+    var task_dir_live = true;
+    defer if (task_dir_live) task_dir.deinit(init.io);
+    const wrapper_path = try pathJoin(allocator, &.{ task_dir.path, hutch_shell_wrapper_name });
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ cottontail_path, "--hutch-shell", script });
+    try argv.appendSlice(allocator, &.{
+        cottontail_path,
+        "--hutch-shell-file",
+        wrapper_path,
+        "--hutch-private-root",
+        task_dir.path,
+        script,
+    });
     for (script_args) |arg| try argv.append(allocator, arg);
-
-    var launcher_shim = try createShellLauncherShim(init, allocator);
-    defer if (launcher_shim) |*directory| {
-        directory.deinit(init.io);
-    };
 
     var env = try configuredScriptEnvironment(
         init,
         allocator,
-        if (launcher_shim) |directory| directory.path else null,
+        if (init.environ_map.get("HUTCH_LAUNCHER_PATH") != null) task_dir.path else null,
     );
     defer env.deinit();
 
@@ -720,7 +907,10 @@ fn runCottontailShellScript(
     });
     defer child.kill(init.io);
 
-    return termExitCode(try child.wait(init.io));
+    const term = try child.wait(init.io);
+    task_dir.deinit(init.io);
+    task_dir_live = false;
+    return termExitCode(term);
 }
 
 fn runArgvScript(
@@ -1508,16 +1698,16 @@ test "private temp cleanup never follows a replaced leaf" {
     });
 
     const child = try createPrivateTempLeaf(std.testing.io, parent, "hutch-private-fixed");
-    try child.writeFile(std.testing.io, .{
+    try child.dir.writeFile(std.testing.io, .{
         .sub_path = "scratch.txt",
         .data = "temporary",
     });
     var private = PrivateTempDirectory{
         .parent = parent,
-        .dir = child,
+        .dir = child.dir,
         .name = "hutch-private-fixed",
         .path = "unused-in-test",
-        .inode = (try child.stat(std.testing.io)).inode,
+        .inode = child.inode,
     };
 
     try std.Io.Dir.rename(
@@ -1539,5 +1729,85 @@ test "private temp cleanup never follows a replaced leaf" {
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.access(std.testing.io, "anchor/moved-private/scratch.txt", .{}),
+    );
+}
+
+test "private temp error cleanup preserves an empty replacement leaf" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "created", @enumFromInt(0o700));
+    const created = try tmp.dir.statFile(std.testing.io, "created", .{
+        .follow_symlinks = false,
+    });
+    try tmp.dir.rename("created", tmp.dir, "moved-created", std.testing.io);
+    try tmp.dir.createDir(std.testing.io, "created", @enumFromInt(0o700));
+
+    deletePrivateTempLeafIfIdentity(std.testing.io, tmp.dir, "created", created.inode);
+
+    const replacement = try tmp.dir.statFile(std.testing.io, "created", .{
+        .follow_symlinks = false,
+    });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, replacement.kind);
+}
+
+test "private temp modes are exact under a restrictive umask" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const previous_umask = std.c.umask(0o777);
+    defer _ = std.c.umask(previous_umask);
+
+    const child = try createPrivateTempLeaf(std.testing.io, tmp.dir, "private");
+    defer cleanupPrivateTempLeaf(
+        std.testing.io,
+        tmp.dir,
+        child.dir,
+        "private",
+        child.inode,
+    );
+    const identity = try posixDirectoryIdentity(child.dir);
+    try std.testing.expectEqual(@as(u32, 0o700), identity.mode & 0o777);
+
+    try writePrivateFileAtomic(std.testing.io, child.dir, "private.mjs", "");
+    const private_file = try child.dir.statFile(std.testing.io, "private.mjs", .{
+        .follow_symlinks = false,
+    });
+    try std.testing.expectEqual(@as(u32, 0o600), private_file.permissions.toMode() & 0o777);
+}
+
+test "private temp is cleaned before child signal propagation" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "anchor", @enumFromInt(0o700));
+    const parent = try tmp.dir.openDir(std.testing.io, "anchor", .{
+        .follow_symlinks = false,
+        .iterate = true,
+    });
+    const child = try createPrivateTempLeaf(std.testing.io, parent, "private");
+    var private = PrivateTempDirectory{
+        .parent = parent,
+        .dir = child.dir,
+        .name = "private",
+        .path = "unused-in-test",
+        .inode = child.inode,
+    };
+    var private_live = true;
+
+    cleanupPrivateTempBeforeSignal(
+        std.testing.io,
+        .{ .signal = std.posix.SIG.TERM },
+        &private,
+        &private_live,
+    );
+
+    try std.testing.expect(!private_live);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(std.testing.io, "anchor/private", .{}),
     );
 }
