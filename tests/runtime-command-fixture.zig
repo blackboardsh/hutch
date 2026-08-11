@@ -52,6 +52,11 @@ pub fn main(init: std.process.Init) !void {
             if (!std.mem.startsWith(u8, executable, "pnpm")) return error.UnexpectedConfigCommand;
             return expectArgs(args[1..], &.{ "run", "dev", "--filter", "app one" });
         }
+        if (std.mem.eql(u8, mode, "config-hutch")) {
+            try expectArgs(args[1..], &.{"--version"});
+            try std.Io.File.stdout().writeStreamingAll(init.io, "0.0.0-test\n");
+            return;
+        }
         if (std.mem.eql(u8, mode, "config-list")) return error.UnexpectedConfigCommand;
         return error.UnknownFixtureMode;
     }

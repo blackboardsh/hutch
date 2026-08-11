@@ -706,12 +706,22 @@ fn runArgvScript(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    for (script_argv.items) |arg| {
+    for (script_argv.items, 0..) |arg, index| {
         if (arg != .string) {
             try stderr.writeAll("hutch: script argv entries must be strings\n");
             return 1;
         }
-        try argv.append(allocator, arg.string);
+        if (index == 0 and std.mem.eql(u8, arg.string, "hutch")) {
+            // Child environment PATH changes do not participate in argv[0]
+            // lookup. Resolve recursive Hutch tasks to the sibling launcher
+            // explicitly so project pins keep applying across task boundaries.
+            const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+            const launcher_name = if (builtin.os.tag == .windows) "hutch.exe" else "hutch";
+            const launcher = try pathJoin(allocator, &.{ exe_dir, launcher_name });
+            try argv.append(allocator, if (pathExists(init.io, launcher)) launcher else arg.string);
+        } else {
+            try argv.append(allocator, arg.string);
+        }
     }
     for (script_args) |arg| try argv.append(allocator, arg);
 

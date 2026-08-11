@@ -87,13 +87,9 @@ fn runConfigCommand(
     try environment.put("CI", "1");
 
     const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
-    const existing_path = environment.get(path_key) orelse environment.get("PATH") orelse "";
-    const path = try std.fmt.allocPrint(
-        allocator,
-        "{s}{c}{s}",
-        .{ fake_bin_dir, std.fs.path.delimiter, existing_path },
-    );
-    try environment.put(path_key, path);
+    // Deliberately exclude the installed Hutch path. Recursive `hutch` argv
+    // must resolve to the sibling launcher selected by the current engine.
+    try environment.put(path_key, fake_bin_dir);
 
     const result = try std.process.run(allocator, init.io, .{
         .argv = argv.items,
@@ -232,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const config_json =
-        \\{"scripts":{"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"]}}
+        \\{"scripts":{"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"]}}
     ;
     const listed = try runConfigCommand(
         init,
@@ -249,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
     try expectExit(listed.term, 0);
     try expectContains(listed.stdout, "npm-install\n");
     try expectContains(listed.stdout, "pnpm-dev\n");
+    try expectContains(listed.stdout, "hutch-version\n");
 
     const npm_run = try runConfigCommand(
         init,
@@ -277,6 +274,21 @@ pub fn main(init: std.process.Init) !void {
         &.{ "run", "pnpm-dev", "--filter", "app one" },
     );
     try expectExit(pnpm_run.term, 0);
+
+    const hutch_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-hutch",
+        config_json,
+        &.{"hutch-version"},
+    );
+    try expectExit(hutch_run.term, 0);
+    try expectContains(hutch_run.stdout, "0.0.0-test\n");
 
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
