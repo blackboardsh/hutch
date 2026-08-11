@@ -4547,6 +4547,20 @@ fn validateSafeOutputSegment(value: []const u8) !void {
     for (value) |byte| {
         if (byte == 0 or byte == '/' or byte == '\\' or byte == ':') return error.UnsafeOutputPath;
     }
+    if (isWindowsDeviceOutputSegment(value)) return error.UnsafeOutputPath;
+}
+
+fn isWindowsDeviceOutputSegment(value: []const u8) bool {
+    const extension = std.mem.indexOfScalar(u8, value, '.') orelse value.len;
+    const base = std.mem.trimEnd(u8, value[0..extension], " .");
+    inline for (.{ "CON", "PRN", "AUX", "NUL" }) |reserved| {
+        if (std.ascii.eqlIgnoreCase(base, reserved)) return true;
+    }
+    if (base.len == 4 and base[3] >= '1' and base[3] <= '9') {
+        return std.ascii.eqlIgnoreCase(base[0..3], "COM") or
+            std.ascii.eqlIgnoreCase(base[0..3], "LPT");
+    }
+    return false;
 }
 
 fn validateSafeRelativeOutputPath(value: []const u8) !void {
@@ -4752,6 +4766,17 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
 
     for ([_][]const u8{ "", ".", "..", ". ", ".. ", "a/../b", "a\\..\\b", "/tmp/out", "C:\\out", "C:out", "safe/file:stream" }) |path| {
         try std.testing.expectError(error.UnsafeOutputPath, validateSafeRelativeOutputPath(path));
+    }
+
+    for ([_][]const u8{
+        "CON",              "con.txt",  "PrN.tar.gz", "aux",      "NUL.json",
+        "COM1",             "com9.log", "LPT1",       "lPt9.txt", "nested/CON.txt",
+        "nested\\LPT2.log",
+    }) |path| {
+        try std.testing.expectError(error.UnsafeOutputPath, validateSafeRelativeOutputPath(path));
+    }
+    for ([_][]const u8{ "console", "conifer.txt", "COM0", "COM10", "LPT0", "LPT10" }) |path| {
+        try validateSafeRelativeOutputPath(path);
     }
 }
 
