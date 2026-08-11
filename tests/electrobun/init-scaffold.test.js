@@ -313,6 +313,7 @@ export default {
     assert.equal(existsSync(join(workspace, "skipped-app", ".configured-install-ran")), false);
     assert.ok(existsSync(join(workspace, "skipped-app", ".hutch", "devkit", "projection.json")));
 
+    const requestsBeforeEnvironmentOffline = { ...requestCounts };
     const cached = await run(
       hutch,
       [
@@ -320,15 +321,47 @@ export default {
         "init",
         "cached-app",
         "--template=hello-world",
+      ],
+      { cwd: workspace, env: { ...env, DASH_RELEASE_OFFLINE: "1" } },
+    );
+    assert.equal(cached.status, 0, cached.stderr || cached.stdout);
+    assert.ok(existsSync(join(workspace, "cached-app", ".hutch", "devkit", "projection.json")));
+    assert.match(cached.stdout, /Running hutch\.config\.ts install task if configured/);
+    assert.doesNotMatch(cached.stdout, /Skipped configured install task/);
+    assert.doesNotMatch(cached.stdout, /hutch run --if-configured install/);
+    assert.equal(
+      readFileSync(join(workspace, "cached-app", ".configured-install-ran"), "utf8"),
+      join(realpathSync(workspace), "cached-app"),
+    );
+    assert.deepEqual(
+      requestCounts,
+      requestsBeforeEnvironmentOffline,
+      "DASH_RELEASE_OFFLINE must prevent Dash-managed HTTP without suppressing install",
+    );
+
+    const requestsBeforeCliOffline = { ...requestCounts };
+    const cliOffline = await run(
+      hutch,
+      [
+        "electrobun",
+        "init",
+        "cli-offline-app",
+        "--template=hello-world",
         "--offline",
       ],
       { cwd: workspace, env },
     );
-    assert.equal(cached.status, 0, cached.stderr || cached.stdout);
-    assert.ok(existsSync(join(workspace, "cached-app", ".hutch", "devkit", "projection.json")));
-    assert.match(cached.stdout, /Skipped configured install task in offline mode\./);
-    assert.match(cached.stdout, /hutch run --if-configured install/);
-    assert.equal(existsSync(join(workspace, "cached-app", ".configured-install-ran")), false);
+    assert.equal(cliOffline.status, 0, cliOffline.stderr || cliOffline.stdout);
+    assert.match(cliOffline.stdout, /Running hutch\.config\.ts install task if configured/);
+    assert.equal(
+      readFileSync(join(workspace, "cli-offline-app", ".configured-install-ran"), "utf8"),
+      join(realpathSync(workspace), "cli-offline-app"),
+    );
+    assert.deepEqual(
+      requestCounts,
+      requestsBeforeCliOffline,
+      "--offline must prevent Dash-managed HTTP without suppressing install",
+    );
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
     rmSync(fixture, { recursive: true, force: true });

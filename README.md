@@ -154,9 +154,12 @@ Run `hutch electrobun init` to choose a release template interactively, then
 accept or replace its suggested project name. The chosen name controls the
 created directory and the printed next steps. After preparing the project,
 init runs its `install` task from `hutch.config.ts` when one is configured.
-Pass `--skip-install` to leave that step to another orchestrator; `--offline`
-also skips it so init cannot unexpectedly invoke a network-capable installer.
-Both modes print `hutch run --if-configured install` as the explicit next step.
+Pass `--skip-install` to leave that step to another orchestrator. `--offline`
+and `DASH_RELEASE_OFFLINE=1` only disable network access for Dash-managed
+catalogs, templates, product artifacts, SDKs, runtimes, and toolchains; they do
+not suppress the configured external install task or govern its network access.
+Only `--skip-install` prints `hutch run --if-configured install` as the explicit
+next step.
 The thin Electrobun npm package
 delegates `npx electrobun init` and `bunx electrobun init` to
 `hutch electrobun init`, installing the matching Hutch channel when needed.

@@ -277,7 +277,8 @@ fn printHelp(writer: anytype) !void {
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
-        \\  - init runs the template's configured install task when present; --skip-install and --offline skip it.
+        \\  - --offline and DASH_RELEASE_OFFLINE require cached Dash-managed assets; they do not suppress external install tasks.
+        \\  - init runs the template's configured install task when present; pass --skip-install to suppress it.
         \\  - Main-process inspection supports Bun and Cottontail only.
         \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
         \\  - runtime.mainProcessInspector accepts { mode: "inspect" | "inspect-wait" | "inspect-brk", address?: string }.
@@ -2482,7 +2483,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     var template_name: ?[]const u8 = null;
     var project_name: ?[]const u8 = null;
     var channel = try electrobun_templates.activeChannel(ctx.environ_map);
-    var offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE");
+    var asset_offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE");
     var skip_install = false;
 
     for (args) |arg| {
@@ -2493,7 +2494,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         } else if (std.mem.startsWith(u8, arg, "--channel=")) {
             channel = try electrobun_templates.parseChannel(arg["--channel=".len..]);
         } else if (std.mem.eql(u8, arg, "--offline")) {
-            offline = true;
+            asset_offline = true;
         } else if (std.mem.eql(u8, arg, "--skip-install")) {
             skip_install = true;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
@@ -2509,7 +2510,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         ctx.init,
         ctx.allocator,
         channel,
-        .{ .offline = offline },
+        .{ .offline = asset_offline },
     ) catch |err| {
         if (err == error.TemplateCatalogUnavailable and channel == .stable) {
             ctx.writeStderr(
@@ -2581,22 +2582,18 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         ctx.allocator,
         template,
         project_dir,
-        .{ .offline = offline },
+        .{ .offline = asset_offline },
     );
     ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
-    try prepareInstalledProject(ctx, project_dir);
-    if (!skip_install and !offline) {
+    try prepareInstalledProject(ctx, project_dir, asset_offline);
+    if (!skip_install) {
         ctx.writeStdout("Running hutch.config.ts install task if configured...\n", .{});
         try runOptionalConfiguredTask(ctx, project_dir, "install");
     } else {
-        if (offline) {
-            ctx.writeStdout("Skipped configured install task in offline mode.\n", .{});
-        } else {
-            ctx.writeStdout("Skipped configured install task (--skip-install).\n", .{});
-        }
+        ctx.writeStdout("Skipped configured install task (--skip-install).\n", .{});
     }
     ctx.writeStdout("Created Electrobun project at {s}\n", .{project_dir});
-    if (!skip_install and !offline) {
+    if (!skip_install) {
         ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
     } else {
         ctx.writeStdout(
@@ -2624,13 +2621,22 @@ fn runOptionalConfiguredTask(
     if (termExitCode(try child.wait(ctx.io)) != 0) return error.ConfiguredInstallTaskFailed;
 }
 
-fn prepareInstalledProject(ctx: *const Context, project_dir: []const u8) !void {
+fn prepareInstalledProject(
+    ctx: *const Context,
+    project_dir: []const u8,
+    asset_offline: bool,
+) !void {
     const absolute_project = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, project_dir, ctx.allocator);
+    var asset_environment = try ctx.environ_map.clone(ctx.allocator);
+    defer asset_environment.deinit();
+    if (asset_offline) try asset_environment.put("DASH_RELEASE_OFFLINE", "1");
+    var child_init = ctx.init;
+    child_init.environ_map = &asset_environment;
     const child_ctx = Context{
-        .init = ctx.init,
+        .init = child_init,
         .io = ctx.io,
         .allocator = ctx.allocator,
-        .environ_map = ctx.environ_map,
+        .environ_map = &asset_environment,
         .self_exe_path = ctx.self_exe_path,
         .cottontail_home = ctx.cottontail_home,
         .cottontail_binary = ctx.cottontail_binary,
