@@ -70,13 +70,7 @@ pub fn resolveVersion(
     }
 
     const home = try release_store.dashHome(init, allocator);
-    const root = try std.fs.path.join(allocator, &.{
-        home,
-        "toolchains",
-        kind.name(),
-        version,
-        try platformKey(),
-    });
+    const root = try cacheRoot(allocator, home, kind, version);
     const binary = try cachedBinaryPath(allocator, root, kind);
     if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
@@ -441,7 +435,7 @@ fn makeExecutable(io: std.Io, path: []const u8) !void {
     try file.setPermissions(io, .executable_file);
 }
 
-fn validateVersion(kind: Kind, version: []const u8) !void {
+pub fn validateVersion(kind: Kind, version: []const u8) !void {
     if (version.len == 0 or version.len > 128 or
         std.mem.eql(u8, version, ".") or std.mem.eql(u8, version, ".."))
     {
@@ -468,6 +462,22 @@ fn validateExactOdinVersion(version: []const u8) !void {
     const month = std.fmt.parseInt(u8, version[9..11], 10) catch return error.InvalidToolchainVersion;
     if (month < 1 or month > 12) return error.InvalidToolchainVersion;
     if (version.len == 12 and !std.ascii.isLower(version[11])) return error.InvalidToolchainVersion;
+}
+
+fn cacheRoot(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    kind: Kind,
+    version: []const u8,
+) ![]const u8 {
+    try validateVersion(kind, version);
+    return std.fs.path.join(allocator, &.{
+        home,
+        "toolchains",
+        kind.name(),
+        version,
+        try platformKey(),
+    });
 }
 
 fn platformKey() ![]const u8 {
@@ -560,4 +570,21 @@ test "zig archive naming flips at 0.14.1" {
     try std.testing.expect(std.mem.startsWith(u8, modern, modern_prefix));
     try std.testing.expect(!std.mem.startsWith(u8, legacy, modern_prefix) or
         builtin.os.tag == .windows);
+}
+
+test "toolchain versions resolve to isolated cache roots without downloading" {
+    const first = try cacheRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.14.1");
+    defer std.testing.allocator.free(first);
+    const second = try cacheRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.15.2");
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, first, "0.14.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "0.15.2") != null);
+}
+
+test "toolchain versions reject unsafe path components" {
+    for ([_][]const u8{ "", ".", "..", "0.16.0/../../escape", "0.16.0\\escape" }) |version| {
+        try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.zig, version));
+    }
 }

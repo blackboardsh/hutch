@@ -25,9 +25,7 @@ const defaultConfig = {
     cottontail: {
       entrypoint: "src/bun/index.ts",
     },
-    zig: {
-      entrypoint: "src/zig/main.zig",
-    },
+    zig: {},
     rust: {
       entrypoint: "src/rust/main.rs",
     },

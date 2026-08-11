@@ -541,8 +541,14 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 }
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
+    const main_process = getMainProcess(config.root);
+    if (main_process == .zig) {
+        try validateProjectZigConfig(ctx, config.root);
+        _ = try requireProjectZigBuildFile(ctx);
+    }
+
     const platform_paths = try getPlatformPaths(ctx, config.root);
-    switch (getMainProcess(config.root)) {
+    switch (main_process) {
         .zig => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig),
         .rust => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust),
         .go => {
@@ -2427,62 +2433,29 @@ test "Linux Zig main target selects the GNU ABI" {
     }
 }
 
-fn appendZigStringLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    try out.append(allocator, '"');
-    for (value) |char| {
-        switch (char) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, char),
-        }
-    }
-    try out.append(allocator, '"');
+fn projectZigBuildFilePath(allocator: std.mem.Allocator, project_root: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ project_root, "build.zig" });
 }
 
-fn writeZigMainBuildScript(ctx: *const Context, build_script_path: []const u8, relative_sdk_path: []const u8, relative_entrypoint_path: []const u8) !void {
-    var source: std.ArrayList(u8) = .empty;
-    defer source.deinit(ctx.allocator);
+fn requireProjectZigBuildFile(ctx: *const Context) ![]const u8 {
+    const path = try projectZigBuildFilePath(ctx.allocator, ctx.project_root);
+    if (pathExists(ctx.io, path)) return path;
+    ctx.writeStderr(
+        "hutch electrobun: Zig projects require a project-owned build.zig at {s}; Hutch does not generate project build files\n",
+        .{path},
+    );
+    return error.ZigBuildFileNotFound;
+}
 
-    try source.appendSlice(ctx.allocator,
-        \\const std = @import("std");
-        \\
-        \\pub fn build(b: *std.Build) void {
-        \\    const target = b.standardTargetOptions(.{});
-        \\    const optimize = b.standardOptimizeOption(.{});
-        \\
-        \\    const electrobun = b.createModule(.{
-        \\        .root_source_file = b.path(
+fn validateProjectZigConfig(ctx: *const Context, root: std.json.Value) !void {
+    const build = getObjectField(root, "build") orelse return;
+    const zig = getObjectFieldFromObject(build, "zig") orelse return;
+    if (zig.get("entrypoint") == null) return;
+    ctx.writeStderr(
+        "hutch electrobun: build.zig.entrypoint was removed; declare the Zig source graph in the project-owned root build.zig\n",
+        .{},
     );
-    try appendZigStringLiteral(ctx.allocator, &source, relative_sdk_path);
-    try source.appendSlice(ctx.allocator,
-        \\),
-        \\    });
-        \\
-        \\    const exe = b.addExecutable(.{
-        \\        .name = "main",
-        \\        .root_source_file = b.path(
-    );
-    try appendZigStringLiteral(ctx.allocator, &source, relative_entrypoint_path);
-    try source.appendSlice(ctx.allocator,
-        \\),
-        \\        .target = target,
-        \\        .optimize = optimize,
-        \\    });
-        \\
-        \\    exe.root_module.addImport("electrobun", electrobun);
-        \\    exe.linkLibC();
-        \\    b.installArtifact(exe);
-        \\}
-        \\
-    );
-
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = build_script_path,
-        .data = source.items,
-    });
+    return error.ZigEntrypointConfigRemoved;
 }
 
 fn resolveBuildToolchain(
@@ -2518,48 +2491,93 @@ fn configuredToolchainVersion(
     kind: toolchain_store.Kind,
     default_version: []const u8,
 ) ![]const u8 {
-    const build = getObjectField(root, "build") orelse return default_version;
-    const language_value = build.get(kind.name()) orelse return default_version;
-    if (language_value != .object) return error.InvalidConfig;
-    const version_value = language_value.object.get("version") orelse return default_version;
-    if (version_value != .string or version_value.string.len == 0) return error.InvalidConfig;
-    return version_value.string;
+    var version = default_version;
+    if (getObjectField(root, "build")) |build| {
+        if (build.get(kind.name())) |language_value| {
+            if (language_value != .object) return error.InvalidConfig;
+            if (language_value.object.get("version")) |version_value| {
+                if (version_value != .string or version_value.string.len == 0) return error.InvalidConfig;
+                version = version_value.string;
+            }
+        }
+    }
+    try toolchain_store.validateVersion(kind, version);
+    return version;
+}
+
+fn appendProjectZigBuildArguments(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    zig_binary: []const u8,
+    build_script_path: []const u8,
+    install_prefix: []const u8,
+    cache_dir: []const u8,
+    zig_sdk_path: []const u8,
+    build_env: BuildEnvironment,
+) !void {
+    try argv.append(allocator, zig_binary);
+    try argv.append(allocator, "build");
+    try argv.append(allocator, "install");
+    try argv.append(allocator, "--build-file");
+    try argv.append(allocator, build_script_path);
+    try argv.append(allocator, "--prefix");
+    try argv.append(allocator, install_prefix);
+    try argv.append(allocator, "--cache-dir");
+    try argv.append(allocator, cache_dir);
+    try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{zigTargetName()}));
+    if (builtin.os.tag == .windows) try argv.append(allocator, "-Dcpu=baseline");
+    try argv.append(allocator, if (build_env == .dev) "-Doptimize=Debug" else "-Doptimize=ReleaseSmall");
+    try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Delectrobun-sdk={s}", .{zig_sdk_path}));
+}
+
+fn prepareZigBuildEnvironment(ctx: *const Context, env_map: *std.process.Environ.Map) !void {
+    try inheritCurrentEnvironmentFromContext(ctx, env_map);
+    for ([_][]const u8{
+        "ZIG_LIB_DIR",
+        "ZIG_LOCAL_CACHE_DIR",
+        "ZIG_GLOBAL_CACHE_DIR",
+        "ZIG_BUILD_RUNNER",
+    }) |name| {
+        _ = env_map.swapRemove(name);
+    }
 }
 
 fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const zig_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
-    const zig_binary = zig_toolchain.binary;
+    const build_script_path = try requireProjectZigBuildFile(ctx);
 
     const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
     const zig_sdk_path = projection.zig_entrypoint;
     if (!pathExists(ctx.io, zig_sdk_path)) return error.ZigSdkNotFound;
 
-    const entrypoint = try resolveMainEntrypoint(ctx, config.root, .zig);
-    if (!pathExists(ctx.io, entrypoint)) return error.ZigEntrypointNotFound;
+    const zig_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+    const zig_binary = zig_toolchain.binary;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
     try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
-
-    const relative_sdk_path = try std.fs.path.relative(ctx.allocator, ctx.project_root, ctx.environ_map, temp_build_dir, zig_sdk_path);
-    const relative_entrypoint_path = try std.fs.path.relative(ctx.allocator, ctx.project_root, ctx.environ_map, temp_build_dir, entrypoint);
-    const build_script_path = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "build.zig" });
-    try writeZigMainBuildScript(ctx, build_script_path, relative_sdk_path, relative_entrypoint_path);
+    const install_prefix = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "install" });
+    const cache_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "cache" });
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
-    try argv.append(ctx.allocator, zig_binary);
-    try argv.append(ctx.allocator, "build");
-    try argv.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "-Dtarget={s}", .{zigTargetName()}));
-    if (builtin.os.tag == .windows) {
-        try argv.append(ctx.allocator, "-Dcpu=baseline");
-    }
-    if (config.build_env != .dev) {
-        try argv.append(ctx.allocator, "-Doptimize=ReleaseSmall");
-    }
+    try appendProjectZigBuildArguments(
+        ctx.allocator,
+        &argv,
+        zig_binary,
+        build_script_path,
+        install_prefix,
+        cache_dir,
+        zig_sdk_path,
+        config.build_env,
+    );
+
+    var env_map = std.process.Environ.Map.init(ctx.allocator);
+    defer env_map.deinit();
+    try prepareZigBuildEnvironment(ctx, &env_map);
 
     const result = try std.process.run(ctx.allocator, ctx.io, .{
         .argv = argv.items,
-        .cwd = .{ .path = temp_build_dir },
+        .cwd = .{ .path = ctx.project_root },
+        .environ_map = &env_map,
         .create_no_window = true,
     });
     defer ctx.allocator.free(result.stdout);
@@ -2571,9 +2589,9 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
         return error.ZigBuildFailed;
     }
 
-    const zig_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "zig-out", "bin", executableFileName("main") });
-    if (!pathExists(ctx.io, zig_out_bin)) return error.ZigMainBinaryNotFound;
-    return zig_out_bin;
+    const installed_binary = try std.fs.path.join(ctx.allocator, &.{ install_prefix, "bin", executableFileName("main") });
+    if (!pathExists(ctx.io, installed_binary)) return error.ZigMainBinaryNotFound;
+    return installed_binary;
 }
 
 fn rustTargetName() []const u8 {
@@ -3953,12 +3971,7 @@ fn resolveMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process
             }
             break :blk "src/bun/index.ts";
         },
-        .zig => blk: {
-            if (getObjectFieldFromObject(build, "zig")) |object| {
-                if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
-            }
-            break :blk "src/zig/main.zig";
-        },
+        .zig => return error.ZigUsesProjectBuildFile,
         .rust => blk: {
             if (getObjectFieldFromObject(build, "rust")) |object| {
                 if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
@@ -4140,7 +4153,12 @@ fn collectWatchRoots(ctx: *const Context, root: std.json.Value) !std.ArrayList([
     const build = getObjectField(root, "build") orelse return roots;
 
     const main_process = getMainProcess(root);
-    if (main_process == .go) {
+    if (main_process == .zig) {
+        try appendWatchRoot(ctx, &roots, try projectZigBuildFilePath(ctx.allocator, ctx.project_root));
+        const zon_path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "build.zig.zon" });
+        if (pathExists(ctx.io, zon_path)) try appendWatchRoot(ctx, &roots, zon_path);
+        try appendWatchRoot(ctx, &roots, try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "src" }));
+    } else if (main_process == .go) {
         const main_package = try configuredGoPackage(root);
         try appendWatchRoot(
             ctx,
@@ -4151,7 +4169,7 @@ fn collectWatchRoots(ctx: *const Context, root: std.json.Value) !std.ArrayList([
             const path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, module_file });
             if (pathExists(ctx.io, path)) try appendWatchRoot(ctx, &roots, path);
         }
-    } else if (main_process != .zig) {
+    } else {
         const main_entry = try resolveMainEntrypoint(ctx, root, main_process);
         try appendWatchRoot(ctx, &roots, dirnameOrSelf(main_entry));
     }
@@ -5072,6 +5090,7 @@ test "preload scripts are resources rather than code-directory files" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5157,6 +5176,7 @@ test "bundled CEF layouts match the native wrapper contract" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5285,6 +5305,7 @@ test "bundled runtime metadata carries CEF debugging policy inputs" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = std.testing.io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5429,6 +5450,210 @@ test "native Electrobun main process names are recognized" {
     }
 }
 
+test "Zig toolchain versions use the devkit default or exact project overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const default_config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"zig":{}}}
+    ,
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "0.16.0",
+        try configuredToolchainVersion(default_config, .zig, "0.16.0"),
+    );
+
+    inline for (.{ "0.14.1", "0.15.2" }) |override| {
+        const source = try std.fmt.allocPrint(
+            allocator,
+            \\{{"build":{{"zig":{{"version":"{s}"}}}}}}
+        ,
+            .{override},
+        );
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{});
+        try std.testing.expectEqualStrings(
+            override,
+            try configuredToolchainVersion(config, .zig, "0.16.0"),
+        );
+    }
+
+    inline for (.{ ".", "..", "latest", "0.16" }) |invalid| {
+        const source = try std.fmt.allocPrint(
+            allocator,
+            \\{{"build":{{"zig":{{"version":"{s}"}}}}}}
+        ,
+            .{invalid},
+        );
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{});
+        try std.testing.expectError(
+            error.InvalidToolchainVersion,
+            configuredToolchainVersion(config, .zig, "0.16.0"),
+        );
+    }
+
+    try std.testing.expectEqualStrings(
+        "dev-2026-07a",
+        try configuredToolchainVersion(default_config, .odin, "dev-2026-07a"),
+    );
+}
+
+test "legacy Zig entrypoint configuration is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "hutch",
+        .cottontail_home = "/cottontail",
+        .cottontail_binary = "/cottontail/bin/cottontail",
+        .project_root = "/project",
+    };
+    const config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"zig","zig":{"entrypoint":"src/zig/main.zig"}}}
+    ,
+        .{},
+    );
+
+    try std.testing.expectError(
+        error.ZigEntrypointConfigRemoved,
+        validateProjectZigConfig(&ctx, config),
+    );
+}
+
+test "Zig watch roots follow the project build contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "hutch",
+        .cottontail_home = "/cottontail",
+        .cottontail_binary = "/cottontail/bin/cottontail",
+        .project_root = "/project",
+    };
+    const config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"zig","zig":{"version":"0.16.0"},"watch":["native/watch.marker"]}}
+    ,
+        .{},
+    );
+
+    var roots = try collectWatchRoots(&ctx, config);
+    defer roots.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), roots.items.len);
+    try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ "/project", "build.zig" }), roots.items[0]);
+    try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ "/project", "src" }), roots.items[1]);
+    try std.testing.expectEqualStrings(try std.fs.path.join(allocator, &.{ "/project", "native" }), roots.items[2]);
+}
+
+test "Zig builds invoke the project build file with the projected SDK contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+
+    try appendProjectZigBuildArguments(
+        allocator,
+        &argv,
+        "/toolchains/zig/0.16.0/zig",
+        "/project/build.zig",
+        "/project/build/private/install",
+        "/project/build/private/cache",
+        "/project/.hutch/devkit/zig-sdk/electrobun.zig",
+        .dev,
+    );
+
+    const optimize_index: usize = if (builtin.os.tag == .windows) 11 else 10;
+    try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .windows) 13 else 12), argv.items.len);
+    try std.testing.expectEqualStrings("/toolchains/zig/0.16.0/zig", argv.items[0]);
+    try std.testing.expectEqualStrings("build", argv.items[1]);
+    try std.testing.expectEqualStrings("install", argv.items[2]);
+    try std.testing.expectEqualStrings("--build-file", argv.items[3]);
+    try std.testing.expectEqualStrings("/project/build.zig", argv.items[4]);
+    try std.testing.expectEqualStrings("--prefix", argv.items[5]);
+    try std.testing.expectEqualStrings("/project/build/private/install", argv.items[6]);
+    try std.testing.expectEqualStrings("--cache-dir", argv.items[7]);
+    try std.testing.expectEqualStrings("/project/build/private/cache", argv.items[8]);
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{zigTargetName()}),
+        argv.items[9],
+    );
+    if (builtin.os.tag == .windows) try std.testing.expectEqualStrings("-Dcpu=baseline", argv.items[10]);
+    try std.testing.expectEqualStrings("-Doptimize=Debug", argv.items[optimize_index]);
+    try std.testing.expectEqualStrings(
+        "-Delectrobun-sdk=/project/.hutch/devkit/zig-sdk/electrobun.zig",
+        argv.items[optimize_index + 1],
+    );
+
+    argv.clearRetainingCapacity();
+    try appendProjectZigBuildArguments(
+        allocator,
+        &argv,
+        "zig",
+        "/project/build.zig",
+        "/install",
+        "/cache",
+        "/sdk/electrobun.zig",
+        .production,
+    );
+    try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", argv.items[optimize_index]);
+}
+
+test "Zig builds scrub environment overrides that can replace the resolved compiler contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var source = std.process.Environ.Map.init(allocator);
+    defer source.deinit();
+    try source.put("PATH", "/tools");
+    try source.put("ZIG_LIB_DIR", "/wrong/lib");
+    try source.put("ZIG_LOCAL_CACHE_DIR", "/wrong/local-cache");
+    try source.put("ZIG_GLOBAL_CACHE_DIR", "/wrong/global-cache");
+    try source.put("ZIG_BUILD_RUNNER", "/wrong/runner");
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &source,
+        .self_exe_path = "hutch",
+        .cottontail_home = "/cottontail",
+        .cottontail_binary = "/cottontail/bin/cottontail",
+        .project_root = "/project",
+    };
+    var sanitized = std.process.Environ.Map.init(allocator);
+    defer sanitized.deinit();
+
+    try prepareZigBuildEnvironment(&ctx, &sanitized);
+
+    try std.testing.expectEqualStrings("/tools", sanitized.get("PATH").?);
+    for ([_][]const u8{
+        "ZIG_LIB_DIR",
+        "ZIG_LOCAL_CACHE_DIR",
+        "ZIG_GLOBAL_CACHE_DIR",
+        "ZIG_BUILD_RUNNER",
+    }) |name| {
+        try std.testing.expect(!sanitized.contains(name));
+    }
+}
+
 test "release base36 formatting is stable" {
     const allocator = std.testing.allocator;
     const zero = try formatBase36(allocator, 0);
@@ -5503,6 +5728,7 @@ test "release bundle hashes are deterministic and content sensitive" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5534,6 +5760,7 @@ test "release metadata and macOS plist preserve public app configuration" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5750,6 +5977,7 @@ test "Linux installer payload uses the extractor marker contract" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
@@ -5871,6 +6099,7 @@ test "Linux bundle archives desktop entries independently of icon configuration"
             .build_env = case.build_env,
         };
         const ctx = Context{
+            .init = undefined,
             .io = io,
             .allocator = allocator,
             .environ_map = &env_map,
@@ -6066,6 +6295,7 @@ test "opt-in Flatpak output stages expanded payload and disables release metadat
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     const ctx = Context{
+        .init = undefined,
         .io = io,
         .allocator = allocator,
         .environ_map = &env_map,
