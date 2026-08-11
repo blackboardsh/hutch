@@ -29,18 +29,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(launcher);
     b.installArtifact(engine);
 
-    if (target.result.os.tag == .windows) {
-        const bun_compat_job_launcher = b.addExecutable(.{
-            .name = "hutch-bun-compat-job",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/bun_compat_job_launcher.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        b.installArtifact(bun_compat_job_launcher);
-    }
-
     const run_cmd = b.addRunArtifact(launcher);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

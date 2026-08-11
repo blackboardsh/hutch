@@ -32,8 +32,6 @@ fn run(
     try environment.put("HUTCH_TEST_FIXTURE_MODE", mode);
     if (expected_entrypoint) |entrypoint| {
         try environment.put("HUTCH_TEST_EXPECTED_ENTRYPOINT", entrypoint);
-        const marker = try std.fmt.allocPrint(allocator, "{s}.scan", .{entrypoint});
-        try environment.put("HUTCH_TEST_SCAN_MARKER", marker);
     }
     try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
     try environment.put("CI", "1");
@@ -141,9 +139,6 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map.get("TMP") orelse
         if (builtin.os.tag == .windows) "." else "/tmp";
     const entrypoint = try std.fs.path.join(allocator, &.{ temp_dir, "hutch-runtime-options-entry.ts" });
-    const scan_marker = try std.fmt.allocPrint(allocator, "{s}.scan", .{entrypoint});
-    std.Io.Dir.cwd().deleteFile(init.io, scan_marker) catch {};
-    defer std.Io.Dir.cwd().deleteFile(init.io, scan_marker) catch {};
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = entrypoint,
         .data = "console.log('runtime option fixture');\n",

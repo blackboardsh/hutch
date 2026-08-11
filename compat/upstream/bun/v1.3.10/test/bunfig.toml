@@ -1,5 +1,0 @@
-[test]
-preload = ["./preload.ts", "../../../hutch-package-manager-test-preload.ts"]
-
-[install]
-linker = "isolated"

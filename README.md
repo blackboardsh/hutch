@@ -4,15 +4,14 @@ Hutch is the native build and workspace CLI for Electrobun projects. Its global
 installation has two parts:
 
 - `hutch`, a small launcher that reads an optional project version pragma.
-- `hutch-engine`, the versioned engine that owns scripts, builds, package management,
-  toolchains, and Electrobun orchestration.
+- `hutch-engine`, the versioned engine that owns scripts, builds, toolchains, and
+  Electrobun orchestration.
 
 Cottontail is an independently released runtime. Hutch resolves it from the same
-global content store when JavaScript execution or package management is needed;
-it is not embedded in or version-locked to a Hutch release.
-
-The intended build/runtime ownership and migration path are documented in
-[docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
+global content store when JavaScript execution is needed; it is not embedded in
+or version-locked to a Hutch release. JavaScript dependency installation is
+delegated to the project's external package manager. Hutch does not implement
+npm registry resolution or mutate package-manager lockfiles.
 
 ## Install
 
@@ -84,8 +83,6 @@ bash scripts/setup.sh
 ./vendors/zig/zig build test
 ./vendors/zig/zig build
 ./zig-out/bin/hutch --version
-node scripts/run-bun-package-manager-tests.js --check
-node scripts/run-local-package-manager-tests.js --all
 ```
 
 `scripts/setup.sh` only installs the pinned Zig toolchain. To run JavaScript
@@ -99,10 +96,6 @@ DASH_USE_LOCAL_COTTONTAIL=1 ./zig-out/bin/hutch examples/smoke.js
 `HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `DASH_HOME` changes
 the global store and must remain set when a non-default install root is used.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
-Run `node scripts/run-bun-package-manager-tests.js --all --jobs 4` for the
-complete 103-file copied compatibility suite. The ownership boundary and
-measured compatibility accounting are documented in
-[docs/cottontail-runtime-boundary.md](docs/cottontail-runtime-boundary.md).
 
 ## Electrobun Projects
 
@@ -232,8 +225,6 @@ for the release workflow.
 - `hutch <entrypoint.js|entrypoint.ts> [args...]`
 - `hutch <script-name> [args...]`
 - `hutch run [script-name] [args...]`
-- `hutch install|add|remove|update [args...]`
-- `hutch init|create|x [args...]`
 - `hutch build [args...]`
 - `hutch electrobun <init|build|run|dev> [args...]`
 - `hutch self <path|version|update> [selector]`
@@ -255,5 +246,6 @@ export default {
 
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
 emulate npm lifecycle variables when running these tasks. The configured
-package manager owns those semantics. Hutch's existing package-management
-commands remain available during the package-manager extraction.
+package manager owns those semantics. Hutch invokes the selected Cottontail
+release for JavaScript execution, runtime compatibility APIs, and
+compiler-backed build paths.

@@ -99,10 +99,8 @@ test("setup always verifies the patch after vendoring", async () => {
   assert.match(setup, /vendor_zig\s+node "\$SCRIPT_DIR\/patch-zig-hostname-connect\.js"/);
 });
 
-test("workflow Zig cache keys include every patch input", async () => {
+test("release workflow Zig cache key includes every patch input", async () => {
   const hashFiles = /hashFiles\('scripts\/setup\.sh', 'scripts\/patch-zig-hostname-connect\.js', 'patches\/zig-0\.16\.0-hostname-connect\.patch'\)/g;
-  const compatWorkflow = await readFile(path.join(hutchRoot, ".github", "workflows", "bun-compat.yml"), "utf8");
   const releaseWorkflow = await readFile(path.join(hutchRoot, ".github", "workflows", "release.yml"), "utf8");
-  assert.equal(compatWorkflow.match(hashFiles)?.length, 2);
   assert.equal(releaseWorkflow.match(hashFiles)?.length, 1);
 });

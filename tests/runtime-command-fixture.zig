@@ -19,13 +19,9 @@ fn expectArgs(actual: []const [:0]const u8, expected: []const []const u8) !void 
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    // Older engines may probe imports before starting the runtime. Keep the
+    // fixture neutral so this forwarding test can straddle that removal.
     if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-scan-package-imports")) {
-        if (init.environ_map.get("HUTCH_TEST_SCAN_MARKER")) |marker| {
-            try std.Io.Dir.cwd().writeFile(init.io, .{
-                .sub_path = marker,
-                .data = "scanned\n",
-            });
-        }
         try std.Io.File.stdout().writeStreamingAll(init.io, "[]\n");
         return;
     }
@@ -64,9 +60,6 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "runtime-options")) {
         const entrypoint = init.environ_map.get("HUTCH_TEST_EXPECTED_ENTRYPOINT") orelse
             return error.MissingExpectedEntrypoint;
-        const marker = init.environ_map.get("HUTCH_TEST_SCAN_MARKER") orelse
-            return error.MissingScanMarker;
-        std.Io.Dir.cwd().access(init.io, marker, .{}) catch return error.AutoInstallWasNotPrepared;
         const expected = [_][]const u8{
             "--ignore-dce-annotations",
             "run",
