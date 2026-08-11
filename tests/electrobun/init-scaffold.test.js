@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -125,10 +126,16 @@ export default {
   const checksum = createHash("sha256").update(archive).digest("hex");
   const nativeArchive = readFileSync(nativeArchivePath);
   const nativeChecksum = createHash("sha256").update(nativeArchive).digest("hex");
+  const requestCounts = {
+    channel: 0,
+    helloArchive: 0,
+    nativeArchive: 0,
+  };
 
   let baseUrl;
   const server = createServer((request, response) => {
     if (request.url === "/channels/stable.json") {
+      requestCounts.channel += 1;
       const catalog = {
         schema: 1,
         kind: "electrobun-template-channel",
@@ -161,16 +168,20 @@ export default {
           },
         ],
       };
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(`${JSON.stringify(catalog)}\n`);
+      setTimeout(() => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(`${JSON.stringify(catalog)}\n`);
+      }, 75);
       return;
     }
     if (request.url === `/artifacts/${checksum}.tar.gz`) {
+      requestCounts.helloArchive += 1;
       response.writeHead(200, { "content-type": "application/gzip" });
       response.end(archive);
       return;
     }
     if (request.url === `/artifacts/${nativeChecksum}.tar.gz`) {
+      requestCounts.nativeArchive += 1;
       response.writeHead(200, { "content-type": "application/gzip" });
       response.end(nativeArchive);
       return;
@@ -187,11 +198,12 @@ export default {
   assert.equal(typeof address, "object");
   baseUrl = `http://127.0.0.1:${address.port}`;
 
+  const dashHome = join(fixture, "dash-home");
   const env = {
     ...process.env,
     COTTONTAIL_BINARY: cottontail,
     DASH_COTTONTAIL: cottontail,
-    DASH_HOME: join(fixture, "dash-home"),
+    DASH_HOME: dashHome,
     ELECTROBUN_TEMPLATES_BASE_URL: baseUrl,
     HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
     HUTCH_ENGINE_BINARY: engine,
@@ -199,6 +211,48 @@ export default {
   };
 
   try {
+    const racedProjectName = "raced-app";
+    const racedProjectRoot = join(realpathSync(workspace), racedProjectName);
+    const raced = await Promise.all([
+      run(
+        hutch,
+        ["electrobun", "init", racedProjectName, "--template=native-basic", "--skip-install"],
+        { cwd: workspace, env },
+      ),
+      run(
+        hutch,
+        ["electrobun", "init", racedProjectName, "--template=native-basic", "--skip-install"],
+        { cwd: workspace, env },
+      ),
+    ]);
+    assert.deepEqual(
+      raced.map((result) => result.status).sort(),
+      [0, 1],
+      raced.map((result) => result.stderr || result.stdout).join("\n"),
+    );
+    const rejectedRace = raced.find((result) => result.status === 1);
+    assert.match(rejectedRace.stderr, /ProjectAlreadyExists/);
+    assert.equal(
+      readFileSync(join(racedProjectRoot, "src", "index.ts"), "utf8"),
+      "console.log('native package-free');\n",
+    );
+    assert.ok(existsSync(join(racedProjectRoot, ".hutch", "devkit", "projection.json")));
+    assert.ok(existsSync(join(workspace, `.${racedProjectName}.hutch-template.lock`)));
+    assert.deepEqual(
+      readdirSync(workspace).filter((name) => name.startsWith(`.${racedProjectName}.hutch-template-tmp-`)),
+      [],
+    );
+    assert.equal(requestCounts.channel, 1, "contending cold init must reuse the published catalog");
+    assert.equal(requestCounts.nativeArchive, 1, "contending cold init must download one template archive");
+    const templateCache = join(dashHome, "cache", "electrobun", "templates");
+    assert.ok(existsSync(join(templateCache, "channels", "stable.json.lock")));
+    assert.ok(existsSync(join(templateCache, "archives", `${nativeChecksum}.tar.gz.lock`)));
+    assert.deepEqual(
+      readFileSync(join(templateCache, "archives", `${nativeChecksum}.tar.gz`)),
+      nativeArchive,
+      "the winning initializer must publish the complete verified template archive",
+    );
+
     const listed = await run(hutch, ["electrobun", "init"], { cwd: workspace, env });
     assert.equal(listed.status, 0, listed.stderr || listed.stdout);
     assert.match(listed.stdout, /Electrobun 2\.0\.0 templates \(stable\):/);

@@ -104,11 +104,7 @@ fn ensure(
     const parent = std.fs.path.dirname(root) orelse return error.InvalidElectrobunInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
-    const lock = try std.Io.Dir.cwd().createFile(init.io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    });
+    const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
     const base_url = try releasesBaseUrl(init, allocator);
@@ -158,12 +154,7 @@ fn resolveArtifactSelection(
     const cache_parent = std.fs.path.dirname(cache_path) orelse
         return error.InvalidElectrobunArtifactIndexCachePath;
     try std.Io.Dir.cwd().createDirPath(init.io, cache_parent);
-    const lock_path = try std.mem.concat(allocator, u8, &.{ cache_path, ".lock" });
-    const lock = try std.Io.Dir.cwd().createFile(init.io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    });
+    const lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
     defer lock.close(init.io);
 
     var cached_too_large = false;
@@ -244,7 +235,8 @@ fn refreshArtifactIndex(
     if (quarantine_existing) {
         try quarantineCacheFile(init.io, allocator, cache_path);
     }
-    try release_store.writeCacheFile(init.io, allocator, cache_path, downloaded);
+    // resolveArtifactSelection holds the persistent `<cache_path>.lock` lock.
+    try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
     return selection;
 }
 

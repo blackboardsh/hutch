@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "$SCRIPT_DIR/build.sh" build
 bash "$SCRIPT_DIR/build.sh" build test
 node "$SCRIPT_DIR/local-stack.test.js"
+node "$SCRIPT_DIR/release-store-smoke.js"
 node --test \
   "$SCRIPT_DIR/r2-settings.test.js" \
   "$SCRIPT_DIR/release-contract.test.js" \

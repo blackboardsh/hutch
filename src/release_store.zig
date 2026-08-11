@@ -77,6 +77,65 @@ const ChannelManifest = struct {
     release_url: []const u8,
 };
 
+/// A persistent sibling lock coordinates cache writers across Hutch processes.
+/// The lock file intentionally remains in place so a newly starting process
+/// can never race another process between lock-file creation and acquisition.
+pub const PersistentFileLock = struct {
+    file: std.Io.File,
+    contended: bool,
+
+    pub fn close(self: PersistentFileLock, io: std.Io) void {
+        self.file.close(io);
+    }
+};
+
+pub fn acquirePersistentFileLock(
+    io: std.Io,
+    lock_path: []const u8,
+) !PersistentFileLock {
+    const parent = std.fs.path.dirname(lock_path) orelse return error.InvalidCachePath;
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+
+    const initializer: ?std.Io.File = std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (initializer) |file| file.close(io);
+
+    const open_options: std.Io.Dir.OpenFileOptions = .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .follow_symlinks = false,
+    };
+    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = open_options.mode,
+        .lock = open_options.lock,
+        .lock_nonblocking = true,
+        .follow_symlinks = open_options.follow_symlinks,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return .{
+            .file = try std.Io.Dir.cwd().openFile(io, lock_path, open_options),
+            .contended = true,
+        },
+        else => return err,
+    };
+    return .{ .file = file, .contended = false };
+}
+
+pub fn acquireCacheFileLock(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !PersistentFileLock {
+    const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
+    defer allocator.free(lock_path);
+    return acquirePersistentFileLock(io, lock_path);
+}
+
 pub fn resolve(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -219,6 +278,7 @@ pub fn checkForUpdate(
         init,
         allocator,
         home,
+        base_url,
         product,
         selector,
         channel_url,
@@ -421,6 +481,7 @@ fn resolveArtifact(
                 init,
                 allocator,
                 home,
+                base_url,
                 product,
                 selector,
                 channel_url,
@@ -466,6 +527,7 @@ fn resolveArtifact(
             init,
             allocator,
             home,
+            base_url,
             product,
             manifest_selector,
             artifact_manifest_url,
@@ -495,32 +557,102 @@ fn readManifest(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     home: []const u8,
+    base_url: []const u8,
     product: Product,
     selector: version_selector.Selector,
     url: []const u8,
     options: Options,
 ) ![]const u8 {
     const cache_path = try manifestCachePath(allocator, home, product, selector);
+    const cache_lock = try acquireCacheFileLock(init.io, allocator, cache_path);
+    defer cache_lock.close(init.io);
+
+    // Re-read only after acquiring the persistent per-path lock. A concurrent
+    // cold resolver may have populated this exact cache while we waited.
     const cached = std.Io.Dir.cwd().readFileAlloc(
         init.io,
         cache_path,
         allocator,
         .limited(max_manifest_bytes),
     ) catch null;
+    const cached_is_valid = if (cached) |bytes|
+        cachedManifestMatches(allocator, bytes, base_url, product, selector)
+    else
+        false;
 
-    const cache_is_current = if (cached != null and !options.refresh) switch (selector.kind) {
+    const cache_is_current = if (cached_is_valid and !options.refresh) switch (selector.kind) {
         .production, .canary => manifestCacheIsCurrent(init.io, cache_path),
         .version, .build => true,
     } else false;
     if (cache_is_current) return cached.?;
-    if (options.offline) return cached orelse error.ReleaseManifestNotCached;
+    if (options.offline) {
+        if (cached_is_valid) return cached.?;
+        return if (cached == null)
+            error.ReleaseManifestNotCached
+        else
+            error.ReleaseManifestCacheInvalid;
+    }
 
     const downloaded = fetchBytes(init, allocator, url, max_manifest_bytes) catch |err| {
-        if (cached) |bytes| return bytes;
+        if (cached_is_valid) return cached.?;
         return err;
     };
-    try writeCacheFile(init.io, allocator, cache_path, downloaded);
+    // Do not publish malformed or mismatched responses into the shared cache.
+    // The caller still parses the response and returns its specific contract
+    // error, but a later offline resolver cannot mistake it for a cache hit.
+    if (cachedManifestMatches(allocator, downloaded, base_url, product, selector)) {
+        try writeCacheFileLocked(init.io, cache_path, downloaded);
+    }
     return downloaded;
+}
+
+fn cachedManifestMatches(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    base_url: []const u8,
+    product: Product,
+    selector: version_selector.Selector,
+) bool {
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{ .duplicate_field_behavior = .@"error" },
+    ) catch return false;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if ((jsonPositiveUsize(root, "schema") catch return false) != manifest_schema) return false;
+    if (!std.mem.eql(u8, jsonString(root, "product") catch return false, product.name())) return false;
+
+    const kind = jsonString(root, "kind") catch return false;
+    return switch (selector.kind) {
+        .production, .canary => blk: {
+            if (!std.mem.eql(u8, kind, "channel")) break :blk false;
+            _ = parseChannelManifest(
+                allocator,
+                bytes,
+                base_url,
+                product,
+                selector.channel().?,
+            ) catch break :blk false;
+            break :blk true;
+        },
+        .version, .build => blk: {
+            const expected_kind = if (selector.kind == .version) "release" else "build";
+            if (!std.mem.eql(u8, kind, expected_kind)) break :blk false;
+            const artifact = parseArtifactManifest(
+                allocator,
+                bytes,
+                base_url,
+                product,
+                platformKey() catch break :blk false,
+            ) catch break :blk false;
+            break :blk if (selector.kind == .version)
+                std.mem.eql(u8, artifact.version, selector.value)
+            else
+                std.mem.eql(u8, artifact.revision, selector.value);
+        },
+    };
 }
 
 fn fetchAndCacheReleaseManifest(
@@ -536,7 +668,7 @@ fn fetchAndCacheReleaseManifest(
     const version = releaseVersionFromUrl(url) orelse return error.InvalidReleaseManifestUrl;
     const selector = try version_selector.parse(version);
     if (selector.kind != .version) return error.InvalidReleaseManifestUrl;
-    return readManifest(init, allocator, home, product, selector, url, options);
+    return readManifest(init, allocator, home, base_url, product, selector, url, options);
 }
 
 fn manifestCachePath(
@@ -577,12 +709,34 @@ pub fn writeCacheFile(
     path: []const u8,
     bytes: []const u8,
 ) !void {
+    const cache_lock = try acquireCacheFileLock(io, allocator, path);
+    defer cache_lock.close(io);
+    return writeCacheFileLocked(io, path, bytes);
+}
+
+/// Atomically publishes a cache file while the caller holds its persistent
+/// `<path>.lock` lock. The temporary file is unique and lives beside the final
+/// path, so independent cache keys do not collide and replacement is atomic.
+pub fn writeCacheFileLocked(
+    io: std.Io,
+    path: []const u8,
+    bytes: []const u8,
+) !void {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidCachePath;
     try std.Io.Dir.cwd().createDirPath(io, parent);
-    const temporary = try std.mem.concat(allocator, u8, &.{ path, ".tmp" });
-    defer allocator.free(temporary);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = bytes });
-    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
+
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .make_path = true,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+
+    var write_buffer: [64 * 1024]u8 = undefined;
+    var writer = atomic_file.file.writer(io, &write_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    try atomic_file.file.sync(io);
+    try atomic_file.replace(io);
 }
 
 pub fn fetchBytes(
@@ -790,11 +944,7 @@ fn installArtifact(
     const parent = std.fs.path.dirname(root) orelse return error.InvalidInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
-    const lock = try std.Io.Dir.cwd().createFile(init.io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    });
+    const lock = try acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
     if (try installationMatches(init.io, allocator, root, executable, artifact.sha256)) return;

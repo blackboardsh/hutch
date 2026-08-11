@@ -87,12 +87,25 @@ pub fn load(
         "channels",
         try std.mem.concat(allocator, u8, &.{ channel.name(), ".json" }),
     });
+    const cache_lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
+    defer cache_lock.close(init.io);
+
     const cached = std.Io.Dir.cwd().readFileAlloc(
         init.io,
         cache_path,
         allocator,
         .limited(max_manifest_bytes),
     ) catch null;
+
+    // A contending cold initializer rechecks and consumes the catalog that
+    // the preceding writer published instead of issuing the same download.
+    if (cache_lock.contended) {
+        if (cached) |bytes| {
+            if (parseCatalog(allocator, bytes, base_url, channel)) |catalog| {
+                return catalog;
+            } else |_| {}
+        }
+    }
 
     if (!options.offline) {
         const url = try std.fmt.allocPrint(
@@ -102,7 +115,7 @@ pub fn load(
         );
         if (release_store.fetchBytes(init, allocator, url, max_manifest_bytes)) |downloaded| {
             const catalog = try parseCatalog(allocator, downloaded, base_url, channel);
-            try release_store.writeCacheFile(init.io, allocator, cache_path, downloaded);
+            try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
             return catalog;
         } else |_| {}
     }
@@ -119,13 +132,31 @@ pub fn install(
     options: LoadOptions,
 ) !void {
     if (pathExists(init.io, destination)) return error.ProjectAlreadyExists;
-    const archive = try loadArchive(init, allocator, template, options);
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidProjectPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
 
-    const temporary = try std.mem.concat(allocator, u8, &.{ destination, ".hutch-template-tmp" });
-    std.Io.Dir.cwd().deleteTree(init.io, temporary) catch {};
-    try std.Io.Dir.cwd().createDirPath(init.io, temporary);
+    const destination_basename = std.fs.path.basename(destination);
+    if (destination_basename.len == 0) return error.InvalidProjectPath;
+    const lock_name = try std.mem.concat(allocator, u8, &.{
+        ".",
+        destination_basename,
+        ".hutch-template.lock",
+    });
+    const lock_path = try std.fs.path.join(allocator, &.{ parent, lock_name });
+    const destination_lock = try release_store.acquirePersistentFileLock(
+        init.io,
+        lock_path,
+    );
+    defer destination_lock.close(init.io);
+    if (pathExists(init.io, destination)) return error.ProjectAlreadyExists;
+
+    const archive = try loadArchive(init, allocator, template, options);
+    const temporary = try createTemplateTemporaryDirectory(
+        init,
+        allocator,
+        parent,
+        destination_basename,
+    );
     errdefer std.Io.Dir.cwd().deleteTree(init.io, temporary) catch {};
 
     {
@@ -138,6 +169,32 @@ pub fn install(
     const electrobun_config = try std.fs.path.join(allocator, &.{ temporary, "electrobun.config.ts" });
     if (!pathExists(init.io, electrobun_config)) return error.InvalidTemplateArchive;
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), destination, init.io);
+}
+
+fn createTemplateTemporaryDirectory(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    destination_basename: []const u8,
+) ![]const u8 {
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var random: [12]u8 = undefined;
+        init.io.random(&random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const name = try std.fmt.allocPrint(
+            allocator,
+            ".{s}.hutch-template-tmp-{s}",
+            .{ destination_basename, &suffix },
+        );
+        const path = try std.fs.path.join(allocator, &.{ parent, name });
+        std.Io.Dir.cwd().createDir(init.io, path, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return path;
+    }
+    return error.TemplateTemporaryDirectoryCollision;
 }
 
 fn loadArchive(
@@ -155,6 +212,11 @@ fn loadArchive(
         "archives",
         try std.mem.concat(allocator, u8, &.{ template.archive.sha256, ".tar.gz" }),
     });
+    const cache_lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
+    defer cache_lock.close(init.io);
+
+    // Re-read after acquiring the lock so only the first cold initializer
+    // downloads and publishes this immutable content-addressed archive.
     if (std.Io.Dir.cwd().readFileAlloc(
         init.io,
         cache_path,
@@ -175,7 +237,7 @@ fn loadArchive(
     if (!archiveMatches(downloaded, template.archive)) {
         return error.TemplateArchiveIntegrityMismatch;
     }
-    try release_store.writeCacheFile(init.io, allocator, cache_path, downloaded);
+    try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
     return downloaded;
 }
 

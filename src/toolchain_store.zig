@@ -100,11 +100,7 @@ pub fn resolveVersion(
     const parent = std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
-    const lock = try std.Io.Dir.cwd().createFile(init.io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    });
+    const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
     if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {

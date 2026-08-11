@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -45,6 +47,29 @@ function run(command, args, options) {
     child.on("error", reject);
     child.on("close", (status) => resolveRun({ status, stdout, stderr }));
   });
+}
+
+function startRun(command, args, options) {
+  const child = spawn(command, args, options);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const result = new Promise((resolveRun, reject) => {
+    child.on("error", reject);
+    child.on("close", (status, signal) => resolveRun({ status, signal, stdout, stderr }));
+  });
+  return { child, result };
+}
+
+function waitFor(promise, timeoutMilliseconds, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMilliseconds);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 test("v2 sync and build use only the cached devkit, without an npm package", { timeout: 120_000 }, async () => {
@@ -90,8 +115,7 @@ export default {
       const basePath = `/releases/download/v${version}`;
       if (request.url === `${basePath}/electrobun-artifacts.json`) {
         const origin = `http://127.0.0.1:${server.address().port}/releases/download`;
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({
+        const body = JSON.stringify({
           schemaVersion: 1,
           product: { name: "electrobun", version },
           devkit: { manifest: "native-devkit.json", schemaVersion: 1 },
@@ -109,12 +133,18 @@ export default {
               },
             },
           },
-        }));
+        });
+        setTimeout(() => {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(body);
+        }, 75);
         return;
       }
       if (request.url === `${basePath}/electrobun-core-${host.asset}.tar.gz`) {
-        response.writeHead(200, { "content-type": "application/gzip" });
-        response.end(archiveBytes);
+        setTimeout(() => {
+          response.writeHead(200, { "content-type": "application/gzip" });
+          response.end(archiveBytes);
+        }, 75);
         return;
       }
       response.writeHead(404);
@@ -134,16 +164,40 @@ export default {
         HUTCH_ENGINE_BINARY: engine,
         HUTCH_NO_UPDATE_CHECK: "1",
       };
-      const first = await run(hutch, ["electrobun", "sync"], {
-        cwd: project,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      assert.equal(first.status, 0, first.stderr || first.stdout);
-      assert.equal(requests, 2);
-      assert.match(first.stdout, /electrobun sync complete/);
+      const coldSyncs = await Promise.all(
+        Array.from({ length: 8 }, () => run(hutch, ["electrobun", "sync"], {
+          cwd: project,
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        })),
+      );
+      for (const sync of coldSyncs) {
+        assert.equal(sync.status, 0, sync.stderr || sync.stdout);
+        assert.match(sync.stdout, /electrobun sync complete/);
+      }
+      assert.equal(
+        requests,
+        2,
+        "concurrent cold syncs must share one artifact index and one core archive download",
+      );
 
       const cacheRoot = join(dashHome, "products", "electrobun", version, host.key);
+      const indexCache = join(
+        dashHome,
+        "cache",
+        "electrobun",
+        "releases",
+        version,
+        "electrobun-artifacts.json",
+      );
+      assert.ok(existsSync(`${indexCache}.lock`));
+      assert.ok(existsSync(`${cacheRoot}.lock`));
+      assert.ok(existsSync(join(project, ".hutch", "devkit.lock")));
+      assert.deepEqual(
+        readdirSync(join(project, ".hutch")).filter((name) =>
+          name.startsWith(".devkit-tmp-") || name.startsWith(".devkit-old-")),
+        [],
+      );
       assert.ok(existsSync(join(cacheRoot, "native-devkit.json")));
       assert.ok(existsSync(join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts")));
       assert.ok(existsSync(join(project, ".hutch", "devkit", "go-sdk", "go.mod")));
@@ -238,6 +292,139 @@ export default {
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+
+test(
+  "concurrent cold native toolchain resolution survives a crashed publisher",
+  { timeout: 120_000, skip: process.platform === "win32" },
+  async () => {
+    const fixture = mkdtempSync(join(os.tmpdir(), "hutch-v2-toolchain-race-"));
+    const project = join(fixture, "project");
+    const coreFiles = join(fixture, "core-files");
+    const dashHome = join(fixture, "dash-home");
+    const host = hostContract();
+    const electrobunVersion = "2.0.0-test.toolchain-race.1";
+    const odinVersion = "dev-2099-01a";
+    const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+    const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+    const cottontail = resolveCottontail();
+    const proxySockets = new Set();
+    let proxyRequests = 0;
+    let resolveProxyRequest;
+    const firstProxyRequest = new Promise((resolveRequest) => { resolveProxyRequest = resolveRequest; });
+    const proxy = createServer((_request, _response) => {
+      proxyRequests += 1;
+      resolveProxyRequest();
+    });
+    proxy.on("connect", (_request, socket) => {
+      proxyRequests += 1;
+      proxySockets.add(socket);
+      socket.on("close", () => proxySockets.delete(socket));
+      resolveProxyRequest();
+      // Deliberately leave the tunnel unanswered. The first resolver remains
+      // inside the download while holding the persistent toolchain root lock.
+    });
+
+    let holder;
+    try {
+      createCoreFixture(coreFiles, electrobunVersion, host);
+      writeFixtureFile(join(project, "src", "odin", "main.odin"), "package main\n");
+      writeFixtureFile(join(project, "electrobun.config.ts"), `
+export default {
+  electrobun: { version: "${electrobunVersion}" },
+  app: { name: "ToolchainRace", identifier: "dev.electrobun.toolchain-race", version: "0.0.0" },
+  build: {
+    mainProcess: "odin",
+    odin: { entrypoint: "src/odin/main.odin", version: "${odinVersion}" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+};
+`);
+
+      await new Promise((resolveListen) => proxy.listen(0, "127.0.0.1", resolveListen));
+      const proxyAddress = proxy.address();
+      assert.ok(proxyAddress && typeof proxyAddress === "object");
+      const proxyUrl = `http://127.0.0.1:${proxyAddress.port}`;
+      const env = {
+        ...process.env,
+        COTTONTAIL_BINARY: cottontail,
+        DASH_COTTONTAIL: cottontail,
+        DASH_HOME: dashHome,
+        HUTCH_ELECTROBUN_DEVKIT_ROOT: coreFiles,
+        HUTCH_ENGINE_BINARY: engine,
+        HUTCH_NO_UPDATE_CHECK: "1",
+        HTTPS_PROXY: proxyUrl,
+        https_proxy: proxyUrl,
+        NO_PROXY: "",
+        no_proxy: "",
+      };
+
+      holder = startRun(hutch, ["electrobun", "sync"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await waitFor(
+        firstProxyRequest,
+        15_000,
+        "the first cold toolchain resolver did not reach the blocking proxy",
+      );
+      assert.equal(holder.child.kill("SIGSTOP"), true);
+
+      let completedWaiters = 0;
+      const waiters = Array.from({ length: 8 }, () =>
+        run(hutch, ["electrobun", "sync"], {
+          cwd: project,
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        }).then((result) => {
+          completedWaiters += 1;
+          return result;
+        }));
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
+      assert.equal(completedWaiters, 0, "cold waiters must remain behind the held toolchain lock");
+      assert.equal(proxyRequests, 1, "blocked waiters must not start duplicate downloads");
+
+      const toolchainRoot = join(dashHome, "toolchains", "odin", odinVersion, host.key);
+      mkdirSync(toolchainRoot, { recursive: true });
+      const odin = join(toolchainRoot, "odin");
+      writeFileSync(odin, "#!/bin/sh\nprintf 'dev-2099-01\\n'\n");
+      chmodSync(odin, 0o755);
+      writeFileSync(join(toolchainRoot, ".hutch-toolchain"), `${odinVersion}\n`);
+
+      assert.equal(holder.child.kill("SIGKILL"), true);
+      const crashed = await holder.result;
+      assert.equal(crashed.signal, "SIGKILL");
+      const results = await Promise.all(waiters);
+      for (const result of results) {
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /electrobun sync complete/);
+      }
+      assert.equal(proxyRequests, 1, "waiters must recheck the completed cache instead of downloading");
+      assert.ok(existsSync(`${toolchainRoot}.lock`));
+      assert.equal(
+        readFileSync(join(toolchainRoot, ".hutch-toolchain"), "utf8").trim(),
+        odinVersion,
+      );
+      assert.ok(existsSync(join(project, ".hutch", "devkit", "projection.json")));
+      assert.match(
+        readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8"),
+        new RegExp(`toolchains/odin/${odinVersion}/${host.key}`),
+      );
+    } finally {
+      if (holder?.child.exitCode == null && holder?.child.signalCode == null) {
+        holder.child.kill("SIGKILL");
+        await holder.result.catch(() => {});
+      }
+      for (const socket of proxySockets) socket.destroy();
+      if (proxy.listening) {
+        await new Promise((resolveClose) => proxy.close(resolveClose));
+      }
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  },
+);
 
 test("v2 Rust builds use the project Cargo manifest and lock without npm", { timeout: 120_000 }, async () => {
   const rustc = spawnSync("rustc", ["--version"], { encoding: "utf8" });

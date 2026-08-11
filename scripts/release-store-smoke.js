@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -99,8 +100,10 @@ const server = createServer((request, response) => {
     },
   };
   if (request.url in bodies) {
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(`${JSON.stringify(bodies[request.url], null, 2)}\n`);
+    setTimeout(() => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(`${JSON.stringify(bodies[request.url], null, 2)}\n`);
+    }, 75);
   } else if (request.url?.endsWith("/cottontail.tar.gz")) {
     response.writeHead(200, {
       "content-type": "application/gzip",
@@ -142,11 +145,33 @@ try {
     HUTCH_ACTIVE_CHANNEL: "canary",
     DASH_ARTIFACTS_BASE_URL: `http://127.0.0.1:${server.address().port}`,
   };
-  const first = await runAsync(engine, ["cottontail", "path", "canary"], environment);
-  const installed = first.stdout.trim();
+  const coldResolvers = await Promise.all(
+    Array.from({ length: 12 }, () =>
+      runAsync(engine, ["cottontail", "path", "canary"], environment)),
+  );
+  const installed = coldResolvers[0].stdout.trim();
+  for (const resolution of coldResolvers) {
+    assert.equal(resolution.stdout.trim(), installed);
+  }
   assert(installed.endsWith(`bin${process.platform === "win32" ? "\\" : "/"}${executableName}`));
   assert(existsSync(installed));
-  assert.equal(requestCount, 3);
+  assert.equal(
+    requestCount,
+    3,
+    "concurrent cold resolvers must share one channel manifest, release manifest, and archive download",
+  );
+  const channelCache = join(dashHome, "cache", "cottontail", "channels");
+  const releaseCache = join(dashHome, "cache", "cottontail", "releases");
+  assert.deepEqual(
+    readdirSync(channelCache).sort(),
+    ["canary.json", "canary.json.lock"],
+    "the channel cache must retain only its manifest and persistent lock",
+  );
+  assert.deepEqual(
+    readdirSync(releaseCache).sort(),
+    [`${version}.json`, `${version}.json.lock`],
+    "the release cache must retain only its manifest and persistent lock",
+  );
 
   await new Promise((resolve) => server.close(resolve));
   const offline = spawnSync(engine, ["cottontail", "path", "canary"], {

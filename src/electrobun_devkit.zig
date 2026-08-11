@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const release_store = @import("release_store.zig");
 
 const manifest_file_name = "native-devkit.json";
 const max_manifest_bytes = 1024 * 1024;
@@ -281,11 +282,7 @@ pub fn project(
     try std.Io.Dir.cwd().createDirPath(io, hutch_root);
 
     const lock_path = try std.fs.path.join(allocator, &.{ hutch_root, "devkit.lock" });
-    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    });
+    const lock = try release_store.acquirePersistentFileLock(io, lock_path);
     defer lock.close(io);
 
     const final_root = try std.fs.path.join(allocator, &.{ hutch_root, "devkit" });
