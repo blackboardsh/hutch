@@ -1024,12 +1024,15 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        const exit_code = try electrobun.run(
+        const exit_code = electrobun.run(
             init,
             args[2..],
             cottontail.executable,
             cottontail.root,
-        );
+        ) catch |err| switch (err) {
+            error.InvalidMainProcess, error.UnsupportedMainProcess => 1,
+            else => return err,
+        };
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }

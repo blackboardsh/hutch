@@ -424,7 +424,7 @@ fn resolveMainProcessInspectorForRun(
         ctx.writeStderr("hutch electrobun: invalid main-process inspector configuration: {s}\n", .{@errorName(err)});
         return err;
     };
-    const main_process = getMainProcess(root);
+    const main_process = try getMainProcess(root);
     if (inspector != null and !mainProcessSupportsInspector(main_process)) {
         ctx.writeStderr(
             "hutch electrobun: main-process inspection is supported for Bun and Cottontail, not {s}\n",
@@ -538,6 +538,13 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 
     const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, trimmed, .{});
+    _ = getMainProcess(parsed) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: build.mainProcess must be bun, cottontail, zig, rust, go, or odin\n",
+            .{},
+        );
+        return err;
+    };
 
     return .{
         .raw_json = try ctx.allocator.dupe(u8, trimmed),
@@ -547,7 +554,7 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 }
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
-    const main_process = getMainProcess(config.root);
+    const main_process = try getMainProcess(config.root);
     if (main_process == .zig) {
         try validateProjectZigConfig(ctx, config.root);
         _ = try requireProjectZigBuildFile(ctx);
@@ -600,7 +607,7 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
 
     try runHook(ctx, config, "preBuild", null);
 
-    const main_process = getMainProcess(config.root);
+    const main_process = try getMainProcess(config.root);
     switch (main_process) {
         .bun, .cottontail, .zig, .rust, .go, .odin => try buildBundledElectrobunApp(ctx, config),
     }
@@ -1120,7 +1127,7 @@ fn installBundleAssets(
             if (embed_main_process_icon) {
                 const main_process_path = try std.fs.path.join(
                     ctx.allocator,
-                    &.{ bundle.exec_dir, windowsMainProcessExecutableName(getMainProcess(config.root)) },
+                    &.{ bundle.exec_dir, windowsMainProcessExecutableName(try getMainProcess(config.root)) },
                 );
                 if (!pathExists(ctx.io, main_process_path)) return error.WindowsMainProcessNotFound;
                 try embedWindowsIcon(ctx, main_process_path, icon_path);
@@ -2168,7 +2175,7 @@ fn runBuiltApp(
     config: CommandContext,
     inspector: ?MainProcessInspector,
 ) !void {
-    const main_process = getMainProcess(config.root);
+    const main_process = try getMainProcess(config.root);
     switch (main_process) {
         .bun, .cottontail, .zig, .rust, .go, .odin => try runBundledElectrobunApp(ctx, config, inspector),
     }
@@ -3702,7 +3709,7 @@ fn copyBundledPreloadScripts(
 fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
-    const main_process = getMainProcess(config.root);
+    const main_process = try getMainProcess(config.root);
 
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.exec_dir);
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.resources_dir);
@@ -3939,7 +3946,7 @@ fn spawnBuiltApp(
     config: CommandContext,
     inspector: ?MainProcessInspector,
 ) !std.process.Child {
-    return switch (getMainProcess(config.root)) {
+    return switch (try getMainProcess(config.root)) {
         .bun, .cottontail, .zig, .rust, .go, .odin => |main_process| blk: {
             const bundle = try appBundlePaths(ctx, config);
             const launcher_path = try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() });
@@ -4487,15 +4494,12 @@ fn artifactOutputRoot(ctx: *const Context, root: std.json.Value) ![]const u8 {
     return std.fs.path.join(ctx.allocator, &.{ ctx.project_root, artifact_folder });
 }
 
-fn getMainProcess(root: std.json.Value) MainProcess {
+fn getMainProcess(root: std.json.Value) !MainProcess {
     const build = getObjectField(root, "build") orelse return .cottontail;
-    const value = getStringFieldFromObject(build, "mainProcess") orelse "cottontail";
-    if (std.mem.eql(u8, value, "cottontail")) return .cottontail;
-    if (std.mem.eql(u8, value, "zig")) return .zig;
-    if (std.mem.eql(u8, value, "rust")) return .rust;
-    if (std.mem.eql(u8, value, "go")) return .go;
-    if (std.mem.eql(u8, value, "odin")) return .odin;
-    return .bun;
+    const configured = build.get("mainProcess") orelse return .cottontail;
+    if (configured != .string) return error.InvalidMainProcess;
+    return std.meta.stringToEnum(MainProcess, configured.string) orelse
+        error.UnsupportedMainProcess;
 }
 
 fn mainProcessName(main_process: MainProcess) []const u8 {
@@ -4625,7 +4629,7 @@ fn collectWatchRoots(ctx: *const Context, root: std.json.Value) !std.ArrayList([
     var roots: std.ArrayList([]const u8) = .empty;
     const build = getObjectField(root, "build") orelse return roots;
 
-    const main_process = getMainProcess(root);
+    const main_process = try getMainProcess(root);
     if (main_process == .zig) {
         try appendWatchRoot(ctx, &roots, try projectZigBuildFilePath(ctx.allocator, ctx.project_root));
         const zon_path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "build.zig.zon" });
@@ -5724,7 +5728,7 @@ fn bundledRuntimeMetadataJson(
 ) ![]const u8 {
     const runtime_value = getValueFieldFromObject(config.root.object, "runtime") orelse std.json.Value{ .object = .empty };
     const platform = platformBuildObject(config.root);
-    const main_process = getMainProcess(config.root);
+    const main_process = try getMainProcess(config.root);
 
     var available_renderers = std.json.Array.init(ctx.allocator);
     try available_renderers.append(.{ .string = "native" });
@@ -5950,11 +5954,11 @@ fn termExitCode(term: std.process.Child.Term) u8 {
     };
 }
 
-test "native Electrobun main process names are recognized" {
+test "Electrobun accepts every supported main process and defaults to Cottontail" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    inline for (.{ "zig", "rust", "go", "odin", "cottontail" }) |name| {
+    inline for (.{ "bun", "cottontail", "zig", "rust", "go", "odin" }) |name| {
         const source = try std.fmt.allocPrint(
             arena.allocator(),
             \\{{"build":{{"mainProcess":"{s}"}}}}
@@ -5967,7 +5971,45 @@ test "native Electrobun main process names are recognized" {
             source,
             .{},
         );
-        try std.testing.expectEqualStrings(name, mainProcessName(getMainProcess(config)));
+        try std.testing.expectEqualStrings(name, mainProcessName(try getMainProcess(config)));
+    }
+
+    const default_config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{}",
+        .{},
+    );
+    try std.testing.expectEqual(MainProcess.cottontail, try getMainProcess(default_config));
+}
+
+test "Electrobun rejects unknown and non-string main processes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const unknown = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"build":{"mainProcess":"bnu"}}
+    ,
+        .{},
+    );
+    try std.testing.expectError(error.UnsupportedMainProcess, getMainProcess(unknown));
+
+    inline for (.{ "null", "true", "42", "[]", "{}" }) |value| {
+        const source = try std.fmt.allocPrint(
+            arena.allocator(),
+            \\{{"build":{{"mainProcess":{s}}}}}
+        ,
+            .{value},
+        );
+        const config = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena.allocator(),
+            source,
+            .{},
+        );
+        try std.testing.expectError(error.InvalidMainProcess, getMainProcess(config));
     }
 }
 

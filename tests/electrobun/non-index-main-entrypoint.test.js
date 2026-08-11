@@ -10,7 +10,7 @@ import {
   readFileSync,
   rmSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -41,6 +41,33 @@ function resolveCottontail() {
 
 function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function prepareExternalBun(root) {
+  const bin = join(root, "external-package-manager");
+  const executable = join(bin, executableName("bun"));
+  const probe = join(root, "external-bun-probe.cjs");
+  const capture = join(root, "external-bun-invocation.json");
+  mkdirSync(bin, { recursive: true });
+  copyFileSync(process.execPath, executable);
+  chmodSync(executable, 0o755);
+  writeFixtureFile(
+    probe,
+    `const { createHash } = require("node:crypto");
+const { readFileSync, writeFileSync } = require("node:fs");
+writeFileSync(process.env.HUTCH_PM_CAPTURE, JSON.stringify({
+  args: process.argv.slice(2),
+  executableSha256: createHash("sha256").update(readFileSync(process.execPath)).digest("hex"),
+}));
+`,
+  );
+  return { bin, capture, executable, probe };
+}
+
+function prependExecutablePath(environment, directory) {
+  const pathKey = Object.keys(environment).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  const current = environment[pathKey];
+  environment[pathKey] = current ? `${directory}${delimiter}${current}` : directory;
 }
 
 function bunCompatibilityVersion(cottontail) {
@@ -101,7 +128,43 @@ function bundlePaths(project) {
   return { execDir, resourcesDir };
 }
 
-test("v2 Electrobun stages and launches a non-index Bun entrypoint from its exact devkit", { timeout: 120_000 }, () => {
+test("v2 Electrobun rejects invalid main processes without falling back to Bun", { timeout: 60_000 }, () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const fixture = mkdtempSync(join(scratchRoot, "invalid-main-process-"));
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+  const diagnostic = "hutch electrobun: build.mainProcess must be bun, cottontail, zig, rust, go, or odin\n";
+
+  try {
+    for (const value of ['"bnu"', "42"]) {
+      writeFixtureFile(
+        join(fixture, "electrobun.config.ts"),
+        `export default { build: { mainProcess: ${value} } };\n`,
+      );
+      const env = {
+        ...process.env,
+        COTTONTAIL_BINARY: cottontail,
+        DASH_COTTONTAIL: cottontail,
+        HUTCH_ENGINE_BINARY: engine,
+        HUTCH_NO_UPDATE_CHECK: "1",
+      };
+      delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+      const result = spawnSync(hutch, ["electrobun", "config"], {
+        cwd: fixture,
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.equal(result.stdout, "");
+      assert.equal(result.stderr, diagnostic);
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("v2 Electrobun keeps external package-manager Bun separate from its bundled Bun runtime", { timeout: 120_000 }, () => {
   mkdirSync(scratchRoot, { recursive: true });
   const fixture = mkdtempSync(join(scratchRoot, "non-index-main-entrypoint-"));
   const project = join(fixture, "project");
@@ -115,9 +178,16 @@ test("v2 Electrobun stages and launches a non-index Bun entrypoint from its exac
     assert.ok(existsSync(hutch), `Hutch must be built before this test: ${hutch}`);
     assert.ok(existsSync(engine), `Hutch engine must be built before this test: ${engine}`);
     const { manifest, runtime: devkitBun } = prepareBunDevkit(coreRoot, version, cottontail);
+    const externalBun = prepareExternalBun(fixture);
     assert.match(manifest.runtimes.bun.version, /^\d+\.\d+\.\d+/);
     const devkitBunSha256 = sha256(devkitBun);
+    const externalBunSha256 = sha256(externalBun.executable);
     const devkitManifestSha256 = sha256(join(coreRoot, "native-devkit.json"));
+    assert.notEqual(
+      externalBunSha256,
+      devkitBunSha256,
+      "the external package manager must be distinguishable from the devkit runtime",
+    );
 
     writeFixtureFile(
       join(project, "src", "bun", "electrobun-main.ts"),
@@ -140,6 +210,10 @@ export default {
   },
 };
 `);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      'export default { packageManager: "bun", scripts: {} };\n',
+    );
 
     const env = {
       ...process.env,
@@ -148,10 +222,32 @@ export default {
       HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
       HUTCH_ENGINE_BINARY: engine,
       HUTCH_NO_UPDATE_CHECK: "1",
+      HUTCH_PM_CAPTURE: externalBun.capture,
     };
     delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+    prependExecutablePath(env, externalBun.bin);
     assert.equal(existsSync(join(project, "package.json")), false);
     assert.equal(existsSync(join(project, "node_modules")), false);
+
+    const packageManager = spawnSync(
+      hutch,
+      ["pm", externalBun.probe, "add", "left-pad", "--exact"],
+      { cwd: project, encoding: "utf8", env },
+    );
+    assert.equal(packageManager.status, 0, packageManager.stderr || packageManager.stdout);
+    const packageManagerInvocation = JSON.parse(readFileSync(externalBun.capture, "utf8"));
+    assert.deepEqual(
+      packageManagerInvocation.args,
+      ["add", "left-pad", "--exact"],
+      "packageManager: bun must preserve the external manager's argv",
+    );
+    assert.equal(
+      packageManagerInvocation.executableSha256,
+      externalBunSha256,
+      "packageManager: bun must execute the PATH Bun, not the devkit runtime",
+    );
+    assert.notEqual(packageManagerInvocation.executableSha256, devkitBunSha256);
+
     const build = spawnSync(hutch, ["electrobun", "build", "--env=dev"], {
       cwd: project,
       encoding: "utf8",
@@ -172,6 +268,10 @@ export default {
     assert.match(readFileSync(canonicalMain, "utf8"), new RegExp(marker));
     assert.match(readFileSync(canonicalMain, "utf8"), /V2_DEVKIT_ALIAS/);
     assert.match(readFileSync(launchBridge, "utf8"), /\.\/app\/bun\/index\.js/);
+    const buildMetadata = JSON.parse(readFileSync(join(resourcesDir, "build.json"), "utf8"));
+    assert.equal(buildMetadata.mainProcess, "bun");
+    assert.equal(buildMetadata.electrobunVersion, version);
+    assert.equal(buildMetadata.runtimeVersions.bun, manifest.runtimes.bun.version);
     assert.equal(existsSync(join(project, "node_modules")), false);
     const projectionMarker = readFileSync(join(project, ".hutch", "devkit", ".complete"), "utf8");
     assert.match(projectionMarker, new RegExp(`electrobun=${version.replaceAll(".", "\\.")}`));
