@@ -159,6 +159,10 @@ const FlatpakManifestOptions = struct {
     finish_args: []const []const u8,
 };
 
+const FlatpakOutputOptions = struct {
+    announce: bool = true,
+};
+
 const default_flatpak_finish_args = [_][]const u8{
     "--share=ipc",
     "--share=network",
@@ -888,7 +892,7 @@ fn runBuildUnlocked(ctx: *const Context, config: CommandContext) !void {
             const bundle = try appBundlePaths(ctx, config);
             const payload_path = try stageFlatpakPayload(ctx, bundle);
             defer deleteTreeWithin(ctx, bundle.build_root, payload_path) catch {};
-            try writeFlatpakOutput(ctx, config, payload_path);
+            try writeFlatpakOutput(ctx, config, payload_path, .{});
         }
         try runHook(ctx, config, "postPackage", null);
         ctx.writeStdout("electrobun build complete: {s}\n", .{build_root});
@@ -1888,7 +1892,7 @@ fn finishRelease(ctx: *const Context, config: CommandContext, state: ReleaseStat
     try writeReleaseArtifacts(ctx, config, state, installer_path);
     if (state.flatpak_payload_path) |payload_path| {
         defer deleteTreeWithin(ctx, state.bundle.build_root, payload_path) catch {};
-        try writeFlatpakOutput(ctx, config, payload_path);
+        try writeFlatpakOutput(ctx, config, payload_path, .{});
     }
 }
 
@@ -2290,7 +2294,12 @@ fn flatpakManifestJson(allocator: std.mem.Allocator, options: FlatpakManifestOpt
     );
 }
 
-fn writeFlatpakOutput(ctx: *const Context, config: CommandContext, staged_payload_path: []const u8) !void {
+fn writeFlatpakOutput(
+    ctx: *const Context,
+    config: CommandContext,
+    staged_payload_path: []const u8,
+    options: FlatpakOutputOptions,
+) !void {
     const app_id = try getAppIdentifier(ctx, config.root);
     try validateSafeOutputSegment(app_id);
     const channel = buildEnvironmentName(config.build_env);
@@ -2356,10 +2365,12 @@ fn writeFlatpakOutput(ctx: *const Context, config: CommandContext, staged_payloa
             "Electrobun's built-in updater is unsupported; publish updates through Flatpak.\n" ++
             "Hutch generated this output but did not invoke flatpak-builder or validate a runtime.\n",
     });
-    ctx.writeStdout(
-        "Flatpak MVP output: {s} (expanded /app payload; built-in updater unsupported)\n",
-        .{output_root},
-    );
+    if (options.announce) {
+        ctx.writeStdout(
+            "Flatpak MVP output: {s} (expanded /app payload; built-in updater unsupported)\n",
+            .{output_root},
+        );
+    }
 }
 
 fn extractorMetadataJson(ctx: *const Context, config: CommandContext, hash: []const u8) ![]const u8 {
@@ -7673,7 +7684,9 @@ test "opt-in Flatpak output stages expanded payload and disables release metadat
         .build_env = .canary,
     };
     try std.testing.expect(flatpakEnabled(root));
-    try writeFlatpakOutput(&ctx, config, staged_payload);
+    // Zig's build test protocol owns stdout, so this unit test must not emit
+    // the production status line while exercising the real output writer.
+    try writeFlatpakOutput(&ctx, config, staged_payload, .{ .announce = false });
 
     const architecture = try flatpakArchitectureName();
     const output_name = try std.fmt.allocPrint(
