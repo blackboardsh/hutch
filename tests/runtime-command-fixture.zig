@@ -46,7 +46,47 @@ const expected_package_manager_adversarial_args = [_][]const u8{
     "tab\tvalue",
     "工作-🚀",
     "safe & echo injected>hutch-batch-argument-injected.txt & rem",
+    "--hutch-test-package-manager=forwarded",
 };
+
+const package_manager_marker = "--hutch-test-package-manager=";
+
+const PackageManagerInvocation = struct {
+    name: []const u8,
+    forwarded_args: []const [:0]const u8,
+};
+
+fn packageManagerInvocation(args: []const [:0]const u8) !PackageManagerInvocation {
+    if (args.len == 0) return error.MissingPackageManagerExecutable;
+    if (comptime builtin.os.tag == .windows) {
+        if (args.len < 2 or !std.mem.startsWith(u8, args[1], package_manager_marker)) {
+            return error.MissingPackageManagerMarker;
+        }
+        const name = args[1][package_manager_marker.len..];
+        if (name.len == 0) return error.MissingPackageManagerIdentity;
+        return .{ .name = name, .forwarded_args = args[2..] };
+    }
+    return .{
+        .name = std.fs.path.basename(args[0]),
+        .forwarded_args = args[1..],
+    };
+}
+
+fn expectPackageManagerInvocation(
+    args: []const [:0]const u8,
+    expected_name: []const u8,
+    expected_args: []const []const u8,
+) !void {
+    const invocation = try packageManagerInvocation(args);
+    if (comptime builtin.os.tag == .windows) {
+        if (!std.mem.eql(u8, invocation.name, expected_name)) {
+            return error.UnexpectedConfigCommand;
+        }
+    } else if (!std.mem.startsWith(u8, invocation.name, expected_name)) {
+        return error.UnexpectedConfigCommand;
+    }
+    return expectArgs(invocation.forwarded_args, expected_args);
+}
 
 fn expectArgs(actual: []const [:0]const u8, expected: []const []const u8) !void {
     if (actual.len != expected.len) return error.UnexpectedArgumentCount;
@@ -309,34 +349,49 @@ pub fn main(init: std.process.Init) !void {
             return error.UnknownShellTaskMode;
         }
 
-        const executable = std.fs.path.basename(args[0]);
         const adversarial_mode_prefix = "config-pm-adversarial-";
         if (std.mem.startsWith(u8, mode, adversarial_mode_prefix)) {
             const expected_manager = mode[adversarial_mode_prefix.len..];
-            if (!std.mem.startsWith(u8, executable, expected_manager)) {
-                return error.UnexpectedConfigCommand;
-            }
-            return expectArgs(args[1..], &expected_package_manager_adversarial_args);
+            return expectPackageManagerInvocation(
+                args,
+                expected_manager,
+                &expected_package_manager_adversarial_args,
+            );
         }
         if (std.mem.eql(u8, mode, "config-npm")) {
-            if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
-            return expectArgs(args[1..], &.{ "install", "--offline", "two words", "$literal" });
+            return expectPackageManagerInvocation(
+                args,
+                "npm",
+                &.{ "install", "--offline", "two words", "$literal" },
+            );
         }
         if (std.mem.eql(u8, mode, "config-pnpm")) {
-            if (!std.mem.startsWith(u8, executable, "pnpm")) return error.UnexpectedConfigCommand;
-            return expectArgs(args[1..], &.{ "run", "dev", "--filter", "app one" });
+            return expectPackageManagerInvocation(
+                args,
+                "pnpm",
+                &.{ "run", "dev", "--filter", "app one" },
+            );
         }
         if (std.mem.eql(u8, mode, "config-pm-default-install")) {
-            if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
-            return expectArgs(args[1..], &.{ "install", "two words", "$literal" });
+            return expectPackageManagerInvocation(
+                args,
+                "npm",
+                &.{ "install", "two words", "$literal" },
+            );
         }
         if (std.mem.eql(u8, mode, "config-pm-bun-raw")) {
-            if (!std.mem.startsWith(u8, executable, "bun")) return error.UnexpectedConfigCommand;
-            return expectArgs(args[1..], &.{ "add", "left-pad", "--exact" });
+            return expectPackageManagerInvocation(
+                args,
+                "bun",
+                &.{ "add", "left-pad", "--exact" },
+            );
         }
         if (std.mem.eql(u8, mode, "config-pm-custom-install")) {
-            if (!std.mem.startsWith(u8, executable, "custom-pm")) return error.UnexpectedConfigCommand;
-            return expectArgs(args[1..], &.{ "install", "--frozen" });
+            return expectPackageManagerInvocation(
+                args,
+                "custom-pm",
+                &.{ "install", "--frozen" },
+            );
         }
         if (std.mem.eql(u8, mode, "config-hutch") or
             std.mem.eql(u8, mode, "config-hutch-shell"))
@@ -350,9 +405,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, mode, "pm-no-config-npm")) {
-        const executable = std.fs.path.basename(args[0]);
-        if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
-        return expectArgs(args[1..], &.{ "install", "--ignore-scripts" });
+        return expectPackageManagerInvocation(args, "npm", &.{ "install", "--ignore-scripts" });
     }
 
     if (std.mem.eql(u8, mode, "runtime-options")) {

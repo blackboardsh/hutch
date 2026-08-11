@@ -190,7 +190,11 @@ fn writeFakePackageManager(
         },
     );
     if (builtin.os.tag == .windows) {
-        const wrapper = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{runtime});
+        const wrapper = try std.fmt.allocPrint(
+            allocator,
+            "@\"{s}\" \"--hutch-test-package-manager={s}\" %*\r\n",
+            .{ runtime, name },
+        );
         try std.Io.Dir.cwd().writeFile(init.io, .{
             .sub_path = fake_command,
             .data = wrapper,
@@ -449,6 +453,7 @@ pub fn main(init: std.process.Init) !void {
         "tab\tvalue",
         "工作-🚀",
         "safe & echo injected>hutch-batch-argument-injected.txt & rem",
+        "--hutch-test-package-manager=forwarded",
     };
     const manager_cases = [_]struct {
         mode: []const u8,
