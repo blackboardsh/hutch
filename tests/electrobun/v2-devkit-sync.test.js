@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -147,6 +148,36 @@ export default {
       assert.ok(existsSync(join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts")));
       assert.ok(existsSync(join(project, ".hutch", "devkit", "go-sdk", "go.mod")));
       assert.match(readFileSync(join(project, ".hutch", "devkit", "tsconfig.json"), "utf8"), /electrobun\/main/);
+      const dependencyLock = readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8");
+      assert.match(dependencyLock, /hutch-project-dependencies/);
+      assert.match(dependencyLock, new RegExp(`products/electrobun/${version}/${host.key}`));
+      assert.match(dependencyLock, new RegExp(archiveSha256));
+      const registrations = readdirSync(join(dashHome, "state", "cache-v2", "projects"))
+        .filter((name) => name.endsWith(".json"));
+      assert.equal(registrations.length, 1);
+      const registration = readFileSync(
+        join(dashHome, "state", "cache-v2", "projects", registrations[0]),
+        "utf8",
+      );
+      assert.match(registration, /hutch-project-registration/);
+      assert.match(registration, new RegExp(`products/electrobun/${version}/${host.key}`));
+
+      const cachePreview = await run(hutch, ["cache", "clean", "--dry-run"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(cachePreview.status, 0, cachePreview.stderr || cachePreview.stdout);
+      assert.match(cachePreview.stdout, /eligible 0/);
+      assert.ok(existsSync(cacheRoot), "a registered exact devkit must remain reachable");
+      const destructiveClean = await run(hutch, ["cache", "clean"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(destructiveClean.status, 1);
+      assert.match(destructiveClean.stderr, /preview-only/);
+      assert.ok(existsSync(cacheRoot), "cache clean without --dry-run must not mutate state");
 
       const build = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,

@@ -1,0 +1,1585 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const release_store = @import("release_store.zig");
+const toolchain_store = @import("toolchain_store.zig");
+
+const schema_version = 1;
+const project_lock_kind = "hutch-project-dependencies";
+const registration_kind = "hutch-project-registration";
+const state_relative_root = "state/cache-v2";
+const max_state_file_bytes = 1024 * 1024;
+
+pub const default_grace_seconds: i64 = 30 * 24 * 60 * 60;
+
+pub const ManagedObject = struct {
+    kind: Kind,
+    relative_root: []const u8,
+    version: []const u8,
+    platform: []const u8,
+    toolchain_kind: ?[]const u8 = null,
+    core_sha256: ?[]const u8 = null,
+    cef_sha256: ?[]const u8 = null,
+    source_manifest_sha256: ?[]const u8 = null,
+
+    pub const Kind = enum {
+        electrobun,
+        toolchain,
+    };
+};
+
+pub const GraphLock = struct {
+    file: std.Io.File,
+
+    pub fn close(self: GraphLock, io: std.Io) void {
+        self.file.close(io);
+    }
+};
+
+pub const PruneOptions = struct {
+    dry_run: bool = false,
+    grace_seconds: i64 = default_grace_seconds,
+    now_unix_seconds: ?i64 = null,
+};
+
+pub const PruneAction = struct {
+    relative_root: []const u8,
+};
+
+pub const PruneResult = struct {
+    actions: []const PruneAction,
+    scanned: usize,
+    reachable: usize,
+    grace_kept: usize,
+    eligible: usize,
+    expired_registrations: usize,
+    pruned: usize,
+};
+
+const Candidate = struct {
+    kind: ManagedObject.Kind,
+    absolute_root: []const u8,
+    relative_root: []const u8,
+    version: []const u8,
+    platform: []const u8,
+    toolchain_kind: ?[]const u8 = null,
+};
+
+const RegistrationScan = struct {
+    reachable: std.ArrayList([]const u8) = .empty,
+    expired_paths: std.ArrayList([]const u8) = .empty,
+    defer_unreachable_pruning: bool = false,
+};
+
+pub fn acquireUsageLock(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !GraphLock {
+    const home = try release_store.dashHome(init, allocator);
+    return acquireGraphLockAt(init.io, allocator, home, .shared);
+}
+
+fn acquireGraphLockAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    mode: std.Io.File.Lock,
+) !GraphLock {
+    const state_parent = try std.fs.path.join(allocator, &.{ home, "state" });
+    try ensureDirectoryWithin(io, allocator, home, state_parent, error.InvalidCacheStatePath);
+    const state_root = try std.fs.path.join(allocator, &.{ state_parent, "cache-v2" });
+    try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidCacheStatePath);
+    const lock_path = try std.fs.path.join(allocator, &.{ state_root, "graph.lock" });
+    try initializePersistentFile(io, lock_path);
+    if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidCacheStatePath;
+    return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_write,
+        .lock = mode,
+        .follow_symlinks = false,
+    }) };
+}
+
+fn initializePersistentFile(io: std.Io, path: []const u8) !void {
+    const initializer: ?std.Io.File = std.Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (initializer) |file| file.close(io);
+}
+
+pub fn managedElectrobunObject(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    version: []const u8,
+    source_manifest_sha256: []const u8,
+    uses_cef: bool,
+) !?ManagedObject {
+    const home = try release_store.dashHome(init, allocator);
+    return managedElectrobunObjectAt(
+        init.io,
+        allocator,
+        home,
+        root,
+        version,
+        source_manifest_sha256,
+        uses_cef,
+    );
+}
+
+fn managedElectrobunObjectAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    root: []const u8,
+    version: []const u8,
+    source_manifest_sha256: []const u8,
+    uses_cef: bool,
+) !?ManagedObject {
+    try validateSegment(version);
+    try validateSha256(source_manifest_sha256);
+    const platform = std.fs.path.basename(root);
+    validateSegment(platform) catch return null;
+    const expected = try std.fs.path.join(allocator, &.{ home, "products", "electrobun", version, platform });
+    if (!std.mem.eql(u8, expected, root)) return null;
+    try validatePlatform(platform);
+
+    const core_sha256 = try readSha256Marker(io, allocator, root, ".core-complete");
+    const cef_sha256 = if (uses_cef)
+        try readSha256Marker(io, allocator, root, ".cef-complete")
+    else
+        null;
+    return .{
+        .kind = .electrobun,
+        .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ version, platform }),
+        .version = try allocator.dupe(u8, version),
+        .platform = try allocator.dupe(u8, platform),
+        .core_sha256 = core_sha256,
+        .cef_sha256 = cef_sha256,
+        .source_manifest_sha256 = try allocator.dupe(u8, source_manifest_sha256),
+    };
+}
+
+pub fn managedToolchainObject(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    kind: toolchain_store.Kind,
+    resolution: toolchain_store.Resolution,
+) !?ManagedObject {
+    const home = try release_store.dashHome(init, allocator);
+    return managedToolchainObjectAt(init.io, allocator, home, kind, resolution);
+}
+
+fn managedToolchainObjectAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    kind: toolchain_store.Kind,
+    resolution: toolchain_store.Resolution,
+) !?ManagedObject {
+    if (resolution.system) return null;
+    const root = resolution.root orelse return error.ManagedToolchainRootMissing;
+    const version = resolution.version;
+    try validateSegment(version);
+    const platform = std.fs.path.basename(root);
+    validateSegment(platform) catch return null;
+    const expected = try std.fs.path.join(allocator, &.{ home, "toolchains", kind.name(), version, platform });
+    if (!std.mem.eql(u8, expected, root)) return null;
+    try validatePlatform(platform);
+
+    const marker = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" });
+    const marker_value = try readTrimmedFile(io, allocator, marker, 256);
+    if (!std.mem.eql(u8, marker_value, version)) return error.ToolchainMarkerMismatch;
+    return .{
+        .kind = .toolchain,
+        .relative_root = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ kind.name(), version, platform }),
+        .version = try allocator.dupe(u8, version),
+        .platform = try allocator.dupe(u8, platform),
+        .toolchain_kind = kind.name(),
+    };
+}
+
+/// The caller must hold `acquireUsageLock` from before artifact resolution
+/// until this registration has been committed.
+pub fn registerPreparedProject(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    canonical_project_root: []const u8,
+    objects_input: []const ManagedObject,
+) !void {
+    const home = try release_store.dashHome(init, allocator);
+    return registerProjectAt(
+        init.io,
+        allocator,
+        home,
+        canonical_project_root,
+        objects_input,
+        unixSeconds(init.io),
+    );
+}
+
+fn registerProjectAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    canonical_project_root: []const u8,
+    objects_input: []const ManagedObject,
+    now: i64,
+) !void {
+    if (!std.fs.path.isAbsolute(canonical_project_root)) return error.ProjectRootNotAbsolute;
+    if (now < 0) return error.InvalidRegistrationTimestamp;
+    const registration_path = try projectRegistrationPath(allocator, home, canonical_project_root);
+    try ensureDirectoryWithin(
+        io,
+        allocator,
+        home,
+        std.fs.path.dirname(registration_path) orelse return error.InvalidCacheStatePath,
+        error.InvalidCacheStatePath,
+    );
+    const registration_lock_path = try std.mem.concat(allocator, u8, &.{ registration_path, ".lock" });
+    try initializePersistentFile(io, registration_lock_path);
+    if (!try pathResolvesWithin(io, allocator, home, registration_lock_path)) return error.InvalidCacheStatePath;
+    const registration_lock = try std.Io.Dir.cwd().openFile(io, registration_lock_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .follow_symlinks = false,
+    });
+    defer registration_lock.close(io);
+
+    const objects = try allocator.dupe(ManagedObject, objects_input);
+    std.mem.sort(ManagedObject, objects, {}, managedObjectLessThan);
+    for (objects) |object| try validateManagedObject(allocator, object);
+
+    const object_values = try objectsJson(allocator, objects);
+
+    var project_lock: std.json.ObjectMap = .empty;
+    try project_lock.put(allocator, "schemaVersion", .{ .integer = schema_version });
+    try project_lock.put(allocator, "kind", .{ .string = project_lock_kind });
+    try project_lock.put(allocator, "objects", .{ .array = object_values });
+    const project_lock_bytes = try stringifyJson(allocator, .{ .object = project_lock });
+    const project_lock_path = try std.fs.path.join(allocator, &.{ canonical_project_root, ".hutch", "dependencies.lock" });
+    try atomicWrite(io, allocator, project_lock_path, project_lock_bytes);
+
+    var lock_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(project_lock_bytes, &lock_digest, .{});
+    const lock_digest_hex = std.fmt.bytesToHex(lock_digest, .lower);
+
+    var registration: std.json.ObjectMap = .empty;
+    try registration.put(allocator, "schemaVersion", .{ .integer = schema_version });
+    try registration.put(allocator, "kind", .{ .string = registration_kind });
+    try registration.put(allocator, "canonicalRoot", .{ .string = canonical_project_root });
+    try registration.put(allocator, "projectLockSha256", .{ .string = try allocator.dupe(u8, &lock_digest_hex) });
+    try registration.put(allocator, "lastSeenUnixSeconds", .{ .integer = now });
+    try registration.put(allocator, "objects", .{ .array = try objectsJson(allocator, objects) });
+    const registration_bytes = try stringifyJson(allocator, .{ .object = registration });
+
+    try atomicWrite(io, allocator, registration_path, registration_bytes);
+    for (objects) |object| try touchLastUsed(io, allocator, home, object.relative_root, now);
+}
+
+fn managedObjectLessThan(_: void, lhs: ManagedObject, rhs: ManagedObject) bool {
+    return std.mem.order(u8, lhs.relative_root, rhs.relative_root) == .lt;
+}
+
+fn objectsJson(allocator: std.mem.Allocator, objects: []const ManagedObject) !std.json.Array {
+    var values = std.json.Array.init(allocator);
+    for (objects) |object| try values.append(try objectJson(allocator, object));
+    return values;
+}
+
+fn objectJson(allocator: std.mem.Allocator, object: ManagedObject) !std.json.Value {
+    var value: std.json.ObjectMap = .empty;
+    try value.put(allocator, "type", .{ .string = @tagName(object.kind) });
+    try value.put(allocator, "relativeRoot", .{ .string = object.relative_root });
+    try value.put(allocator, "version", .{ .string = object.version });
+    try value.put(allocator, "platform", .{ .string = object.platform });
+    switch (object.kind) {
+        .electrobun => {
+            try value.put(allocator, "product", .{ .string = "electrobun" });
+            try value.put(allocator, "coreSha256", .{ .string = object.core_sha256.? });
+            try value.put(allocator, "sourceManifestSha256", .{ .string = object.source_manifest_sha256.? });
+            if (object.cef_sha256) |checksum| try value.put(allocator, "cefSha256", .{ .string = checksum });
+        },
+        .toolchain => try value.put(allocator, "toolchain", .{ .string = object.toolchain_kind.? }),
+    }
+    return .{ .object = value };
+}
+
+fn stringifyJson(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    return std.mem.concat(allocator, u8, &.{ bytes, "\n" });
+}
+
+pub fn prune(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: PruneOptions,
+) !PruneResult {
+    const home = try release_store.dashHome(init, allocator);
+    return pruneAt(init.io, allocator, home, options);
+}
+
+fn pruneAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    options: PruneOptions,
+) !PruneResult {
+    if (options.grace_seconds < 0) return error.InvalidCacheGracePeriod;
+    const now = options.now_unix_seconds orelse unixSeconds(io);
+    var trash_root: ?[]const u8 = null;
+    var stale_trash: std.ArrayList([]const u8) = .empty;
+    var final_result: PruneResult = undefined;
+    {
+        const graph_lock = try acquireGraphLockAt(io, allocator, home, .exclusive);
+        defer graph_lock.close(io);
+
+        if (!options.dry_run) try collectTrashRoots(io, allocator, home, &stale_trash);
+
+        const registrations = try scanRegistrations(io, allocator, home, now);
+        var candidates: std.ArrayList(Candidate) = .empty;
+        try collectElectrobunCandidates(io, allocator, home, &candidates);
+        try collectToolchainCandidates(io, allocator, home, &candidates);
+        std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
+
+        var eligible_actions: std.ArrayList(PruneAction) = .empty;
+        var reachable_count: usize = 0;
+        var grace_kept: usize = 0;
+        for (candidates.items) |candidate| {
+            if (containsPath(registrations.reachable.items, candidate.relative_root)) {
+                reachable_count += 1;
+                continue;
+            }
+            if (registrations.defer_unreachable_pruning) {
+                grace_kept += 1;
+                continue;
+            }
+            const last_used = try readLastUsed(io, allocator, home, candidate.relative_root);
+            if (options.grace_seconds > 0 and (last_used == null or now < last_used.? or now - last_used.? < options.grace_seconds)) {
+                grace_kept += 1;
+                if (!options.dry_run and last_used == null) {
+                    try touchLastUsed(io, allocator, home, candidate.relative_root, now);
+                }
+                continue;
+            }
+            try eligible_actions.append(allocator, .{ .relative_root = try allocator.dupe(u8, candidate.relative_root) });
+        }
+
+        const eligible_count = eligible_actions.items.len;
+        if (options.dry_run) {
+            final_result = .{
+                .actions = try eligible_actions.toOwnedSlice(allocator),
+                .scanned = candidates.items.len,
+                .reachable = reachable_count,
+                .grace_kept = grace_kept,
+                .eligible = eligible_count,
+                .expired_registrations = registrations.expired_paths.items.len,
+                .pruned = 0,
+            };
+        } else {
+            for (registrations.expired_paths.items) |path| {
+                std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+            }
+
+            var pruned_actions: std.ArrayList(PruneAction) = .empty;
+            for (eligible_actions.items) |action| {
+                const candidate = findCandidate(candidates.items, action.relative_root) orelse continue;
+                if (!try candidateStillValid(io, allocator, candidate)) continue;
+                {
+                    const object_lock = try tryAcquireCandidateLock(io, allocator, candidate.absolute_root) orelse continue;
+                    defer object_lock.close(io);
+                    const batch = trash_root orelse blk: {
+                        const created = try createTrashRoot(io, allocator, home);
+                        trash_root = created;
+                        break :blk created;
+                    };
+                    const destination = try relativeRootPath(allocator, batch, candidate.relative_root);
+                    const destination_parent = std.fs.path.dirname(destination) orelse return error.InvalidCacheTrashPath;
+                    try std.Io.Dir.cwd().createDirPath(io, destination_parent);
+                    std.Io.Dir.cwd().rename(candidate.absolute_root, std.Io.Dir.cwd(), destination, io) catch |err| switch (err) {
+                        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.FileBusy => continue,
+                        else => return err,
+                    };
+                }
+                const last_used_path = try lastUsedPath(allocator, home, candidate.relative_root);
+                std.Io.Dir.cwd().deleteFile(io, last_used_path) catch {};
+                try pruned_actions.append(allocator, action);
+            }
+            const pruned_count = pruned_actions.items.len;
+            final_result = .{
+                .actions = try pruned_actions.toOwnedSlice(allocator),
+                .scanned = candidates.items.len,
+                .reachable = reachable_count,
+                .grace_kept = grace_kept,
+                .eligible = eligible_count,
+                .expired_registrations = registrations.expired_paths.items.len,
+                .pruned = pruned_count,
+            };
+        }
+    }
+
+    // Candidates were detached atomically under the graph lock. Slow recursive
+    // deletion happens afterward; crash trash is safe to remove on a later run.
+    for (stale_trash.items) |path| std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    if (trash_root) |path| std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    return final_result;
+}
+
+fn collectTrashRoots(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    output: *std.ArrayList([]const u8),
+) !void {
+    const trash_parent = try std.fs.path.join(allocator, &.{ home, "trash" });
+    try ensureDirectoryWithin(io, allocator, home, trash_parent, error.InvalidCacheTrashPath);
+    const root = try std.fs.path.join(allocator, &.{ trash_parent, "cache-v2" });
+    try ensureDirectoryWithin(io, allocator, home, root, error.InvalidCacheTrashPath);
+    var directory = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        validateTrashName(entry.name) catch continue;
+        try output.append(allocator, try std.fs.path.join(allocator, &.{ root, entry.name }));
+    }
+}
+
+fn scanRegistrations(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    now: i64,
+) !RegistrationScan {
+    var result: RegistrationScan = .{};
+    const projects_root = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
+    try ensureDirectoryWithin(io, allocator, home, projects_root, error.InvalidCacheStatePath);
+    var directory = try std.Io.Dir.cwd().openDir(io, projects_root, .{ .iterate = true });
+    defer directory.close(io);
+    if (!try pathResolvesWithin(io, allocator, home, projects_root)) return error.InvalidCacheStatePath;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        if (entry.kind != .file) return error.InvalidCacheRegistration;
+        const path = try std.fs.path.join(allocator, &.{ projects_root, entry.name });
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_file_bytes));
+        const registration = std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+            .duplicate_field_behavior = .@"error",
+        }) catch return error.InvalidCacheRegistration;
+        const object = try requiredObject(registration);
+        if (try requiredInteger(object, "schemaVersion") != schema_version or
+            !std.mem.eql(u8, try requiredString(object, "kind"), registration_kind))
+        {
+            return error.InvalidCacheRegistration;
+        }
+        const canonical_root = try requiredString(object, "canonicalRoot");
+        if (!std.fs.path.isAbsolute(canonical_root)) return error.InvalidCacheRegistration;
+        const expected_name = try projectRegistrationName(allocator, canonical_root);
+        if (!std.mem.eql(u8, expected_name, entry.name)) return error.InvalidCacheRegistration;
+        const lock_sha256 = try requiredString(object, "projectLockSha256");
+        try validateSha256(lock_sha256);
+        const last_seen = try requiredInteger(object, "lastSeenUnixSeconds");
+        if (last_seen < 0) return error.InvalidCacheRegistration;
+        const values = object.get("objects") orelse return error.InvalidCacheRegistration;
+        if (values != .array) return error.InvalidCacheRegistration;
+
+        var parsed_objects: std.ArrayList(ManagedObject) = .empty;
+        for (values.array.items) |value| {
+            try parsed_objects.append(allocator, try parseManagedObject(allocator, value));
+        }
+
+        const project_objects = try projectLockObjectsIfMatches(io, allocator, canonical_root, lock_sha256);
+        const within_missing_grace = now < last_seen or now - last_seen < default_grace_seconds;
+        if (project_objects == null and !within_missing_grace) {
+            try result.expired_paths.append(allocator, path);
+            continue;
+        }
+        if (project_objects == null) result.defer_unreachable_pruning = true;
+        for ((project_objects orelse parsed_objects.items)) |parsed| {
+            if (!containsPath(result.reachable.items, parsed.relative_root)) {
+                try result.reachable.append(allocator, parsed.relative_root);
+            }
+        }
+    }
+    return result;
+}
+
+fn projectLockObjectsIfMatches(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    canonical_root: []const u8,
+    expected_sha256: []const u8,
+) !?[]const ManagedObject {
+    const lock_path = try std.fs.path.join(allocator, &.{ canonical_root, ".hutch", "dependencies.lock" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(max_state_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, expected_sha256)) return null;
+
+    const project_lock = std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidProjectDependencyLock;
+    const object = requiredObject(project_lock) catch return error.InvalidProjectDependencyLock;
+    if ((requiredInteger(object, "schemaVersion") catch return error.InvalidProjectDependencyLock) != schema_version or
+        !std.mem.eql(u8, requiredString(object, "kind") catch return error.InvalidProjectDependencyLock, project_lock_kind))
+    {
+        return error.InvalidProjectDependencyLock;
+    }
+    const values = object.get("objects") orelse return error.InvalidProjectDependencyLock;
+    if (values != .array) return error.InvalidProjectDependencyLock;
+    var objects: std.ArrayList(ManagedObject) = .empty;
+    for (values.array.items) |value| {
+        objects.append(allocator, parseManagedObject(allocator, value) catch return error.InvalidProjectDependencyLock) catch |err| return err;
+    }
+    const owned = try objects.toOwnedSlice(allocator);
+    return @as(?[]const ManagedObject, owned);
+}
+
+fn parseManagedObject(allocator: std.mem.Allocator, value: std.json.Value) !ManagedObject {
+    const object = try requiredObject(value);
+    const kind_name = try requiredString(object, "type");
+    const relative_root = try requiredString(object, "relativeRoot");
+    const version = try requiredString(object, "version");
+    const platform = try requiredString(object, "platform");
+    try validateSegment(version);
+    try validatePlatform(platform);
+    if (std.mem.eql(u8, kind_name, "electrobun")) {
+        if (!std.mem.eql(u8, try requiredString(object, "product"), "electrobun")) return error.InvalidCacheRegistration;
+        const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ version, platform });
+        if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
+        const core_sha256 = try requiredString(object, "coreSha256");
+        const source_sha256 = try requiredString(object, "sourceManifestSha256");
+        try validateSha256(core_sha256);
+        try validateSha256(source_sha256);
+        const cef_sha256 = if (object.get("cefSha256")) |cef| blk: {
+            if (cef != .string) return error.InvalidCacheRegistration;
+            try validateSha256(cef.string);
+            break :blk cef.string;
+        } else null;
+        return .{
+            .kind = .electrobun,
+            .relative_root = relative_root,
+            .version = version,
+            .platform = platform,
+            .core_sha256 = core_sha256,
+            .cef_sha256 = cef_sha256,
+            .source_manifest_sha256 = source_sha256,
+        };
+    }
+    if (std.mem.eql(u8, kind_name, "toolchain")) {
+        const toolchain_kind = try requiredString(object, "toolchain");
+        try validateToolchainKind(toolchain_kind);
+        const expected = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ toolchain_kind, version, platform });
+        if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
+        return .{
+            .kind = .toolchain,
+            .relative_root = relative_root,
+            .version = version,
+            .platform = platform,
+            .toolchain_kind = toolchain_kind,
+        };
+    }
+    return error.InvalidCacheRegistration;
+}
+
+fn collectElectrobunCandidates(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    output: *std.ArrayList(Candidate),
+) !void {
+    const root = try std.fs.path.join(allocator, &.{ home, "products", "electrobun" });
+    var versions = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer versions.close(io);
+    if (!try pathResolvesWithin(io, allocator, home, root)) return error.InvalidManagedObjectPath;
+    var version_iterator = versions.iterate();
+    while (try version_iterator.next(io)) |version_entry| {
+        if (version_entry.kind != .directory) continue;
+        validateSegment(version_entry.name) catch continue;
+        const version_root = try std.fs.path.join(allocator, &.{ root, version_entry.name });
+        var platforms = try std.Io.Dir.cwd().openDir(io, version_root, .{ .iterate = true });
+        defer platforms.close(io);
+        var platform_iterator = platforms.iterate();
+        while (try platform_iterator.next(io)) |platform_entry| {
+            if (platform_entry.kind != .directory) continue;
+            validatePlatform(platform_entry.name) catch continue;
+            const absolute = try std.fs.path.join(allocator, &.{ version_root, platform_entry.name });
+            const candidate: Candidate = .{
+                .kind = .electrobun,
+                .absolute_root = absolute,
+                .relative_root = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ version_entry.name, platform_entry.name }),
+                .version = try allocator.dupe(u8, version_entry.name),
+                .platform = try allocator.dupe(u8, platform_entry.name),
+            };
+            if (try pathResolvesWithin(io, allocator, home, absolute) and
+                try candidateStillValid(io, allocator, candidate))
+            {
+                try output.append(allocator, candidate);
+            }
+        }
+    }
+}
+
+fn collectToolchainCandidates(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    output: *std.ArrayList(Candidate),
+) !void {
+    const root = try std.fs.path.join(allocator, &.{ home, "toolchains" });
+    var kinds = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer kinds.close(io);
+    if (!try pathResolvesWithin(io, allocator, home, root)) return error.InvalidManagedObjectPath;
+    var kind_iterator = kinds.iterate();
+    while (try kind_iterator.next(io)) |kind_entry| {
+        if (kind_entry.kind != .directory) continue;
+        validateToolchainKind(kind_entry.name) catch continue;
+        const kind_root = try std.fs.path.join(allocator, &.{ root, kind_entry.name });
+        var versions = try std.Io.Dir.cwd().openDir(io, kind_root, .{ .iterate = true });
+        defer versions.close(io);
+        var version_iterator = versions.iterate();
+        while (try version_iterator.next(io)) |version_entry| {
+            if (version_entry.kind != .directory) continue;
+            validateSegment(version_entry.name) catch continue;
+            const version_root = try std.fs.path.join(allocator, &.{ kind_root, version_entry.name });
+            var platforms = try std.Io.Dir.cwd().openDir(io, version_root, .{ .iterate = true });
+            defer platforms.close(io);
+            var platform_iterator = platforms.iterate();
+            while (try platform_iterator.next(io)) |platform_entry| {
+                if (platform_entry.kind != .directory) continue;
+                validatePlatform(platform_entry.name) catch continue;
+                const absolute = try std.fs.path.join(allocator, &.{ version_root, platform_entry.name });
+                const candidate: Candidate = .{
+                    .kind = .toolchain,
+                    .absolute_root = absolute,
+                    .relative_root = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ kind_entry.name, version_entry.name, platform_entry.name }),
+                    .version = try allocator.dupe(u8, version_entry.name),
+                    .platform = try allocator.dupe(u8, platform_entry.name),
+                    .toolchain_kind = try allocator.dupe(u8, kind_entry.name),
+                };
+                if (try pathResolvesWithin(io, allocator, home, absolute) and
+                    try candidateStillValid(io, allocator, candidate))
+                {
+                    try output.append(allocator, candidate);
+                }
+            }
+        }
+    }
+}
+
+fn candidateLessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+    return std.mem.order(u8, lhs.relative_root, rhs.relative_root) == .lt;
+}
+
+fn candidateStillValid(io: std.Io, allocator: std.mem.Allocator, candidate: Candidate) !bool {
+    switch (candidate.kind) {
+        .electrobun => {
+            _ = readSha256Marker(io, allocator, candidate.absolute_root, ".core-complete") catch return false;
+            return pathExists(
+                io,
+                try std.fs.path.join(allocator, &.{ candidate.absolute_root, "native-devkit.json" }),
+            );
+        },
+        .toolchain => {
+            const marker = try std.fs.path.join(allocator, &.{ candidate.absolute_root, ".hutch-toolchain" });
+            const value = readTrimmedFile(io, allocator, marker, 256) catch return false;
+            return std.mem.eql(u8, value, candidate.version);
+        },
+    }
+}
+
+fn findCandidate(candidates: []const Candidate, relative_root: []const u8) ?Candidate {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.relative_root, relative_root)) return candidate;
+    }
+    return null;
+}
+
+fn containsPath(paths: []const []const u8, needle: []const u8) bool {
+    for (paths) |path| if (std.mem.eql(u8, path, needle)) return true;
+    return false;
+}
+
+fn tryAcquireCandidateLock(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    candidate_root: []const u8,
+) !?std.Io.File {
+    const lock_path = try std.mem.concat(allocator, u8, &.{ candidate_root, ".lock" });
+    return std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.WouldBlock, error.AccessDenied, error.PermissionDenied => null,
+        else => return err,
+    };
+}
+
+fn createTrashRoot(io: std.Io, allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
+    var random: [12]u8 = undefined;
+    io.random(&random);
+    const suffix = std.fmt.bytesToHex(random, .lower);
+    const trash_parent = try std.fs.path.join(allocator, &.{ home, "trash" });
+    try ensureDirectoryWithin(io, allocator, home, trash_parent, error.InvalidCacheTrashPath);
+    const cache_trash = try std.fs.path.join(allocator, &.{ trash_parent, "cache-v2" });
+    try ensureDirectoryWithin(io, allocator, home, cache_trash, error.InvalidCacheTrashPath);
+    const root = try std.fs.path.join(allocator, &.{ cache_trash, &suffix });
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    if (!try pathResolvesWithin(io, allocator, home, root)) return error.InvalidCacheTrashPath;
+    return root;
+}
+
+fn relativeRootPath(allocator: std.mem.Allocator, base: []const u8, relative_root: []const u8) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    try parts.append(allocator, base);
+    var iterator = std.mem.splitScalar(u8, relative_root, '/');
+    while (iterator.next()) |part| {
+        try validateSegment(part);
+        try parts.append(allocator, part);
+    }
+    return std.fs.path.join(allocator, parts.items);
+}
+
+fn projectRegistrationPath(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    canonical_root: []const u8,
+) ![]const u8 {
+    return std.fs.path.join(allocator, &.{
+        home,
+        state_relative_root,
+        "projects",
+        try projectRegistrationName(allocator, canonical_root),
+    });
+}
+
+fn projectRegistrationName(allocator: std.mem.Allocator, canonical_root: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical_root, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}.json", .{hex});
+}
+
+fn lastUsedPath(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    relative_root: []const u8,
+) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(relative_root, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const name = try std.fmt.allocPrint(allocator, "{s}.timestamp", .{hex});
+    return std.fs.path.join(allocator, &.{ home, state_relative_root, "last-used", name });
+}
+
+fn touchLastUsed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    relative_root: []const u8,
+    now: i64,
+) !void {
+    const path = try lastUsedPath(allocator, home, relative_root);
+    try ensureDirectoryWithin(
+        io,
+        allocator,
+        home,
+        std.fs.path.dirname(path) orelse return error.InvalidCacheStatePath,
+        error.InvalidCacheStatePath,
+    );
+    const value = try std.fmt.allocPrint(allocator, "{d}\n", .{now});
+    try atomicWrite(io, allocator, path, value);
+}
+
+fn readLastUsed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    relative_root: []const u8,
+) !?i64 {
+    const path = try lastUsedPath(allocator, home, relative_root);
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidCacheStatePath;
+    var directory = std.Io.Dir.cwd().openDir(io, parent, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer directory.close(io);
+    if (!try pathResolvesWithin(io, allocator, home, parent)) return error.InvalidCacheStatePath;
+    const value = readTrimmedFile(io, allocator, path, 64) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const timestamp = std.fmt.parseInt(i64, value, 10) catch return error.InvalidLastUsedMarker;
+    if (timestamp < 0) return error.InvalidLastUsedMarker;
+    return timestamp;
+}
+
+fn atomicWrite(io: std.Io, allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidCacheStatePath;
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+    var random: [12]u8 = undefined;
+    io.random(&random);
+    const suffix = std.fmt.bytesToHex(random, .lower);
+    const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp-{s}", .{ path, suffix });
+    errdefer std.Io.Dir.cwd().deleteFile(io, temporary) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = bytes });
+    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, io);
+}
+
+fn readSha256Marker(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    const path = try std.fs.path.join(allocator, &.{ root, name });
+    const value = try readTrimmedFile(io, allocator, path, 128);
+    try validateSha256(value);
+    return value;
+}
+
+fn readTrimmedFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]const u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+    return std.mem.trim(u8, bytes, " \t\r\n");
+}
+
+fn validateManagedObject(allocator: std.mem.Allocator, object: ManagedObject) !void {
+    try validateSegment(object.version);
+    try validatePlatform(object.platform);
+    switch (object.kind) {
+        .electrobun => {
+            try validateSha256(object.core_sha256 orelse return error.InvalidManagedObject);
+            try validateSha256(object.source_manifest_sha256 orelse return error.InvalidManagedObject);
+            if (object.cef_sha256) |value| try validateSha256(value);
+            const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}", .{ object.version, object.platform });
+            if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
+        },
+        .toolchain => {
+            const kind = object.toolchain_kind orelse return error.InvalidManagedObject;
+            try validateToolchainKind(kind);
+            const expected = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ kind, object.version, object.platform });
+            if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
+        },
+    }
+}
+
+fn validateSegment(value: []const u8) !void {
+    if (value.len == 0 or std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) {
+        return error.InvalidManagedObjectPath;
+    }
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-' or byte == '+')) {
+            return error.InvalidManagedObjectPath;
+        }
+    }
+}
+
+fn validateToolchainKind(value: []const u8) !void {
+    inline for (.{ "zig", "rust", "go", "odin" }) |kind| {
+        if (std.mem.eql(u8, value, kind)) return;
+    }
+    return error.InvalidManagedObjectPath;
+}
+
+fn validatePlatform(value: []const u8) !void {
+    inline for (.{
+        "macos-arm64",
+        "macos-x64",
+        "linux-arm64",
+        "linux-x64",
+        "windows-x64",
+    }) |platform| {
+        if (std.mem.eql(u8, value, platform)) return;
+    }
+    return error.InvalidManagedObjectPath;
+}
+
+fn validateTrashName(value: []const u8) !void {
+    if (value.len != 24) return error.InvalidCacheTrashPath;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidCacheTrashPath;
+    }
+}
+
+fn validateSha256(value: []const u8) !void {
+    if (value.len != 64) return error.InvalidSha256;
+    for (value) |byte| if (!std.ascii.isHex(byte)) return error.InvalidSha256;
+}
+
+fn requiredObject(value: std.json.Value) !std.json.ObjectMap {
+    if (value != .object) return error.InvalidCacheRegistration;
+    return value.object;
+}
+
+fn requiredString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.InvalidCacheRegistration;
+    if (value != .string) return error.InvalidCacheRegistration;
+    return value.string;
+}
+
+fn requiredInteger(object: std.json.ObjectMap, name: []const u8) !i64 {
+    const value = object.get(name) orelse return error.InvalidCacheRegistration;
+    if (value != .integer) return error.InvalidCacheRegistration;
+    return value.integer;
+}
+
+fn unixSeconds(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn pathResolvesWithin(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    child: []const u8,
+) !bool {
+    const canonical_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, parent, allocator);
+    const canonical_child = try std.Io.Dir.cwd().realPathFileAlloc(io, child, allocator);
+    const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const lexical_parent = try std.fs.path.resolve(allocator, &.{ canonical_cwd, parent });
+    const lexical_child = try std.fs.path.resolve(allocator, &.{ canonical_cwd, child });
+    const relative = try std.fs.path.relative(allocator, canonical_cwd, null, lexical_parent, lexical_child);
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative)) return false;
+    const expected_child = try std.fs.path.resolve(allocator, &.{ canonical_parent, relative });
+    if (!pathHasParent(expected_child, canonical_parent)) return false;
+    return pathEqual(expected_child, canonical_child);
+}
+
+fn pathHasParent(child: []const u8, parent: []const u8) bool {
+    if (child.len <= parent.len or !pathEqual(child[0..parent.len], parent)) return false;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
+fn pathEqual(lhs: []const u8, rhs: []const u8) bool {
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(lhs, rhs)
+    else
+        std.mem.eql(u8, lhs, rhs);
+}
+
+fn ensureDirectoryWithin(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    path: []const u8,
+    comptime invalid_path_error: anyerror,
+) !void {
+    const existing: ?std.Io.File.Stat = std.Io.Dir.cwd().statFile(io, path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing) |stat| {
+        if (stat.kind != .directory) return invalid_path_error;
+    }
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    if (!try pathResolvesWithin(io, allocator, home, path)) return invalid_path_error;
+}
+
+const test_core_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const test_manifest_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const test_cef_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn testAbsoluteRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+) ![]const u8 {
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    return std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+}
+
+fn createTestCandidate(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    object: ManagedObject,
+) ![]const u8 {
+    const root = try relativeRootPath(allocator, home, object.relative_root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    switch (object.kind) {
+        .electrobun => try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ root, ".core-complete" }),
+            .data = try std.mem.concat(allocator, u8, &.{ object.core_sha256.?, "\n" }),
+        }),
+        .toolchain => try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" }),
+            .data = object.version,
+        }),
+    }
+    if (object.kind == .electrobun) {
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ root, "native-devkit.json" }),
+            .data = "{}",
+        });
+    }
+    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
+    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .read = true, .truncate = false });
+    lock.close(io);
+    return root;
+}
+
+fn testElectrobunObject() ManagedObject {
+    return .{
+        .kind = .electrobun,
+        .relative_root = "products/electrobun/2.0.0/macos-arm64",
+        .version = "2.0.0",
+        .platform = "macos-arm64",
+        .core_sha256 = test_core_sha256,
+        .source_manifest_sha256 = test_manifest_sha256,
+    };
+}
+
+fn testToolchainObject() ManagedObject {
+    return .{
+        .kind = .toolchain,
+        .relative_root = "toolchains/zig/0.16.0/macos-arm64",
+        .version = "0.16.0",
+        .platform = "macos-arm64",
+        .toolchain_kind = "zig",
+    };
+}
+
+test "project registration records a deterministic exact dependency graph" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+
+    const electrobun = testElectrobunObject();
+    const toolchain = testToolchainObject();
+    try registerProjectAt(io, allocator, home, project, &.{ toolchain, electrobun }, 1_000);
+
+    const project_lock_path = try std.fs.path.join(allocator, &.{ project, ".hutch", "dependencies.lock" });
+    const project_lock = try std.Io.Dir.cwd().readFileAlloc(io, project_lock_path, allocator, .limited(max_state_file_bytes));
+    const electrobun_index = std.mem.indexOf(u8, project_lock, electrobun.relative_root).?;
+    const toolchain_index = std.mem.indexOf(u8, project_lock, toolchain.relative_root).?;
+    try std.testing.expect(electrobun_index < toolchain_index);
+
+    const registration_path = try projectRegistrationPath(allocator, home, project);
+    const registration = try std.Io.Dir.cwd().readFileAlloc(io, registration_path, allocator, .limited(max_state_file_bytes));
+    try std.testing.expect(std.mem.indexOf(u8, registration, "\"lastSeenUnixSeconds\":1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registration, test_core_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, registration, test_manifest_sha256) != null);
+
+    const scanned = try scanRegistrations(io, allocator, home, 1_001);
+    try std.testing.expectEqual(@as(usize, 2), scanned.reachable.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scanned.expired_paths.items.len);
+    try std.testing.expectEqual(@as(?i64, 1_000), try readLastUsed(io, allocator, home, electrobun.relative_root));
+    try std.testing.expectEqual(@as(?i64, 1_000), try readLastUsed(io, allocator, home, toolchain.relative_root));
+}
+
+test "resolver outputs become managed objects only inside DASH_HOME" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const electrobun_fixture = testElectrobunObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun_fixture);
+    const electrobun = (try managedElectrobunObjectAt(
+        io,
+        allocator,
+        home,
+        electrobun_root,
+        electrobun_fixture.version,
+        test_manifest_sha256,
+        false,
+    )).?;
+    try std.testing.expectEqualStrings(electrobun_fixture.relative_root, electrobun.relative_root);
+    try std.testing.expectEqualStrings(test_core_sha256, electrobun.core_sha256.?);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ electrobun_root, ".cef-complete" }),
+        .data = test_cef_sha256,
+    });
+    const with_cef = (try managedElectrobunObjectAt(
+        io,
+        allocator,
+        home,
+        electrobun_root,
+        electrobun_fixture.version,
+        test_manifest_sha256,
+        true,
+    )).?;
+    try std.testing.expectEqualStrings(test_cef_sha256, with_cef.cef_sha256.?);
+
+    const external_root = try std.fs.path.join(allocator, &.{ root, "local-devkit" });
+    try std.Io.Dir.cwd().createDirPath(io, external_root);
+    try std.testing.expect((try managedElectrobunObjectAt(
+        io,
+        allocator,
+        home,
+        external_root,
+        electrobun_fixture.version,
+        test_manifest_sha256,
+        false,
+    )) == null);
+
+    const toolchain_fixture = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain_fixture);
+    const toolchain = (try managedToolchainObjectAt(io, allocator, home, .zig, .{
+        .binary = try std.fs.path.join(allocator, &.{ toolchain_root, "zig" }),
+        .root = toolchain_root,
+        .version = toolchain_fixture.version,
+        .system = false,
+    })).?;
+    try std.testing.expectEqualStrings(toolchain_fixture.relative_root, toolchain.relative_root);
+    try std.testing.expect((try managedToolchainObjectAt(io, allocator, home, .zig, .{
+        .binary = "zig",
+        .root = null,
+        .version = toolchain_fixture.version,
+        .system = true,
+    })) == null);
+}
+
+test "prune removes only stale unreachable managed objects" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+
+    const electrobun = testElectrobunObject();
+    const toolchain = testToolchainObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+    try registerProjectAt(io, allocator, home, project, &.{electrobun}, 10_000);
+    try touchLastUsed(io, allocator, home, toolchain.relative_root, 10_000 - default_grace_seconds - 1);
+
+    const third_party_cache = try std.fs.path.join(allocator, &.{ home, "cache", "npm", "keep" });
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(third_party_cache).?);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = third_party_cache, .data = "third-party" });
+    const stale_trash = try std.fs.path.join(allocator, &.{ home, "trash", "cache-v2", "111111111111111111111111", "leftover" });
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(stale_trash).?);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_trash, .data = "detached" });
+
+    const preview = try pruneAt(io, allocator, home, .{
+        .dry_run = true,
+        .now_unix_seconds = 10_000,
+    });
+    try std.testing.expectEqual(@as(usize, 2), preview.scanned);
+    try std.testing.expectEqual(@as(usize, 1), preview.reachable);
+    try std.testing.expectEqual(@as(usize, 1), preview.eligible);
+    try std.testing.expectEqualStrings(toolchain.relative_root, preview.actions[0].relative_root);
+    try std.testing.expect(pathExists(io, toolchain_root));
+
+    const pruned = try pruneAt(io, allocator, home, .{
+        .now_unix_seconds = 10_000,
+    });
+    try std.testing.expectEqual(@as(usize, 1), pruned.pruned);
+    try std.testing.expect(pathExists(io, electrobun_root));
+    try std.testing.expect(!pathExists(io, toolchain_root));
+    try std.testing.expect(pathExists(io, third_party_cache));
+    try std.testing.expect(!pathExists(io, stale_trash));
+}
+
+test "missing last-used state receives grace before an object can be pruned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const toolchain = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+
+    const seeded = try pruneAt(io, allocator, home, .{ .now_unix_seconds = 20_000 });
+    try std.testing.expectEqual(@as(usize, 0), seeded.pruned);
+    try std.testing.expectEqual(@as(usize, 1), seeded.grace_kept);
+    try std.testing.expectEqual(@as(?i64, 20_000), try readLastUsed(io, allocator, home, toolchain.relative_root));
+    try std.testing.expect(pathExists(io, toolchain_root));
+
+    const expired = try pruneAt(io, allocator, home, .{
+        .now_unix_seconds = 20_000 + default_grace_seconds + 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), expired.pruned);
+    try std.testing.expect(!pathExists(io, toolchain_root));
+}
+
+test "zero-grace dry-run previews without mutating artifacts or state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const electrobun = testElectrobunObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+
+    const preview = try pruneAt(io, allocator, home, .{
+        .dry_run = true,
+        .grace_seconds = 0,
+        .now_unix_seconds = 30_000,
+    });
+    try std.testing.expectEqual(@as(usize, 1), preview.eligible);
+    try std.testing.expectEqual(@as(usize, 0), preview.pruned);
+    try std.testing.expect(pathExists(io, electrobun_root));
+    try std.testing.expectEqual(@as(?i64, null), try readLastUsed(io, allocator, home, electrobun.relative_root));
+}
+
+test "missing projects retain shadow roots for grace then expire" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    const electrobun = testElectrobunObject();
+    try registerProjectAt(io, allocator, home, project, &.{electrobun}, 40_000);
+    try std.Io.Dir.cwd().deleteTree(io, project);
+
+    const retained = try scanRegistrations(io, allocator, home, 40_001);
+    try std.testing.expectEqual(@as(usize, 1), retained.reachable.items.len);
+    try std.testing.expectEqual(@as(usize, 0), retained.expired_paths.items.len);
+
+    const expired = try scanRegistrations(io, allocator, home, 40_000 + default_grace_seconds + 1);
+    try std.testing.expectEqual(@as(usize, 0), expired.reachable.items.len);
+    try std.testing.expectEqual(@as(usize, 1), expired.expired_paths.items.len);
+}
+
+test "a live shadow registration defers all pruning for its grace window" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    try registerProjectAt(io, allocator, home, project, &.{testElectrobunObject()}, 1);
+    try std.Io.Dir.cwd().deleteTree(io, project);
+
+    const toolchain = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+    try touchLastUsed(io, allocator, home, toolchain.relative_root, 1);
+    const retained = try pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 2,
+    });
+    try std.testing.expectEqual(@as(usize, 0), retained.pruned);
+    try std.testing.expectEqual(@as(usize, 1), retained.grace_kept);
+    try std.testing.expect(pathExists(io, toolchain_root));
+
+    const expired = try pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = default_grace_seconds + 2,
+    });
+    try std.testing.expectEqual(@as(usize, 1), expired.pruned);
+    try std.testing.expect(!pathExists(io, toolchain_root));
+}
+
+test "a verified project lock is the live reachability source of truth" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    const electrobun = testElectrobunObject();
+    const toolchain = testToolchainObject();
+    try registerProjectAt(io, allocator, home, project, &.{ electrobun, toolchain }, 45_000);
+
+    const registration_path = try projectRegistrationPath(allocator, home, project);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, registration_path, allocator, .limited(max_state_file_bytes));
+    var registration = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
+    const registration_objects = registration.object.getPtr("objects").?;
+    registration_objects.array.items = registration_objects.array.items[0..1];
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = registration_path,
+        .data = try stringifyJson(allocator, registration),
+    });
+
+    const scanned = try scanRegistrations(io, allocator, home, 45_001);
+    try std.testing.expectEqual(@as(usize, 2), scanned.reachable.items.len);
+    try std.testing.expect(containsPath(scanned.reachable.items, electrobun.relative_root));
+    try std.testing.expect(containsPath(scanned.reachable.items, toolchain.relative_root));
+}
+
+test "corrupt registration fails closed before artifact mutation" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const electrobun = testElectrobunObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+    const registrations = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
+    try std.Io.Dir.cwd().createDirPath(io, registrations);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ registrations, "bad.json" }),
+        .data = "{not-json",
+    });
+
+    try std.testing.expectError(error.InvalidCacheRegistration, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 50_000,
+    }));
+    try std.testing.expect(pathExists(io, electrobun_root));
+}
+
+test "expired registrations are fully validated before removal" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    const electrobun = testElectrobunObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+    try registerProjectAt(io, allocator, home, project, &.{electrobun}, 1);
+    try std.Io.Dir.cwd().deleteTree(io, project);
+
+    const registration_path = try projectRegistrationPath(allocator, home, project);
+    const valid = try std.Io.Dir.cwd().readFileAlloc(io, registration_path, allocator, .limited(max_state_file_bytes));
+    const invalid = try std.mem.replaceOwned(u8, allocator, valid, "\"type\":\"electrobun\"", "\"type\":\"unknown\"");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = registration_path, .data = invalid });
+
+    try std.testing.expectError(error.InvalidCacheRegistration, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = default_grace_seconds + 2,
+    }));
+    try std.testing.expect(pathExists(io, registration_path));
+    try std.testing.expect(pathExists(io, electrobun_root));
+}
+
+test "registration symlinks fail closed before artifact mutation" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const electrobun = testElectrobunObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+    const registrations = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
+    try std.Io.Dir.cwd().createDirPath(io, registrations);
+    const outside = try std.fs.path.join(allocator, &.{ root, "outside-registration.json" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outside, .data = "{}" });
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside,
+        try std.fs.path.join(allocator, &.{ registrations, "alias.json" }),
+        .{},
+    );
+
+    try std.testing.expectError(error.InvalidCacheRegistration, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 55_000,
+    }));
+    try std.testing.expect(pathExists(io, electrobun_root));
+}
+
+test "managed object discovery never follows directory symlinks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const outside = try std.fs.path.join(allocator, &.{ root, "outside-toolchains", "zig", "9.9.9", "macos-arm64" });
+    try std.Io.Dir.cwd().createDirPath(io, outside);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ outside, ".hutch-toolchain" }),
+        .data = "9.9.9",
+    });
+    const outside_root = try std.fs.path.join(allocator, &.{ root, "outside-toolchains" });
+    const link = try std.fs.path.join(allocator, &.{ home, "toolchains" });
+    try std.Io.Dir.cwd().symLink(io, outside_root, link, .{ .is_directory = true });
+
+    const preview = try pruneAt(io, allocator, home, .{
+        .dry_run = true,
+        .grace_seconds = 0,
+        .now_unix_seconds = 60_000,
+    });
+    try std.testing.expectEqual(@as(usize, 0), preview.scanned);
+    try std.testing.expect(pathExists(io, outside));
+    try std.testing.expect(pathExists(io, link));
+}
+
+test "a state namespace escaping DASH_HOME blocks deletion" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const outside_state = try std.fs.path.join(allocator, &.{ root, "outside-state" });
+    try std.Io.Dir.cwd().createDirPath(io, outside_state);
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside_state,
+        try std.fs.path.join(allocator, &.{ home, "state" }),
+        .{ .is_directory = true },
+    );
+    const toolchain = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+
+    try std.testing.expectError(error.InvalidCacheStatePath, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 65_000,
+    }));
+    try std.testing.expect(pathExists(io, toolchain_root));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside_state, "cache-v2" })));
+}
+
+test "a dangling projects namespace cannot hide registrations" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const projects_root = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(projects_root).?);
+    try std.Io.Dir.cwd().symLink(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "missing-projects-target" }),
+        projects_root,
+        .{ .is_directory = true },
+    );
+    const toolchain = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+
+    try std.testing.expectError(error.InvalidCacheStatePath, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 66_000,
+    }));
+    try std.testing.expect(pathExists(io, toolchain_root));
+}
+
+test "an in-home trash alias cannot delete third-party cache data" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const npm_cache = try std.fs.path.join(allocator, &.{ home, "cache", "npm" });
+    const third_party_file = try std.fs.path.join(allocator, &.{ npm_cache, "cache-v2", "111111111111111111111111", "keep" });
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(third_party_file).?);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = third_party_file, .data = "third-party" });
+    try std.Io.Dir.cwd().symLink(
+        io,
+        npm_cache,
+        try std.fs.path.join(allocator, &.{ home, "trash" }),
+        .{ .is_directory = true },
+    );
+
+    try std.testing.expectError(error.InvalidCacheTrashPath, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 67_000,
+    }));
+    try std.testing.expect(pathExists(io, third_party_file));
+}
+
+test "a trash namespace escaping DASH_HOME blocks deletion" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const outside_trash = try std.fs.path.join(allocator, &.{ root, "outside-trash" });
+    try std.Io.Dir.cwd().createDirPath(io, outside_trash);
+    try std.Io.Dir.cwd().symLink(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "outside-trash" }),
+        try std.fs.path.join(allocator, &.{ home, "trash" }),
+        .{ .is_directory = true },
+    );
+    const toolchain = testToolchainObject();
+    const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
+    try touchLastUsed(io, allocator, home, toolchain.relative_root, 1);
+
+    try std.testing.expectError(error.InvalidCacheTrashPath, pruneAt(io, allocator, home, .{
+        .grace_seconds = 0,
+        .now_unix_seconds = 70_000,
+    }));
+    try std.testing.expect(pathExists(io, toolchain_root));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside_trash, "cache-v2" })));
+}

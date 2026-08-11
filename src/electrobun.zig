@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cache_store = @import("cache_store.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
@@ -552,18 +553,44 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         _ = try requireProjectZigBuildFile(ctx);
     }
 
+    const graph_lock = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    defer graph_lock.close(ctx.io);
+
     const platform_paths = try getPlatformPaths(ctx, config.root);
+    var objects: std.ArrayList(cache_store.ManagedObject) = .empty;
+    if (platform_paths.devkit) |devkit| {
+        if (try cache_store.managedElectrobunObject(
+            ctx.init,
+            ctx.allocator,
+            devkit.root,
+            devkit.version,
+            devkit.source_manifest_sha256,
+            bundleUsesCef(config.root),
+        )) |object| try objects.append(ctx.allocator, object);
+    }
     switch (main_process) {
-        .zig => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig),
-        .rust => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust),
+        .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)),
+        .rust => try appendManagedToolchain(ctx, &objects, .rust, try resolveBuildToolchain(ctx, config.root, platform_paths, .rust)),
         .go => {
-            _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
+            try appendManagedToolchain(ctx, &objects, .go, try resolveBuildToolchain(ctx, config.root, platform_paths, .go));
             if (builtin.os.tag == .windows) {
-                _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+                try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchain(ctx, config.root, platform_paths, .zig));
             }
         },
-        .odin => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin),
+        .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchain(ctx, config.root, platform_paths, .odin)),
         .bun, .cottontail => {},
+    }
+    try cache_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
+}
+
+fn appendManagedToolchain(
+    ctx: *const Context,
+    objects: *std.ArrayList(cache_store.ManagedObject),
+    kind: toolchain_store.Kind,
+    resolution: toolchain_store.Resolution,
+) !void {
+    if (try cache_store.managedToolchainObject(ctx.init, ctx.allocator, kind, resolution)) |object| {
+        try objects.append(ctx.allocator, object);
     }
 }
 
