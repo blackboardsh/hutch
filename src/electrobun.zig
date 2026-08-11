@@ -4538,12 +4538,14 @@ fn absoluteProjectPath(ctx: *const Context, relative_or_absolute: []const u8) ![
 fn validateSafeOutputSegment(value: []const u8) !void {
     if (value.len == 0 or
         std.mem.eql(u8, value, ".") or
-        std.mem.eql(u8, value, ".."))
+        std.mem.eql(u8, value, "..") or
+        value[value.len - 1] == ' ' or
+        value[value.len - 1] == '.')
     {
         return error.UnsafeOutputPath;
     }
     for (value) |byte| {
-        if (byte == 0 or byte == '/' or byte == '\\') return error.UnsafeOutputPath;
+        if (byte == 0 or byte == '/' or byte == '\\' or byte == ':') return error.UnsafeOutputPath;
     }
 }
 
@@ -4644,6 +4646,12 @@ fn ensureOutputTargetWithin(
             else => return err,
         };
         if (stat.kind == .sym_link) return error.UnsafeOutputPath;
+        const canonical_current = std.Io.Dir.cwd().realPathFileAlloc(
+            ctx.io,
+            current,
+            ctx.allocator,
+        ) catch return error.UnsafeOutputPath;
+        if (!outputPathsEqual(current, canonical_current)) return error.UnsafeOutputPath;
     }
 }
 
@@ -4742,7 +4750,7 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
         }));
     }
 
-    for ([_][]const u8{ "", ".", "..", "a/../b", "a\\..\\b", "/tmp/out", "C:\\out", "C:out" }) |path| {
+    for ([_][]const u8{ "", ".", "..", ". ", ".. ", "a/../b", "a\\..\\b", "/tmp/out", "C:\\out", "C:out", "safe/file:stream" }) |path| {
         try std.testing.expectError(error.UnsafeOutputPath, validateSafeRelativeOutputPath(path));
     }
 }
