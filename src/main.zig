@@ -822,6 +822,12 @@ fn runPackageManager(
         subcommand,
         forwarded_args,
     ) catch |err| {
+        if (err == error.InvalidBatchScriptArg) {
+            try stderr.writeAll(
+                "hutch: Windows .cmd/.bat package-manager shims reject arguments containing NUL, CR, or LF\n",
+            );
+            return 1;
+        }
         try stderr.print("hutch: could not run package manager {s} ({s}): {s}\n", .{
             @tagName(selection.name),
             selection.executable,

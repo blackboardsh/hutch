@@ -24,6 +24,25 @@ const expected_shell_args = [_][]const u8{
     "",
 };
 
+const expected_package_manager_adversarial_args = [_][]const u8{
+    "install",
+    "%HUTCH_BATCH_SENTINEL%",
+    "!HUTCH_BATCH_DELAYED!",
+    "caret^value",
+    "quote\"value",
+    "amp&value",
+    "pipe|value",
+    "input<value",
+    "output>value",
+    "(parentheses)",
+    "",
+    "trailing\\",
+    "two words",
+    "tab\tvalue",
+    "工作-🚀",
+    "safe & echo injected>hutch-batch-argument-injected.txt & rem",
+};
+
 fn expectArgs(actual: []const [:0]const u8, expected: []const []const u8) !void {
     if (actual.len != expected.len) return error.UnexpectedArgumentCount;
     for (expected, actual) |expected_arg, actual_arg| {
@@ -127,6 +146,14 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const executable = std.fs.path.basename(args[0]);
+        const adversarial_mode_prefix = "config-pm-adversarial-";
+        if (std.mem.startsWith(u8, mode, adversarial_mode_prefix)) {
+            const expected_manager = mode[adversarial_mode_prefix.len..];
+            if (!std.mem.startsWith(u8, executable, expected_manager)) {
+                return error.UnexpectedConfigCommand;
+            }
+            return expectArgs(args[1..], &expected_package_manager_adversarial_args);
+        }
         if (std.mem.eql(u8, mode, "config-npm")) {
             if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
             return expectArgs(args[1..], &.{ "install", "--offline", "two words", "$literal" });

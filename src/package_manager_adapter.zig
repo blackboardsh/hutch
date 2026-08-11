@@ -71,6 +71,12 @@ pub fn run(
     if (subcommand) |command| try argv.append(allocator, command);
     for (forwarded_args) |arg| try argv.append(allocator, arg);
 
+    // Keep package managers on the native argv path. On Windows, Zig's
+    // process implementation resolves .cmd/.bat through PATHEXT and routes
+    // them through its hardened batch serializer. That path disables delayed
+    // expansion, protects cmd.exe metacharacters, and rejects NUL/CR/LF rather
+    // than silently changing argv. Pre-wrapping this in cmd.exe or a shell
+    // would bypass those guarantees.
     var child = try std.process.spawn(init.io, .{
         .argv = argv.items,
         .stdin = .inherit,

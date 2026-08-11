@@ -89,6 +89,12 @@ The external `bun` package-manager executable comes from `PATH` (or the explicit
 inside an Electrobun devkit for `mainProcess: "bun"`; Hutch does not expose or
 repurpose that application runtime as a package manager.
 
+On Windows, Hutch invokes npm/pnpm/yarn `.cmd` and `.bat` shims only through its
+native argv adapter. The underlying Windows batch format cannot preserve NUL,
+carriage-return, or line-feed arguments, so Hutch rejects those values instead
+of changing them. Shell-string tasks refuse batch shims entirely; use `hutch
+pm`, an argv-form task such as `["npm", "run", "dev"]`, or a native executable.
+
 ## Managed Cache Lifecycle
 
 Successful Electrobun preparation records the exact cached core/devkit and

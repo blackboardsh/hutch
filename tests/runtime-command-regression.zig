@@ -83,6 +83,8 @@ fn runConfigCommand(
     try environment.put("HUTCH_TEST_CONFIG_JSON", config_json);
     try environment.put("HUTCH_TEST_EXPECTED_CWD", project_dir);
     try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
+    try environment.put("HUTCH_BATCH_SENTINEL", "expanded-percent-value");
+    try environment.put("HUTCH_BATCH_DELAYED", "expanded-delayed-value");
     try environment.put("CI", "1");
 
     const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
@@ -113,6 +115,47 @@ fn expectExit(term: std.process.Child.Term, expected: u8) !void {
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) return error.ExpectedTextMissing;
+}
+
+fn expectMissing(init: std.process.Init, path: []const u8) !void {
+    std.Io.Dir.cwd().access(init.io, path, .{}) catch return;
+    return error.UnexpectedInjectionMarker;
+}
+
+fn writeFakePackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    fake_bin: []const u8,
+    runtime: []const u8,
+    name: []const u8,
+    windows_extension: []const u8,
+) !void {
+    const fake_command = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}{s}",
+        .{
+            fake_bin,
+            std.fs.path.sep,
+            name,
+            if (builtin.os.tag == .windows) windows_extension else "",
+        },
+    );
+    if (builtin.os.tag == .windows) {
+        const wrapper = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{runtime});
+        try std.Io.Dir.cwd().writeFile(init.io, .{
+            .sub_path = fake_command,
+            .data = wrapper,
+        });
+    } else {
+        try std.Io.Dir.copyFile(
+            std.Io.Dir.cwd(),
+            runtime,
+            std.Io.Dir.cwd(),
+            fake_command,
+            init.io,
+            .{ .permissions = .executable_file, .make_path = true },
+        );
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -199,27 +242,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     for ([_][]const u8{ "npm", "bun", "pnpm", "custom-pm" }) |name| {
-        const fake_command = try std.fmt.allocPrint(
-            allocator,
-            "{s}{c}{s}{s}",
-            .{ fake_bin, std.fs.path.sep, name, if (builtin.os.tag == .windows) ".cmd" else "" },
-        );
-        if (builtin.os.tag == .windows) {
-            const wrapper = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{runtime});
-            try std.Io.Dir.cwd().writeFile(init.io, .{
-                .sub_path = fake_command,
-                .data = wrapper,
-            });
-        } else {
-            try std.Io.Dir.copyFile(
-                std.Io.Dir.cwd(),
-                runtime,
-                std.Io.Dir.cwd(),
-                fake_command,
-                init.io,
-                .{ .permissions = .executable_file, .make_path = true },
-            );
-        }
+        try writeFakePackageManager(init, allocator, fake_bin, runtime, name, ".cmd");
     }
 
     const no_config_root = try std.fmt.allocPrint(
@@ -350,6 +373,82 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(missing_manager.term, 1);
     try expectContains(missing_manager.stderr, "could not run package manager yarn (yarn)");
+
+    // npm/pnpm normally expose .cmd shims and Yarn commonly exposes either a
+    // .cmd or .bat shim on Windows. Exercise both extensions through Hutch's
+    // native argv adapter with values that would become cmd.exe grammar if
+    // batch serialization regressed.
+    try writeFakePackageManager(init, allocator, fake_bin, runtime, "yarn", ".bat");
+    const injection_marker = try std.fs.path.join(
+        allocator,
+        &.{ fixture_root, "hutch-batch-argument-injected.txt" },
+    );
+    const adversarial_invocation = [_][]const u8{
+        "install",
+        "%HUTCH_BATCH_SENTINEL%",
+        "!HUTCH_BATCH_DELAYED!",
+        "caret^value",
+        "quote\"value",
+        "amp&value",
+        "pipe|value",
+        "input<value",
+        "output>value",
+        "(parentheses)",
+        "",
+        "trailing\\",
+        "two words",
+        "tab\tvalue",
+        "工作-🚀",
+        "safe & echo injected>hutch-batch-argument-injected.txt & rem",
+    };
+    const manager_cases = [_]struct {
+        mode: []const u8,
+        config: []const u8,
+    }{
+        .{ .mode = "config-pm-adversarial-npm", .config = "{}" },
+        .{ .mode = "config-pm-adversarial-pnpm", .config = "{\"packageManager\":\"pnpm\"}" },
+        .{ .mode = "config-pm-adversarial-yarn", .config = "{\"packageManager\":\"yarn\"}" },
+    };
+    for (manager_cases) |case| {
+        std.Io.Dir.cwd().deleteFile(init.io, injection_marker) catch {};
+        const adversarial = try runConfigCommand(
+            init,
+            allocator,
+            launcher,
+            engine,
+            runtime,
+            fixture_root,
+            fake_bin,
+            case.mode,
+            case.config,
+            &adversarial_invocation,
+        );
+        try expectExit(adversarial.term, 0);
+        try expectMissing(init, injection_marker);
+    }
+
+    if (comptime builtin.os.tag == .windows) {
+        for ([_][]const u8{ "line\nfeed", "carriage\rreturn" }) |invalid_arg| {
+            const invalid_batch_arg = try runConfigCommand(
+                init,
+                allocator,
+                launcher,
+                engine,
+                runtime,
+                fixture_root,
+                fake_bin,
+                "config-pm-adversarial-npm",
+                "{}",
+                &.{ "install", invalid_arg },
+            );
+            try expectExit(invalid_batch_arg.term, 1);
+            try expectContains(
+                invalid_batch_arg.stderr,
+                "Windows .cmd/.bat package-manager shims reject arguments containing NUL, CR, or LF",
+            );
+            try expectMissing(init, injection_marker);
+        }
+    }
 
     const install_run = try runConfigCommand(
         init,
