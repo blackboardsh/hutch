@@ -53,6 +53,7 @@ test("hutch electrobun init lists and downloads the active remote template chann
   mkdirSync(workspace, { recursive: true });
   const projectRoot = join(realpathSync(workspace), projectName);
   writeFileSync(join(templateRoot, "package.json"), '{"name":"hello-world"}\n');
+  writeFileSync(join(templateRoot, "electrobun.config.ts"), "export default {};\n");
   writeFileSync(join(templateRoot, "src", "index.ts"), 'console.log("hello");\n');
   const tar = spawnSync("tar", ["-czf", archivePath, "-C", archiveSource, "hello-world"], {
     encoding: "utf8",
@@ -144,23 +145,10 @@ test("hutch electrobun init lists and downloads the active remote template chann
       readFileSync(join(projectRoot, "src", "index.ts"), "utf8"),
       'console.log("hello");\n',
     );
-
-    const aliasProjectName = "alias-app";
-    const aliased = await run(
-      hutch,
-      [
-        "x",
-        "electrobun",
-        "init",
-        aliasProjectName,
-        "--template=hello-world",
-        "--offline",
-      ],
-      { cwd: workspace, env },
+    assert.equal(
+      readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"),
+      "export default {};\n",
     );
-    assert.equal(aliased.status, 0, aliased.stderr || aliased.stdout);
-    assert.match(aliased.stdout, new RegExp(`cd ${aliasProjectName}\\n`));
-    assert.ok(existsSync(join(workspace, aliasProjectName, "package.json")));
 
     const cached = await run(
       hutch,

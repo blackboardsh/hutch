@@ -135,8 +135,8 @@ pub fn install(
             .strip_components = 1,
         });
     }
-    const package_json = try std.fs.path.join(allocator, &.{ temporary, "package.json" });
-    if (!pathExists(init.io, package_json)) return error.InvalidTemplateArchive;
+    const electrobun_config = try std.fs.path.join(allocator, &.{ temporary, "electrobun.config.ts" });
+    if (!pathExists(init.io, electrobun_config)) return error.InvalidTemplateArchive;
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), destination, init.io);
 }
 
