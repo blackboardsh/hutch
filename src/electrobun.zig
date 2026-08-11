@@ -2695,6 +2695,12 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
         go_toolchain.root,
         zig_binary,
     );
+    try validateGoSdkDependency(
+        ctx,
+        go_binary,
+        &env_map,
+        projection.go_root,
+    );
 
     const result = try std.process.run(ctx.allocator, ctx.io, .{
         .argv = argv.items,
@@ -2870,6 +2876,106 @@ fn configureGoBuildEnvironment(
     }
 }
 
+fn validateGoSdkDependency(
+    ctx: *const Context,
+    go_binary: []const u8,
+    environment: *const std.process.Environ.Map,
+    expected_sdk_root: []const u8,
+) !void {
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = &.{ go_binary, "mod", "edit", "-json" },
+        .cwd = .{ .path = ctx.project_root },
+        .environ_map = environment,
+        .create_no_window = true,
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    if (termExitCode(result.term) != 0) {
+        if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
+        return error.InvalidGoModule;
+    }
+    try validateGoSdkDependencyJson(
+        ctx.io,
+        ctx.allocator,
+        ctx.project_root,
+        expected_sdk_root,
+        result.stdout,
+    );
+}
+
+fn validateGoSdkDependencyJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    expected_sdk_root: []const u8,
+    source: []const u8,
+) !void {
+    const document = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        source,
+        .{ .duplicate_field_behavior = .@"error" },
+    ) catch return error.InvalidGoModule;
+    if (document != .object) return error.InvalidGoModule;
+
+    const required_version = blk: {
+        const requirements = document.object.get("Require") orelse
+            return error.ElectrobunGoSdkDependencyNotFound;
+        if (requirements == .null) return error.ElectrobunGoSdkDependencyNotFound;
+        if (requirements != .array) return error.InvalidGoModule;
+        for (requirements.array.items) |requirement| {
+            if (requirement != .object) return error.InvalidGoModule;
+            const path = getStringFieldFromObject(requirement.object, "Path") orelse
+                return error.InvalidGoModule;
+            if (!std.mem.eql(u8, path, "electrobun")) continue;
+            break :blk getStringFieldFromObject(requirement.object, "Version") orelse
+                return error.InvalidGoModule;
+        }
+        return error.ElectrobunGoSdkDependencyNotFound;
+    };
+
+    const replacements = document.object.get("Replace") orelse
+        return error.ElectrobunGoSdkReplacementNotFound;
+    if (replacements == .null) return error.ElectrobunGoSdkReplacementNotFound;
+    if (replacements != .array) return error.InvalidGoModule;
+    var replacement_path: ?[]const u8 = null;
+    for (replacements.array.items) |replacement| {
+        if (replacement != .object) return error.InvalidGoModule;
+        const old = getObjectFieldFromObject(replacement.object, "Old") orelse
+            return error.InvalidGoModule;
+        const old_path = getStringFieldFromObject(old, "Path") orelse
+            return error.InvalidGoModule;
+        if (!std.mem.eql(u8, old_path, "electrobun")) continue;
+        if (getStringFieldFromObject(old, "Version")) |old_version| {
+            if (old_version.len > 0 and !std.mem.eql(u8, old_version, required_version)) continue;
+        }
+
+        const new = getObjectFieldFromObject(replacement.object, "New") orelse
+            return error.InvalidGoModule;
+        if (getStringFieldFromObject(new, "Version")) |new_version| {
+            if (new_version.len > 0) return error.ElectrobunGoSdkReplacementNotLocal;
+        }
+        replacement_path = getStringFieldFromObject(new, "Path") orelse
+            return error.InvalidGoModule;
+        break;
+    }
+    const configured_path = replacement_path orelse
+        return error.ElectrobunGoSdkReplacementNotFound;
+    const candidate = if (std.fs.path.isAbsolute(configured_path))
+        configured_path
+    else
+        try std.fs.path.resolve(allocator, &.{ project_root, configured_path });
+    const actual = std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator) catch
+        return error.ElectrobunGoSdkReplacementNotFound;
+    const expected = std.Io.Dir.cwd().realPathFileAlloc(io, expected_sdk_root, allocator) catch
+        return error.GoSdkNotFound;
+    const matches = if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(actual, expected)
+    else
+        std.mem.eql(u8, actual, expected);
+    if (!matches) return error.ElectrobunGoSdkReplacementMismatch;
+}
+
 test "Go v2 build arguments use the project module package" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2979,6 +3085,67 @@ test "Go v2 Windows cgo compiler command quotes cached Zig paths" {
     try std.testing.expectError(
         error.InvalidGoCompilerPath,
         quotedGoCompilerCommand(std.testing.allocator, "C:\\bad\"path\\zig.exe", "cc"),
+    );
+}
+
+test "Go v2 requires the project module to replace the selected SDK" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/.hutch/devkit/go-sdk");
+    try tmp.dir.createDirPath(io, "project/wrong-sdk");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const sdk_root = try std.fs.path.join(allocator, &.{ project_root, ".hutch", "devkit", "go-sdk" });
+
+    const valid =
+        \\{
+        \\  "Require": [{"Path":"electrobun","Version":"v0.0.0"}],
+        \\  "Replace": [{
+        \\    "Old":{"Path":"electrobun"},
+        \\    "New":{"Path":"./.hutch/devkit/go-sdk"}
+        \\  }]
+        \\}
+    ;
+    try validateGoSdkDependencyJson(io, allocator, project_root, sdk_root, valid);
+
+    const wrong =
+        \\{
+        \\  "Require": [{"Path":"electrobun","Version":"v0.0.0"}],
+        \\  "Replace": [{
+        \\    "Old":{"Path":"electrobun"},
+        \\    "New":{"Path":"./wrong-sdk"}
+        \\  }]
+        \\}
+    ;
+    try std.testing.expectError(
+        error.ElectrobunGoSdkReplacementMismatch,
+        validateGoSdkDependencyJson(io, allocator, project_root, sdk_root, wrong),
+    );
+
+    try std.testing.expectError(
+        error.ElectrobunGoSdkReplacementNotFound,
+        validateGoSdkDependencyJson(
+            io,
+            allocator,
+            project_root,
+            sdk_root,
+            "{\"Require\":[{\"Path\":\"electrobun\",\"Version\":\"v0.0.0\"}],\"Replace\":null}",
+        ),
+    );
+    try std.testing.expectError(
+        error.ElectrobunGoSdkDependencyNotFound,
+        validateGoSdkDependencyJson(
+            io,
+            allocator,
+            project_root,
+            sdk_root,
+            "{\"Require\":null,\"Replace\":null}",
+        ),
     );
 }
 
