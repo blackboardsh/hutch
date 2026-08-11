@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const electrobun = @import("electrobun.zig");
+const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
@@ -17,6 +18,8 @@ const help_text_template =
     \\  hutch <entrypoint.js|entrypoint.ts> [args...]
     \\  hutch <script-name> [args...]
     \\  hutch electrobun <init|build|run|dev> [args...]
+    \\  hutch install [package-manager-options...]
+    \\  hutch pm [package-manager-arguments...]
     \\  hutch run [--if-configured] [script-name] [args...]
     \\  hutch test [files/options...]
     \\  hutch build [args...]
@@ -28,7 +31,8 @@ const help_text_template =
     \\Config:
     \\  Scripts are resolved only from hutch.config.ts.
     \\  Script values may be shell strings or non-empty argv string arrays.
-    \\  Scripts invoke dependency managers and other external tools explicitly.
+    \\  packageManager selects npm (default), bun, pnpm, yarn, or an explicit executable.
+    \\  Hutch delegates package-manager argv and never resolves package.json dependencies.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\
 ;
@@ -798,6 +802,66 @@ fn runNamedConfigScript(
     );
 }
 
+fn resolvePackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *std.Io.Writer,
+) !?package_manager_adapter.Selection {
+    if (findHutchConfig(init, allocator)) |_| {
+        const no_args: [0][:0]const u8 = .{};
+        const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
+            try stderr.print(
+                "hutch: could not resolve Cottontail to load hutch.config.ts: {s}\n",
+                .{@errorName(err)},
+            );
+            return null;
+        };
+        const config = loadHutchConfig(init, allocator, cottontail.executable) catch |err| {
+            try stderr.print("hutch: failed to load hutch.config.ts: {s}\n", .{@errorName(err)});
+            return null;
+        };
+        return package_manager_adapter.fromConfig(config.root) catch |err| {
+            switch (err) {
+                error.UnsupportedPackageManager => try stderr.writeAll(
+                    "hutch: unsupported packageManager in hutch.config.ts; expected npm, bun, pnpm, or yarn\n",
+                ),
+                error.InvalidPackageManagerConfig => try stderr.writeAll(
+                    "hutch: packageManager must be npm, bun, pnpm, yarn, or { name, executable? }\n",
+                ),
+            }
+            return null;
+        };
+    } else |err| switch (err) {
+        error.HutchConfigNotFound => return package_manager_adapter.defaultSelection(),
+        else => return err,
+    }
+}
+
+fn runPackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    subcommand: ?[]const u8,
+    forwarded_args: []const [:0]const u8,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const selection = (try resolvePackageManager(init, allocator, stderr)) orelse return 1;
+    const term = package_manager_adapter.run(
+        init,
+        allocator,
+        selection,
+        subcommand,
+        forwarded_args,
+    ) catch |err| {
+        try stderr.print("hutch: could not run package manager {s} ({s}): {s}\n", .{
+            @tagName(selection.name),
+            selection.executable,
+            @errorName(err),
+        });
+        return 1;
+    };
+    return termExitCode(term);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -886,6 +950,19 @@ pub fn main(init: std.process.Init) !void {
             runtimeCommandArguments(args),
             stderr,
         );
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "install") or std.mem.eql(u8, command, "pm")) {
+        const exit_code = try runPackageManager(
+            init,
+            allocator,
+            if (std.mem.eql(u8, command, "install")) "install" else null,
+            args[2..],
+            stderr,
+        );
+        try stderr.flush();
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
@@ -1026,11 +1103,13 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch run") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "--if-configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch pm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "packageManager") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "argv string arrays") != null);
 }
 

@@ -190,15 +190,14 @@ pub fn main(init: std.process.Init) !void {
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "hutch.config.ts" }),
         .data = "export default {};\n",
     });
-    // Any attempt by the task runner to parse package.json makes the config
-    // invocations fail. The configured npm/pnpm commands still receive it as
-    // their own project input if they choose to read it.
+    // Any attempt by Hutch to parse package.json makes these invocations fail.
+    // External package managers still receive the project directory normally.
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
         .data = "{ this is intentionally invalid package json\n",
     });
 
-    for ([_][]const u8{ "npm", "pnpm" }) |name| {
+    for ([_][]const u8{ "npm", "bun", "pnpm", "custom-pm" }) |name| {
         const fake_command = try std.fmt.allocPrint(
             allocator,
             "{s}{c}{s}{s}",
@@ -222,6 +221,32 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const no_config_root = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}hutch-package-manager-no-config-{d}",
+        .{ temp_dir, std.fs.path.sep, std.Thread.getCurrentId() },
+    );
+    std.Io.Dir.cwd().deleteTree(init.io, no_config_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, no_config_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(init.io, no_config_root);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ no_config_root, "package.json" }),
+        .data = "{ this stays invalid because Hutch must not read it\n",
+    });
+    const default_without_config = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        no_config_root,
+        fake_bin,
+        "pm-no-config-npm",
+        "{}",
+        &.{ "install", "--ignore-scripts" },
+    );
+    try expectExit(default_without_config.term, 0);
+
     const config_json =
         \\{"scripts":{"install":["npm","install","--offline"],"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"],"hutch-version-shell":"hutch --version"}}
     ;
@@ -234,7 +259,7 @@ pub fn main(init: std.process.Init) !void {
     });
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "install.ts" }),
-        .data = "throw new Error('install must stay a configured task');\n",
+        .data = "throw new Error('install is reserved for the external package manager');\n",
     });
     const listed = try runConfigCommand(
         init,
@@ -276,11 +301,54 @@ pub fn main(init: std.process.Init) !void {
         runtime,
         fixture_root,
         fake_bin,
-        "config-npm",
+        "config-pm-default-install",
         config_json,
         &.{ "install", "two words", "$literal" },
     );
     try expectExit(install_bare.term, 0);
+
+    const bun_raw = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pm-bun-raw",
+        "{\"packageManager\":\"bun\",\"scripts\":{}}",
+        &.{ "pm", "add", "left-pad", "--exact" },
+    );
+    try expectExit(bun_raw.term, 0);
+
+    const custom_install = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pm-custom-install",
+        "{\"packageManager\":{\"name\":\"pnpm\",\"executable\":\"custom-pm\"}}",
+        &.{ "install", "--frozen" },
+    );
+    try expectExit(custom_install.term, 0);
+
+    const missing_manager = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pm-missing",
+        "{\"packageManager\":\"yarn\"}",
+        &.{"install"},
+    );
+    try expectExit(missing_manager.term, 1);
+    try expectContains(missing_manager.stderr, "could not run package manager yarn (yarn)");
 
     const install_run = try runConfigCommand(
         init,
@@ -466,12 +534,11 @@ pub fn main(init: std.process.Init) !void {
         runtime,
         fixture_root,
         fake_bin,
-        "config-list",
+        "config-pm-default-install",
         "{\"scripts\":{}}",
-        &.{"install"},
+        &.{ "install", "two words", "$literal" },
     );
-    try expectExit(absent_install.term, 1);
-    try expectContains(absent_install.stderr, "Script not found");
+    try expectExit(absent_install.term, 0);
 
     const absent_optional_install = try runConfigCommand(
         init,

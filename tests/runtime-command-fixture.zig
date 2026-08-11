@@ -48,6 +48,18 @@ pub fn main(init: std.process.Init) !void {
             if (!std.mem.startsWith(u8, executable, "pnpm")) return error.UnexpectedConfigCommand;
             return expectArgs(args[1..], &.{ "run", "dev", "--filter", "app one" });
         }
+        if (std.mem.eql(u8, mode, "config-pm-default-install")) {
+            if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
+            return expectArgs(args[1..], &.{ "install", "two words", "$literal" });
+        }
+        if (std.mem.eql(u8, mode, "config-pm-bun-raw")) {
+            if (!std.mem.startsWith(u8, executable, "bun")) return error.UnexpectedConfigCommand;
+            return expectArgs(args[1..], &.{ "add", "left-pad", "--exact" });
+        }
+        if (std.mem.eql(u8, mode, "config-pm-custom-install")) {
+            if (!std.mem.startsWith(u8, executable, "custom-pm")) return error.UnexpectedConfigCommand;
+            return expectArgs(args[1..], &.{ "install", "--frozen" });
+        }
         if (std.mem.eql(u8, mode, "config-hutch") or
             std.mem.eql(u8, mode, "config-hutch-shell"))
         {
@@ -57,6 +69,12 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, mode, "config-list")) return error.UnexpectedConfigCommand;
         return error.UnknownFixtureMode;
+    }
+
+    if (std.mem.eql(u8, mode, "pm-no-config-npm")) {
+        const executable = std.fs.path.basename(args[0]);
+        if (!std.mem.startsWith(u8, executable, "npm")) return error.UnexpectedConfigCommand;
+        return expectArgs(args[1..], &.{ "install", "--ignore-scripts" });
     }
 
     if (std.mem.eql(u8, mode, "runtime-options")) {

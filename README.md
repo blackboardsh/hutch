@@ -61,6 +61,34 @@ config field; omitted fields continue to use the invocation channel.
 Malformed pragmas and unavailable releases are hard errors. A project pin never
 replaces the global production or canary selection.
 
+## Package Managers
+
+Hutch delegates JavaScript dependency operations to an external package
+manager. `npm` is the default; projects can select `bun`, `pnpm`, or `yarn` in
+`hutch.config.ts`, or provide an explicit executable:
+
+```ts
+export default {
+  packageManager: "pnpm",
+  // Or: packageManager: { name: "pnpm", executable: "/opt/tools/pnpm" },
+  scripts: {
+    install: ["hutch", "install"],
+  },
+};
+```
+
+`hutch install [args...]` runs `<package-manager> install [args...]`. `hutch pm
+[args...]` passes the remaining arguments through unchanged. Other package
+operations stay native to the selected manager; for example, use `hutch pm add
+three` rather than a Hutch-specific add command. Hutch does not read
+`package.json`, resolve dependencies, emulate lifecycle scripts, or mutate
+lockfiles.
+
+The external `bun` package-manager executable comes from `PATH` (or the explicit
+`executable` above). It is intentionally separate from the Bun runtime bundled
+inside an Electrobun devkit for `mainProcess: "bun"`; Hutch does not expose or
+repurpose that application runtime as a package manager.
+
 ## Updates
 
 ```sh
