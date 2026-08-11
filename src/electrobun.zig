@@ -1941,6 +1941,7 @@ fn flatpakDesktopEntry(
         try std.fmt.allocPrint(allocator, "Icon={s}\n", .{app_id})
     else
         "";
+    defer if (has_icon) allocator.free(icon_line);
     return std.fmt.allocPrint(
         allocator,
         "[Desktop Entry]\nVersion=1.0\nType=Application\nName={s}\nComment={s}\nExec=launcher\n{s}Terminal=false\nStartupWMClass={s}\nCategories=Utility;\n",
@@ -2619,7 +2620,7 @@ test "Rust toolchain overrides are exact semantic versions" {
             .{},
         );
         try std.testing.expectError(
-            error.InvalidConfig,
+            error.InvalidToolchainVersion,
             configuredToolchainVersion(invalid, .rust, "1.87.0"),
         );
     }

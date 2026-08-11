@@ -327,11 +327,15 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 }
 
 test "template catalogs expose the selected channel and immutable archive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     const bytes =
         \\{
         \\  "schema": 1,
         \\  "kind": "electrobun-template-channel",
-        \\  "channel": "canary",
+        \\  "channel": "beta",
         \\  "version": "2.0.0-beta.1",
         \\  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "tools": { "hutch": "0.5.0-canary.1", "cottontail": "0.2.3" },
@@ -349,24 +353,26 @@ test "template catalogs expose the selected channel and immutable archive" {
         \\}
     ;
     const catalog = try parseCatalog(
-        std.testing.allocator,
+        allocator,
         bytes,
         "https://example.test/electrobun/templates",
-        .canary,
+        .beta,
     );
-    defer std.testing.allocator.free(catalog.templates);
-    try std.testing.expectEqual(Channel.canary, catalog.channel);
+    try std.testing.expectEqual(Channel.beta, catalog.channel);
     try std.testing.expectEqualStrings("2.0.0-beta.1", catalog.version);
     try std.testing.expectEqualStrings("hello-world", catalog.templates[0].id);
     try std.testing.expect(catalog.find("missing") == null);
 }
 
 test "template catalogs reject archive URLs outside their artifact origin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const bytes =
         \\{
         \\  "schema": 1,
         \\  "kind": "electrobun-template-channel",
-        \\  "channel": "production",
+        \\  "channel": "stable",
         \\  "version": "2.0.0",
         \\  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "tools": { "hutch": "0.5.0", "cottontail": "0.2.3" },
@@ -386,10 +392,10 @@ test "template catalogs reject archive URLs outside their artifact origin" {
     try std.testing.expectError(
         error.UntrustedTemplateArchiveUrl,
         parseCatalog(
-            std.testing.allocator,
+            arena.allocator(),
             bytes,
             "https://example.test/electrobun/templates",
-            .production,
+            .stable,
         ),
     );
 }

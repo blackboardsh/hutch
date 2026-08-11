@@ -59,6 +59,21 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const electrobun_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/electrobun.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    electrobun_tests.root_module.link_libc = true;
+    const electrobun_template_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/electrobun_templates.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     engine_tests.root_module.link_libc = true;
 
     const hostname_connect_regression_tests = b.addTest(.{
@@ -73,6 +88,8 @@ pub fn build(b: *std.Build) void {
     const run_engine_tests = b.addRunArtifact(engine_tests);
     const run_launcher_tests = b.addRunArtifact(launcher_tests);
     const run_windows_icon_tests = b.addRunArtifact(windows_icon_tests);
+    const run_electrobun_tests = b.addRunArtifact(electrobun_tests);
+    const run_electrobun_template_tests = b.addRunArtifact(electrobun_template_tests);
     const run_hostname_connect_regression_tests = b.addRunArtifact(hostname_connect_regression_tests);
 
     const runtime_command_fixture = b.addExecutable(.{
@@ -100,6 +117,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_launcher_tests.step);
     test_step.dependOn(&run_windows_icon_tests.step);
+    test_step.dependOn(&run_electrobun_tests.step);
+    test_step.dependOn(&run_electrobun_template_tests.step);
     test_step.dependOn(&run_hostname_connect_regression_tests.step);
     test_step.dependOn(&run_runtime_command_regression.step);
 }
