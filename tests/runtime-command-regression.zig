@@ -369,6 +369,47 @@ pub fn main(init: std.process.Init) !void {
     try expectExit(hutch_shell_run.term, 0);
     try expectContains(hutch_shell_run.stdout, "0.0.0-test\n");
 
+    // Canary installs name the authoritative launcher `hutch-canary`, while
+    // configured shell tasks conventionally invoke `hutch`. A same-directory
+    // production launcher must not capture that recursive command.
+    const canary_launcher_dir = try std.fs.path.join(allocator, &.{ fixture_root, "canary-launcher-only" });
+    try std.Io.Dir.cwd().createDirPath(init.io, canary_launcher_dir);
+    const canary_launcher = try std.fs.path.join(
+        allocator,
+        &.{ canary_launcher_dir, if (builtin.os.tag == .windows) "hutch-canary.exe" else "hutch-canary" },
+    );
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        launcher,
+        std.Io.Dir.cwd(),
+        canary_launcher,
+        init.io,
+        .{ .permissions = .executable_file },
+    );
+    const wrong_production_launcher = try std.fs.path.join(
+        allocator,
+        &.{ canary_launcher_dir, if (builtin.os.tag == .windows) "hutch.cmd" else "hutch" },
+    );
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = wrong_production_launcher,
+        .data = if (builtin.os.tag == .windows) "@exit /b 91\r\n" else "#!/bin/sh\nexit 91\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const canary_hutch_shell_run = try runConfigCommand(
+        init,
+        allocator,
+        canary_launcher,
+        split_engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-hutch-shell",
+        config_json,
+        &.{"hutch-version-shell"},
+    );
+    try expectExit(canary_hutch_shell_run.term, 0);
+    try expectContains(canary_hutch_shell_run.stdout, "0.0.0-test\n");
+
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
         .data = "{\"scripts\":{\"package-only\":\"exit 0\"}}\n",

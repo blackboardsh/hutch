@@ -368,6 +368,7 @@ fn shellCommandWithArgs(
 fn configuredScriptEnvironment(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    launcher_path_directory: ?[]const u8,
 ) !std.process.Environ.Map {
     var env = try init.environ_map.clone(allocator);
     errdefer env.deinit();
@@ -375,7 +376,7 @@ fn configuredScriptEnvironment(
     // Keep the version-matched Hutch launcher available to recursive config
     // tasks. Release installs place it next to the engine; split/custom layouts
     // communicate its authoritative location explicitly.
-    const executable_dir = if (init.environ_map.get("HUTCH_LAUNCHER_PATH")) |launcher|
+    const executable_dir = launcher_path_directory orelse if (init.environ_map.get("HUTCH_LAUNCHER_PATH")) |launcher|
         std.fs.path.dirname(launcher) orelse return error.InvalidConfiguredLauncherPath
     else
         try std.process.executableDirPathAlloc(init.io, allocator);
@@ -393,6 +394,42 @@ fn configuredScriptEnvironment(
     return env;
 }
 
+fn createShellLauncherShim(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !?[]const u8 {
+    const launcher = init.environ_map.get("HUTCH_LAUNCHER_PATH") orelse return null;
+    const stat = std.Io.Dir.cwd().statFile(init.io, launcher, .{}) catch
+        return error.ConfiguredLauncherNotFound;
+    if (stat.kind != .file) return error.ConfiguredLauncherIsNotAFile;
+
+    var random_bytes: [12]u8 = undefined;
+    init.io.random(&random_bytes);
+    var random_name: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&random_name, &random_bytes);
+
+    const shim_dir = try std.fs.path.join(allocator, &.{
+        try tempDir(init, allocator),
+        try std.mem.concat(allocator, u8, &.{ "hutch-shell-launcher-", &random_name }),
+    });
+    try std.Io.Dir.cwd().createDirPath(init.io, shim_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(init.io, shim_dir) catch {};
+
+    const shim_path = try std.fs.path.join(allocator, &.{
+        shim_dir,
+        if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
+    });
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        launcher,
+        std.Io.Dir.cwd(),
+        shim_path,
+        init.io,
+        .{ .permissions = .executable_file },
+    );
+    return shim_dir;
+}
+
 fn runShellScript(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -405,7 +442,12 @@ fn runShellScript(
     else
         &[_][]const u8{ "/bin/sh", "-c", command };
 
-    var env = try configuredScriptEnvironment(init, allocator);
+    const launcher_shim = try createShellLauncherShim(init, allocator);
+    defer if (launcher_shim) |directory| {
+        std.Io.Dir.cwd().deleteTree(init.io, directory) catch {};
+    };
+
+    var env = try configuredScriptEnvironment(init, allocator, launcher_shim);
     defer env.deinit();
 
     var child = try std.process.spawn(init.io, .{
@@ -464,7 +506,7 @@ fn runArgvScript(
     }
     for (script_args) |arg| try argv.append(allocator, arg);
 
-    var env = try configuredScriptEnvironment(init, allocator);
+    var env = try configuredScriptEnvironment(init, allocator, null);
     defer env.deinit();
     var child = std.process.spawn(init.io, .{
         .argv = argv.items,
