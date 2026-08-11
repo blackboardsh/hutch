@@ -2465,7 +2465,14 @@ fn spawnBuiltAppWithReadLease(
 }
 
 fn waitForBuiltApp(ctx: *const Context, running: *RunningBuiltApp) !void {
+    // Zig's POSIX Child.wait drops the child id even when cancellation
+    // interrupts waitpid. Protect the wait so ownership cannot be lost before
+    // the app exits, and keep the kill defer ahead of lease release for every
+    // other error path.
+    const previous_cancel_protection = ctx.io.swapCancelProtection(.blocked);
+    defer _ = ctx.io.swapCancelProtection(previous_cancel_protection);
     defer running.lease.close(ctx);
+    defer running.child.kill(ctx.io);
 
     const term = try running.child.wait(ctx.io);
     if (termExitCode(term) != 0) return error.RunFailed;
@@ -2683,8 +2690,11 @@ fn stopBuiltAppForRebuild(ctx: *const Context, running: *RunningBuiltApp) void {
             "[electrobun dev --watch] Close the running app to rebuild safely on Windows...\n",
             .{},
         );
+        const previous_cancel_protection = ctx.io.swapCancelProtection(.blocked);
+        defer _ = ctx.io.swapCancelProtection(previous_cancel_protection);
+        defer running.lease.close(ctx);
+        defer running.child.kill(ctx.io);
         _ = running.child.wait(ctx.io) catch {};
-        running.lease.close(ctx);
         return;
     }
 
