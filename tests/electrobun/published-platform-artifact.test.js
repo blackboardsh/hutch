@@ -122,7 +122,6 @@ if (completionDirectory && runId) writeFileSync(join(completionDirectory, runId)
 `);
     writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "PublishedArtifact", identifier: "dev.electrobun.published-artifact", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -137,6 +136,10 @@ export default {
   },
 };
 `);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" } };\n`,
+    );
     assert.equal(existsSync(join(project, "package.json")), false);
 
     let indexRequests = 0;

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const cache_cli = @import("cache_cli.zig");
 const electrobun = @import("electrobun.zig");
+const electrobun_devkit = @import("electrobun_devkit.zig");
 const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
@@ -1319,15 +1320,53 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
+        const requires_project_version = args.len > 2 and
+            (std.mem.eql(u8, args[2], "config") or
+                std.mem.eql(u8, args[2], "sync") or
+                std.mem.eql(u8, args[2], "build") or
+                std.mem.eql(u8, args[2], "run") or
+                std.mem.eql(u8, args[2], "dev"));
+        const electrobun_version: ?[]const u8 = if (requires_project_version) blk: {
+            const hutch_config = loadHutchConfig(init, allocator, cottontail.executable) catch |err| {
+                switch (err) {
+                    error.HutchConfigNotFound => try stderr.writeAll(
+                        "hutch electrobun: hutch.config.ts is required and must pin electrobun.version\n",
+                    ),
+                    else => try stderr.print(
+                        "hutch electrobun: failed to load hutch.config.ts: {s}\n",
+                        .{@errorName(err)},
+                    ),
+                }
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            break :blk electrobun_devkit.configuredVersion(hutch_config.root) catch |err| {
+                switch (err) {
+                    error.ElectrobunVersionMissing => try stderr.writeAll(
+                        "hutch electrobun: hutch.config.ts must set electrobun: { version: \"<exact-semver>\" }\n",
+                    ),
+                    error.InvalidElectrobunVersion => try stderr.writeAll(
+                        "hutch electrobun: electrobun.version in hutch.config.ts must be an exact semantic version; channels, ranges, and latest are not allowed\n",
+                    ),
+                    else => try stderr.writeAll(
+                        "hutch electrobun: electrobun in hutch.config.ts must be an object containing an exact string version\n",
+                    ),
+                }
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        } else null;
         const exit_code = electrobun.run(
             init,
             args[2..],
             cottontail.executable,
             cottontail.root,
+            electrobun_version,
         ) catch |err| switch (err) {
             error.InvalidMainProcess,
             error.UnsupportedMainProcess,
             error.LegacyBunVersionConfig,
+            error.ElectrobunProductConfigMovedToHutch,
             => 1,
             else => return err,
         };

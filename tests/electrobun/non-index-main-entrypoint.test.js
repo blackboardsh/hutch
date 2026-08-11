@@ -10,6 +10,7 @@ import {
   readFileSync,
   rmSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -134,10 +135,16 @@ test("v2 Electrobun rejects invalid main processes without falling back to Bun",
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
   const cottontail = resolveCottontail();
+  const coreRoot = join(fixture, "core");
+  createCoreFixture(coreRoot, "2.0.0-test.1");
   const diagnostic = "hutch electrobun: build.mainProcess must be bun, cottontail, zig, rust, go, or odin\n";
 
   try {
     for (const value of ['"bnu"', "42"]) {
+      writeFixtureFile(
+        join(fixture, "hutch.config.ts"),
+        'export default { electrobun: { version: "2.0.0-test.1" } };\n',
+      );
       writeFixtureFile(
         join(fixture, "electrobun.config.ts"),
         `export default { build: { mainProcess: ${value} } };\n`,
@@ -146,6 +153,7 @@ test("v2 Electrobun rejects invalid main processes without falling back to Bun",
         ...process.env,
         COTTONTAIL_BINARY: cottontail,
         DASH_COTTONTAIL: cottontail,
+        HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
         HUTCH_ENGINE_BINARY: engine,
         HUTCH_NO_UPDATE_CHECK: "1",
       };
@@ -164,23 +172,106 @@ test("v2 Electrobun rejects invalid main processes without falling back to Bun",
   }
 });
 
+test("v2 Electrobun product versions are exact Hutch config pins", { timeout: 60_000 }, () => {
+  const fixture = mkdtempSync(join(tmpdir(), "hutch-electrobun-product-version-"));
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+  const coreRoot = join(fixture, "core");
+  createCoreFixture(coreRoot, "2.0.0-test.1");
+  const env = {
+    ...process.env,
+    COTTONTAIL_BINARY: cottontail,
+    DASH_COTTONTAIL: cottontail,
+    HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
+    HUTCH_ENGINE_BINARY: engine,
+    HUTCH_NO_UPDATE_CHECK: "1",
+  };
+  delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+  writeFixtureFile(join(fixture, "electrobun.config.ts"), "export default {};\n");
+
+  const runConfig = () => spawnSync(hutch, ["electrobun", "config"], {
+    cwd: fixture,
+    encoding: "utf8",
+    env,
+  });
+
+  try {
+    const missingConfig = runConfig();
+    assert.equal(missingConfig.status, 1, missingConfig.stderr || missingConfig.stdout);
+    assert.match(missingConfig.stderr, /hutch\.config\.ts is required/);
+
+    for (const source of [
+      "export default {};\n",
+      "export default { electrobun: {} };\n",
+    ]) {
+      writeFixtureFile(join(fixture, "hutch.config.ts"), source);
+      const missingVersion = runConfig();
+      assert.equal(missingVersion.status, 1, missingVersion.stderr || missingVersion.stdout);
+      assert.match(missingVersion.stderr, /must set electrobun: \{ version: \"<exact-semver>\" \}/);
+    }
+
+    for (const version of ["latest", "^2.0.0", "2.x", "not-semver"]) {
+      writeFixtureFile(
+        join(fixture, "hutch.config.ts"),
+        `export default { electrobun: { version: "${version}" } };\n`,
+      );
+      const inexact = runConfig();
+      assert.equal(inexact.status, 1, inexact.stderr || inexact.stdout);
+      assert.match(inexact.stderr, /must be an exact semantic version/);
+    }
+
+    writeFixtureFile(
+      join(fixture, "hutch.config.ts"),
+      'export default { electrobun: { version: 2 } };\n',
+    );
+    const malformed = runConfig();
+    assert.equal(malformed.status, 1, malformed.stderr || malformed.stdout);
+    assert.match(malformed.stderr, /must be an object containing an exact string version/);
+
+    writeFixtureFile(
+      join(fixture, "hutch.config.ts"),
+      'export default { electrobun: { version: "2.0.0-test.1" } };\n',
+    );
+    writeFixtureFile(
+      join(fixture, "electrobun.config.ts"),
+      'export default { electrobun: { version: "9.9.9" } };\n',
+    );
+    const appOwnedVersion = runConfig();
+    assert.equal(appOwnedVersion.status, 1, appOwnedVersion.stderr || appOwnedVersion.stdout);
+    assert.equal(
+      appOwnedVersion.stderr,
+      "hutch electrobun: electrobun.version belongs in hutch.config.ts; remove electrobun from electrobun.config.ts\n",
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("v2 Electrobun rejects removed Bun version fields but permits unknown build fields", { timeout: 60_000 }, () => {
   mkdirSync(scratchRoot, { recursive: true });
   const fixture = mkdtempSync(join(scratchRoot, "legacy-bun-version-config-"));
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
   const cottontail = resolveCottontail();
-  const diagnostic = "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because the exact electrobun.version devkit pins the Bun runtime\n";
+  const coreRoot = join(fixture, "core");
+  createCoreFixture(coreRoot, "2.0.0-test.1");
+  const diagnostic = "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because hutch.config.ts pins the exact Electrobun devkit and Bun runtime\n";
   const env = {
     ...process.env,
     COTTONTAIL_BINARY: cottontail,
     DASH_COTTONTAIL: cottontail,
+    HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
     HUTCH_ENGINE_BINARY: engine,
     HUTCH_NO_UPDATE_CHECK: "1",
   };
   delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
 
   try {
+    writeFixtureFile(
+      join(fixture, "hutch.config.ts"),
+      'export default { electrobun: { version: "2.0.0-test.1" } };\n',
+    );
     for (const field of ["bunVersion", "bunnyBun"]) {
       writeFixtureFile(
         join(fixture, "electrobun.config.ts"),
@@ -247,7 +338,6 @@ test("v2 Electrobun keeps external package-manager Bun separate from its bundled
     );
     writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${version}" },
   app: {
     name: "NonIndexEntrypoint",
     identifier: "dev.electrobun.non-index-entrypoint",
@@ -264,7 +354,7 @@ export default {
 `);
     writeFixtureFile(
       join(project, "hutch.config.ts"),
-      'export default { packageManager: "bun", scripts: {} };\n',
+      `export default { electrobun: { version: "${version}" }, packageManager: "bun", scripts: {} };\n`,
     );
 
     const env = {

@@ -62,6 +62,7 @@ const Context = struct {
     cottontail_home: []const u8,
     cottontail_binary: []const u8,
     project_root: []const u8,
+    electrobun_version: ?[]const u8 = null,
     build_lock_key: ?[]const u8 = null,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
@@ -174,6 +175,7 @@ pub fn run(
     args: []const [:0]const u8,
     cottontail_binary: []const u8,
     cottontail_home: []const u8,
+    electrobun_version: ?[]const u8,
 ) !u8 {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -201,13 +203,14 @@ pub fn run(
         .cottontail_home = cottontail_home,
         .cottontail_binary = cottontail_binary,
         .project_root = project_root,
+        .electrobun_version = electrobun_version,
     };
     defer cleanupCliTempDir(&ctx);
 
     const command = args[0];
 
     if (std.mem.eql(u8, command, "config")) {
-        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigAfterProductDevkit(&ctx, parseBuildEnvironment(args[1..]));
         ctx.writeStdout("{s}\n", .{config.raw_json});
         return 0;
     }
@@ -221,20 +224,20 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, command, "sync")) {
-        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
         try prepareProjectWithBuildLock(&ctx, config);
         ctx.writeStdout("electrobun sync complete: {s}/.hutch/devkit\n", .{ctx.project_root});
         return 0;
     }
 
     if (std.mem.eql(u8, command, "build")) {
-        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
         try runBuild(&ctx, config);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "run")) {
-        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuiltApp(&ctx, config, inspector);
         return 0;
@@ -242,13 +245,13 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "dev")) {
         if (hasFlag(args[1..], "--watch")) {
-            const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+            const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
             const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
             try runDevWatch(&ctx, config, inspector);
             return 0;
         }
 
-        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try buildAndRunBuiltApp(&ctx, config, inspector);
         return 0;
@@ -551,9 +554,16 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 
     const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, trimmed, .{});
+    if (parsed == .object and parsed.object.get("electrobun") != null) {
+        ctx.writeStderr(
+            "hutch electrobun: electrobun.version belongs in hutch.config.ts; remove electrobun from electrobun.config.ts\n",
+            .{},
+        );
+        return error.ElectrobunProductConfigMovedToHutch;
+    }
     validateRemovedBunVersionConfig(parsed) catch |err| {
         ctx.writeStderr(
-            "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because the exact electrobun.version devkit pins the Bun runtime\n",
+            "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because hutch.config.ts pins the exact Electrobun devkit and Bun runtime\n",
             .{},
         );
         return err;
@@ -571,6 +581,43 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
         .root = parsed,
         .build_env = build_env,
     };
+}
+
+fn loadConfigAfterProductDevkit(ctx: *const Context, build_env: BuildEnvironment) !CommandContext {
+    const build_lock = try acquireProjectBuildLock(ctx);
+    defer build_lock.close(ctx.io);
+    _ = try resolveProductPlatformPaths(ctx);
+    return loadConfig(ctx, build_env);
+}
+
+fn loadConfigForPreparedOperation(ctx: *const Context, build_env: BuildEnvironment) !CommandContext {
+    // The operation immediately revalidates and, when necessary, refreshes
+    // the projection while holding the project build lock. A same-version
+    // projection is already sufficient to evaluate application configuration;
+    // avoiding an eager refresh here keeps a queued build from replacing the
+    // SDK beneath the currently active build.
+    if (projectedDevkitMatchesProductVersion(ctx)) return loadConfig(ctx, build_env);
+    return loadConfigAfterProductDevkit(ctx, build_env);
+}
+
+fn projectedDevkitMatchesProductVersion(ctx: *const Context) bool {
+    const expected_version = ctx.electrobun_version orelse return false;
+    const metadata_path = std.fs.path.join(
+        ctx.allocator,
+        &.{ ctx.project_root, ".hutch", "devkit", "projection.json" },
+    ) catch return false;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        metadata_path,
+        ctx.allocator,
+        .limited(128 * 1024),
+    ) catch return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, source, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return false;
+    const product = getObjectField(parsed, "product") orelse return false;
+    const version = getStringFieldFromObject(product, "version") orelse return false;
+    return std.mem.eql(u8, version, expected_version);
 }
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
@@ -2626,25 +2673,20 @@ fn prepareInstalledProject(
     project_dir: []const u8,
     asset_offline: bool,
 ) !void {
-    const absolute_project = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, project_dir, ctx.allocator);
     var asset_environment = try ctx.environ_map.clone(ctx.allocator);
     defer asset_environment.deinit();
     if (asset_offline) try asset_environment.put("DASH_RELEASE_OFFLINE", "1");
-    var child_init = ctx.init;
-    child_init.environ_map = &asset_environment;
-    const child_ctx = Context{
-        .init = child_init,
-        .io = ctx.io,
-        .allocator = ctx.allocator,
+    const hutch = ctx.environ_map.get("HUTCH_LAUNCHER_PATH") orelse ctx.self_exe_path;
+    var child = try std.process.spawn(ctx.io, .{
+        .argv = &[_][]const u8{ hutch, "electrobun", "sync", "--env=dev" },
+        .cwd = .{ .path = project_dir },
         .environ_map = &asset_environment,
-        .self_exe_path = ctx.self_exe_path,
-        .cottontail_home = ctx.cottontail_home,
-        .cottontail_binary = ctx.cottontail_binary,
-        .project_root = absolute_project,
-    };
-    defer cleanupCliTempDir(&child_ctx);
-    const config = try loadConfig(&child_ctx, .dev);
-    try prepareProjectWithBuildLock(&child_ctx, config);
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    defer child.kill(ctx.io);
+    if (termExitCode(try child.wait(ctx.io)) != 0) return error.ProjectPreparationFailed;
 }
 
 fn validateProjectName(name: []const u8) !void {
@@ -4493,11 +4535,18 @@ fn addElectrobunImportAliases(
     use_runtime_sdk_aliases: bool,
 ) !void {
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
     const default_main_sdk = devkit.sdks.javascript.main;
     const default_view_sdk = devkit.sdks.javascript.browser;
 
     var alias: std.json.ObjectMap = .empty;
-    try putElectrobunManifestAliases(ctx.allocator, &alias, devkit.sdks.javascript.exports);
+    try putElectrobunManifestAliases(
+        ctx.allocator,
+        &alias,
+        projection.package_root,
+        devkit.sdks.javascript.relative_root,
+        devkit.sdks.javascript.exports,
+    );
 
     if (use_runtime_sdk_aliases) {
         const main_sdk = (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_MAIN_MODULE")) orelse
@@ -4544,6 +4593,8 @@ fn addElectrobunImportAliases(
 fn putElectrobunManifestAliases(
     allocator: std.mem.Allocator,
     alias: *std.json.ObjectMap,
+    projection_root: []const u8,
+    source_root: []const u8,
     exports: []const electrobun_devkit.JavaScriptExport,
 ) !void {
     for (exports) |item| {
@@ -4553,7 +4604,16 @@ fn putElectrobunManifestAliases(
             try std.mem.concat(allocator, u8, &.{ "electrobun/", item.specifier[2..] })
         else
             return error.InvalidElectrobunDevkitManifest;
-        try alias.put(allocator, specifier, .{ .string = item.absolute_path });
+        try alias.put(
+            allocator,
+            specifier,
+            .{ .string = try electrobun_devkit.projectedJavaScriptPath(
+                allocator,
+                projection_root,
+                source_root,
+                item.relative_path,
+            ) },
+        );
     }
 }
 
@@ -4580,16 +4640,22 @@ test "Electrobun build aliases include every manifest export" {
 
     var aliases: std.json.ObjectMap = .empty;
     const exports = [_]electrobun_devkit.JavaScriptExport{
-        .{ .specifier = ".", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
-        .{ .specifier = "./main/ui", .relative_path = "api/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
-        .{ .specifier = "./browser/ui", .relative_path = "api/browser/ui.ts", .absolute_path = "/sdk/browser/ui.ts" },
+        .{ .specifier = ".", .relative_path = "js-sdk/main.ts", .absolute_path = "/sdk/main.ts" },
+        .{ .specifier = "./main/ui", .relative_path = "js-sdk/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
+        .{ .specifier = "./browser/ui", .relative_path = "js-sdk/browser/ui.ts", .absolute_path = "/sdk/browser/ui.ts" },
     };
-    try putElectrobunManifestAliases(arena.allocator(), &aliases, &exports);
+    try putElectrobunManifestAliases(
+        arena.allocator(),
+        &aliases,
+        "/project/.hutch/devkit",
+        "js-sdk",
+        &exports,
+    );
 
     for ([_][2][]const u8{
-        .{ "electrobun", "/sdk/main.ts" },
-        .{ "electrobun/main/ui", "/sdk/main/ui.ts" },
-        .{ "electrobun/browser/ui", "/sdk/browser/ui.ts" },
+        .{ "electrobun", "/project/.hutch/devkit/api/main.ts" },
+        .{ "electrobun/main/ui", "/project/.hutch/devkit/api/main/ui.ts" },
+        .{ "electrobun/browser/ui", "/project/.hutch/devkit/api/browser/ui.ts" },
     }) |expected| {
         const value = aliases.get(expected[0]) orelse return error.MissingElectrobunAlias;
         try std.testing.expectEqualStrings(expected[1], value.string);
@@ -4606,12 +4672,21 @@ test "Electrobun runtime SDK overrides are limited to manifest root exports" {
         .{ .specifier = "./main", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
         .{ .specifier = "./main/ui", .relative_path = "api/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
     };
-    try putElectrobunManifestAliases(arena.allocator(), &aliases, &exports);
+    try putElectrobunManifestAliases(
+        arena.allocator(),
+        &aliases,
+        "/project/.hutch/devkit",
+        "api",
+        &exports,
+    );
     try overrideElectrobunSdkRootAliases(arena.allocator(), &aliases, &exports, "/sdk/main.ts", "/runtime/main.ts");
 
     try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun").?.string);
     try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun/main").?.string);
-    try std.testing.expectEqualStrings("/sdk/main/ui.ts", aliases.get("electrobun/main/ui").?.string);
+    try std.testing.expectEqualStrings(
+        "/project/.hutch/devkit/api/main/ui.ts",
+        aliases.get("electrobun/main/ui").?.string,
+    );
 }
 
 fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {
@@ -5515,7 +5590,13 @@ fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
 }
 
 fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
-    const version = try electrobun_devkit.configuredVersion(config_root);
+    var platform_paths = try resolveProductPlatformPaths(ctx);
+    try ensureRequiredPlatformArtifacts(ctx, config_root, &platform_paths);
+    return platform_paths;
+}
+
+fn resolveProductPlatformPaths(ctx: *const Context) !PlatformPaths {
+    const version = ctx.electrobun_version orelse return error.ElectrobunVersionMissing;
     const core_root = if (ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| blk: {
         if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
         break :blk std.Io.Dir.cwd().realPathFileAlloc(ctx.io, configured, ctx.allocator) catch |err| {
@@ -5561,9 +5642,7 @@ fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformP
         );
         return err;
     };
-    var platform_paths = try platformPathsFromDevkit(ctx, devkit, projection);
-    try ensureRequiredPlatformArtifacts(ctx, config_root, &platform_paths);
-    return platform_paths;
+    return platformPathsFromDevkit(ctx, devkit, projection);
 }
 
 fn ensureRequiredPlatformArtifacts(

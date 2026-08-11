@@ -120,7 +120,7 @@ export function createCoreFixture(root, version, host = hostContract()) {
   }
   writeFixtureFile(join(root, "api", "sdks", "main", "index.ts"), "export const devkitMarker = 'V2_DEVKIT_ALIAS';\nexport type { ElectrobunConfig } from '../../config/ElectrobunConfig';\n");
   writeFixtureFile(join(root, "api", "browser", "index.ts"), "export const viewMarker = 'V2_VIEW_ALIAS';\n");
-  writeFixtureFile(join(root, "api", "config", "ElectrobunConfig.ts"), "export interface ElectrobunConfig { app?: unknown; build?: unknown; electrobun?: { version: string } }\n");
+  writeFixtureFile(join(root, "api", "config", "ElectrobunConfig.ts"), "export interface ElectrobunConfig { app?: unknown; build?: unknown }\n");
   writeFixtureFile(join(root, "api", "preload", "index.ts"), "export {};\n");
   writeFixtureFile(join(root, "zig-sdk", "electrobun.zig"), "pub const marker = true;\n");
   writeFixtureFile(join(root, "rust-sdk", "Cargo.toml"), "[package]\nname = \"electrobun\"\nversion = \"2.0.0\"\nedition = \"2021\"\n[lib]\npath = \"electrobun.rs\"\n");

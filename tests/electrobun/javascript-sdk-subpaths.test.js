@@ -76,8 +76,11 @@ test("package-free builds resolve every JavaScript SDK subpath from the devkit m
       "import { browserUiMarker } from 'electrobun/browser/ui';\nconsole.log(browserUiMarker);\n",
     );
     writeFixtureFile(join(project, "electrobun.config.ts"), `
+import { existsSync } from "node:fs";
+if (!process.env.HUTCH_EXPECT_PROJECT_SDK || !existsSync(process.env.HUTCH_EXPECT_PROJECT_SDK)) {
+  throw new Error("project devkit was not projected before electrobun.config.ts loaded");
+}
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "SdkSubpaths", identifier: "dev.electrobun.sdk-subpaths", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -89,6 +92,10 @@ export default {
   },
 };
 `);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" } };\n`,
+    );
 
     assert.equal(existsSync(join(project, "package.json")), false);
     assert.equal(existsSync(join(project, "node_modules")), false);
@@ -103,6 +110,7 @@ export default {
         DASH_HOME: dashHome,
         HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
         HUTCH_ENGINE_BINARY: engine,
+        HUTCH_EXPECT_PROJECT_SDK: join(project, ".hutch", "devkit", "api", "sdks", "main", "entries", "ui.ts"),
         HUTCH_NO_UPDATE_CHECK: "1",
       },
     });

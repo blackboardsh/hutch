@@ -73,7 +73,6 @@ test("hutch electrobun init lists and downloads the active remote template chann
   createCoreFixture(coreRoot, version);
   writeFileSync(join(templateRoot, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "HelloWorld", identifier: "dev.electrobun.hello-world", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -86,7 +85,7 @@ export default {
 `);
   writeFileSync(
     join(templateRoot, "hutch.config.ts"),
-    'export default { scripts: { install: [process.execPath, "install.cjs"] } };\n',
+    `export default { electrobun: { version: "${version}" }, scripts: { install: [process.execPath, "install.cjs"] } };\n`,
   );
   writeFileSync(
     join(templateRoot, "install.cjs"),
@@ -96,7 +95,6 @@ export default {
   mkdirSync(join(nativeTemplateRoot, "src"), { recursive: true });
   writeFileSync(join(nativeTemplateRoot, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "NativeBasic", identifier: "dev.electrobun.native-basic", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -109,7 +107,7 @@ export default {
 `);
   writeFileSync(
     join(nativeTemplateRoot, "hutch.config.ts"),
-    'export default { scripts: { dev: ["hutch", "electrobun", "dev"] } };\n',
+    `export default { electrobun: { version: "${version}" }, scripts: { dev: ["hutch", "electrobun", "dev"] } };\n`,
   );
   writeFileSync(join(nativeTemplateRoot, "src", "index.ts"), "console.log('native package-free');\n");
   const tar = spawnSync("tar", ["-czf", archivePath, "-C", archiveSource, "hello-world"], {
@@ -282,7 +280,8 @@ export default {
       readFileSync(join(projectRoot, "src", "index.ts"), "utf8"),
       'console.log("hello");\n',
     );
-    assert.match(readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
+    assert.doesNotMatch(readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"), /electrobun:/);
+    assert.match(readFileSync(join(projectRoot, "hutch.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
     assert.ok(existsSync(join(projectRoot, ".hutch", "devkit", "projection.json")));
     assert.equal(readFileSync(join(projectRoot, ".configured-install-ran"), "utf8"), projectRoot);
 

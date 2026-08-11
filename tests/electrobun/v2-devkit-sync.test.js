@@ -95,7 +95,6 @@ test("v2 sync and build use only the cached devkit, without an npm package", { t
     writeFixtureFile(join(project, "electrobun.config.ts"), `
 import type { ElectrobunConfig } from "electrobun";
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "V2Devkit", identifier: "dev.electrobun.v2-devkit", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -106,6 +105,10 @@ export default {
   },
 } satisfies ElectrobunConfig;
 `);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" } };\n`,
+    );
     assert.equal(existsSync(join(project, "package.json")), false);
     assert.equal(existsSync(join(project, "node_modules")), false);
 
@@ -233,6 +236,17 @@ export default {
       assert.match(destructiveClean.stderr, /preview-only/);
       assert.ok(existsSync(cacheRoot), "cache clean without --dry-run must not mutate state");
 
+      const projectedMainSdk = join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts");
+      writeFixtureFile(
+        projectedMainSdk,
+        "export const devkitMarker = 'PROJECT_SDK_EDIT';\nexport type { ElectrobunConfig } from '../../config/ElectrobunConfig';\n",
+      );
+      assert.match(
+        readFileSync(join(cacheRoot, "api", "sdks", "main", "index.ts"), "utf8"),
+        /V2_DEVKIT_ALIAS/,
+        "editing the project SDK must not mutate the cached core",
+      );
+
       const build = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
         env,
@@ -243,7 +257,9 @@ export default {
       const bundledMain = process.platform === "darwin"
         ? join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev.app", "Contents", "Resources", "app", "bun", "index.js")
         : join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev", "Resources", "app", "bun", "index.js");
-      assert.match(readFileSync(bundledMain, "utf8"), /V2_DEVKIT_ALIAS/);
+      assert.match(readFileSync(bundledMain, "utf8"), /PROJECT_SDK_EDIT/);
+      assert.doesNotMatch(readFileSync(bundledMain, "utf8"), /V2_DEVKIT_ALIAS/);
+      assert.match(readFileSync(projectedMainSdk, "utf8"), /PROJECT_SDK_EDIT/);
       assert.equal(existsSync(join(project, "node_modules")), false);
 
       rmSync(cacheRoot, { recursive: true, force: true });
@@ -330,7 +346,6 @@ test(
       writeFixtureFile(join(project, "src", "odin", "main.odin"), "package main\n");
       writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${electrobunVersion}" },
   app: { name: "ToolchainRace", identifier: "dev.electrobun.toolchain-race", version: "0.0.0" },
   build: {
     mainProcess: "odin",
@@ -341,6 +356,10 @@ export default {
   },
 };
 `);
+      writeFixtureFile(
+        join(project, "hutch.config.ts"),
+        `export default { electrobun: { version: "${electrobunVersion}" } };\n`,
+      );
 
       await new Promise((resolveListen) => proxy.listen(0, "127.0.0.1", resolveListen));
       const proxyAddress = proxy.address();
@@ -487,7 +506,6 @@ fn main() {
     writeFixtureFile(join(project, "electrobun.config.ts"), `
 import type { ElectrobunConfig } from "electrobun";
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "RustCargo", identifier: "dev.electrobun.rust-cargo", version: "0.0.0" },
   build: {
     mainProcess: "rust",
@@ -498,6 +516,10 @@ export default {
   },
 } satisfies ElectrobunConfig;
 `);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" } };\n`,
+    );
     assert.equal(existsSync(join(project, "package.json")), false);
     assert.equal(existsSync(join(project, "node_modules")), false);
 

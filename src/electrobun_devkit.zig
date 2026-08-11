@@ -130,16 +130,31 @@ pub const ProjectOptions = struct {
     force: bool = false,
 };
 
+pub fn projectedJavaScriptPath(
+    allocator: std.mem.Allocator,
+    projection_root: []const u8,
+    source_root: []const u8,
+    source_path: []const u8,
+) ![]const u8 {
+    return projectedAbsolutePath(
+        allocator,
+        projection_root,
+        projected_api_root,
+        source_root,
+        source_path,
+    );
+}
+
 pub fn configuredVersion(root: std.json.Value) ![]const u8 {
-    if (root != .object) return error.InvalidElectrobunConfig;
+    if (root != .object) return error.InvalidHutchConfig;
 
     const electrobun = root.object.get("electrobun") orelse
         return error.ElectrobunVersionMissing;
-    if (electrobun != .object) return error.InvalidElectrobunConfig;
+    if (electrobun != .object) return error.InvalidHutchConfig;
 
     const version = electrobun.object.get("version") orelse
         return error.ElectrobunVersionMissing;
-    if (version != .string) return error.InvalidElectrobunVersion;
+    if (version != .string) return error.InvalidElectrobunVersionType;
     try validateExactVersion(version.string);
     return version.string;
 }
@@ -939,7 +954,7 @@ fn parseTestJson(allocator: std.mem.Allocator, source: []const u8) !std.json.Val
     });
 }
 
-test "v2 Electrobun versions are exact config pins" {
+test "v2 Electrobun versions are exact Hutch config pins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -953,7 +968,7 @@ test "v2 Electrobun versions are exact config pins" {
     );
 }
 
-test "v2 config requires an Electrobun version pin" {
+test "v2 Hutch config requires an Electrobun version pin" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -986,7 +1001,7 @@ test "v2 Electrobun version rejects channels ranges and paths" {
     }
 }
 
-test "present v2 config requires a string version" {
+test "present v2 Hutch product config requires a string version" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -994,10 +1009,10 @@ test "present v2 config requires a string version" {
     try std.testing.expectError(error.ElectrobunVersionMissing, configuredVersion(missing));
 
     const wrong_type = try parseTestJson(arena.allocator(), "{\"electrobun\":{\"version\":2}}");
-    try std.testing.expectError(error.InvalidElectrobunVersion, configuredVersion(wrong_type));
+    try std.testing.expectError(error.InvalidElectrobunVersionType, configuredVersion(wrong_type));
 
     const wrong_container = try parseTestJson(arena.allocator(), "{\"electrobun\":\"2.0.0\"}");
-    try std.testing.expectError(error.InvalidElectrobunConfig, configuredVersion(wrong_container));
+    try std.testing.expectError(error.InvalidHutchConfig, configuredVersion(wrong_container));
 }
 
 test "native compiler defaults use exact versions" {

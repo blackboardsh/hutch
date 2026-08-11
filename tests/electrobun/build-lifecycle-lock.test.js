@@ -195,7 +195,6 @@ if (process.env.HUTCH_RECURSIVE_HOOK === "1") {
 `);
       writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
-  electrobun: { version: "${version}" },
   app: { name: "BuildLease", identifier: "dev.electrobun.build-lease", version: "0.0.0" },
   build: {
     mainProcess: "cottontail",
@@ -207,6 +206,10 @@ export default {
   scripts: { preBuild: "prebuild-probe.mjs" },
 };
 `);
+      writeFixtureFile(
+        join(project, "hutch.config.ts"),
+        `export default { electrobun: { version: "${version}" } };\n`,
+      );
 
       const baseEnv = {
         ...process.env,
