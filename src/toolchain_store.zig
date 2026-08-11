@@ -72,7 +72,7 @@ pub fn resolveVersion(
     version: []const u8,
 ) !Resolution {
     try validateVersion(kind, version);
-    const system_matches = try executableMatchesVersion(
+    const system_matches = try systemExecutableMatchesVersion(
         init.io,
         allocator,
         kind.systemExecutable(),
@@ -458,6 +458,22 @@ fn executableMatchesVersion(
     };
 }
 
+fn systemExecutableMatchesVersion(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    kind: Kind,
+    version: []const u8,
+) !bool {
+    // Odin's `version` output identifies only the dated build month plus a
+    // source revision, not the exact immutable release tag suffix (`a`, `b`,
+    // ...). A same-month system binary therefore cannot prove it satisfies a
+    // `dev-YYYY-MM[a-z]?` pin. Exact dated pins always use the URL-keyed cache;
+    // executable output remains an archive sanity check there.
+    if (kind == .odin and std.mem.startsWith(u8, version, "dev-")) return false;
+    return executableMatchesVersion(io, allocator, executable, kind, version);
+}
+
 fn runCommand(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -663,6 +679,48 @@ test "a Rust toolchain with mismatched Cargo is never published" {
     );
     try std.testing.expect(!pathExists(io, published));
     try std.testing.expect(!pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, ".hutch-toolchain" })));
+}
+
+test "dated Odin pins never select an ambiguous system compiler" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(!try systemExecutableMatchesVersion(
+            std.testing.io,
+            std.testing.allocator,
+            "odin.exe",
+            .odin,
+            "dev-2026-07a",
+        ));
+        return;
+    }
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "odin",
+        .data = "#!/bin/sh\nprintf 'version dev-2026-07-nightly:819fdc7\\n'\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const relative = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "odin" });
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena.allocator());
+
+    try std.testing.expect(try executableMatchesVersion(
+        io,
+        arena.allocator(),
+        executable,
+        .odin,
+        "dev-2026-07a",
+    ));
+    try std.testing.expect(!try systemExecutableMatchesVersion(
+        io,
+        arena.allocator(),
+        executable,
+        .odin,
+        "dev-2026-07a",
+    ));
 }
 
 test "toolchain archive URLs follow upstream release naming" {
