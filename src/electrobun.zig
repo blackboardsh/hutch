@@ -609,8 +609,9 @@ fn appendManagedToolchain(
 }
 
 fn runBuild(ctx: *const Context, config: CommandContext) !void {
+    try validateOutputConfiguration(ctx, config);
     const build_root = try buildOutputRoot(ctx, config);
-    try recreateDir(ctx, build_root);
+    try recreateDirWithin(ctx, ctx.project_root, build_root);
 
     try runHook(ctx, config, "preBuild", null);
 
@@ -623,7 +624,7 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
         if (builtin.os.tag == .linux and flatpakEnabled(config.root)) {
             const bundle = try appBundlePaths(ctx, config);
             const payload_path = try stageFlatpakPayload(ctx, bundle);
-            defer std.Io.Dir.cwd().deleteTree(ctx.io, payload_path) catch {};
+            defer deleteTreeWithin(ctx, bundle.build_root, payload_path) catch {};
             try writeFlatpakOutput(ctx, config, payload_path);
         }
         try runHook(ctx, config, "postPackage", null);
@@ -697,11 +698,13 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
 fn artifactAppFileName(ctx: *const Context, config: CommandContext) ![]const u8 {
     const app_name = try getAppName(ctx, config.root);
     const sanitized = try removeAsciiSpaces(ctx.allocator, app_name);
-    return switch (config.build_env) {
+    const result = try switch (config.build_env) {
         .production => sanitized,
         .canary => std.mem.concat(ctx.allocator, u8, &.{ sanitized, "-canary" }),
         .dev => std.mem.concat(ctx.allocator, u8, &.{ sanitized, "-dev" }),
     };
+    try validateSafeOutputSegment(result);
+    return result;
 }
 
 fn removeAsciiSpaces(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -1036,9 +1039,9 @@ fn createOuterWrapper(
     hash: []const u8,
     compressed_tar_path: []const u8,
 ) !void {
-    std.Io.Dir.cwd().deleteTree(ctx.io, bundle.bundle_root) catch {};
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.exec_dir);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.resources_dir);
+    try recreateDirWithin(ctx, bundle.build_root, bundle.bundle_root);
+    try createOutputDirWithin(ctx, bundle.bundle_root, bundle.exec_dir);
+    try createOutputDirWithin(ctx, bundle.bundle_root, bundle.resources_dir);
     if (builtin.os.tag == .macos) {
         try writeInfoPlist(ctx, config, bundle);
     }
@@ -1621,7 +1624,7 @@ fn finishRelease(ctx: *const Context, config: CommandContext, state: ReleaseStat
 
     try writeReleaseArtifacts(ctx, config, state, installer_path);
     if (state.flatpak_payload_path) |payload_path| {
-        defer std.Io.Dir.cwd().deleteTree(ctx.io, payload_path) catch {};
+        defer deleteTreeWithin(ctx, state.bundle.build_root, payload_path) catch {};
         try writeFlatpakOutput(ctx, config, payload_path);
     }
 }
@@ -1640,8 +1643,8 @@ fn createDmg(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths
     else
         output_path;
     const staging = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".dmg-staging" });
-    try recreateDir(ctx, staging);
-    defer std.Io.Dir.cwd().deleteTree(ctx.io, staging) catch {};
+    try recreateDirWithin(ctx, bundle.build_root, staging);
+    defer deleteTreeWithin(ctx, bundle.build_root, staging) catch {};
 
     const staged_app = try std.fs.path.join(ctx.allocator, &.{ staging, std.fs.path.basename(bundle.bundle_root) });
     try runReleaseCommand(ctx, &.{ "/usr/bin/ditto", bundle.bundle_root, staged_app }, ctx.project_root, null);
@@ -1702,10 +1705,10 @@ fn createWindowsInstaller(ctx: *const Context, config: CommandContext, state: Re
     try embedWindowsInstallerIcon(ctx, config, setup_path);
 
     const staging = try std.fs.path.join(ctx.allocator, &.{ state.bundle.build_root, ".installer-zip" });
-    try recreateDir(ctx, staging);
-    defer std.Io.Dir.cwd().deleteTree(ctx.io, staging) catch {};
+    try recreateDirWithin(ctx, state.bundle.build_root, staging);
+    defer deleteTreeWithin(ctx, state.bundle.build_root, staging) catch {};
     const hidden = try std.fs.path.join(ctx.allocator, &.{ staging, ".installer" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, hidden);
+    try createOutputDirWithin(ctx, staging, hidden);
     try copyPath(ctx, setup_path, try std.fs.path.join(ctx.allocator, &.{ staging, setup_name }));
     try copyPath(ctx, metadata_path, try std.fs.path.join(ctx.allocator, &.{ hidden, metadata_name }));
     try copyPath(ctx, archive_path, try std.fs.path.join(ctx.allocator, &.{ hidden, archive_name }));
@@ -1809,8 +1812,8 @@ fn createLinuxInstaller(ctx: *const Context, config: CommandContext, state: Rele
     const app_file_name = try artifactAppFileName(ctx, config);
     const installer_name = try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, "-Setup" });
     const staging = try std.fs.path.join(ctx.allocator, &.{ state.bundle.build_root, try std.mem.concat(ctx.allocator, u8, &.{ installer_name, "-staging" }) });
-    try recreateDir(ctx, staging);
-    defer std.Io.Dir.cwd().deleteTree(ctx.io, staging) catch {};
+    try recreateDirWithin(ctx, state.bundle.build_root, staging);
+    defer deleteTreeWithin(ctx, state.bundle.build_root, staging) catch {};
 
     const installer_path = try std.fs.path.join(ctx.allocator, &.{ staging, "installer" });
     const metadata = try extractorMetadataJson(ctx, config, state.hash);
@@ -1883,7 +1886,7 @@ fn flatpakArchitectureName() ![]const u8 {
 
 fn stageFlatpakPayload(ctx: *const Context, bundle: AppBundlePaths) ![]const u8 {
     const payload_path = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".flatpak-payload" });
-    try recreateDir(ctx, payload_path);
+    try recreateDirWithin(ctx, bundle.build_root, payload_path);
     try copyPath(ctx, bundle.exec_dir, try std.fs.path.join(ctx.allocator, &.{ payload_path, "bin" }));
     try copyPath(ctx, bundle.resources_dir, try std.fs.path.join(ctx.allocator, &.{ payload_path, "Resources" }));
     return payload_path;
@@ -2026,19 +2029,20 @@ fn flatpakManifestJson(allocator: std.mem.Allocator, options: FlatpakManifestOpt
 
 fn writeFlatpakOutput(ctx: *const Context, config: CommandContext, staged_payload_path: []const u8) !void {
     const app_id = try getAppIdentifier(ctx, config.root);
+    try validateSafeOutputSegment(app_id);
     const channel = buildEnvironmentName(config.build_env);
     const architecture = try flatpakArchitectureName();
     const output_path = flatpakConfigString(config.root, "outputPath", "flatpak");
-    const output_base = if (std.fs.path.isAbsolute(output_path))
-        output_path
-    else
-        try std.fs.path.join(ctx.allocator, &.{ try artifactOutputRoot(ctx, config.root), output_path });
+    const artifact_root = try artifactOutputRoot(ctx, config.root);
+    try createOutputDirWithin(ctx, ctx.project_root, artifact_root);
+    const output_base = try safeOutputJoin(ctx, artifact_root, output_path);
     const output_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{s}", .{ app_id, channel, architecture });
-    const output_root = try std.fs.path.join(ctx.allocator, &.{ output_base, output_name });
-    try recreateDir(ctx, output_root);
+    try validateSafeOutputSegment(output_name);
+    const output_root = try safeOutputJoin(ctx, output_base, output_name);
+    try recreateDirWithin(ctx, artifact_root, output_root);
 
-    const payload_path = try std.fs.path.join(ctx.allocator, &.{ output_root, "payload" });
-    try copyPath(ctx, staged_payload_path, payload_path);
+    const payload_path = try safeOutputJoin(ctx, output_root, "payload");
+    try copyPathWithin(ctx, output_root, staged_payload_path, payload_path);
     try annotateFlatpakPayloadMetadata(ctx, payload_path);
 
     const icon_path = try std.fs.path.join(ctx.allocator, &.{ payload_path, "Resources", "appIcon.png" });
@@ -2140,7 +2144,7 @@ fn writeReleaseArtifacts(
     installer_path: ?[]const u8,
 ) !void {
     const artifact_root = try artifactOutputRoot(ctx, config.root);
-    try recreateDir(ctx, artifact_root);
+    try recreateDirWithin(ctx, ctx.project_root, artifact_root);
     const prefix = try releasePlatformPrefix(ctx, config);
 
     var update: std.json.ObjectMap = .empty;
@@ -2173,7 +2177,7 @@ fn writeReleaseArtifacts(
             ctx.allocator,
             &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-", std.fs.path.basename(source) }) },
         );
-        try copyPath(ctx, source, destination);
+        try copyPathWithin(ctx, artifact_root, source, destination);
         std.Io.Dir.cwd().deleteFile(ctx.io, source) catch {};
     }
 }
@@ -2401,7 +2405,7 @@ fn buildCottontailApp(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     const build_root = try buildOutputRoot(ctx, config);
     const app_dir = try std.fs.path.join(ctx.allocator, &.{ build_root, "app" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, app_dir);
+    try createOutputDirWithin(ctx, build_root, app_dir);
 
     const main_source = try resolveMainEntrypoint(ctx, config.root, .cottontail);
     const main_output = try std.fs.path.join(ctx.allocator, &.{ app_dir, "main.js" });
@@ -2637,7 +2641,7 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
     const zig_binary = zig_toolchain.binary;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const install_prefix = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "install" });
     const cache_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "cache" });
 
@@ -3046,7 +3050,7 @@ fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform
     if (!pathExists(ctx.io, project.manifest)) return error.RustManifestNotFound;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-rust-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const cargo_target_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "target" });
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -3129,7 +3133,7 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
     const go_binary = go_toolchain.binary;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-go-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try recreateDir(ctx, temp_build_dir);
+    try recreateDirWithin(ctx, bundle.build_root, temp_build_dir);
 
     const go_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
     var argv: std.ArrayList([]const u8) = .empty;
@@ -3659,7 +3663,7 @@ fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform
     if (!pathExists(ctx.io, entrypoint)) return error.OdinEntrypointNotFound;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-odin-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const odin_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
     const entrypoint_dir = std.fs.path.dirname(entrypoint) orelse entrypoint;
 
@@ -3719,11 +3723,11 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     const bundle = try appBundlePaths(ctx, config);
     const main_process = try getMainProcess(config.root);
 
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.exec_dir);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.resources_dir);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.app_code_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, bundle.exec_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, bundle.resources_dir);
+    try createOutputDirWithin(ctx, bundle.build_root, bundle.app_code_dir);
     if (bundle.frameworks_dir) |frameworks_dir| {
-        try std.Io.Dir.cwd().createDirPath(ctx.io, frameworks_dir);
+        try createOutputDirWithin(ctx, bundle.build_root, frameworks_dir);
     }
 
     if (builtin.os.tag == .macos) {
@@ -3774,7 +3778,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         .bun => {
             const main_source = try resolveMainEntrypoint(ctx, config.root, .bun);
             const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
-            try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
+            try createOutputDirWithin(ctx, bundle.app_code_dir, bun_dir);
             const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
             try buildMainEntrypoint(ctx, config.root, platform_paths, .bun, main_source, main_output);
         },
@@ -3797,7 +3801,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         .cottontail => {
             const main_source = try resolveMainEntrypoint(ctx, config.root, .cottontail);
             const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
-            try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
+            try createOutputDirWithin(ctx, bundle.app_code_dir, bun_dir);
             const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
             try buildMainEntrypoint(ctx, config.root, platform_paths, .cottontail, main_source, main_output);
         },
@@ -3863,10 +3867,12 @@ fn buildCarrotOutput(ctx: *const Context, config: CommandContext, bundle: AppBun
     const carrot_name = getStringFieldFromObject(carrot, "name") orelse carrot_id;
     const carrot_description = getStringFieldFromObject(carrot, "description") orelse "";
     const carrot_mode = getStringFieldFromObject(carrot, "mode") orelse "window";
+    try validateSafeOutputSegment(carrot_id);
 
     const build_root = try buildOutputRoot(ctx, config);
-    const carrot_dir = try std.fs.path.join(ctx.allocator, &.{ build_root, "carrot", carrot_id });
-    try recreateDir(ctx, carrot_dir);
+    const carrot_root = try safeOutputJoin(ctx, build_root, "carrot");
+    const carrot_dir = try safeOutputJoin(ctx, carrot_root, carrot_id);
+    try recreateDirWithin(ctx, build_root, carrot_dir);
 
     const worker_src = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun", "index.js" });
     if (pathExists(ctx.io, worker_src)) {
@@ -3884,7 +3890,8 @@ fn buildCarrotOutput(ctx: *const Context, config: CommandContext, bundle: AppBun
             if (entry.value_ptr.* != .string) continue;
             const built_asset = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, entry.value_ptr.*.string });
             if (pathExists(ctx.io, built_asset)) {
-                try copyPath(ctx, built_asset, try std.fs.path.join(ctx.allocator, &.{ carrot_dir, entry.value_ptr.*.string }));
+                const destination = try safeOutputJoin(ctx, carrot_dir, entry.value_ptr.*.string);
+                try copyPathWithin(ctx, carrot_dir, built_asset, destination);
             }
         }
     }
@@ -4093,15 +4100,18 @@ fn buildViews(ctx: *const Context, root: std.json.Value, platform_paths: Platfor
     var it = views.iterator();
     while (it.next()) |entry| {
         const view_name = entry.key_ptr.*;
+        try validateSafeRelativeOutputPath(view_name);
         const view_value = entry.value_ptr.*;
         if (view_value != .object) continue;
 
         const entrypoint = getStringFieldFromObject(view_value.object, "entrypoint") orelse continue;
         const source_path = try absoluteProjectPath(ctx, entrypoint);
-        const output_dir = try std.fs.path.join(ctx.allocator, &.{ app_dir, "views", view_name });
-        const output_file = try std.fs.path.join(ctx.allocator, &.{ output_dir, "index.js" });
+        const views_root = try safeOutputJoin(ctx, app_dir, "views");
+        const output_dir = try safeOutputJoin(ctx, views_root, view_name);
+        const output_file = try safeOutputJoin(ctx, output_dir, "index.js");
 
-        try std.Io.Dir.cwd().createDirPath(ctx.io, output_dir);
+        try createOutputDirWithin(ctx, app_dir, output_dir);
+        try ensureOutputTargetWithin(ctx, app_dir, output_file);
 
         var spec: std.json.ObjectMap = .empty;
         try spec.put(ctx.allocator, "entryPoints", .{ .array = try singleValueArray(ctx.allocator, .{ .string = source_path }) });
@@ -4124,8 +4134,8 @@ fn copyStaticAssets(ctx: *const Context, root: std.json.Value, app_dir: []const 
         if (entry.value_ptr.* != .string) continue;
 
         const source_path = try absoluteProjectPath(ctx, entry.key_ptr.*);
-        const dest_path = try std.fs.path.join(ctx.allocator, &.{ app_dir, entry.value_ptr.*.string });
-        try copyPath(ctx, source_path, dest_path);
+        const dest_path = try safeOutputJoin(ctx, app_dir, entry.value_ptr.*.string);
+        try copyPathWithin(ctx, app_dir, source_path, dest_path);
     }
 }
 
@@ -4336,6 +4346,7 @@ fn runCottontailBuild(ctx: *const Context, build_spec: std.json.Value) !void {
 }
 
 fn copyPath(ctx: *const Context, source_path: []const u8, dest_path: []const u8) !void {
+    try ensureOutputTargetWithin(ctx, ctx.project_root, dest_path);
     if (std.Io.Dir.cwd().statFile(ctx.io, source_path, .{})) |stat| {
         switch (stat.kind) {
             .file, .sym_link => {
@@ -4353,6 +4364,7 @@ fn copyPath(ctx: *const Context, source_path: []const u8, dest_path: []const u8)
 
                 while (try walker.next(ctx.io)) |entry| {
                     const target_path = try std.fs.path.join(ctx.allocator, &.{ dest_path, entry.path });
+                    try ensureOutputTargetWithin(ctx, ctx.project_root, target_path);
                     switch (entry.kind) {
                         .directory => try std.Io.Dir.cwd().createDirPath(ctx.io, target_path),
                         .file, .sym_link => {
@@ -4373,21 +4385,59 @@ fn copyPath(ctx: *const Context, source_path: []const u8, dest_path: []const u8)
     }
 }
 
-fn ensureParentDir(ctx: *const Context, path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+fn copyPathWithin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    source_path: []const u8,
+    dest_path: []const u8,
+) !void {
+    try ensureOutputTargetWithin(ctx, intended_root, dest_path);
+    try copyPath(ctx, source_path, dest_path);
 }
 
-fn recreateDir(ctx: *const Context, absolute_path: []const u8) !void {
-    if (pathExists(ctx.io, absolute_path)) {
-        std.Io.Dir.cwd().deleteTree(ctx.io, absolute_path) catch {};
-    }
+fn ensureParentDir(ctx: *const Context, path: []const u8) !void {
+    try ensureOutputTargetWithin(ctx, ctx.project_root, path);
+    const parent = std.fs.path.dirname(path) orelse return;
+    try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+    try ensureOutputTargetWithin(ctx, ctx.project_root, path);
+}
+
+fn createOutputDirWithin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    absolute_path: []const u8,
+) !void {
+    try ensureOutputTargetWithin(ctx, ctx.project_root, absolute_path);
+    try ensureOutputTargetWithin(ctx, intended_root, absolute_path);
     try std.Io.Dir.cwd().createDirPath(ctx.io, absolute_path);
+    try ensureOutputTargetWithin(ctx, ctx.project_root, absolute_path);
+    try ensureOutputTargetWithin(ctx, intended_root, absolute_path);
+}
+
+fn deleteTreeWithin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    absolute_path: []const u8,
+) !void {
+    try ensureOutputTargetWithin(ctx, ctx.project_root, absolute_path);
+    try ensureOutputTargetWithin(ctx, intended_root, absolute_path);
+    if (pathExists(ctx.io, absolute_path)) {
+        try std.Io.Dir.cwd().deleteTree(ctx.io, absolute_path);
+    }
+}
+
+fn recreateDirWithin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    absolute_path: []const u8,
+) !void {
+    try deleteTreeWithin(ctx, intended_root, absolute_path);
+    try createOutputDirWithin(ctx, intended_root, absolute_path);
 }
 
 fn ensureCliTempDir(ctx: *const Context) ![]const u8 {
     const tmp_dir = try cliTempDir(ctx);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, tmp_dir);
+    try createOutputDirWithin(ctx, ctx.project_root, tmp_dir);
     return tmp_dir;
 }
 
@@ -4402,7 +4452,7 @@ fn cliTempDir(ctx: *const Context) ![]const u8 {
 
 fn cleanupCliTempDir(ctx: *const Context) void {
     const tmp_dir = cliTempDir(ctx) catch return;
-    std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+    deleteTreeWithin(ctx, ctx.project_root, tmp_dir) catch {};
 }
 
 fn singleValueArray(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Array {
@@ -4485,21 +4535,288 @@ fn absoluteProjectPath(ctx: *const Context, relative_or_absolute: []const u8) ![
     return std.fs.path.join(ctx.allocator, &.{ ctx.project_root, relative_or_absolute });
 }
 
+fn validateSafeOutputSegment(value: []const u8) !void {
+    if (value.len == 0 or
+        std.mem.eql(u8, value, ".") or
+        std.mem.eql(u8, value, ".."))
+    {
+        return error.UnsafeOutputPath;
+    }
+    for (value) |byte| {
+        if (byte == 0 or byte == '/' or byte == '\\') return error.UnsafeOutputPath;
+    }
+}
+
+fn validateSafeRelativeOutputPath(value: []const u8) !void {
+    if (value.len == 0 or
+        std.fs.path.isAbsolutePosix(value) or
+        std.fs.path.isAbsoluteWindows(value) or
+        (value.len >= 2 and value[1] == ':'))
+    {
+        return error.UnsafeOutputPath;
+    }
+
+    var components = std.mem.splitAny(u8, value, "/\\");
+    var count: usize = 0;
+    while (components.next()) |component| {
+        try validateSafeOutputSegment(component);
+        count += 1;
+    }
+    if (count == 0) return error.UnsafeOutputPath;
+}
+
+fn safeOutputJoin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    relative_path: []const u8,
+) ![]const u8 {
+    try validateSafeRelativeOutputPath(relative_path);
+    const target = try std.fs.path.join(ctx.allocator, &.{ intended_root, relative_path });
+    try ensureLexicalOutputDescendant(ctx, intended_root, target);
+    return target;
+}
+
+fn outputPathsEqual(lhs: []const u8, rhs: []const u8) bool {
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(lhs, rhs)
+    else
+        std.mem.eql(u8, lhs, rhs);
+}
+
+fn outputPathHasParent(child: []const u8, parent: []const u8) bool {
+    if (child.len <= parent.len or !outputPathsEqual(child[0..parent.len], parent)) return false;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
+fn resolvedOutputPaths(
+    ctx: *const Context,
+    intended_root: []const u8,
+    target: []const u8,
+) !struct { root: []const u8, target: []const u8 } {
+    const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, ".", ctx.allocator);
+    const root = try std.fs.path.resolve(ctx.allocator, &.{ canonical_cwd, intended_root });
+    const resolved_target = try std.fs.path.resolve(ctx.allocator, &.{ canonical_cwd, target });
+    if (!outputPathHasParent(resolved_target, root)) return error.UnsafeOutputPath;
+    return .{ .root = root, .target = resolved_target };
+}
+
+fn ensureLexicalOutputDescendant(
+    ctx: *const Context,
+    intended_root: []const u8,
+    target: []const u8,
+) !void {
+    _ = try resolvedOutputPaths(ctx, intended_root, target);
+}
+
+fn ensureOutputTargetWithin(
+    ctx: *const Context,
+    intended_root: []const u8,
+    target: []const u8,
+) !void {
+    const resolved = try resolvedOutputPaths(ctx, intended_root, target);
+    const canonical_root = std.Io.Dir.cwd().realPathFileAlloc(
+        ctx.io,
+        resolved.root,
+        ctx.allocator,
+    ) catch return error.UnsafeOutputPath;
+    const relative = try std.fs.path.relative(
+        ctx.allocator,
+        resolved.root,
+        null,
+        resolved.root,
+        resolved.target,
+    );
+
+    var current = canonical_root[0..canonical_root.len];
+    var missing_ancestor = false;
+    var components = std.fs.path.componentIterator(relative);
+    while (components.next()) |component| {
+        current = try std.fs.path.join(ctx.allocator, &.{ current, component.name });
+        if (missing_ancestor) continue;
+
+        const stat = std.Io.Dir.cwd().statFile(ctx.io, current, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                missing_ancestor = true;
+                continue;
+            },
+            else => return err,
+        };
+        if (stat.kind == .sym_link) return error.UnsafeOutputPath;
+    }
+}
+
+fn validateOutputConfiguration(ctx: *const Context, config: CommandContext) !void {
+    const build = getObjectField(config.root, "build") orelse return error.InvalidConfig;
+    try validateSafeRelativeOutputPath(getStringFieldFromObject(build, "buildFolder") orelse "build");
+    try validateSafeRelativeOutputPath(getStringFieldFromObject(build, "artifactFolder") orelse "artifacts");
+
+    try validateSafeOutputSegment(try getAppName(ctx, config.root));
+    _ = try artifactAppFileName(ctx, config);
+    _ = try bundleDisplayName(ctx, config);
+
+    if (getObjectFieldFromObject(build, "carrot")) |carrot| {
+        try validateSafeOutputSegment(getStringFieldFromObject(carrot, "id") orelse return error.InvalidConfig);
+    }
+    if (getObjectFieldFromObject(build, "views")) |views| {
+        var it = views.iterator();
+        while (it.next()) |entry| try validateSafeRelativeOutputPath(entry.key_ptr.*);
+    }
+    if (getObjectFieldFromObject(build, "copy")) |copy| {
+        var it = copy.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .string) try validateSafeRelativeOutputPath(entry.value_ptr.*.string);
+        }
+    }
+    if (flatpakEnabled(config.root)) {
+        try validateSafeOutputSegment(try getAppIdentifier(ctx, config.root));
+        try validateSafeRelativeOutputPath(flatpakConfigString(config.root, "outputPath", "flatpak"));
+    }
+}
+
+test "output configuration accepts nested paths and rejects traversal-capable fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+
+    const valid_json =
+        \\{
+        \\  "app":{"name":"Safe App","identifier":"com.example.safe","version":"1.0.0"},
+        \\  "build":{
+        \\    "buildFolder":"build/matrix/zig-0.15",
+        \\    "artifactFolder":"artifacts/matrix/zig-0.15",
+        \\    "views":{"playgrounds/file-dialog":{}},
+        \\    "copy":{"src/index.html":"views/playgrounds/file-dialog/index.html"},
+        \\    "carrot":{"id":"com.example.carrot"},
+        \\    "linux":{"flatpak":{"enabled":true,"outputPath":"flatpak/canary"}}
+        \\  }
+        \\}
+    ;
+    const valid_root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, valid_json, .{});
+    try validateOutputConfiguration(&ctx, .{
+        .raw_json = valid_json,
+        .root = valid_root,
+        .build_env = .production,
+    });
+
+    const cases = [_][]const u8{
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"buildFolder":"."}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"artifactFolder":"../outside"}}
+        ,
+        \\{"app":{"name":"../Outside","identifier":"com.example.safe","version":"1"},"build":{}}
+        ,
+        \\{"app":{"name":"Bad\\\\Name","identifier":"com.example.safe","version":"1"},"build":{}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"carrot":{"id":"../outside"}}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"views":{"../outside":{}}}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"copy":{"src/file":"views/../../outside"}}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com.example.safe","version":"1"},"build":{"linux":{"flatpak":{"enabled":true,"outputPath":"/tmp/outside"}}}}
+        ,
+        \\{"app":{"name":"Safe","identifier":"com/example/safe","version":"1"},"build":{"linux":{"flatpak":{"enabled":true}}}}
+        ,
+    };
+    for (cases) |config_json| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, config_json, .{});
+        try std.testing.expectError(error.UnsafeOutputPath, validateOutputConfiguration(&ctx, .{
+            .raw_json = config_json,
+            .root = root,
+            .build_env = .production,
+        }));
+    }
+
+    for ([_][]const u8{ "", ".", "..", "a/../b", "a\\..\\b", "/tmp/out", "C:\\out", "C:out" }) |path| {
+        try std.testing.expectError(error.UnsafeOutputPath, validateSafeRelativeOutputPath(path));
+    }
+}
+
+test "output mutation refuses project roots parents and symlink escapes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const project_root = try std.fs.path.join(allocator, &.{ root, "project" });
+    const outside_root = try std.fs.path.join(allocator, &.{ root, "outside" });
+    try std.Io.Dir.cwd().createDirPath(io, project_root);
+    try std.Io.Dir.cwd().createDirPath(io, outside_root);
+    const sentinel = try std.fs.path.join(allocator, &.{ outside_root, "sentinel.txt" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "KEEP" });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+
+    try std.testing.expectError(error.UnsafeOutputPath, recreateDirWithin(&ctx, project_root, project_root));
+    try std.testing.expectError(error.UnsafeOutputPath, recreateDirWithin(&ctx, project_root, root));
+
+    const build_link = try std.fs.path.join(allocator, &.{ project_root, "build" });
+    try std.Io.Dir.cwd().symLink(io, outside_root, build_link, .{ .is_directory = true });
+    const escaped_build = try std.fs.path.join(allocator, &.{ build_link, "production" });
+    try std.testing.expectError(error.UnsafeOutputPath, recreateDirWithin(&ctx, project_root, escaped_build));
+
+    const output_root = try std.fs.path.join(allocator, &.{ project_root, "output" });
+    try std.Io.Dir.cwd().createDirPath(io, output_root);
+    const views_link = try std.fs.path.join(allocator, &.{ output_root, "views" });
+    try std.Io.Dir.cwd().symLink(io, outside_root, views_link, .{ .is_directory = true });
+    const source = try std.fs.path.join(allocator, &.{ project_root, "source.txt" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = source, .data = "SOURCE" });
+    const escaped_copy = try std.fs.path.join(allocator, &.{ views_link, "copied.txt" });
+    try std.testing.expectError(
+        error.UnsafeOutputPath,
+        copyPathWithin(&ctx, output_root, source, escaped_copy),
+    );
+
+    try std.testing.expect(pathExists(io, sentinel));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside_root, "copied.txt" })));
+}
+
 fn buildOutputRoot(ctx: *const Context, config: CommandContext) ![]const u8 {
     const build = getObjectField(config.root, "build") orelse return error.InvalidConfig;
     const build_folder = getStringFieldFromObject(build, "buildFolder") orelse "build";
+    const build_folder_root = try safeOutputJoin(ctx, ctx.project_root, build_folder);
     const prefix = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{s}", .{
         buildEnvironmentName(config.build_env),
         osName(),
         archName(),
     });
-    return std.fs.path.join(ctx.allocator, &.{ ctx.project_root, build_folder, prefix });
+    return safeOutputJoin(ctx, build_folder_root, prefix);
 }
 
 fn artifactOutputRoot(ctx: *const Context, root: std.json.Value) ![]const u8 {
     const build = getObjectField(root, "build") orelse return error.InvalidConfig;
     const artifact_folder = getStringFieldFromObject(build, "artifactFolder") orelse "artifacts";
-    return std.fs.path.join(ctx.allocator, &.{ ctx.project_root, artifact_folder });
+    return safeOutputJoin(ctx, ctx.project_root, artifact_folder);
 }
 
 fn getMainProcess(root: std.json.Value) !MainProcess {
@@ -4961,9 +5278,10 @@ fn platformPathsFromDevkit(
 fn appBundlePaths(ctx: *const Context, config: CommandContext) !AppBundlePaths {
     const build_root = try buildOutputRoot(ctx, config);
     const bundle_name = try bundleDisplayName(ctx, config);
+    try validateSafeOutputSegment(bundle_name);
 
     if (builtin.os.tag == .macos) {
-        const bundle_root = try std.fs.path.join(ctx.allocator, &.{ build_root, bundle_name });
+        const bundle_root = try safeOutputJoin(ctx, build_root, bundle_name);
         const contents_dir = try std.fs.path.join(ctx.allocator, &.{ bundle_root, "Contents" });
         const exec_dir = try std.fs.path.join(ctx.allocator, &.{ contents_dir, "MacOS" });
         const resources_dir = try std.fs.path.join(ctx.allocator, &.{ contents_dir, "Resources" });
@@ -4979,7 +5297,7 @@ fn appBundlePaths(ctx: *const Context, config: CommandContext) !AppBundlePaths {
         };
     }
 
-    const bundle_root = try std.fs.path.join(ctx.allocator, &.{ build_root, bundle_name });
+    const bundle_root = try safeOutputJoin(ctx, build_root, bundle_name);
     const exec_dir = try std.fs.path.join(ctx.allocator, &.{ bundle_root, "bin" });
     const resources_dir = try std.fs.path.join(ctx.allocator, &.{ bundle_root, "Resources" });
     const app_code_dir = try std.fs.path.join(ctx.allocator, &.{ resources_dir, "app" });
@@ -4994,10 +5312,12 @@ fn appBundlePaths(ctx: *const Context, config: CommandContext) !AppBundlePaths {
 }
 
 fn bundleDisplayName(ctx: *const Context, config: CommandContext) ![]const u8 {
-    if (builtin.os.tag == .macos) {
-        return std.fmt.allocPrint(ctx.allocator, "{s}.app", .{try appDisplayName(ctx, config)});
-    }
-    return artifactAppFileName(ctx, config);
+    const result = if (builtin.os.tag == .macos)
+        try std.fmt.allocPrint(ctx.allocator, "{s}.app", .{try appDisplayName(ctx, config)})
+    else
+        try artifactAppFileName(ctx, config);
+    try validateSafeOutputSegment(result);
+    return result;
 }
 
 fn appDisplayName(ctx: *const Context, config: CommandContext) ![]const u8 {
