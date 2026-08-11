@@ -556,4 +556,19 @@ pub fn main(init: std.process.Init) !void {
     if (absent_optional_install.stdout.len != 0 or absent_optional_install.stderr.len != 0) {
         return error.OptionalScriptWasNotSilent;
     }
+
+    const logged_config = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-console-log",
+        "{\"scripts\":{}}",
+        &.{ "run", "--if-configured", "install" },
+    );
+    try expectExit(logged_config.term, 0);
+    try expectContains(logged_config.stdout, "config console output\n");
 }

@@ -225,18 +225,26 @@ fn appendJsStringLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), 
     try out.append(allocator, '"');
 }
 
-fn makeConfigLoaderSource(allocator: std.mem.Allocator, config_path: []const u8) ![]const u8 {
+fn makeConfigLoaderSource(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    result_path: []const u8,
+) ![]const u8 {
     var source: std.ArrayList(u8) = .empty;
     errdefer source.deinit(allocator);
 
-    try source.appendSlice(allocator, "import * as configModule from ");
+    try source.appendSlice(
+        allocator,
+        "import { writeFileSync as __hutchWriteConfig } from \"node:fs\";\nimport * as configModule from ",
+    );
     try appendJsStringLiteral(allocator, &source, config_path);
     try source.appendSlice(allocator,
         \\;
         \\const loadedConfig = configModule.default ?? {};
-        \\console.log(JSON.stringify(loadedConfig));
-        \\
+        \\__hutchWriteConfig(
     );
+    try appendJsStringLiteral(allocator, &source, result_path);
+    try source.appendSlice(allocator, ", JSON.stringify(loadedConfig));\n");
 
     return try source.toOwnedSlice(allocator);
 }
@@ -258,56 +266,52 @@ fn tempDir(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, "/tmp");
 }
 
-fn currentProcessId() u64 {
-    return switch (builtin.os.tag) {
-        .windows => std.os.windows.GetCurrentProcessId(),
-        else => @intCast(std.posix.system.getpid()),
-    };
-}
-
 fn loadHutchConfig(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     cottontail_path: []const u8,
 ) !Config {
     const config_path = try findHutchConfig(init, allocator);
-    const loader_source = try makeConfigLoaderSource(allocator, config_path);
-
-    const tmp_root = try tempDir(init, allocator);
-    const tmp_dir = try pathJoin(allocator, &.{ tmp_root, "hutch" });
-    try std.Io.Dir.cwd().createDirPath(init.io, tmp_dir);
-
-    const loader_name = try std.fmt.allocPrint(
-        allocator,
-        "hutch-config-loader-{d}.mjs",
-        .{currentProcessId()},
-    );
-    const loader_path = try pathJoin(allocator, &.{ tmp_dir, loader_name });
+    const tmp_dir = try createPrivateTempDirectory(init, allocator, "hutch-config-loader-");
+    defer std.Io.Dir.cwd().deleteTree(init.io, tmp_dir) catch {};
+    const loader_path = try pathJoin(allocator, &.{ tmp_dir, "load.mjs" });
+    const result_path = try pathJoin(allocator, &.{ tmp_dir, "config.json" });
+    const loader_source = try makeConfigLoaderSource(allocator, config_path, result_path);
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = loader_path,
         .data = loader_source,
     });
-    defer std.Io.Dir.cwd().deleteFile(init.io, loader_path) catch {};
 
-    const result = try std.process.run(allocator, init.io, .{
+    const execution = try std.process.run(allocator, init.io, .{
         .argv = &[_][]const u8{ cottontail_path, loader_path },
         .create_no_window = true,
     });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    defer allocator.free(execution.stdout);
+    defer allocator.free(execution.stderr);
 
-    if (termExitCode(result.term) != 0) {
-        if (result.stderr.len > 0) {
+    if (execution.stdout.len > 0) {
+        var stdout_buffer: [2048]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        try stdout_writer.interface.writeAll(execution.stdout);
+        try stdout_writer.interface.flush();
+    }
+    if (termExitCode(execution.term) != 0) {
+        if (execution.stderr.len > 0) {
             var stderr_buffer: [2048]u8 = undefined;
             var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-            const stderr = &stderr_writer.interface;
-            try stderr.writeAll(result.stderr);
-            try stderr.flush();
+            try stderr_writer.interface.writeAll(execution.stderr);
+            try stderr_writer.interface.flush();
         }
         return error.HutchConfigLoadFailed;
     }
 
-    const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
+    const result = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        result_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    const trimmed = std.mem.trim(u8, result, " \r\n\t");
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, trimmed, .{});
 
     return .{
@@ -369,6 +373,38 @@ fn shellCommandWithArgs(
     return try command.toOwnedSlice(allocator);
 }
 
+fn createPrivateTempDirectory(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) ![]const u8 {
+    const permissions: std.Io.Dir.Permissions = if (builtin.os.tag == .windows)
+        .default_dir
+    else
+        @enumFromInt(0o700);
+    const tmp_root = try tempDir(init, allocator);
+
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var random_bytes: [12]u8 = undefined;
+        init.io.random(&random_bytes);
+        var random_name: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&random_name, &random_bytes);
+
+        const path = try std.fs.path.join(allocator, &.{
+            tmp_root,
+            try std.mem.concat(allocator, u8, &.{ prefix, &random_name }),
+        });
+        std.Io.Dir.cwd().createDir(init.io, path, permissions) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return path;
+    }
+
+    return error.TemporaryDirectoryCollision;
+}
+
 fn configuredScriptEnvironment(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -407,16 +443,7 @@ fn createShellLauncherShim(
         return error.ConfiguredLauncherNotFound;
     if (stat.kind != .file) return error.ConfiguredLauncherIsNotAFile;
 
-    var random_bytes: [12]u8 = undefined;
-    init.io.random(&random_bytes);
-    var random_name: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
-    _ = std.base64.url_safe.Encoder.encode(&random_name, &random_bytes);
-
-    const shim_dir = try std.fs.path.join(allocator, &.{
-        try tempDir(init, allocator),
-        try std.mem.concat(allocator, u8, &.{ "hutch-shell-launcher-", &random_name }),
-    });
-    try std.Io.Dir.cwd().createDirPath(init.io, shim_dir);
+    const shim_dir = try createPrivateTempDirectory(init, allocator, "hutch-shell-launcher-");
     errdefer std.Io.Dir.cwd().deleteTree(init.io, shim_dir) catch {};
 
     const shim_path = try std.fs.path.join(allocator, &.{

@@ -29,13 +29,32 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingFixtureMode;
 
     if (std.mem.startsWith(u8, mode, "config-")) {
-        if (args.len == 2 and
-            std.mem.indexOf(u8, std.fs.path.basename(args[1]), "hutch-config-loader-") != null)
-        {
+        if (args.len == 2 and std.mem.eql(u8, std.fs.path.basename(args[1]), "load.mjs")) {
+            const loader_dir = std.fs.path.dirname(args[1]) orelse return error.InvalidConfigLoaderPath;
+            if (!std.mem.startsWith(u8, std.fs.path.basename(loader_dir), "hutch-config-loader-")) {
+                return error.ConfigLoaderDirectoryWasNotPrivate;
+            }
             const config_json = init.environ_map.get("HUTCH_TEST_CONFIG_JSON") orelse
                 return error.MissingConfigJson;
-            try std.Io.File.stdout().writeStreamingAll(init.io, config_json);
-            try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+            if (std.mem.eql(u8, mode, "config-console-log")) {
+                try std.Io.File.stdout().writeStreamingAll(init.io, "config console output\n");
+            }
+
+            const loader_source = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                args[1],
+                init.arena.allocator(),
+                .limited(1024 * 1024),
+            );
+            const result_marker = "config.json";
+            if (std.mem.indexOf(u8, loader_source, result_marker) == null) {
+                return error.ConfigResultSideChannelMissing;
+            }
+            const result_path = try std.fs.path.join(init.arena.allocator(), &.{ loader_dir, result_marker });
+            try std.Io.Dir.cwd().writeFile(init.io, .{
+                .sub_path = result_path,
+                .data = config_json,
+            });
             return;
         }
 
