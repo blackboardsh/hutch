@@ -280,9 +280,11 @@ for the release workflow.
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
 
-Scripts resolve exclusively from the nearest `hutch.config.ts`. A script may
-be a shell command string or a non-empty argv array; invocation arguments are
-appended to either form:
+Scripts resolve exclusively from the nearest `hutch.config.ts`. A string is
+command text parsed and executed by the selected Cottontail release's Bun.$
+shell. A non-empty array is exact argv. Invocation arguments are appended as
+separately escaped Bun.$ interpolations for strings and exact argv entries for
+arrays:
 
 ```ts
 export default {
@@ -293,6 +295,11 @@ export default {
   },
 };
 ```
+
+String values always use Bun.$ command semantics, even when the entire string
+looks like a JavaScript or TypeScript filename. Hutch does not infer an
+execution mode from a filename extension and does not send string tasks to the
+host's `/bin/sh` or `cmd.exe`.
 
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
 emulate npm lifecycle variables when running these tasks. The configured

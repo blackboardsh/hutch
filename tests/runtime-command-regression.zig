@@ -81,6 +81,7 @@ fn runConfigCommand(
     try environment.put("DASH_COTTONTAIL", runtime);
     try environment.put("HUTCH_TEST_FIXTURE_MODE", mode);
     try environment.put("HUTCH_TEST_CONFIG_JSON", config_json);
+    try environment.put("HUTCH_TEST_EXPECTED_CWD", project_dir);
     try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
     try environment.put("CI", "1");
 
@@ -248,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
     try expectExit(default_without_config.term, 0);
 
     const config_json =
-        \\{"scripts":{"install":["npm","install","--offline"],"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"],"hutch-version-shell":"hutch --version"}}
+        \\{"scripts":{"install":["npm","install","--offline"],"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"],"hutch-version-shell":"hutch --version","shell-args":"shell-probe","ts-command":"entry.ts","bun-shell":"HUTCH_VALUE=alpha; echo \"$HUTCH_VALUE\" | tr a-z A-Z","shell-fail":"exit 37"}}
     ;
     // A bare non-path name is a configured task even when Cottontail could
     // resolve a same-stem source file. Direct runtime entrypoints stay
@@ -377,6 +378,77 @@ pub fn main(init: std.process.Init) !void {
         &.{ "run", "--if-configured", "install", "two words", "$literal" },
     );
     try expectExit(optional_install_run.term, 0);
+
+    const shell_args_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-shell-args",
+        config_json,
+        &.{
+            "shell-args",
+            "two words",
+            "$literal",
+            "%PATH%",
+            "quote\"inside",
+            "amp&ersand",
+            "pipe|value",
+            "paren(value)",
+            "caret^value",
+            "bang!value",
+            "trail\\",
+            "",
+        },
+    );
+    try expectExit(shell_args_run.term, 0);
+
+    // A filename-looking string is still Bun.$ command text. Only an argv
+    // array requests exact process execution.
+    const ts_command_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-ts-command",
+        config_json,
+        &.{ "ts-command", "two words" },
+    );
+    try expectExit(ts_command_run.term, 0);
+
+    const bun_shell_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-bun-shell",
+        config_json,
+        &.{"bun-shell"},
+    );
+    try expectExit(bun_shell_run.term, 0);
+
+    const shell_fail_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-shell-fail",
+        config_json,
+        &.{"shell-fail"},
+    );
+    try expectExit(shell_fail_run.term, 37);
 
     const pnpm_run = try runConfigCommand(
         init,

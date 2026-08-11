@@ -10,11 +10,48 @@ const expected_test_args = [_][]const u8{
     "--bail=3",
 };
 
+const expected_shell_args = [_][]const u8{
+    "two words",
+    "$literal",
+    "%PATH%",
+    "quote\"inside",
+    "amp&ersand",
+    "pipe|value",
+    "paren(value)",
+    "caret^value",
+    "bang!value",
+    "trail\\",
+    "",
+};
+
 fn expectArgs(actual: []const [:0]const u8, expected: []const []const u8) !void {
     if (actual.len != expected.len) return error.UnexpectedArgumentCount;
     for (expected, actual) |expected_arg, actual_arg| {
         if (!std.mem.eql(u8, expected_arg, actual_arg)) return error.UnexpectedArgument;
     }
+}
+
+fn runRecursiveHutchVersion(init: std.process.Init) !void {
+    var child = try std.process.spawn(init.io, .{
+        .argv = &.{ "hutch", "--version" },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(init.io);
+    switch (try child.wait(init.io)) {
+        .exited => |exit_code| if (exit_code != 0) return error.RecursiveHutchFailed,
+        else => return error.RecursiveHutchTerminated,
+    }
+}
+
+fn expectConfiguredCwd(init: std.process.Init) !void {
+    const expected_path = init.environ_map.get("HUTCH_TEST_EXPECTED_CWD") orelse
+        return error.MissingExpectedCwd;
+    const allocator = init.arena.allocator();
+    const expected = try std.Io.Dir.cwd().realPathFileAlloc(init.io, expected_path, allocator);
+    const actual = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    if (!std.mem.eql(u8, expected, actual)) return error.UnexpectedConfiguredCwd;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -56,6 +93,37 @@ pub fn main(init: std.process.Init) !void {
                 .data = config_json,
             });
             return;
+        }
+
+        if (args.len >= 3 and std.mem.eql(u8, args[1], "--hutch-shell")) {
+            try expectConfiguredCwd(init);
+            const command = args[2];
+            const appended = args[3..];
+            if (std.mem.eql(u8, mode, "config-hutch-shell")) {
+                if (!std.mem.eql(u8, command, "hutch --version")) return error.UnexpectedShellCommand;
+                try expectArgs(appended, &.{});
+                return runRecursiveHutchVersion(init);
+            }
+            if (std.mem.eql(u8, mode, "config-shell-args")) {
+                if (!std.mem.eql(u8, command, "shell-probe")) return error.UnexpectedShellCommand;
+                return expectArgs(appended, &expected_shell_args);
+            }
+            if (std.mem.eql(u8, mode, "config-ts-command")) {
+                if (!std.mem.eql(u8, command, "entry.ts")) return error.UnexpectedShellCommand;
+                return expectArgs(appended, &.{"two words"});
+            }
+            if (std.mem.eql(u8, mode, "config-bun-shell")) {
+                if (!std.mem.eql(u8, command, "HUTCH_VALUE=alpha; echo \"$HUTCH_VALUE\" | tr a-z A-Z")) {
+                    return error.UnexpectedShellCommand;
+                }
+                return expectArgs(appended, &.{});
+            }
+            if (std.mem.eql(u8, mode, "config-shell-fail")) {
+                if (!std.mem.eql(u8, command, "exit 37")) return error.UnexpectedShellCommand;
+                try expectArgs(appended, &.{});
+                std.process.exit(37);
+            }
+            return error.UnknownShellTaskMode;
         }
 
         const executable = std.fs.path.basename(args[0]);

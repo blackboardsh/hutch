@@ -30,9 +30,11 @@ const help_text_template =
     \\
     \\Config:
     \\  Scripts are resolved only from hutch.config.ts.
-    \\  Script values may be shell strings or non-empty argv string arrays.
+    \\  String scripts run through the selected Cottontail Bun.$ shell.
+    \\  Array scripts run as exact non-empty argv string arrays.
     \\  packageManager selects npm (default), bun, pnpm, yarn, or an explicit executable.
     \\  Hutch delegates package-manager argv and never resolves package.json dependencies.
+    \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\
 ;
@@ -132,24 +134,6 @@ fn runProcess(
     defer child.kill(init.io);
 
     return termExitCode(try child.wait(init.io));
-}
-
-fn runCottontailScript(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
-    script_path: []const u8,
-    script_args: []const [:0]const u8,
-) !u8 {
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(allocator);
-
-    try args.append(allocator, script_path);
-    for (script_args) |arg| {
-        try args.append(allocator, arg);
-    }
-
-    return try runCottontailCommand(init, allocator, cottontail_path, args.items);
 }
 
 fn runCottontailCommand(
@@ -326,53 +310,6 @@ fn getObjectField(value: std.json.Value, name: []const u8) ?std.json.Value {
     };
 }
 
-fn scriptLooksLikeEntrypoint(script: []const u8) bool {
-    if (std.mem.indexOfAny(u8, script, " \t\r\n") != null) return false;
-    return std.mem.endsWith(u8, script, ".js") or
-        std.mem.endsWith(u8, script, ".mjs") or
-        std.mem.endsWith(u8, script, ".ts") or
-        std.mem.endsWith(u8, script, ".mts");
-}
-
-fn appendShellQuoted(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    if (builtin.os.tag == .windows) {
-        try out.append(allocator, '"');
-        for (value) |char| {
-            if (char == '"') try out.append(allocator, '\\');
-            try out.append(allocator, char);
-        }
-        try out.append(allocator, '"');
-        return;
-    }
-
-    try out.append(allocator, '\'');
-    for (value) |char| {
-        if (char == '\'') {
-            try out.appendSlice(allocator, "'\\''");
-        } else {
-            try out.append(allocator, char);
-        }
-    }
-    try out.append(allocator, '\'');
-}
-
-fn shellCommandWithArgs(
-    allocator: std.mem.Allocator,
-    script: []const u8,
-    script_args: []const [:0]const u8,
-) ![]const u8 {
-    var command: std.ArrayList(u8) = .empty;
-    errdefer command.deinit(allocator);
-
-    try command.appendSlice(allocator, script);
-    for (script_args) |arg| {
-        try command.append(allocator, ' ');
-        try appendShellQuoted(allocator, &command, arg);
-    }
-
-    return try command.toOwnedSlice(allocator);
-}
-
 fn createPrivateTempDirectory(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -461,17 +398,17 @@ fn createShellLauncherShim(
     return shim_dir;
 }
 
-fn runShellScript(
+fn runCottontailShellScript(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    cottontail_path: []const u8,
     script: []const u8,
     script_args: []const [:0]const u8,
 ) !u8 {
-    const command = try shellCommandWithArgs(allocator, script, script_args);
-    const argv = if (builtin.os.tag == .windows)
-        &[_][]const u8{ "cmd.exe", "/C", command }
-    else
-        &[_][]const u8{ "/bin/sh", "-c", command };
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ cottontail_path, "--hutch-shell", script });
+    for (script_args) |arg| try argv.append(allocator, arg);
 
     const launcher_shim = try createShellLauncherShim(init, allocator);
     defer if (launcher_shim) |directory| {
@@ -482,7 +419,7 @@ fn runShellScript(
     defer env.deinit();
 
     var child = try std.process.spawn(init.io, .{
-        .argv = argv,
+        .argv = argv.items,
         .environ_map = &env,
         .stdin = .inherit,
         .stdout = .inherit,
@@ -603,10 +540,13 @@ fn runConfiguredScriptIfExists(
     const script = getObjectField(scripts, script_name) orelse return null;
 
     return switch (script) {
-        .string => |command| if (scriptLooksLikeEntrypoint(command))
-            try runCottontailScript(init, allocator, cottontail_path, command, script_args)
-        else
-            try runShellScript(init, allocator, command, script_args),
+        .string => |command| try runCottontailShellScript(
+            init,
+            allocator,
+            cottontail_path,
+            command,
+            script_args,
+        ),
         .array => |argv| try runArgvScript(init, allocator, argv, script_args, stderr),
         else => {
             try stderr.print(
@@ -1138,6 +1078,7 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "argv string arrays") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Cottontail Bun.$ shell") != null);
 }
 
 test "test is a reserved Cottontail command and preserves every argument" {
