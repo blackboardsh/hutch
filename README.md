@@ -101,7 +101,12 @@ the global store and must remain set when a non-default install root is used.
 
 Run `hutch electrobun init` to choose a release template interactively, then
 accept or replace its suggested project name. The chosen name controls the
-created directory and the printed next steps. The thin Electrobun npm package
+created directory and the printed next steps. After preparing the project,
+init runs its `install` task from `hutch.config.ts` when one is configured.
+Pass `--skip-install` to leave that step to another orchestrator; `--offline`
+also skips it so init cannot unexpectedly invoke a network-capable installer.
+Both modes print `hutch run --if-configured install` as the explicit next step.
+The thin Electrobun npm package
 delegates `npx electrobun init` and `bunx electrobun init` to
 `hutch electrobun init`, installing the matching Hutch channel when needed.
 Starter templates come from the selected production or canary Electrobun
@@ -241,7 +246,7 @@ for the release workflow.
 
 - `hutch <entrypoint.js|entrypoint.ts> [args...]`
 - `hutch <script-name> [args...]`
-- `hutch run [script-name] [args...]`
+- `hutch run [--if-configured] [script-name] [args...]`
 - `hutch build [args...]`
 - `hutch electrobun <init|sync|build|run|dev> [args...]`
 - `hutch self <path|version|update> [selector]`
@@ -266,3 +271,8 @@ emulate npm lifecycle variables when running these tasks. The configured
 package manager owns those semantics. Hutch invokes the selected Cottontail
 release for JavaScript execution, runtime compatibility APIs, and
 compiler-backed build paths.
+
+`hutch run --if-configured <script-name>` uses the same config-only lookup but
+exits successfully when the task is absent. It is intended for generic setup
+seams such as Electrobun init's optional `install` task; it never infers an
+installer or package manager from project files.

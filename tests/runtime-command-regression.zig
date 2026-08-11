@@ -296,6 +296,20 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(install_run.term, 0);
 
+    const optional_install_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-npm",
+        config_json,
+        &.{ "run", "--if-configured", "install", "two words", "$literal" },
+    );
+    try expectExit(optional_install_run.term, 0);
+
     const pnpm_run = try runConfigCommand(
         init,
         allocator,
@@ -458,4 +472,21 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(absent_install.term, 1);
     try expectContains(absent_install.stderr, "Script not found");
+
+    const absent_optional_install = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        "{\"scripts\":{}}",
+        &.{ "run", "--if-configured", "install" },
+    );
+    try expectExit(absent_optional_install.term, 0);
+    if (absent_optional_install.stdout.len != 0 or absent_optional_install.stderr.len != 0) {
+        return error.OptionalScriptWasNotSilent;
+    }
 }

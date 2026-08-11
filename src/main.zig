@@ -17,7 +17,7 @@ const help_text_template =
     \\  hutch <entrypoint.js|entrypoint.ts> [args...]
     \\  hutch <script-name> [args...]
     \\  hutch electrobun <init|build|run|dev> [args...]
-    \\  hutch run [script-name] [args...]
+    \\  hutch run [--if-configured] [script-name] [args...]
     \\  hutch test [files/options...]
     \\  hutch build [args...]
     \\  hutch self <path|version|update> [selector]
@@ -913,8 +913,16 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
 
-        const requested = args[2];
-        if (std.mem.startsWith(u8, requested, "-")) {
+        const if_configured = std.mem.eql(u8, args[2], "--if-configured");
+        const requested_index: usize = if (if_configured) 3 else 2;
+        if (args.len <= requested_index) {
+            try stderr.writeAll("hutch run --if-configured requires a script name\n");
+            try stderr.flush();
+            std.process.exit(1);
+        }
+
+        const requested = args[requested_index];
+        if (!if_configured and std.mem.startsWith(u8, requested, "-")) {
             const exit_code = try runCottontailCommand(
                 init,
                 allocator,
@@ -929,13 +937,15 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             cottontail.executable,
             requested,
-            args[3..],
+            args[requested_index + 1 ..],
             stderr,
         )) |exit_code| {
             try stderr.flush();
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
+
+        if (if_configured) return;
 
         if (!pathExists(init.io, requested) and !runtimeDiagnosticEligible(requested)) {
             try stderr.print("error: Script not found \"{s}\"\n", .{requested});
@@ -1014,6 +1024,7 @@ pub fn main(init: std.process.Init) !void {
 }
 test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "--if-configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);

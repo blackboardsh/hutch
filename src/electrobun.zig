@@ -248,7 +248,7 @@ fn printHelp(writer: anytype) !void {
         \\Electrobun app build commands orchestrated by Hutch.
         \\
         \\Usage:
-        \\  hutch electrobun init [project-name] [--template=name] [--beta] [--offline]
+        \\  hutch electrobun init [project-name] [--template=name] [--beta] [--offline] [--skip-install]
         \\  hutch electrobun config [--env=dev|canary|production|stable]
         \\  hutch electrobun sync [--env=dev|canary|production|stable]
         \\  hutch electrobun build [--env=dev|canary|production|stable]
@@ -259,6 +259,7 @@ fn printHelp(writer: anytype) !void {
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
+        \\  - init runs the template's configured install task when present; --skip-install and --offline skip it.
         \\  - Main-process inspection supports Bun and Cottontail only.
         \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
         \\  - runtime.mainProcessInspector accepts { mode: "inspect" | "inspect-wait" | "inspect-brk", address?: string }.
@@ -2140,6 +2141,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     var project_name: ?[]const u8 = null;
     var channel = try electrobun_templates.activeChannel(ctx.environ_map);
     var offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE");
+    var skip_install = false;
 
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--template=")) {
@@ -2150,6 +2152,8 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
             channel = try electrobun_templates.parseChannel(arg["--channel=".len..]);
         } else if (std.mem.eql(u8, arg, "--offline")) {
             offline = true;
+        } else if (std.mem.eql(u8, arg, "--skip-install")) {
+            skip_install = true;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
             if (project_name == null) {
                 project_name = arg;
@@ -2239,8 +2243,43 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     );
     ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
     try prepareInstalledProject(ctx, project_dir);
+    if (!skip_install and !offline) {
+        ctx.writeStdout("Running hutch.config.ts install task if configured...\n", .{});
+        try runOptionalConfiguredTask(ctx, project_dir, "install");
+    } else {
+        if (offline) {
+            ctx.writeStdout("Skipped configured install task in offline mode.\n", .{});
+        } else {
+            ctx.writeStdout("Skipped configured install task (--skip-install).\n", .{});
+        }
+    }
     ctx.writeStdout("Created Electrobun project at {s}\n", .{project_dir});
-    ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
+    if (!skip_install and !offline) {
+        ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
+    } else {
+        ctx.writeStdout(
+            "Next steps:\n  cd {s}\n  hutch run --if-configured install\n  hutch run dev\n",
+            .{project_name.?},
+        );
+    }
+}
+
+fn runOptionalConfiguredTask(
+    ctx: *const Context,
+    project_dir: []const u8,
+    task_name: []const u8,
+) !void {
+    const hutch = ctx.environ_map.get("HUTCH_LAUNCHER_PATH") orelse ctx.self_exe_path;
+    var child = try std.process.spawn(ctx.io, .{
+        .argv = &[_][]const u8{ hutch, "run", "--if-configured", task_name },
+        .cwd = .{ .path = project_dir },
+        .environ_map = ctx.environ_map,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(ctx.io);
+    if (termExitCode(try child.wait(ctx.io)) != 0) return error.ConfiguredInstallTaskFailed;
 }
 
 fn prepareInstalledProject(ctx: *const Context, project_dir: []const u8) !void {

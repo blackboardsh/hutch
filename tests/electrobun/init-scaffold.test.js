@@ -57,7 +57,9 @@ test("hutch electrobun init lists and downloads the active remote template chann
   const fixture = mkdtempSync(join(tmpdir(), "hutch-electrobun-init-"));
   const archiveSource = join(fixture, "archive-source");
   const templateRoot = join(archiveSource, "hello-world");
+  const nativeTemplateRoot = join(archiveSource, "native-basic");
   const archivePath = join(fixture, "hello-world.tar.gz");
+  const nativeArchivePath = join(fixture, "native-basic.tar.gz");
   const workspace = join(fixture, "workspace");
   const coreRoot = join(fixture, "core");
   const projectName = "sample-app";
@@ -81,14 +83,48 @@ export default {
   },
 };
 `);
+  writeFileSync(
+    join(templateRoot, "hutch.config.ts"),
+    'export default { scripts: { install: [process.execPath, "install.cjs"] } };\n',
+  );
+  writeFileSync(
+    join(templateRoot, "install.cjs"),
+    'require("node:fs").writeFileSync(".configured-install-ran", process.cwd());\n',
+  );
   writeFileSync(join(templateRoot, "src", "index.ts"), 'console.log("hello");\n');
+  mkdirSync(join(nativeTemplateRoot, "src"), { recursive: true });
+  writeFileSync(join(nativeTemplateRoot, "electrobun.config.ts"), `
+export default {
+  electrobun: { version: "${version}" },
+  app: { name: "NativeBasic", identifier: "dev.electrobun.native-basic", version: "0.0.0" },
+  build: {
+    mainProcess: "cottontail",
+    cottontail: { entrypoint: "src/index.ts" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+};
+`);
+  writeFileSync(
+    join(nativeTemplateRoot, "hutch.config.ts"),
+    'export default { scripts: { dev: ["hutch", "electrobun", "dev"] } };\n',
+  );
+  writeFileSync(join(nativeTemplateRoot, "src", "index.ts"), "console.log('native package-free');\n");
   const tar = spawnSync("tar", ["-czf", archivePath, "-C", archiveSource, "hello-world"], {
     encoding: "utf8",
     env: { ...process.env, COPYFILE_DISABLE: "1" },
   });
   assert.equal(tar.status, 0, tar.stderr || tar.stdout);
+  const nativeTar = spawnSync("tar", ["-czf", nativeArchivePath, "-C", archiveSource, "native-basic"], {
+    encoding: "utf8",
+    env: { ...process.env, COPYFILE_DISABLE: "1" },
+  });
+  assert.equal(nativeTar.status, 0, nativeTar.stderr || nativeTar.stdout);
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
+  const nativeArchive = readFileSync(nativeArchivePath);
+  const nativeChecksum = createHash("sha256").update(nativeArchive).digest("hex");
 
   let baseUrl;
   const server = createServer((request, response) => {
@@ -100,17 +136,30 @@ export default {
         version: "2.0.0",
         revision: "a".repeat(40),
         tools: { hutch: "0.5.0", cottontail: "0.2.3" },
-        templates: [{
-          id: "hello-world",
-          name: "Hello World",
-          description: "A remote starter",
-          mainProcess: "cottontail",
-          archive: {
-            url: `${baseUrl}/artifacts/${checksum}.tar.gz`,
-            sha256: checksum,
-            size: archive.length,
+        templates: [
+          {
+            id: "hello-world",
+            name: "Hello World",
+            description: "A remote starter",
+            mainProcess: "cottontail",
+            archive: {
+              url: `${baseUrl}/artifacts/${checksum}.tar.gz`,
+              sha256: checksum,
+              size: archive.length,
+            },
           },
-        }],
+          {
+            id: "native-basic",
+            name: "Native Basic",
+            description: "A package-free starter",
+            mainProcess: "cottontail",
+            archive: {
+              url: `${baseUrl}/artifacts/${nativeChecksum}.tar.gz`,
+              sha256: nativeChecksum,
+              size: nativeArchive.length,
+            },
+          },
+        ],
       };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(`${JSON.stringify(catalog)}\n`);
@@ -119,6 +168,11 @@ export default {
     if (request.url === `/artifacts/${checksum}.tar.gz`) {
       response.writeHead(200, { "content-type": "application/gzip" });
       response.end(archive);
+      return;
+    }
+    if (request.url === `/artifacts/${nativeChecksum}.tar.gz`) {
+      response.writeHead(200, { "content-type": "application/gzip" });
+      response.end(nativeArchive);
       return;
     }
     response.writeHead(404);
@@ -149,6 +203,7 @@ export default {
     assert.equal(listed.status, 0, listed.stderr || listed.stdout);
     assert.match(listed.stdout, /Electrobun 2\.0\.0 templates \(stable\):/);
     assert.match(listed.stdout, /hello-world - A remote starter/);
+    assert.match(listed.stdout, /native-basic - A package-free starter/);
 
     const result = await run(
       hutch,
@@ -162,6 +217,7 @@ export default {
       result.stdout,
       "Downloading hello-world from Electrobun 2.0.0 (stable)...\n" +
         "Preparing the Electrobun devkit and required toolchain...\n" +
+        "Running hutch.config.ts install task if configured...\n" +
         `Created Electrobun project at ${projectRoot}\n` +
         "Next steps:\n" +
         `  cd ${projectName}\n` +
@@ -174,6 +230,34 @@ export default {
     );
     assert.match(readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
     assert.ok(existsSync(join(projectRoot, ".hutch", "devkit", "projection.json")));
+    assert.equal(readFileSync(join(projectRoot, ".configured-install-ran"), "utf8"), projectRoot);
+
+    const nativeProjectName = "native-app";
+    const nativeProjectRoot = join(realpathSync(workspace), nativeProjectName);
+    const nativeResult = await run(
+      hutch,
+      ["electrobun", "init", nativeProjectName, "--template=native-basic"],
+      { cwd: workspace, env },
+    );
+    assert.equal(nativeResult.status, 0, nativeResult.stderr || nativeResult.stdout);
+    assert.equal(nativeResult.stderr, "");
+    assert.match(nativeResult.stdout, /Preparing the Electrobun devkit and required toolchain/);
+    assert.match(nativeResult.stdout, /Running hutch\.config\.ts install task if configured/);
+    assert.ok(existsSync(join(nativeProjectRoot, "src", "index.ts")));
+    assert.equal(existsSync(join(nativeProjectRoot, "package.json")), false);
+    assert.equal(existsSync(join(nativeProjectRoot, ".configured-install-ran")), false);
+    assert.ok(existsSync(join(nativeProjectRoot, ".hutch", "devkit", "projection.json")));
+
+    const skipped = await run(
+      hutch,
+      ["electrobun", "init", "skipped-app", "--template=hello-world", "--skip-install"],
+      { cwd: workspace, env },
+    );
+    assert.equal(skipped.status, 0, skipped.stderr || skipped.stdout);
+    assert.match(skipped.stdout, /Skipped configured install task \(--skip-install\)\./);
+    assert.match(skipped.stdout, /hutch run --if-configured install/);
+    assert.equal(existsSync(join(workspace, "skipped-app", ".configured-install-ran")), false);
+    assert.ok(existsSync(join(workspace, "skipped-app", ".hutch", "devkit", "projection.json")));
 
     const cached = await run(
       hutch,
@@ -188,6 +272,9 @@ export default {
     );
     assert.equal(cached.status, 0, cached.stderr || cached.stdout);
     assert.ok(existsSync(join(workspace, "cached-app", ".hutch", "devkit", "projection.json")));
+    assert.match(cached.stdout, /Skipped configured install task in offline mode\./);
+    assert.match(cached.stdout, /hutch run --if-configured install/);
+    assert.equal(existsSync(join(workspace, "cached-app", ".configured-install-ran")), false);
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
     rmSync(fixture, { recursive: true, force: true });
