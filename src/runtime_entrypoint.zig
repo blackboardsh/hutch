@@ -1,5 +1,4 @@
 const std = @import("std");
-const package_manager = @import("package_manager/root.zig");
 
 const extensions = [_][]const u8{
     ".tsx", ".jsx", ".mts", ".ts", ".cts", ".js", ".mjs", ".cjs", ".json",
@@ -29,16 +28,7 @@ pub fn resolve(
     allocator: std.mem.Allocator,
     requested: []const u8,
 ) !?[:0]const u8 {
-    return resolveDepth(io, allocator, requested, 0);
-}
-
-fn resolveDepth(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    requested: []const u8,
-    depth: usize,
-) !?[:0]const u8 {
-    if (requested.len == 0 or depth > 8) return null;
+    if (requested.len == 0) return null;
     const trailing_separator = requested[requested.len - 1] == '/' or
         requested[requested.len - 1] == '\\';
 
@@ -50,50 +40,22 @@ fn resolveDepth(
             const stem = requested[0 .. requested.len - extension.len];
             for (fallbackExtensions(requested)) |replacement| {
                 const candidate = try std.mem.concat(allocator, u8, &.{ stem, replacement });
+                defer allocator.free(candidate);
                 if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
             }
         } else {
             for (extensions) |candidate_extension| {
                 const candidate = try std.mem.concat(allocator, u8, &.{ requested, candidate_extension });
+                defer allocator.free(candidate);
                 if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
             }
         }
     }
 
-    if (!pathIsDirectory(io, requested)) return null;
-    const package_json = try std.fs.path.join(allocator, &.{ requested, "package.json" });
-    if (std.Io.Dir.cwd().readFileAlloc(
-        io,
-        package_json,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch null) |source| {
-        if (package_manager.lockfile.normalizeJsonc(allocator, source) catch null) |normalized| {
-            if (std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
-                .duplicate_field_behavior = .use_last,
-            }) catch null) |manifest| {
-                if (manifest == .object) {
-                    if (manifest.object.get("main")) |main_value| {
-                        if (main_value == .string and main_value.string.len > 0) {
-                            const main_path = if (std.fs.path.isAbsolute(main_value.string))
-                                main_value.string
-                            else
-                                try std.fs.path.join(allocator, &.{ requested, main_value.string });
-                            if (try resolveDepth(io, allocator, main_path, depth + 1)) |resolved| {
-                                return resolved;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for (extensions) |candidate_extension| {
-        const basename = try std.mem.concat(allocator, u8, &.{ "index", candidate_extension });
-        const candidate = try std.fs.path.join(allocator, &.{ requested, basename });
-        if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
-    }
+    // Cottontail owns directory entrypoint semantics, including package.json
+    // `main` and index-file resolution. Hutch only needs to identify that the
+    // argument is an existing runtime path rather than a configured task name.
+    if (pathIsDirectory(io, requested)) return try allocator.dupeZ(u8, requested);
     return null;
 }
 
@@ -111,9 +73,8 @@ test "entrypoint resolution matches Bun file and directory priority" {
     try tmp.dir.createDirPath(io, "package-main");
     try tmp.dir.writeFile(io, .{
         .sub_path = "package-main/package.json",
-        .data = "{ // comment\n \"main\": \"entry.ts\", }\n",
+        .data = "{ this manifest is intentionally invalid\n",
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "package-main/entry.ts", .data = "" });
 
     const ambiguous = try std.fs.path.join(allocator, &.{ root, "folderandfile" });
     defer allocator.free(ambiguous);
@@ -125,11 +86,11 @@ test "entrypoint resolution matches Bun file and directory priority" {
     defer allocator.free(directory);
     const directory_resolved = (try resolve(io, allocator, directory)).?;
     defer allocator.free(directory_resolved);
-    try std.testing.expect(std.mem.endsWith(u8, directory_resolved, "folderandfile/index.js"));
+    try std.testing.expectEqualStrings(directory, directory_resolved);
 
     const package_main = try std.fs.path.join(allocator, &.{ root, "package-main" });
     defer allocator.free(package_main);
     const package_resolved = (try resolve(io, allocator, package_main)).?;
     defer allocator.free(package_resolved);
-    try std.testing.expect(std.mem.endsWith(u8, package_resolved, "package-main/entry.ts"));
+    try std.testing.expectEqualStrings(package_main, package_resolved);
 }
