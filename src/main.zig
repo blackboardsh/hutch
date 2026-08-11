@@ -240,16 +240,334 @@ fn findHutchConfig(init: std.process.Init, allocator: std.mem.Allocator) ![]cons
         error.HutchConfigNotFound;
 }
 
-fn tempDir(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    if (init.environ_map.get("TMPDIR")) |value| {
-        return try allocator.dupe(u8, value);
+const TrustedTempParent = struct {
+    dir: std.Io.Dir,
+    path: []const u8,
+
+    fn close(self: *TrustedTempParent, io: std.Io) void {
+        self.dir.close(io);
+    }
+};
+
+const PrivateTempDirectory = struct {
+    parent: std.Io.Dir,
+    dir: std.Io.Dir,
+    name: []const u8,
+    path: []const u8,
+    inode: std.Io.File.INode,
+
+    fn deinit(self: *PrivateTempDirectory, io: std.Io) void {
+        // Empty the directory through the retained handle. After it is closed,
+        // remove only the original leaf entry, non-recursively: if another
+        // same-user process replaced that entry, cleanup must never follow the
+        // replacement into an unrelated tree.
+        var cleanup_pass: usize = 0;
+        while (cleanup_pass < 4) : (cleanup_pass += 1) {
+            var iterator = self.dir.iterate();
+            var found_entry = false;
+            while (iterator.next(io) catch null) |entry| {
+                found_entry = true;
+                self.dir.deleteTree(io, entry.name) catch {};
+            }
+            if (!found_entry) break;
+        }
+        self.dir.close(io);
+        const current = self.parent.statFile(io, self.name, .{
+            .follow_symlinks = false,
+        }) catch null;
+        if (current) |stat| {
+            if (stat.kind == .directory and stat.inode == self.inode) {
+                self.parent.deleteDir(io, self.name) catch {};
+            }
+        }
+        self.parent.close(io);
+    }
+};
+
+const PosixDirectoryIdentity = struct {
+    owner: u64,
+    mode: u32,
+};
+
+fn posixDirectoryIdentity(dir: std.Io.Dir) !PosixDirectoryIdentity {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx = std.mem.zeroes(linux.Statx);
+        const result = linux.statx(
+            dir.handle,
+            "",
+            linux.AT.EMPTY_PATH,
+            .{ .TYPE = true, .MODE = true, .UID = true },
+            &statx,
+        );
+        if (linux.errno(result) != .SUCCESS or
+            !statx.mask.TYPE or !statx.mask.MODE or !statx.mask.UID)
+        {
+            return error.TemporaryDirectoryMetadataUnavailable;
+        }
+        return .{ .owner = statx.uid, .mode = statx.mode };
+    } else if (comptime builtin.os.tag != .windows) {
+        var stat = std.mem.zeroes(std.c.Stat);
+        if (std.posix.errno(std.c.fstat(dir.handle, &stat)) != .SUCCESS) {
+            return error.TemporaryDirectoryMetadataUnavailable;
+        }
+        return .{ .owner = stat.uid, .mode = stat.mode };
+    } else {
+        unreachable;
+    }
+}
+
+fn posixDirectoryIsTrusted(dir: std.Io.Dir) !bool {
+    const identity = try posixDirectoryIdentity(dir);
+    const effective_user: u64 = std.c.geteuid();
+    const owned_by_process = identity.owner == effective_user;
+    const owned_by_root = identity.owner == 0;
+    const writable_by_others = identity.mode & 0o022 != 0;
+    const sticky = identity.mode & 0o1000 != 0;
+
+    return ((owned_by_process or owned_by_root) and !writable_by_others) or
+        ((owned_by_process or owned_by_root) and sticky);
+}
+
+fn pathIsProjectDescendant(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    candidate: []const u8,
+) !bool {
+    const relative = try std.fs.path.relative(
+        allocator,
+        project_root,
+        null,
+        project_root,
+        candidate,
+    );
+    defer allocator.free(relative);
+    if (relative.len == 0) return true;
+    if (std.fs.path.isAbsolute(relative)) return false;
+    var components = std.fs.path.componentIterator(relative);
+    const first = components.next() orelse return true;
+    return !std.mem.eql(u8, first.name, "..");
+}
+
+fn canonicalDirPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+) ![]const u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try dir.realPath(io, &buffer);
+    return try allocator.dupe(u8, buffer[0..length]);
+}
+
+fn validateCanonicalTempAncestors(
+    io: std.Io,
+    canonical_path: []const u8,
+) !bool {
+    if (comptime builtin.os.tag == .windows) return true;
+
+    var current = canonical_path;
+    while (true) {
+        var ancestor = std.Io.Dir.openDirAbsolute(io, current, .{
+            .follow_symlinks = false,
+            .iterate = true,
+        }) catch return false;
+        const trusted = posixDirectoryIsTrusted(ancestor) catch false;
+        ancestor.close(io);
+        if (!trusted) return false;
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
+    return true;
+}
+
+fn tryOpenTrustedTempParent(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    candidate: []const u8,
+) !?TrustedTempParent {
+    if (candidate.len == 0) return null;
+    var dir = std.Io.Dir.cwd().openDir(init.io, candidate, .{
+        .follow_symlinks = false,
+        .iterate = true,
+    }) catch return null;
+    errdefer dir.close(init.io);
+
+    const stat = dir.stat(init.io) catch {
+        dir.close(init.io);
+        return null;
+    };
+    if (stat.kind != .directory) {
+        dir.close(init.io);
+        return null;
+    }
+    const canonical_path = canonicalDirPath(init.io, allocator, dir) catch {
+        dir.close(init.io);
+        return null;
+    };
+    if (try pathIsProjectDescendant(allocator, project_root, canonical_path)) {
+        dir.close(init.io);
+        return null;
+    }
+    if (!try validateCanonicalTempAncestors(init.io, canonical_path)) {
+        dir.close(init.io);
+        return null;
     }
 
-    if (init.environ_map.get("TEMP")) |value| {
-        return try allocator.dupe(u8, value);
-    }
+    return .{ .dir = dir, .path = canonical_path };
+}
 
-    return try allocator.dupe(u8, "/tmp");
+const windows_temp_api = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+    const csidl_local_app_data = 0x001c;
+    const shgfp_type_current = 0;
+
+    extern "shell32" fn SHGetFolderPathW(
+        owner: ?*anyopaque,
+        folder: c_int,
+        token: ?*anyopaque,
+        flags: windows.DWORD,
+        path: [*]u16,
+    ) callconv(.winapi) i32;
+} else struct {};
+
+fn windowsTrustedTempPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.os.tag != .windows) unreachable;
+
+    var local_app_data_w: [std.os.windows.PATH_MAX_WIDE]u16 = undefined;
+    const result = windows_temp_api.SHGetFolderPathW(
+        null,
+        windows_temp_api.csidl_local_app_data,
+        null,
+        windows_temp_api.shgfp_type_current,
+        &local_app_data_w,
+    );
+    if (result < 0) return error.TrustedTemporaryDirectoryUnavailable;
+    const wide_length = std.mem.indexOfScalar(u16, &local_app_data_w, 0) orelse
+        return error.TrustedTemporaryDirectoryUnavailable;
+    var local_app_data: [std.os.windows.PATH_MAX_WIDE * 3]u8 = undefined;
+    const local_length = std.unicode.wtf16LeToWtf8(
+        &local_app_data,
+        local_app_data_w[0..wide_length],
+    );
+    return try std.fs.path.join(allocator, &.{ local_app_data[0..local_length], "Temp" });
+}
+
+fn createPrivateTempLeaf(
+    io: std.Io,
+    parent: std.Io.Dir,
+    name: []const u8,
+) !std.Io.Dir {
+    const permissions: std.Io.Dir.Permissions = if (builtin.os.tag == .windows)
+        .default_dir
+    else
+        @enumFromInt(0o700);
+    try parent.createDir(io, name, permissions);
+    errdefer parent.deleteTree(io, name) catch {};
+
+    var child = try parent.openDir(io, name, .{
+        .follow_symlinks = false,
+        .iterate = true,
+    });
+    errdefer child.close(io);
+    const stat = try child.stat(io);
+    if (stat.kind != .directory) return error.UnsafeTemporaryDirectory;
+    if (comptime builtin.os.tag != .windows) {
+        const identity = try posixDirectoryIdentity(child);
+        if (identity.owner != @as(u64, std.c.geteuid()) or identity.mode & 0o077 != 0) {
+            return error.UnsafeTemporaryDirectory;
+        }
+    }
+    return child;
+}
+
+fn createPrivateTempDirectoryInParent(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    parent: TrustedTempParent,
+    prefix: []const u8,
+) !PrivateTempDirectory {
+    var attempt: usize = 0;
+    while (attempt < 16) : (attempt += 1) {
+        var random_bytes: [16]u8 = undefined;
+        init.io.random(&random_bytes);
+        var random_name: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        _ = std.base64.url_safe.Encoder.encode(&random_name, &random_bytes);
+        const name = try std.mem.concat(allocator, u8, &.{ prefix, &random_name });
+        const path = try std.fs.path.join(allocator, &.{ parent.path, name });
+
+        const child = createPrivateTempLeaf(init.io, parent.dir, name) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        errdefer {
+            child.close(init.io);
+            parent.dir.deleteTree(init.io, name) catch {};
+        }
+        const child_stat = try child.stat(init.io);
+        return .{
+            .parent = parent.dir,
+            .dir = child,
+            .name = name,
+            .path = path,
+            .inode = child_stat.inode,
+        };
+    }
+    return error.TemporaryDirectoryCollision;
+}
+
+fn createPrivateTempDirectory(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) !PrivateTempDirectory {
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+
+    if (comptime builtin.os.tag == .windows) {
+        const candidate = try windowsTrustedTempPath(allocator);
+        var parent = (try tryOpenTrustedTempParent(
+            init,
+            allocator,
+            project_root,
+            candidate,
+        )) orelse return error.TrustedTemporaryDirectoryUnavailable;
+        errdefer parent.close(init.io);
+        return try createPrivateTempDirectoryInParent(init, allocator, parent, prefix);
+    } else {
+        const candidates = [_]?[]const u8{
+            init.environ_map.get("TMPDIR"),
+            init.environ_map.get("TEMP"),
+            if (builtin.os.tag.isDarwin()) "/private/tmp" else "/tmp",
+        };
+        for (candidates) |optional_candidate| {
+            const candidate = optional_candidate orelse continue;
+            var parent = (try tryOpenTrustedTempParent(
+                init,
+                allocator,
+                project_root,
+                candidate,
+            )) orelse continue;
+            const private = createPrivateTempDirectoryInParent(
+                init,
+                allocator,
+                parent,
+                prefix,
+            ) catch |err| {
+                parent.close(init.io);
+                switch (err) {
+                    error.AccessDenied,
+                    error.PermissionDenied,
+                    error.ReadOnlyFileSystem,
+                    => continue,
+                    else => return err,
+                }
+            };
+            return private;
+        }
+        return error.TrustedTemporaryDirectoryUnavailable;
+    }
 }
 
 fn loadHutchConfig(
@@ -258,13 +576,13 @@ fn loadHutchConfig(
     cottontail_path: []const u8,
 ) !Config {
     const config_path = try findHutchConfig(init, allocator);
-    const tmp_dir = try createPrivateTempDirectory(init, allocator, "hutch-config-loader-");
-    defer std.Io.Dir.cwd().deleteTree(init.io, tmp_dir) catch {};
-    const loader_path = try pathJoin(allocator, &.{ tmp_dir, "load.mjs" });
-    const result_path = try pathJoin(allocator, &.{ tmp_dir, "config.json" });
+    var tmp_dir = try createPrivateTempDirectory(init, allocator, "hutch-config-loader-");
+    defer tmp_dir.deinit(init.io);
+    const loader_path = try pathJoin(allocator, &.{ tmp_dir.path, "load.mjs" });
+    const result_path = try pathJoin(allocator, &.{ tmp_dir.path, "config.json" });
     const loader_source = try makeConfigLoaderSource(allocator, config_path, result_path);
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = loader_path,
+    try tmp_dir.dir.writeFile(init.io, .{
+        .sub_path = "load.mjs",
         .data = loader_source,
     });
 
@@ -291,9 +609,9 @@ fn loadHutchConfig(
         return error.HutchConfigLoadFailed;
     }
 
-    const result = try std.Io.Dir.cwd().readFileAlloc(
+    const result = try tmp_dir.dir.readFileAlloc(
         init.io,
-        result_path,
+        "config.json",
         allocator,
         .limited(1024 * 1024),
     );
@@ -311,38 +629,6 @@ fn getObjectField(value: std.json.Value, name: []const u8) ?std.json.Value {
         .object => |object| object.get(name),
         else => null,
     };
-}
-
-fn createPrivateTempDirectory(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-) ![]const u8 {
-    const permissions: std.Io.Dir.Permissions = if (builtin.os.tag == .windows)
-        .default_dir
-    else
-        @enumFromInt(0o700);
-    const tmp_root = try tempDir(init, allocator);
-
-    var attempt: usize = 0;
-    while (attempt < 16) : (attempt += 1) {
-        var random_bytes: [12]u8 = undefined;
-        init.io.random(&random_bytes);
-        var random_name: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
-        _ = std.base64.url_safe.Encoder.encode(&random_name, &random_bytes);
-
-        const path = try std.fs.path.join(allocator, &.{
-            tmp_root,
-            try std.mem.concat(allocator, u8, &.{ prefix, &random_name }),
-        });
-        std.Io.Dir.cwd().createDir(init.io, path, permissions) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => return err,
-        };
-        return path;
-    }
-
-    return error.TemporaryDirectoryCollision;
 }
 
 fn configuredScriptEnvironment(
@@ -377,24 +663,23 @@ fn configuredScriptEnvironment(
 fn createShellLauncherShim(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-) !?[]const u8 {
+) !?PrivateTempDirectory {
     const launcher = init.environ_map.get("HUTCH_LAUNCHER_PATH") orelse return null;
     const stat = std.Io.Dir.cwd().statFile(init.io, launcher, .{}) catch
         return error.ConfiguredLauncherNotFound;
     if (stat.kind != .file) return error.ConfiguredLauncherIsNotAFile;
 
-    const shim_dir = try createPrivateTempDirectory(init, allocator, "hutch-shell-launcher-");
-    errdefer std.Io.Dir.cwd().deleteTree(init.io, shim_dir) catch {};
+    var shim_dir = try createPrivateTempDirectory(init, allocator, "hutch-shell-launcher-");
+    errdefer shim_dir.deinit(init.io);
 
-    const shim_path = try std.fs.path.join(allocator, &.{
-        shim_dir,
-        if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
-    });
+    // String tasks resolve the literal command name `hutch`. A private PATH
+    // entry containing the exact selected launcher preserves canary/custom
+    // identity without rewriting shell text or relying on Windows batch shims.
     try std.Io.Dir.copyFile(
         std.Io.Dir.cwd(),
         launcher,
-        std.Io.Dir.cwd(),
-        shim_path,
+        shim_dir.dir,
+        if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
         init.io,
         .{ .permissions = .executable_file },
     );
@@ -413,12 +698,16 @@ fn runCottontailShellScript(
     try argv.appendSlice(allocator, &.{ cottontail_path, "--hutch-shell", script });
     for (script_args) |arg| try argv.append(allocator, arg);
 
-    const launcher_shim = try createShellLauncherShim(init, allocator);
-    defer if (launcher_shim) |directory| {
-        std.Io.Dir.cwd().deleteTree(init.io, directory) catch {};
+    var launcher_shim = try createShellLauncherShim(init, allocator);
+    defer if (launcher_shim) |*directory| {
+        directory.deinit(init.io);
     };
 
-    var env = try configuredScriptEnvironment(init, allocator, launcher_shim);
+    var env = try configuredScriptEnvironment(
+        init,
+        allocator,
+        if (launcher_shim) |directory| directory.path else null,
+    );
     defer env.deinit();
 
     var child = try std.process.spawn(init.io, .{
@@ -1127,4 +1416,89 @@ test "test is a reserved Cottontail command and preserves every argument" {
     for (args[1..], forwarded) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "project descendant detection is component aware" {
+    const allocator = std.testing.allocator;
+    const root = if (builtin.os.tag == .windows) "C:\\workspace\\app" else "/workspace/app";
+    const child = if (builtin.os.tag == .windows) "C:\\workspace\\app\\tmp" else "/workspace/app/tmp";
+    const sibling = if (builtin.os.tag == .windows) "C:\\workspace\\application" else "/workspace/application";
+
+    try std.testing.expect(try pathIsProjectDescendant(allocator, root, root));
+    try std.testing.expect(try pathIsProjectDescendant(allocator, root, child));
+    try std.testing.expect(!try pathIsProjectDescendant(allocator, root, sibling));
+}
+
+test "private temp creation refuses a symlink preclaim" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "preclaim-target", @enumFromInt(0o700));
+    try tmp.dir.symLink(
+        std.testing.io,
+        "preclaim-target",
+        "hutch-config-loader-preclaimed",
+        .{ .is_directory = true },
+    );
+
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        createPrivateTempLeaf(
+            std.testing.io,
+            tmp.dir,
+            "hutch-config-loader-preclaimed",
+        ),
+    );
+}
+
+test "private temp cleanup never follows a replaced leaf" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "anchor", @enumFromInt(0o700));
+    var parent = try tmp.dir.openDir(std.testing.io, "anchor", .{
+        .follow_symlinks = false,
+        .iterate = true,
+    });
+    try parent.createDir(std.testing.io, "target", @enumFromInt(0o700));
+    try parent.writeFile(std.testing.io, .{
+        .sub_path = "target/keep.txt",
+        .data = "must survive",
+    });
+
+    const child = try createPrivateTempLeaf(std.testing.io, parent, "hutch-private-fixed");
+    try child.writeFile(std.testing.io, .{
+        .sub_path = "scratch.txt",
+        .data = "temporary",
+    });
+    var private = PrivateTempDirectory{
+        .parent = parent,
+        .dir = child,
+        .name = "hutch-private-fixed",
+        .path = "unused-in-test",
+        .inode = (try child.stat(std.testing.io)).inode,
+    };
+
+    try std.Io.Dir.rename(
+        private.parent,
+        private.name,
+        private.parent,
+        "moved-private",
+        std.testing.io,
+    );
+    try private.parent.symLink(
+        std.testing.io,
+        "target",
+        private.name,
+        .{ .is_directory = true },
+    );
+    private.deinit(std.testing.io);
+
+    try tmp.dir.access(std.testing.io, "anchor/target/keep.txt", .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access(std.testing.io, "anchor/moved-private/scratch.txt", .{}),
+    );
 }

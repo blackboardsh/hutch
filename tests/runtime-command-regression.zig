@@ -58,7 +58,12 @@ const CapturedRun = struct {
     stderr: []const u8,
 };
 
-fn runConfigCommand(
+const EnvironmentOverride = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn runConfigCommandWithOverrides(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     launcher: []const u8,
@@ -69,6 +74,7 @@ fn runConfigCommand(
     mode: []const u8,
     config_json: []const u8,
     invocation: []const []const u8,
+    overrides: []const EnvironmentOverride,
 ) !CapturedRun {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -86,6 +92,9 @@ fn runConfigCommand(
     try environment.put("HUTCH_BATCH_SENTINEL", "expanded-percent-value");
     try environment.put("HUTCH_BATCH_DELAYED", "expanded-delayed-value");
     try environment.put("CI", "1");
+    for (overrides) |override| {
+        try environment.put(override.key, override.value);
+    }
 
     const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
     // Deliberately exclude the installed Hutch path. Recursive `hutch` argv
@@ -106,6 +115,33 @@ fn runConfigCommand(
     };
 }
 
+fn runConfigCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    launcher: []const u8,
+    engine: []const u8,
+    runtime: []const u8,
+    project_dir: []const u8,
+    fake_bin_dir: []const u8,
+    mode: []const u8,
+    config_json: []const u8,
+    invocation: []const []const u8,
+) !CapturedRun {
+    return runConfigCommandWithOverrides(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        project_dir,
+        fake_bin_dir,
+        mode,
+        config_json,
+        invocation,
+        &.{},
+    );
+}
+
 fn expectExit(term: std.process.Child.Term, expected: u8) !void {
     switch (term) {
         .exited => |actual| if (actual != expected) return error.UnexpectedExitCode,
@@ -120,6 +156,19 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 fn expectMissing(init: std.process.Init, path: []const u8) !void {
     std.Io.Dir.cwd().access(init.io, path, .{}) catch return;
     return error.UnexpectedInjectionMarker;
+}
+
+fn expectNoPrivateTempArtifacts(init: std.process.Init, directory: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(init.io, directory, .{ .iterate = true });
+    defer dir.close(init.io);
+    var iterator = dir.iterate();
+    while (try iterator.next(init.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "hutch-config-loader-") or
+            std.mem.startsWith(u8, entry.name, "hutch-shell-launcher-"))
+        {
+            return error.PrivateTempArtifactEscapedIntoProject;
+        }
+    }
 }
 
 fn writeFakePackageManager(
@@ -662,6 +711,89 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(canary_hutch_shell_run.term, 0);
     try expectContains(canary_hutch_shell_run.stdout, "0.0.0-test\n");
+
+    // A project must never become Hutch's scratch directory merely because it
+    // poisoned TMPDIR/TEMP. Exercise both the config side channel and the
+    // copied canary launcher while the project itself is read-only. On POSIX,
+    // make the first candidate a symlink preclaim as well; the retained
+    // no-follow parent must reject it and fall back to a trusted system root.
+    const hardened_project = try std.fs.path.join(
+        allocator,
+        &.{ fixture_root, "temp-hardening-project" },
+    );
+    try std.Io.Dir.cwd().createDirPath(init.io, hardened_project);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ hardened_project, "hutch.config.ts" }),
+        .data = "export default {};\n",
+    });
+    const poison_candidate = try std.fs.path.join(
+        allocator,
+        &.{ hardened_project, "poisoned-temp" },
+    );
+    if (comptime builtin.os.tag != .windows) {
+        try std.Io.Dir.cwd().symLink(
+            init.io,
+            hardened_project,
+            poison_candidate,
+            .{ .is_directory = true },
+        );
+    } else {
+        try std.Io.Dir.cwd().createDir(init.io, poison_candidate, .default_dir);
+    }
+
+    const project_stat = try std.Io.Dir.cwd().statFile(init.io, hardened_project, .{});
+    if (comptime builtin.os.tag != .windows) {
+        try std.Io.Dir.cwd().setFilePermissions(
+            init.io,
+            hardened_project,
+            @enumFromInt(0o555),
+            .{ .follow_symlinks = false },
+        );
+    }
+    defer if (builtin.os.tag != .windows) {
+        std.Io.Dir.cwd().setFilePermissions(
+            init.io,
+            hardened_project,
+            project_stat.permissions,
+            .{ .follow_symlinks = false },
+        ) catch {};
+    };
+
+    const poisoned_temp_overrides = [_]EnvironmentOverride{
+        .{ .key = "TMPDIR", .value = poison_candidate },
+        .{ .key = "TEMP", .value = hardened_project },
+    };
+    const hardened_config = try runConfigCommandWithOverrides(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        hardened_project,
+        fake_bin,
+        "config-list",
+        "{\"scripts\":{}}",
+        &.{"run"},
+        &poisoned_temp_overrides,
+    );
+    try expectExit(hardened_config.term, 0);
+
+    const hardened_shell = try runConfigCommandWithOverrides(
+        init,
+        allocator,
+        canary_launcher,
+        split_engine,
+        runtime,
+        hardened_project,
+        fake_bin,
+        "config-hutch-shell",
+        "{\"scripts\":{\"hutch-version-shell\":\"hutch --version\"}}",
+        &.{"hutch-version-shell"},
+        &poisoned_temp_overrides,
+    );
+    try expectExit(hardened_shell.term, 0);
+    try expectContains(hardened_shell.stdout, "0.0.0-test\n");
+    try expectNoPrivateTempArtifacts(init, hardened_project);
 
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),

@@ -73,6 +73,42 @@ fn expectConfiguredCwd(init: std.process.Init) !void {
     if (!std.mem.eql(u8, expected, actual)) return error.UnexpectedConfiguredCwd;
 }
 
+fn expectPrivateTempDirectory(
+    init: std.process.Init,
+    path: []const u8,
+    prefix: []const u8,
+) !void {
+    if (!std.mem.startsWith(u8, std.fs.path.basename(path), prefix)) {
+        return error.UnexpectedPrivateTempDirectoryName;
+    }
+    const stat = try std.Io.Dir.cwd().statFile(init.io, path, .{
+        .follow_symlinks = false,
+    });
+    if (stat.kind != .directory) return error.PrivateTempDirectoryWasReplaced;
+    if (comptime builtin.os.tag != .windows) {
+        if (stat.permissions.toMode() & 0o077 != 0) {
+            return error.PrivateTempDirectoryPermissionsTooBroad;
+        }
+    }
+}
+
+fn expectPrivateShellLauncher(init: std.process.Init) !void {
+    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+    const path = init.environ_map.get(path_key) orelse
+        init.environ_map.get("PATH") orelse return error.MissingPath;
+    var entries = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    const shim_dir = entries.first();
+    try expectPrivateTempDirectory(init, shim_dir, "hutch-shell-launcher-");
+    const launcher = try std.fs.path.join(init.arena.allocator(), &.{
+        shim_dir,
+        if (builtin.os.tag == .windows) "hutch.exe" else "hutch",
+    });
+    const stat = try std.Io.Dir.cwd().statFile(init.io, launcher, .{
+        .follow_symlinks = false,
+    });
+    if (stat.kind != .file) return error.PrivateShellLauncherMissing;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     // Older engines may probe imports before starting the runtime. Keep the
@@ -87,9 +123,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.startsWith(u8, mode, "config-")) {
         if (args.len == 2 and std.mem.eql(u8, std.fs.path.basename(args[1]), "load.mjs")) {
             const loader_dir = std.fs.path.dirname(args[1]) orelse return error.InvalidConfigLoaderPath;
-            if (!std.mem.startsWith(u8, std.fs.path.basename(loader_dir), "hutch-config-loader-")) {
-                return error.ConfigLoaderDirectoryWasNotPrivate;
-            }
+            try expectPrivateTempDirectory(init, loader_dir, "hutch-config-loader-");
             const config_json = init.environ_map.get("HUTCH_TEST_CONFIG_JSON") orelse
                 return error.MissingConfigJson;
             if (std.mem.eql(u8, mode, "config-console-log")) {
@@ -116,6 +150,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (args.len >= 3 and std.mem.eql(u8, args[1], "--hutch-shell")) {
             try expectConfiguredCwd(init);
+            try expectPrivateShellLauncher(init);
             const command = args[2];
             const appended = args[3..];
             if (std.mem.eql(u8, mode, "config-hutch-shell")) {
