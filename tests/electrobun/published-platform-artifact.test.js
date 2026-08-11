@@ -61,6 +61,8 @@ test("exact Electrobun artifacts are cached and same-project builds serialize", 
   const project = join(fixture, "project");
   const coreFiles = join(fixture, "core-files");
   const archive = join(fixture, "electrobun-core.tar.gz");
+  const malformedCoreFiles = join(fixture, "malformed-core-files");
+  const malformedArchive = join(fixture, "malformed-electrobun-core.tar.gz");
   const dashHome = join(fixture, "dash-home");
   const names = hostContract();
   const version = "9.8.7-test.1";
@@ -74,6 +76,19 @@ test("exact Electrobun artifacts are cached and same-project builds serialize", 
     assert.equal(packed.status, 0, packed.stderr || packed.stdout);
     const archiveBytes = readFileSync(archive);
     const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
+
+    createCoreFixture(malformedCoreFiles, version, names);
+    rmSync(join(malformedCoreFiles, "go-sdk", "go.mod"));
+    const packedMalformed = spawnSync(
+      "tar",
+      ["-czf", malformedArchive, "-C", malformedCoreFiles, "."],
+      { encoding: "utf8" },
+    );
+    assert.equal(packedMalformed.status, 0, packedMalformed.stderr || packedMalformed.stdout);
+    const malformedArchiveBytes = readFileSync(malformedArchive);
+    const malformedArchiveSha256 = createHash("sha256")
+      .update(malformedArchiveBytes)
+      .digest("hex");
 
     writeFixtureFile(join(project, "src", "bun", "index.ts"), "console.log('published artifact fixture');\n");
     writeFixtureFile(join(project, "claim-build-window.mjs"), `
@@ -128,6 +143,7 @@ export default {
     let coreRequests = 0;
     let serveOversizedIndex = false;
     let serveCoreUnavailable = false;
+    let serveMalformedCore = false;
     const server = createServer((request, response) => {
       const basePath = `/releases/download/v${version}`;
       if (request.url === `${basePath}/electrobun-artifacts.json`) {
@@ -140,6 +156,10 @@ export default {
           response.end();
           return;
         }
+        const selectedArchiveBytes = serveMalformedCore ? malformedArchiveBytes : archiveBytes;
+        const selectedArchiveSha256 = serveMalformedCore
+          ? malformedArchiveSha256
+          : archiveSha256;
         const origin = `http://127.0.0.1:${server.address().port}/releases/download`;
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
@@ -155,8 +175,8 @@ export default {
               target: { os: names.os, arch: names.arch },
               core: {
                 url: `${origin}/v${version}/electrobun-core-${names.asset}.tar.gz`,
-                size: archiveBytes.length,
-                sha256: archiveSha256,
+                size: selectedArchiveBytes.length,
+                sha256: selectedArchiveSha256,
               },
             },
           },
@@ -171,7 +191,7 @@ export default {
           return;
         }
         response.writeHead(200, { "content-type": "application/gzip" });
-        response.end(archiveBytes);
+        response.end(serveMalformedCore ? malformedArchiveBytes : archiveBytes);
         return;
       }
       response.writeHead(404);
@@ -255,20 +275,63 @@ export default {
       assert.equal(coreRequests, 1, "offline artifact misses must not perform HTTP requests");
 
       serveCoreUnavailable = false;
+      serveMalformedCore = true;
+      rmSync(indexCache);
+      const malformed = await run(hutch, ["electrobun", "build", "--env=dev"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.notEqual(malformed.status, 0);
+      assert.match(malformed.stderr, /ElectrobunDevkitLayoutMissing/);
+      assert.equal(indexRequests, 3);
+      assert.equal(coreRequests, 2);
+      assert.equal(
+        existsSync(join(cacheRoot, ".core-complete")),
+        false,
+        "a semantically incomplete archive must never publish a core marker",
+      );
+      assert.equal(existsSync(`${cacheRoot}.core-tmp`), false, "failed extraction must be cleaned");
+
+      serveMalformedCore = false;
+      rmSync(indexCache);
       const first = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
         env,
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(first.status, 0, first.stderr || first.stdout);
-      assert.equal(indexRequests, 2, "the first online build should reuse the valid artifact index");
-      assert.equal(coreRequests, 2, "the first build should download one verified core archive");
+      assert.equal(indexRequests, 4);
+      assert.equal(coreRequests, 3, "the first build should download one complete core archive");
       assert.match(first.stderr, /downloading Electrobun 9\.8\.7-test\.1 core/);
 
       assert.ok(existsSync(join(cacheRoot, executableName("launcher"))));
       assert.ok(existsSync(join(cacheRoot, ".core-complete")));
       assert.equal(readFileSync(join(cacheRoot, ".core-complete"), "utf8").trim(), archiveSha256);
       assert.ok(existsSync(indexCache));
+
+      const missingSdkRole = join(cacheRoot, "api", "browser", "index.ts");
+      rmSync(missingSdkRole);
+      rmSync(join(project, "build"), { recursive: true, force: true });
+      const offlineTampered = await run(hutch, ["electrobun", "build", "--env=dev"], {
+        cwd: project,
+        env: { ...env, DASH_RELEASE_OFFLINE: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.notEqual(offlineTampered.status, 0);
+      assert.match(offlineTampered.stderr, /ElectrobunArtifactCacheInvalid/);
+      assert.equal(indexRequests, 4, "offline validation failures must not refresh the index");
+      assert.equal(coreRequests, 3, "offline validation failures must not perform HTTP requests");
+
+      const repaired = await run(hutch, ["electrobun", "build", "--env=dev"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout);
+      assert.equal(indexRequests, 4, "repair should reuse the verified artifact index");
+      assert.equal(coreRequests, 4, "repair should download the verified core archive exactly once");
+      assert.ok(existsSync(missingSdkRole), "repair must restore the missing manifest-declared role");
 
       writeFileSync(indexCache, "{truncated");
       rmSync(join(project, "build"), { recursive: true, force: true });
@@ -278,8 +341,8 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
-      assert.equal(indexRequests, 3, "online mode should replace one corrupt cached index");
-      assert.equal(coreRequests, 2, "index recovery must preserve the verified core install");
+      assert.equal(indexRequests, 5, "online mode should replace one corrupt cached index");
+      assert.equal(coreRequests, 4, "index recovery must preserve the verified core install");
       assert.ok(existsSync(`${indexCache}.invalid`));
 
       rmSync(join(project, "build"), { recursive: true, force: true });
@@ -289,8 +352,8 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(second.status, 0, second.stderr || second.stdout);
-      assert.equal(indexRequests, 3, "offline cache hits must not refresh the artifact index");
-      assert.equal(coreRequests, 2, "offline cache hits must reuse the verified core cache");
+      assert.equal(indexRequests, 5, "offline cache hits must not refresh the artifact index");
+      assert.equal(coreRequests, 4, "offline cache hits must reuse the verified core cache");
 
       rmSync(join(project, "build"), { recursive: true, force: true });
       rmSync(join(project, ".hutch", "locks"), { recursive: true, force: true });
@@ -332,8 +395,8 @@ export default {
       for (const result of concurrent) {
         assert.equal(result.status, 0, result.stderr || result.stdout);
       }
-      assert.equal(indexRequests, 3, "local concurrent builds must not refresh the artifact index");
-      assert.equal(coreRequests, 2, "local concurrent builds must not download artifacts");
+      assert.equal(indexRequests, 5, "local concurrent builds must not refresh the artifact index");
+      assert.equal(coreRequests, 4, "local concurrent builds must not download artifacts");
       assert.equal(existsSync(sentinel), false, "the final build must release its serialization sentinel");
       assert.ok(existsSync(join(project, ".hutch", "locks", "electrobun-build.lock")));
       for (let index = 0; index < concurrent.length; index += 1) {

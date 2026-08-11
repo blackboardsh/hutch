@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
+const electrobun_devkit = @import("electrobun_devkit.zig");
 const release_store = @import("release_store.zig");
 
 const default_releases_base_url =
@@ -68,6 +69,12 @@ const ArtifactSelection = struct {
     }
 };
 
+const InstallationStatus = enum {
+    missing,
+    invalid,
+    valid,
+};
+
 pub fn ensureCore(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -119,8 +126,20 @@ fn ensure(
         offline,
     );
     const artifact = try selection.artifact(kind);
-    if (try installationMatches(init.io, allocator, root, kind, artifact.sha256)) return root;
-    if (offline) return error.ElectrobunArtifactNotCached;
+    const installation_status = try installationStatus(
+        init.io,
+        allocator,
+        root,
+        kind,
+        selection,
+    );
+    if (installation_status == .valid) return root;
+    if (offline) {
+        return if (installation_status == .invalid)
+            error.ElectrobunArtifactCacheInvalid
+        else
+            error.ElectrobunArtifactNotCached;
+    }
 
     std.debug.print(
         "hutch: downloading Electrobun {s} {s} for {s}\n",
@@ -457,8 +476,7 @@ fn installCore(
             },
         );
     }
-    try validateCoreFiles(io, allocator, temporary);
-    try validateNativeDevkitIdentity(io, allocator, temporary, selection);
+    try validateCoreInstallation(io, allocator, temporary, selection);
     try writeMarker(io, allocator, temporary, .core, selection.core.sha256);
 
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -472,7 +490,7 @@ fn installCef(
     archive: []const u8,
     selection: ArtifactSelection,
 ) !void {
-    if (!try installationMatches(io, allocator, root, .core, selection.core.sha256)) {
+    if (try installationStatus(io, allocator, root, .core, selection) != .valid) {
         return error.ElectrobunCoreNotInstalled;
     }
     const cef_artifact = selection.cef orelse return error.ElectrobunCefArtifactUnavailable;
@@ -507,47 +525,48 @@ fn installCef(
     try writeMarker(io, allocator, root, .cef, cef_artifact.sha256);
 }
 
-fn installationMatches(
+fn installationStatus(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
     kind: Kind,
-    expected_sha256: []const u8,
-) !bool {
-    switch (kind) {
-        .core => validateCoreFiles(io, allocator, root) catch return false,
-        .cef => {
-            const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
-            if (!pathIsDirectory(io, cef)) return false;
-        },
-    }
-
+    selection: ArtifactSelection,
+) !InstallationStatus {
     const marker = try markerPath(allocator, root, kind);
     const value = std.Io.Dir.cwd().readFileAlloc(
         io,
         marker,
         allocator,
         .limited(128),
-    ) catch return false;
-    return std.mem.eql(
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.StreamTooLong => return .invalid,
+        else => |e| return e,
+    };
+    if (!std.mem.eql(
         u8,
         std.mem.trim(u8, value, " \t\r\n"),
-        expected_sha256,
-    );
+        (try selection.artifact(kind)).sha256,
+    )) return .invalid;
+
+    switch (kind) {
+        .core => validateCoreInstallation(io, allocator, root, selection) catch return .invalid,
+        .cef => {
+            const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
+            if (!pathIsDirectory(io, cef)) return .invalid;
+        },
+    }
+    return .valid;
 }
 
-fn validateCoreFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !void {
-    const required = [_][]const u8{
-        launcherFileName(),
-        coreLibraryFileName(),
-        nativeWrapperFileName(),
-        asarLibraryFileName(),
-        native_devkit_manifest_file_name,
-    };
-    for (required) |name| {
-        const path = try std.fs.path.join(allocator, &.{ root, name });
-        if (!pathExists(io, path)) return error.ElectrobunCoreArchiveInvalid;
-    }
+fn validateCoreInstallation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    selection: ArtifactSelection,
+) !void {
+    try validateNativeDevkitIdentity(io, allocator, root, selection);
+    _ = try electrobun_devkit.load(io, allocator, root, selection.version);
 }
 
 fn validateNativeDevkitIdentity(
@@ -768,39 +787,6 @@ fn releaseArchName() []const u8 {
     };
 }
 
-fn launcherFileName() []const u8 {
-    return if (builtin.os.tag == .windows) "launcher.exe" else "launcher";
-}
-
-fn coreLibraryFileName() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => "ElectrobunCore.dll",
-        .macos => "libElectrobunCore.dylib",
-        else => "libElectrobunCore.so",
-    };
-}
-
-fn nativeWrapperFileName() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => "libNativeWrapper.dll",
-        .macos => "libNativeWrapper.dylib",
-        else => "libNativeWrapper.so",
-    };
-}
-
-fn asarLibraryFileName() []const u8 {
-    return switch (builtin.os.tag) {
-        .windows => "libasar.dll",
-        .macos => "libasar.dylib",
-        else => "libasar.so",
-    };
-}
-
-fn pathExists(io: std.Io, path: []const u8) bool {
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
 fn pathIsDirectory(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
@@ -961,4 +947,140 @@ test "Electrobun index URLs and versions cannot escape the shared cache" {
     try std.testing.expectError(error.InvalidElectrobunVersion, validateVersion(".."));
     try std.testing.expectError(error.InvalidElectrobunVersion, validateVersion("../../other"));
     try std.testing.expectError(error.InvalidElectrobunVersion, validateVersion("2.0.0/path"));
+}
+
+test "matching core markers do not hide incomplete manifest layouts" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const manifest_template =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "product": { "name": "electrobun", "version": "2.0.0" },
+        \\  "target": { "os": "__OS__", "arch": "__ARCH__" },
+        \\  "abi": {
+        \\    "core": { "name": "electrobun-core", "version": 1 },
+        \\    "sdk": { "name": "electrobun-sdk", "version": 1 }
+        \\  },
+        \\  "toolchains": {
+        \\    "zig": { "defaultVersion": "0.16.0" },
+        \\    "rust": { "defaultVersion": "1.88.0" },
+        \\    "go": { "defaultVersion": "1.26.4" },
+        \\    "odin": { "defaultVersion": "1.0.0" }
+        \\  },
+        \\  "runtimes": { "bun": { "version": "1.3.13" } },
+        \\  "layout": {
+        \\    "runtime": {
+        \\      "main": "missing/main.js",
+        \\      "preloadFull": "missing/preload-full.js",
+        \\      "preloadSandboxed": "missing/preload-sandboxed.js",
+        \\      "bun": "missing/bun",
+        \\      "launcher": "missing/launcher",
+        \\      "extractor": "missing/extractor",
+        \\      "coreLibrary": "missing/core",
+        \\      "nativeWrapper": "missing/native",
+        \\      "nativeWrapperCef": "missing/native-cef",
+        \\      "asarLibrary": "missing/asar",
+        \\      "wgpuLibrary": "missing/wgpu",
+        \\      "processHelper": "missing/helper",
+        \\      "bsdiff": "missing/bsdiff",
+        \\      "bspatch": "missing/bspatch",
+        \\      "zigAsar": "missing/zig-asar",
+        \\      "zigZstd": "missing/zig-zstd"
+        \\    },
+        \\    "sdks": {
+        \\      "javascript": {
+        \\        "root": "missing/api",
+        \\        "main": "missing/api/main.ts",
+        \\        "browser": "missing/api/browser.ts",
+        \\        "config": "missing/api/config.ts",
+        \\        "preload": "missing/api/preload",
+        \\        "exports": { ".": "missing/api/main.ts" }
+        \\      },
+        \\      "zig": { "root": "missing/zig", "entrypoint": "missing/zig/electrobun.zig" },
+        \\      "rust": { "root": "missing/rust", "manifest": "missing/rust/Cargo.toml" },
+        \\      "go": { "root": "missing/go", "manifest": "missing/go/go.mod", "module": "electrobun" },
+        \\      "odin": {
+        \\        "root": "missing/odin/electrobun",
+        \\        "entrypoint": "missing/odin/electrobun/electrobun.odin",
+        \\        "collection": "missing/odin",
+        \\        "collectionName": "electrobun_sdk"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    const with_os = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        manifest_template,
+        "__OS__",
+        targetOsName(),
+    );
+    const manifest = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        with_os,
+        "__ARCH__",
+        releaseArchName(),
+    );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = native_devkit_manifest_file_name,
+        .data = manifest,
+    });
+
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".core-complete",
+        .data = checksum ++ "\n",
+    });
+    const relative_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+    });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const selection: ArtifactSelection = .{
+        .version = "2.0.0",
+        .target_os = targetOsName(),
+        .target_arch = releaseArchName(),
+        .devkit_manifest = native_devkit_manifest_file_name,
+        .devkit_schema_version = native_devkit_schema_version,
+        .abi = .{
+            .core_name = "electrobun-core",
+            .core_version = supported_core_abi_version,
+            .sdk_name = "electrobun-sdk",
+            .sdk_version = supported_sdk_abi_version,
+        },
+        .core = .{
+            .url = "https://releases.example.test/core.tar.gz",
+            .sha256 = checksum,
+            .size = 1,
+        },
+        .cef = null,
+    };
+
+    try validateNativeDevkitIdentity(io, allocator, root, selection);
+    try std.testing.expectError(
+        error.ElectrobunDevkitLayoutMissing,
+        validateCoreInstallation(io, allocator, root, selection),
+    );
+    try std.testing.expectEqual(
+        InstallationStatus.invalid,
+        try installationStatus(io, allocator, root, .core, selection),
+    );
+
+    try tmp.dir.createDirPath(io, "missing/main.js");
+    try std.testing.expectError(
+        error.ElectrobunDevkitLayoutInvalid,
+        validateCoreInstallation(io, allocator, root, selection),
+    );
+    try std.testing.expectEqual(
+        InstallationStatus.invalid,
+        try installationStatus(io, allocator, root, .core, selection),
+    );
 }
