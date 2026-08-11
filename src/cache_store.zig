@@ -1,13 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cache_locks = @import("cache_locks.zig");
 const project_state = @import("project_state.zig");
 const release_store = @import("release_store.zig");
 const toolchain_store = @import("toolchain_store.zig");
 
-const schema_version = 1;
+const schema_version = 2;
+const minimum_readable_schema_version = 1;
 const project_lock_kind = "hutch-project-dependencies";
 const registration_kind = "hutch-project-registration";
-const state_relative_root = "state/cache-v2";
+const state_relative_root = cache_locks.state_relative_root;
 const max_state_file_bytes = 1024 * 1024;
 
 pub const default_grace_seconds: i64 = 30 * 24 * 60 * 60;
@@ -21,21 +23,20 @@ pub const ManagedObject = struct {
     core_sha256: ?[]const u8 = null,
     cef_sha256: ?[]const u8 = null,
     source_manifest_sha256: ?[]const u8 = null,
+    release_product: ?[]const u8 = null,
+    revision: ?[]const u8 = null,
+    archive_sha256: ?[]const u8 = null,
 
     pub const Kind = enum {
         electrobun,
         electrobun_cef,
+        release,
         toolchain,
     };
 };
 
-pub const GraphLock = struct {
-    file: std.Io.File,
-
-    pub fn close(self: GraphLock, io: std.Io) void {
-        self.file.close(io);
-    }
-};
+pub const GraphLock = cache_locks.GraphLock;
+pub const ObjectLease = cache_locks.ObjectLease;
 
 pub const PruneOptions = struct {
     dry_run: bool = false,
@@ -84,7 +85,7 @@ pub fn acquireUsageLock(
     allocator: std.mem.Allocator,
 ) !GraphLock {
     const home = try release_store.dashHome(init, allocator);
-    return acquireGraphLockAt(init.io, allocator, home, .shared);
+    return cache_locks.acquireGraph(init.io, allocator, home, .shared);
 }
 
 fn acquireGraphLockAt(
@@ -93,30 +94,7 @@ fn acquireGraphLockAt(
     home: []const u8,
     mode: std.Io.File.Lock,
 ) !GraphLock {
-    const state_parent = try std.fs.path.join(allocator, &.{ home, "state" });
-    try ensureDirectoryWithin(io, allocator, home, state_parent, error.InvalidCacheStatePath);
-    const state_root = try std.fs.path.join(allocator, &.{ state_parent, "cache-v2" });
-    try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidCacheStatePath);
-    const lock_path = try std.fs.path.join(allocator, &.{ state_root, "graph.lock" });
-    try initializePersistentFile(io, lock_path);
-    if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidCacheStatePath;
-    return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = mode,
-        .follow_symlinks = false,
-    }) };
-}
-
-fn initializePersistentFile(io: std.Io, path: []const u8) !void {
-    const initializer: ?std.Io.File = std.Io.Dir.cwd().createFile(io, path, .{
-        .read = true,
-        .truncate = false,
-        .exclusive = true,
-    }) catch |err| switch (err) {
-        error.PathAlreadyExists => null,
-        else => return err,
-    };
-    if (initializer) |file| file.close(io);
+    return cache_locks.acquireGraph(io, allocator, home, mode);
 }
 
 pub fn managedElectrobunObjects(
@@ -255,7 +233,7 @@ fn registerProjectAt(
         error.InvalidCacheStatePath,
     );
     const registration_lock_path = try std.mem.concat(allocator, u8, &.{ registration_path, ".lock" });
-    try initializePersistentFile(io, registration_lock_path);
+    try cache_locks.initializePersistentFile(io, registration_lock_path);
     if (!try pathResolvesWithin(io, allocator, home, registration_lock_path)) return error.InvalidCacheStatePath;
     const registration_lock = try std.Io.Dir.cwd().openFile(io, registration_lock_path, .{
         .mode = .read_write,
@@ -311,6 +289,7 @@ fn objectJson(allocator: std.mem.Allocator, object: ManagedObject) !std.json.Val
     try value.put(allocator, "type", .{ .string = switch (object.kind) {
         .electrobun => "electrobun",
         .electrobun_cef => "electrobun-cef",
+        .release => "release",
         .toolchain => "toolchain",
     } });
     try value.put(allocator, "relativeRoot", .{ .string = object.relative_root });
@@ -325,6 +304,11 @@ fn objectJson(allocator: std.mem.Allocator, object: ManagedObject) !std.json.Val
         .electrobun_cef => {
             try value.put(allocator, "product", .{ .string = "electrobun" });
             try value.put(allocator, "cefSha256", .{ .string = object.cef_sha256.? });
+        },
+        .release => {
+            try value.put(allocator, "product", .{ .string = object.release_product.? });
+            try value.put(allocator, "revision", .{ .string = object.revision.? });
+            try value.put(allocator, "archiveSha256", .{ .string = object.archive_sha256.? });
         },
         .toolchain => try value.put(allocator, "toolchain", .{ .string = object.toolchain_kind.? }),
     }
@@ -521,9 +505,8 @@ fn scanRegistrations(
             .duplicate_field_behavior = .@"error",
         }) catch return error.InvalidCacheRegistration;
         const object = try requiredObject(registration);
-        if (try requiredInteger(object, "schemaVersion") != schema_version or
-            !std.mem.eql(u8, try requiredString(object, "kind"), registration_kind))
-        {
+        const registration_schema = try readableSchemaVersion(object);
+        if (!std.mem.eql(u8, try requiredString(object, "kind"), registration_kind)) {
             return error.InvalidCacheRegistration;
         }
         const canonical_root = try requiredString(object, "canonicalRoot");
@@ -539,7 +522,7 @@ fn scanRegistrations(
 
         var parsed_objects: std.ArrayList(ManagedObject) = .empty;
         for (values.array.items) |value| {
-            try parsed_objects.append(allocator, try parseManagedObject(allocator, value));
+            try appendParsedManagedObjects(allocator, &parsed_objects, value, registration_schema);
         }
 
         const project_objects = try projectLockObjectsIfMatches(io, allocator, canonical_root, lock_sha256);
@@ -588,22 +571,34 @@ fn projectLockObjectsIfMatches(
         .duplicate_field_behavior = .@"error",
     }) catch return error.InvalidProjectDependencyLock;
     const object = requiredObject(project_lock) catch return error.InvalidProjectDependencyLock;
-    if ((requiredInteger(object, "schemaVersion") catch return error.InvalidProjectDependencyLock) != schema_version or
-        !std.mem.eql(u8, requiredString(object, "kind") catch return error.InvalidProjectDependencyLock, project_lock_kind))
-    {
+    const project_schema = readableSchemaVersion(object) catch return error.InvalidProjectDependencyLock;
+    if (!std.mem.eql(u8, requiredString(object, "kind") catch return error.InvalidProjectDependencyLock, project_lock_kind)) {
         return error.InvalidProjectDependencyLock;
     }
     const values = object.get("objects") orelse return error.InvalidProjectDependencyLock;
     if (values != .array) return error.InvalidProjectDependencyLock;
     var objects: std.ArrayList(ManagedObject) = .empty;
     for (values.array.items) |value| {
-        objects.append(allocator, parseManagedObject(allocator, value) catch return error.InvalidProjectDependencyLock) catch |err| return err;
+        appendParsedManagedObjects(allocator, &objects, value, project_schema) catch return error.InvalidProjectDependencyLock;
     }
     const owned = try objects.toOwnedSlice(allocator);
     return @as(?[]const ManagedObject, owned);
 }
 
-fn parseManagedObject(allocator: std.mem.Allocator, value: std.json.Value) !ManagedObject {
+fn readableSchemaVersion(object: std.json.ObjectMap) !usize {
+    const value = try requiredInteger(object, "schemaVersion");
+    if (value < minimum_readable_schema_version or value > schema_version) {
+        return error.UnsupportedCacheSchema;
+    }
+    return @intCast(value);
+}
+
+fn appendParsedManagedObjects(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(ManagedObject),
+    value: std.json.Value,
+    source_schema: usize,
+) !void {
     const object = try requiredObject(value);
     const kind_name = try requiredString(object, "type");
     const relative_root = try requiredString(object, "relativeRoot");
@@ -619,14 +614,37 @@ fn parseManagedObject(allocator: std.mem.Allocator, value: std.json.Value) !Mana
         const source_sha256 = try requiredString(object, "sourceManifestSha256");
         try validateSha256(core_sha256);
         try validateSha256(source_sha256);
-        return .{
+        try output.append(allocator, .{
             .kind = .electrobun,
             .relative_root = relative_root,
             .version = version,
             .platform = platform,
             .core_sha256 = core_sha256,
             .source_manifest_sha256 = source_sha256,
-        };
+        });
+        // The original schema stored optional CEF provenance on the core
+        // object. Expand it into the independently reachable v2 child so a
+        // live v1 project can never lose its CEF payload during migration.
+        if (source_schema == 1) {
+            if (object.get("cefSha256")) |cef| {
+                if (cef != .string) return error.InvalidCacheRegistration;
+                try validateSha256(cef.string);
+                try output.append(allocator, .{
+                    .kind = .electrobun_cef,
+                    .relative_root = try std.fmt.allocPrint(
+                        allocator,
+                        "products/electrobun/{s}/{s}/cef",
+                        .{ version, platform },
+                    ),
+                    .version = version,
+                    .platform = platform,
+                    .cef_sha256 = cef.string,
+                });
+            }
+        } else if (object.get("cefSha256") != null) {
+            return error.InvalidCacheRegistration;
+        }
+        return;
     }
     if (std.mem.eql(u8, kind_name, "electrobun-cef")) {
         if (!std.mem.eql(u8, try requiredString(object, "product"), "electrobun")) return error.InvalidCacheRegistration;
@@ -634,26 +652,53 @@ fn parseManagedObject(allocator: std.mem.Allocator, value: std.json.Value) !Mana
         if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
         const cef_sha256 = try requiredString(object, "cefSha256");
         try validateSha256(cef_sha256);
-        return .{
+        try output.append(allocator, .{
             .kind = .electrobun_cef,
             .relative_root = relative_root,
             .version = version,
             .platform = platform,
             .cef_sha256 = cef_sha256,
-        };
+        });
+        return;
+    }
+    if (std.mem.eql(u8, kind_name, "release")) {
+        if (source_schema < 2) return error.InvalidCacheRegistration;
+        const product = try requiredString(object, "product");
+        try validateReleaseProduct(product);
+        const revision = try requiredString(object, "revision");
+        try validateRevision(revision);
+        const archive_sha256 = try requiredString(object, "archiveSha256");
+        try validateSha256(archive_sha256);
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "products/{s}/{s}/{s}/{s}",
+            .{ product, version, revision, platform },
+        );
+        if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
+        try output.append(allocator, .{
+            .kind = .release,
+            .relative_root = relative_root,
+            .version = version,
+            .platform = platform,
+            .release_product = product,
+            .revision = revision,
+            .archive_sha256 = archive_sha256,
+        });
+        return;
     }
     if (std.mem.eql(u8, kind_name, "toolchain")) {
         const toolchain_kind = try requiredString(object, "toolchain");
         try validateToolchainKind(toolchain_kind);
         const expected = try std.fmt.allocPrint(allocator, "toolchains/{s}/{s}/{s}", .{ toolchain_kind, version, platform });
         if (!std.mem.eql(u8, expected, relative_root)) return error.InvalidCacheRegistration;
-        return .{
+        try output.append(allocator, .{
             .kind = .toolchain,
             .relative_root = relative_root,
             .version = version,
             .platform = platform,
             .toolchain_kind = toolchain_kind,
-        };
+        });
+        return;
     }
     return error.InvalidCacheRegistration;
 }
@@ -784,6 +829,9 @@ fn candidateStillValid(io: std.Io, allocator: std.mem.Allocator, candidate: Cand
             _ = readSha256Marker(io, allocator, candidate.absolute_root, ".cef-complete") catch return false;
             return true;
         },
+        // Release discovery is deliberately enabled only after channel roots,
+        // bootstrap publication, and process leases are wired together.
+        .release => return false,
         .toolchain => {
             const marker = try std.fs.path.join(allocator, &.{ candidate.absolute_root, ".hutch-toolchain" });
             const value = readTrimmedFile(io, allocator, marker, 256) catch return false;
@@ -841,16 +889,7 @@ fn tryAcquireCandidateLock(
     allocator: std.mem.Allocator,
     candidate_root: []const u8,
 ) !?std.Io.File {
-    const lock_path = try std.mem.concat(allocator, u8, &.{ candidate_root, ".lock" });
-    return std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound, error.WouldBlock, error.AccessDenied, error.PermissionDenied => null,
-        else => return err,
-    };
+    return cache_locks.tryAcquireObjectExclusive(io, allocator, candidate_root);
 }
 
 fn createTrashRoot(io: std.Io, allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
@@ -1001,6 +1040,19 @@ fn validateManagedObject(allocator: std.mem.Allocator, object: ManagedObject) !v
             const expected = try std.fmt.allocPrint(allocator, "products/electrobun/{s}/{s}/cef", .{ object.version, object.platform });
             if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
         },
+        .release => {
+            const product = object.release_product orelse return error.InvalidManagedObject;
+            try validateReleaseProduct(product);
+            const revision = object.revision orelse return error.InvalidManagedObject;
+            try validateRevision(revision);
+            try validateSha256(object.archive_sha256 orelse return error.InvalidManagedObject);
+            const expected = try std.fmt.allocPrint(
+                allocator,
+                "products/{s}/{s}/{s}/{s}",
+                .{ product, object.version, revision, object.platform },
+            );
+            if (!std.mem.eql(u8, expected, object.relative_root)) return error.InvalidManagedObject;
+        },
         .toolchain => {
             const kind = object.toolchain_kind orelse return error.InvalidManagedObject;
             try validateToolchainKind(kind);
@@ -1026,6 +1078,18 @@ fn validateToolchainKind(value: []const u8) !void {
         if (std.mem.eql(u8, value, kind)) return;
     }
     return error.InvalidManagedObjectPath;
+}
+
+fn validateReleaseProduct(value: []const u8) !void {
+    if (std.mem.eql(u8, value, "hutch") or std.mem.eql(u8, value, "cottontail")) return;
+    return error.InvalidManagedObjectPath;
+}
+
+fn validateRevision(value: []const u8) !void {
+    if (value.len != 40 and value.len != 64) return error.InvalidRevision;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidRevision;
+    }
 }
 
 fn validatePlatform(value: []const u8) !void {
@@ -1132,6 +1196,8 @@ fn ensureDirectoryWithin(
 const test_core_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const test_manifest_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const test_cef_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const test_release_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const test_release_revision = "0123456789abcdef0123456789abcdef01234567";
 
 fn testAbsoluteRoot(
     io: std.Io,
@@ -1158,6 +1224,10 @@ fn createTestCandidate(
         .electrobun_cef => try std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = try std.fs.path.join(allocator, &.{ root, ".cef-complete" }),
             .data = try std.mem.concat(allocator, u8, &.{ object.cef_sha256.?, "\n" }),
+        }),
+        .release => try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ root, ".dash-installed" }),
+            .data = object.archive_sha256.?,
         }),
         .toolchain => try std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" }),
@@ -1209,6 +1279,58 @@ fn testToolchainObject() ManagedObject {
         .platform = "macos-arm64",
         .toolchain_kind = "zig",
     };
+}
+
+fn testReleaseObject(product: []const u8) ManagedObject {
+    return .{
+        .kind = .release,
+        .relative_root = if (std.mem.eql(u8, product, "hutch"))
+            "products/hutch/0.6.0/0123456789abcdef0123456789abcdef01234567/macos-arm64"
+        else
+            "products/cottontail/0.4.0/0123456789abcdef0123456789abcdef01234567/macos-arm64",
+        .version = if (std.mem.eql(u8, product, "hutch")) "0.6.0" else "0.4.0",
+        .platform = "macos-arm64",
+        .release_product = product,
+        .revision = test_release_revision,
+        .archive_sha256 = test_release_sha256,
+    };
+}
+
+test "schema v2 records exact release identity and expands combined v1 CEF reachability" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const v1 = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{\"type\":\"electrobun\",\"product\":\"electrobun\",\"relativeRoot\":\"products/electrobun/2.0.0/macos-arm64\",\"version\":\"2.0.0\",\"platform\":\"macos-arm64\",\"coreSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sourceManifestSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"cefSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+        .{},
+    );
+    var expanded: std.ArrayList(ManagedObject) = .empty;
+    try appendParsedManagedObjects(allocator, &expanded, v1, 1);
+    try std.testing.expectEqual(@as(usize, 2), expanded.items.len);
+    try std.testing.expectEqual(ManagedObject.Kind.electrobun, expanded.items[0].kind);
+    try std.testing.expectEqual(ManagedObject.Kind.electrobun_cef, expanded.items[1].kind);
+    try std.testing.expectEqualStrings(
+        "products/electrobun/2.0.0/macos-arm64/cef",
+        expanded.items[1].relative_root,
+    );
+    try std.testing.expectEqualStrings(test_cef_sha256, expanded.items[1].cef_sha256.?);
+
+    const release = testReleaseObject("hutch");
+    const serialized = try objectJson(allocator, release);
+    var parsed: std.ArrayList(ManagedObject) = .empty;
+    try appendParsedManagedObjects(allocator, &parsed, serialized, schema_version);
+    try std.testing.expectEqual(@as(usize, 1), parsed.items.len);
+    try std.testing.expectEqual(ManagedObject.Kind.release, parsed.items[0].kind);
+    try std.testing.expectEqualStrings(release.relative_root, parsed.items[0].relative_root);
+    try std.testing.expectEqualStrings(test_release_sha256, parsed.items[0].archive_sha256.?);
+
+    var rejected: std.ArrayList(ManagedObject) = .empty;
+    try std.testing.expectError(
+        error.InvalidCacheRegistration,
+        appendParsedManagedObjects(allocator, &rejected, serialized, 1),
+    );
 }
 
 test "project registration records a deterministic exact dependency graph" {
