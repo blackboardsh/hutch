@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const package_manager = @import("package_manager/root.zig");
+const archive_util = @import("archive.zig");
 const release_store = @import("release_store.zig");
 
 const default_releases_base_url =
@@ -100,7 +100,7 @@ fn installCore(
     {
         var destination = try std.Io.Dir.cwd().openDir(io, temporary, .{});
         defer destination.close(io);
-        try package_manager.cli.extractTarGzipArchive(
+        try archive_util.extractTarGzip(
             io,
             allocator,
             destination,
@@ -134,7 +134,7 @@ fn installCef(
     {
         var destination = try std.Io.Dir.cwd().openDir(io, temporary, .{});
         defer destination.close(io);
-        try package_manager.cli.extractTarGzipArchive(
+        try archive_util.extractTarGzip(
             io,
             allocator,
             destination,

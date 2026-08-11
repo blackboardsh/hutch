@@ -1,5 +1,5 @@
 const std = @import("std");
-const package_manager = @import("package_manager/root.zig");
+const archive_util = @import("archive.zig");
 const release_store = @import("release_store.zig");
 
 const default_base_url = "https://electrobun-artifacts.blackboard.sh/electrobun/templates";
@@ -131,7 +131,9 @@ pub fn install(
     {
         var output = try std.Io.Dir.cwd().openDir(init.io, temporary, .{});
         defer output.close(init.io);
-        try package_manager.cli.extractTarballArchive(init.io, allocator, output, archive);
+        try archive_util.extractTarGzip(init.io, allocator, output, archive, .{
+            .strip_components = 1,
+        });
     }
     const package_json = try std.fs.path.join(allocator, &.{ temporary, "package.json" });
     if (!pathExists(init.io, package_json)) return error.InvalidTemplateArchive;
