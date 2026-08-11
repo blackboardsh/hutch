@@ -2,6 +2,27 @@ const std = @import("std");
 
 pub const TarGzipOptions = struct {
     strip_components: u32,
+    max_entries: usize = std.math.maxInt(usize),
+    max_file_bytes: u64 = std.math.maxInt(u64),
+    max_total_file_bytes: u64 = std.math.maxInt(u64),
+};
+
+const ExtractionBudget = struct {
+    entries: usize = 0,
+    total_file_bytes: u64 = 0,
+
+    fn account(self: *ExtractionBudget, entry: std.tar.Iterator.File, options: TarGzipOptions) !void {
+        self.entries = std.math.add(usize, self.entries, 1) catch
+            return error.ArchiveEntryLimitExceeded;
+        if (self.entries > options.max_entries) return error.ArchiveEntryLimitExceeded;
+        if (entry.kind != .file) return;
+        if (entry.size > options.max_file_bytes) return error.ArchiveFileTooLarge;
+        self.total_file_bytes = std.math.add(u64, self.total_file_bytes, entry.size) catch
+            return error.ArchiveExpansionLimitExceeded;
+        if (self.total_file_bytes > options.max_total_file_bytes) {
+            return error.ArchiveExpansionLimitExceeded;
+        }
+    }
 };
 
 pub fn extractTarGzip(
@@ -30,7 +51,9 @@ pub fn extractTarGzip(
         .link_name_buffer = &link_name_buffer,
         .diagnostics = &diagnostics,
     });
+    var budget: ExtractionBudget = .{};
     while (try iterator.next()) |entry| {
+        try budget.account(entry, options);
         const path_len = sanitizeTarPath(
             &path_buffer,
             entry.name,
@@ -113,5 +136,61 @@ test "tar paths cannot escape the extraction root" {
     try std.testing.expectError(
         error.Invalid,
         sanitizeTarPath(&buffer, "C:/absolute", 0),
+    );
+}
+
+test "archive extraction budgets reject entry, file, and expansion excess" {
+    const file: std.tar.Iterator.File = .{
+        .name = "large.bin",
+        .link_name = "",
+        .size = 8,
+        .kind = .file,
+        .mode = 0,
+    };
+    var budget: ExtractionBudget = .{};
+    try std.testing.expectError(
+        error.ArchiveFileTooLarge,
+        budget.account(file, .{
+            .strip_components = 0,
+            .max_file_bytes = 7,
+        }),
+    );
+
+    budget = .{};
+    try budget.account(file, .{
+        .strip_components = 0,
+        .max_total_file_bytes = 8,
+    });
+    try std.testing.expectError(
+        error.ArchiveExpansionLimitExceeded,
+        budget.account(file, .{
+            .strip_components = 0,
+            .max_total_file_bytes = 8,
+        }),
+    );
+
+    budget = .{};
+    try budget.account(.{
+        .name = "dir",
+        .link_name = "",
+        .size = 0,
+        .kind = .directory,
+        .mode = 0,
+    }, .{
+        .strip_components = 0,
+        .max_entries = 1,
+    });
+    try std.testing.expectError(
+        error.ArchiveEntryLimitExceeded,
+        budget.account(.{
+            .name = "second",
+            .link_name = "",
+            .size = 0,
+            .kind = .directory,
+            .mode = 0,
+        }, .{
+            .strip_components = 0,
+            .max_entries = 1,
+        }),
     );
 }
