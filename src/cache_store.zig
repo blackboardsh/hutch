@@ -1186,8 +1186,9 @@ test "prune removes only stale unreachable managed objects" {
     const toolchain = testToolchainObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
     const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
-    try registerProjectAt(io, allocator, home, project, &.{electrobun}, 10_000);
-    try touchLastUsed(io, allocator, home, toolchain.relative_root, 10_000 - default_grace_seconds - 1);
+    const now = default_grace_seconds + 10_000;
+    try registerProjectAt(io, allocator, home, project, &.{electrobun}, now);
+    try touchLastUsed(io, allocator, home, toolchain.relative_root, now - default_grace_seconds - 1);
 
     const third_party_cache = try std.fs.path.join(allocator, &.{ home, "cache", "npm", "keep" });
     try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(third_party_cache).?);
@@ -1198,7 +1199,7 @@ test "prune removes only stale unreachable managed objects" {
 
     const preview = try pruneAt(io, allocator, home, .{
         .dry_run = true,
-        .now_unix_seconds = 10_000,
+        .now_unix_seconds = now,
     });
     try std.testing.expectEqual(@as(usize, 2), preview.scanned);
     try std.testing.expectEqual(@as(usize, 1), preview.reachable);
@@ -1207,7 +1208,7 @@ test "prune removes only stale unreachable managed objects" {
     try std.testing.expect(pathExists(io, toolchain_root));
 
     const pruned = try pruneAt(io, allocator, home, .{
-        .now_unix_seconds = 10_000,
+        .now_unix_seconds = now,
     });
     try std.testing.expectEqual(@as(usize, 1), pruned.pruned);
     try std.testing.expect(pathExists(io, electrobun_root));
@@ -1457,12 +1458,11 @@ test "managed object discovery never follows directory symlinks" {
     const link = try std.fs.path.join(allocator, &.{ home, "toolchains" });
     try std.Io.Dir.cwd().symLink(io, outside_root, link, .{ .is_directory = true });
 
-    const preview = try pruneAt(io, allocator, home, .{
+    try std.testing.expectError(error.InvalidManagedObjectPath, pruneAt(io, allocator, home, .{
         .dry_run = true,
         .grace_seconds = 0,
         .now_unix_seconds = 60_000,
-    });
-    try std.testing.expectEqual(@as(usize, 0), preview.scanned);
+    }));
     try std.testing.expect(pathExists(io, outside));
     try std.testing.expect(pathExists(io, link));
 }
