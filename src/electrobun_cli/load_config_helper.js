@@ -27,7 +27,8 @@ const defaultConfig = {
     },
     zig: {},
     rust: {
-      entrypoint: "src/rust/main.rs",
+      manifest: "Cargo.toml",
+      binary: "main",
     },
     go: {
       package: "./src/go",

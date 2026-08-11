@@ -48,6 +48,18 @@ pub const Resolution = struct {
     system: bool,
 };
 
+pub fn rustCargoBinary(
+    allocator: std.mem.Allocator,
+    resolution: Resolution,
+) ![]const u8 {
+    const root = resolution.root orelse return "cargo";
+    return std.fs.path.join(allocator, &.{
+        root,
+        "bin",
+        if (builtin.os.tag == .windows) "cargo.exe" else "cargo",
+    });
+}
+
 const Archive = struct {
     url: []const u8,
     filename: []const u8,
@@ -60,7 +72,16 @@ pub fn resolveVersion(
     version: []const u8,
 ) !Resolution {
     try validateVersion(kind, version);
-    if (try executableMatchesVersion(init.io, allocator, kind.systemExecutable(), kind, version)) {
+    const system_matches = try executableMatchesVersion(
+        init.io,
+        allocator,
+        kind.systemExecutable(),
+        kind,
+        version,
+    );
+    const system_cargo_matches = kind != .rust or
+        try cargoMatchesVersion(init.io, allocator, "cargo", version);
+    if (system_matches and system_cargo_matches) {
         return .{
             .binary = kind.systemExecutable(),
             .root = null,
@@ -160,6 +181,19 @@ fn publishInstalledToolchain(
     if (builtin.os.tag != .windows) try makeExecutable(io, installed_binary);
     if (!try executableMatchesVersion(io, allocator, installed_binary, kind, version)) {
         return error.ToolchainVersionMismatch;
+    }
+    if (kind == .rust) {
+        const cargo_binary = try rustCargoBinary(allocator, .{
+            .binary = installed_binary,
+            .root = temporary,
+            .version = version,
+            .system = false,
+        });
+        if (!pathExists(io, cargo_binary)) return error.ToolchainExecutableMissing;
+        if (builtin.os.tag != .windows) try makeExecutable(io, cargo_binary);
+        if (!try cargoMatchesVersion(io, allocator, cargo_binary, version)) {
+            return error.ToolchainVersionMismatch;
+        }
     }
 
     const marker = try std.fs.path.join(allocator, &.{ temporary, ".hutch-toolchain" });
@@ -349,6 +383,16 @@ fn cachedToolchainMatches(
     version: []const u8,
 ) !bool {
     if (!pathExists(io, binary)) return false;
+    if (kind == .rust) {
+        const cargo_binary = try rustCargoBinary(allocator, .{
+            .binary = binary,
+            .root = root,
+            .version = version,
+            .system = false,
+        });
+        if (!pathExists(io, cargo_binary)) return false;
+        if (!try cargoMatchesVersion(io, allocator, cargo_binary, version)) return false;
+    }
     const marker = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" });
     const value = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -358,6 +402,27 @@ fn cachedToolchainMatches(
     ) catch return false;
     if (!std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), version)) return false;
     return executableMatchesVersion(io, allocator, binary, kind, version);
+}
+
+fn cargoMatchesVersion(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    version: []const u8,
+) !bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ executable, "--version" },
+        .create_no_window = true,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (termExitCode(result.term) != 0) return false;
+    const output = std.mem.trim(u8, result.stdout, " \t\r\n");
+    return std.mem.startsWith(
+        u8,
+        output,
+        try std.fmt.allocPrint(allocator, "cargo {s} ", .{version}),
+    );
 }
 
 fn executableMatchesVersion(
@@ -509,6 +574,38 @@ test "toolchain versions cannot escape their cache path" {
     try validateVersion(.odin, "dev-2026-07a");
 }
 
+test "Rust Cargo is selected from the resolved Rust toolchain" {
+    const cached = Resolution{
+        .binary = "/cache/rust/bin/rustc",
+        .root = "/cache/rust",
+        .version = "1.88.0",
+        .system = false,
+    };
+    const cargo = try rustCargoBinary(std.testing.allocator, cached);
+    defer std.testing.allocator.free(cargo);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{
+        "/cache/rust",
+        "bin",
+        if (builtin.os.tag == .windows) "cargo.exe" else "cargo",
+    });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(
+        expected,
+        cargo,
+    );
+
+    const system = Resolution{
+        .binary = "rustc",
+        .root = null,
+        .version = "1.88.0",
+        .system = true,
+    };
+    try std.testing.expectEqualStrings(
+        "cargo",
+        try rustCargoBinary(std.testing.allocator, system),
+    );
+}
+
 test "a mismatched toolchain executable is never published" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -534,6 +631,37 @@ test "a mismatched toolchain executable is never published" {
     );
     try std.testing.expect(!pathExists(io, published));
     try std.testing.expect(pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, "zig" })));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, ".hutch-toolchain" })));
+}
+
+test "a Rust toolchain with mismatched Cargo is never published" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try tmp.dir.createDirPath(io, "candidate/bin");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "candidate/bin/rustc",
+        .data = "#!/bin/sh\nprintf 'rustc 1.88.0 (fixture)\\n'\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "candidate/bin/cargo",
+        .data = "#!/bin/sh\nprintf 'cargo 1.87.0 (fixture)\\n'\n",
+    });
+    const relative = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena.allocator());
+    const candidate = try std.fs.path.join(arena.allocator(), &.{ fixture_root, "candidate" });
+    const published = try std.fs.path.join(arena.allocator(), &.{ fixture_root, "published" });
+
+    try std.testing.expectError(
+        error.ToolchainVersionMismatch,
+        publishInstalledToolchain(io, arena.allocator(), published, candidate, .rust, "1.88.0"),
+    );
+    try std.testing.expect(!pathExists(io, published));
     try std.testing.expect(!pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, ".hutch-toolchain" })));
 }
 

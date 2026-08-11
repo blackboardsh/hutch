@@ -2542,6 +2542,43 @@ fn prepareZigBuildEnvironment(ctx: *const Context, env_map: *std.process.Environ
     }
 }
 
+test "Rust toolchain overrides are exact semantic versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const exact = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"rust":{"version":"1.88.0"}}}
+    ,
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "1.88.0",
+        try configuredToolchainVersion(exact, .rust, "1.87.0"),
+    );
+
+    inline for (.{ "stable", "^1.88.0", "1.88" }) |invalid_version| {
+        const source = try std.fmt.allocPrint(
+            allocator,
+            \\{{"build":{{"rust":{{"version":"{s}"}}}}}}
+        ,
+            .{invalid_version},
+        );
+        const invalid = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            allocator,
+            source,
+            .{},
+        );
+        try std.testing.expectError(
+            error.InvalidConfig,
+            configuredToolchainVersion(invalid, .rust, "1.87.0"),
+        );
+    }
+}
+
 fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
     const build_script_path = try requireProjectZigBuildFile(ctx);
 
@@ -2596,10 +2633,8 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
 
 fn rustTargetName() []const u8 {
     return switch (builtin.os.tag) {
-        .windows => switch (builtin.cpu.arch) {
-            .aarch64 => "aarch64-pc-windows-msvc",
-            else => "x86_64-pc-windows-msvc",
-        },
+        // Electrobun's Windows runtime and Rust devkit currently ship x64.
+        .windows => "x86_64-pc-windows-msvc",
         .linux => switch (builtin.cpu.arch) {
             .aarch64 => "aarch64-unknown-linux-gnu",
             else => "x86_64-unknown-linux-gnu",
@@ -2612,56 +2647,405 @@ fn rustTargetName() []const u8 {
     };
 }
 
-fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const rust_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust);
-    const rust_binary = rust_toolchain.binary;
+const RustProject = struct {
+    manifest: []const u8,
+    binary: []const u8,
+};
 
-    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
-    const rust_sdk_path = projection.rust_manifest;
-    if (!pathExists(ctx.io, rust_sdk_path)) return error.RustSdkNotFound;
+fn rustProject(ctx: *const Context, root: std.json.Value) !RustProject {
+    const configured = try configuredRustProject(root);
+    return .{
+        .manifest = try absoluteProjectPath(ctx, configured.manifest),
+        .binary = configured.binary,
+    };
+}
 
-    const entrypoint = try resolveMainEntrypoint(ctx, config.root, .rust);
-    if (!pathExists(ctx.io, entrypoint)) return error.RustEntrypointNotFound;
+fn configuredRustProject(root: std.json.Value) !RustProject {
+    const build = getObjectField(root, "build") orelse return error.InvalidConfig;
+    const rust = if (build.get("rust")) |value| blk: {
+        if (value != .object) return error.InvalidConfig;
+        break :blk value.object;
+    } else std.json.ObjectMap.empty;
 
-    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-rust-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+    const manifest_value = rust.get("manifest");
+    if (manifest_value) |value| {
+        if (value != .string or value.string.len == 0) return error.InvalidConfig;
+    }
+    const binary_value = rust.get("binary");
+    if (binary_value) |value| {
+        if (value != .string or !validCargoBinaryName(value.string)) return error.InvalidConfig;
+    }
 
-    const rust_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
-    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "main.rs" });
-    const rust_sdk_literal = try jsonStringLiteral(ctx, rust_sdk_path);
-    const entrypoint_literal = try jsonStringLiteral(ctx, entrypoint);
-    const wrapper_source = try std.fmt.allocPrint(
-        ctx.allocator,
-        \\#[path = {s}]
-        \\pub mod electrobun;
-        \\
-        \\#[path = {s}]
-        \\mod user_main;
-        \\
-        \\fn main() {{
-        \\    user_main::main();
-        \\}}
-        \\
-    ,
-        .{ rust_sdk_literal, entrypoint_literal },
-    );
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = wrapper_path,
-        .data = wrapper_source,
+    return .{
+        .manifest = if (manifest_value) |value| value.string else "Cargo.toml",
+        .binary = if (binary_value) |value| value.string else "main",
+    };
+}
+
+fn validCargoBinaryName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128 or !std.ascii.isAlphanumeric(name[0])) return false;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return false;
+    }
+    return true;
+}
+
+fn pinRustCompilerEnvironment(
+    env_map: *std.process.Environ.Map,
+    rustc_binary: []const u8,
+) !void {
+    try env_map.put("RUSTC", rustc_binary);
+    // An empty wrapper value overrides both inherited environment values and
+    // project Cargo config, keeping the resolved rustc as the compiler authority.
+    try env_map.put("RUSTC_WRAPPER", "");
+    try env_map.put("RUSTC_WORKSPACE_WRAPPER", "");
+}
+
+fn rustCargoProfile(build_env: BuildEnvironment) []const u8 {
+    return if (build_env == .dev) "dev" else "release";
+}
+
+fn rustCargoOutputProfile(build_env: BuildEnvironment) []const u8 {
+    return if (build_env == .dev) "debug" else "release";
+}
+
+fn rustBinaryFileName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.mem.concat(allocator, u8, &.{ name, ".exe" });
+    }
+    return name;
+}
+
+fn appendRustCargoBuildArgs(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    cargo_binary: []const u8,
+    manifest: []const u8,
+    profile: []const u8,
+    binary: []const u8,
+) !void {
+    try argv.appendSlice(allocator, &.{
+        cargo_binary,
+        "build",
+        "--locked",
+        "--manifest-path",
+        manifest,
+        "--target",
+        rustTargetName(),
+        "--profile",
+        profile,
+        "--bin",
+        binary,
     });
+}
 
+fn appendRustCargoMetadataArgs(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    cargo_binary: []const u8,
+    manifest: []const u8,
+) !void {
+    try argv.appendSlice(allocator, &.{
+        cargo_binary,
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1",
+        "--manifest-path",
+        manifest,
+        "--filter-platform",
+        rustTargetName(),
+    });
+}
+
+fn rustSdkManifestFromMetadata(metadata: std.json.Value) ![]const u8 {
+    if (metadata != .object) return error.InvalidRustCargoMetadata;
+    const packages = metadata.object.get("packages") orelse return error.InvalidRustCargoMetadata;
+    if (packages != .array) return error.InvalidRustCargoMetadata;
+
+    var manifest: ?[]const u8 = null;
+    for (packages.array.items) |package| {
+        if (package != .object) return error.InvalidRustCargoMetadata;
+        const name = package.object.get("name") orelse return error.InvalidRustCargoMetadata;
+        const manifest_path = package.object.get("manifest_path") orelse return error.InvalidRustCargoMetadata;
+        if (name != .string or manifest_path != .string) return error.InvalidRustCargoMetadata;
+        if (!std.mem.eql(u8, name.string, "electrobun")) continue;
+        if (manifest != null) return error.AmbiguousRustSdkDependency;
+        manifest = manifest_path.string;
+    }
+    return manifest orelse error.RustSdkDependencyMissing;
+}
+
+fn validateRustSdkDependency(
+    ctx: *const Context,
+    cargo_binary: []const u8,
+    project_manifest: []const u8,
+    projected_sdk_manifest: []const u8,
+    env_map: *const std.process.Environ.Map,
+) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
-    try argv.appendSlice(ctx.allocator, &.{ rust_binary, "--edition=2021", wrapper_path, "--target", rustTargetName(), "-o", rust_out_bin });
-    if (config.build_env == .dev) {
-        try argv.appendSlice(ctx.allocator, &.{ "-C", "opt-level=2", "-C", "debuginfo=0" });
-    } else {
-        try argv.appendSlice(ctx.allocator, &.{ "-C", "opt-level=z", "-C", "strip=symbols" });
-    }
+    try appendRustCargoMetadataArgs(
+        ctx.allocator,
+        &argv,
+        cargo_binary,
+        project_manifest,
+    );
 
     const result = try std.process.run(ctx.allocator, ctx.io, .{
         .argv = argv.items,
-        .cwd = .{ .path = temp_build_dir },
+        .cwd = .{ .path = ctx.project_root },
+        .environ_map = env_map,
+        .create_no_window = true,
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    if (termExitCode(result.term) != 0) {
+        if (result.stdout.len > 0) ctx.writeStdout("{s}", .{result.stdout});
+        if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
+        return error.RustCargoMetadataFailed;
+    }
+
+    const metadata = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        ctx.allocator,
+        result.stdout,
+        .{},
+    ) catch return error.InvalidRustCargoMetadata;
+    const resolved_manifest = try rustSdkManifestFromMetadata(metadata);
+    const resolved_canonical = std.Io.Dir.cwd().realPathFileAlloc(
+        ctx.io,
+        resolved_manifest,
+        ctx.allocator,
+    ) catch return error.RustSdkDependencyMismatch;
+    const projected_canonical = std.Io.Dir.cwd().realPathFileAlloc(
+        ctx.io,
+        projected_sdk_manifest,
+        ctx.allocator,
+    ) catch return error.RustSdkDependencyMismatch;
+    if (!std.mem.eql(u8, resolved_canonical, projected_canonical)) {
+        ctx.writeStderr(
+            "hutch electrobun: Cargo resolved electrobun from {s}; expected projected SDK {s}\n",
+            .{ resolved_canonical, projected_canonical },
+        );
+        return error.RustSdkDependencyMismatch;
+    }
+}
+
+test "Rust main processes use an explicit locked Cargo invocation" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendRustCargoBuildArgs(
+        std.testing.allocator,
+        &argv,
+        "/toolchain/bin/cargo",
+        "/project/Cargo.toml",
+        "release",
+        "main",
+    );
+    const expected = [_][]const u8{
+        "/toolchain/bin/cargo",
+        "build",
+        "--locked",
+        "--manifest-path",
+        "/project/Cargo.toml",
+        "--target",
+        rustTargetName(),
+        "--profile",
+        "release",
+        "--bin",
+        "main",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+
+    argv.clearRetainingCapacity();
+    try appendRustCargoMetadataArgs(
+        std.testing.allocator,
+        &argv,
+        "/toolchain/bin/cargo",
+        "/project/Cargo.toml",
+    );
+    const expected_metadata = [_][]const u8{
+        "/toolchain/bin/cargo",
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1",
+        "--manifest-path",
+        "/project/Cargo.toml",
+        "--filter-platform",
+        rustTargetName(),
+    };
+    try std.testing.expectEqual(expected_metadata.len, argv.items.len);
+    for (expected_metadata, argv.items) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+}
+
+test "Rust Cargo metadata selects exactly the projected SDK package" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const exact = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"packages":[{"name":"app","manifest_path":"/project/Cargo.toml"},{"name":"electrobun","manifest_path":"/project/.hutch/devkit/rust-sdk/Cargo.toml"}]}
+    ,
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "/project/.hutch/devkit/rust-sdk/Cargo.toml",
+        try rustSdkManifestFromMetadata(exact),
+    );
+
+    const missing = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"packages":[{"name":"app","manifest_path":"/project/Cargo.toml"}]}
+    ,
+        .{},
+    );
+    try std.testing.expectError(error.RustSdkDependencyMissing, rustSdkManifestFromMetadata(missing));
+
+    const ambiguous = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"packages":[{"name":"electrobun","manifest_path":"/one/Cargo.toml"},{"name":"electrobun","manifest_path":"/two/Cargo.toml"}]}
+    ,
+        .{},
+    );
+    try std.testing.expectError(error.AmbiguousRustSdkDependency, rustSdkManifestFromMetadata(ambiguous));
+}
+
+test "Rust project Cargo defaults and overrides are config owned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const defaults = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"rust"}}
+    ,
+        .{},
+    );
+    const default_project = try configuredRustProject(defaults);
+    try std.testing.expectEqualStrings("Cargo.toml", default_project.manifest);
+    try std.testing.expectEqualStrings("main", default_project.binary);
+
+    const configured = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"rust","rust":{"manifest":"native/Cargo.toml","binary":"desktop-main"}}}
+    ,
+        .{},
+    );
+    const project = try configuredRustProject(configured);
+    try std.testing.expectEqualStrings("native/Cargo.toml", project.manifest);
+    try std.testing.expectEqualStrings("desktop-main", project.binary);
+
+    const invalid = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"rust","rust":{"manifest":"","binary":"../main"}}}
+    ,
+        .{},
+    );
+    try std.testing.expectError(error.InvalidConfig, configuredRustProject(invalid));
+}
+
+test "Rust Cargo profiles map to deterministic artifact directories" {
+    try std.testing.expectEqualStrings("dev", rustCargoProfile(.dev));
+    try std.testing.expectEqualStrings("debug", rustCargoOutputProfile(.dev));
+    try std.testing.expectEqualStrings("release", rustCargoProfile(.canary));
+    try std.testing.expectEqualStrings("release", rustCargoOutputProfile(.production));
+    try std.testing.expect(validCargoBinaryName("desktop-main"));
+    try std.testing.expect(validCargoBinaryName("desktop_main2"));
+    try std.testing.expect(!validCargoBinaryName("."));
+    try std.testing.expect(!validCargoBinaryName(".."));
+    try std.testing.expect(!validCargoBinaryName("-main"));
+    try std.testing.expect(!validCargoBinaryName("main.exe"));
+    try std.testing.expect(!validCargoBinaryName("main:debug"));
+    try std.testing.expect(!validCargoBinaryName("../main"));
+    try std.testing.expect(!validCargoBinaryName("nested/main"));
+}
+
+test "Rust compiler wrappers cannot override the resolved rustc" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("RUSTC", "/poisoned/rustc");
+    try env_map.put("RUSTC_WRAPPER", "/poisoned/wrapper");
+    try env_map.put("RUSTC_WORKSPACE_WRAPPER", "/poisoned/workspace-wrapper");
+
+    try pinRustCompilerEnvironment(&env_map, "/managed/bin/rustc");
+
+    try std.testing.expectEqualStrings("/managed/bin/rustc", env_map.get("RUSTC").?);
+    try std.testing.expectEqualStrings("", env_map.get("RUSTC_WRAPPER").?);
+    try std.testing.expectEqualStrings("", env_map.get("RUSTC_WORKSPACE_WRAPPER").?);
+}
+
+fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
+    const rust_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust);
+    const cargo_binary = try toolchain_store.rustCargoBinary(ctx.allocator, rust_toolchain);
+
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    if (!pathExists(ctx.io, projection.rust_manifest)) return error.RustSdkManifestNotFound;
+
+    const project = try rustProject(ctx, config.root);
+    if (!pathExists(ctx.io, project.manifest)) return error.RustManifestNotFound;
+
+    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-rust-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+    const cargo_target_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "target" });
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(ctx.allocator);
+    try appendRustCargoBuildArgs(
+        ctx.allocator,
+        &argv,
+        cargo_binary,
+        project.manifest,
+        rustCargoProfile(config.build_env),
+        project.binary,
+    );
+
+    var env_map = std.process.Environ.Map.init(ctx.allocator);
+    defer env_map.deinit();
+    try inheritCurrentEnvironmentFromContext(ctx, &env_map);
+    try env_map.put("CARGO_TARGET_DIR", cargo_target_dir);
+    try pinRustCompilerEnvironment(&env_map, rust_toolchain.binary);
+    if (rust_toolchain.root) |toolchain_root| {
+        const toolchain_bin = try std.fs.path.join(ctx.allocator, &.{ toolchain_root, "bin" });
+        const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+        const existing_path = env_map.get(path_key) orelse env_map.get("PATH") orelse "";
+        const rust_path = if (existing_path.len == 0)
+            toolchain_bin
+        else
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "{s}{c}{s}",
+                .{ toolchain_bin, std.fs.path.delimiter, existing_path },
+            );
+        try env_map.put(path_key, rust_path);
+    }
+    if (builtin.os.tag == .macos) try env_map.put("MACOSX_DEPLOYMENT_TARGET", "14.0");
+
+    try validateRustSdkDependency(
+        ctx,
+        cargo_binary,
+        project.manifest,
+        projection.rust_manifest,
+        &env_map,
+    );
+
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = ctx.project_root },
+        .environ_map = &env_map,
         .create_no_window = true,
     });
     defer ctx.allocator.free(result.stdout);
@@ -2673,6 +3057,12 @@ fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform
         return error.RustBuildFailed;
     }
 
+    const rust_out_bin = try std.fs.path.join(ctx.allocator, &.{
+        cargo_target_dir,
+        rustTargetName(),
+        rustCargoOutputProfile(config.build_env),
+        try rustBinaryFileName(ctx.allocator, project.binary),
+    });
     if (!pathExists(ctx.io, rust_out_bin)) return error.RustMainBinaryNotFound;
     return rust_out_bin;
 }
@@ -3972,12 +4362,7 @@ fn resolveMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process
             break :blk "src/bun/index.ts";
         },
         .zig => return error.ZigUsesProjectBuildFile,
-        .rust => blk: {
-            if (getObjectFieldFromObject(build, "rust")) |object| {
-                if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
-            }
-            break :blk "src/rust/main.rs";
-        },
+        .rust => return error.RustUsesCargoManifest,
         .go => return error.GoMainProcessUsesPackage,
         .odin => blk: {
             if (getObjectFieldFromObject(build, "odin")) |object| {
@@ -4158,6 +4543,9 @@ fn collectWatchRoots(ctx: *const Context, root: std.json.Value) !std.ArrayList([
         const zon_path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "build.zig.zon" });
         if (pathExists(ctx.io, zon_path)) try appendWatchRoot(ctx, &roots, zon_path);
         try appendWatchRoot(ctx, &roots, try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "src" }));
+    } else if (main_process == .rust) {
+        const project = try rustProject(ctx, root);
+        try appendWatchRoot(ctx, &roots, dirnameOrSelf(project.manifest));
     } else if (main_process == .go) {
         const main_package = try configuredGoPackage(root);
         try appendWatchRoot(
