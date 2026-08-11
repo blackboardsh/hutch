@@ -184,8 +184,9 @@ app. Both resolve the exact core and SDK release, optional CEF payload, and the
 native compiler required by `build.mainProcess`. They atomically generate the
 package-shaped editor/build facade at `.hutch/devkit`; projects should ignore
 `.hutch/` by default and may extend `./.hutch/devkit/tsconfig.json`. The project
-facade is a writable copy, so a project may edit it and change its ignore rules
-to commit the chosen SDK copy. Electrobun itself is not an npm dependency.
+facade is generated state owned by Hutch; direct edits and committing it are
+not supported workflows, and a later sync may replace it. Electrobun itself is
+not an npm dependency.
 Third-party JavaScript dependencies remain owned by the external package
 manager invoked by a project script.
 
