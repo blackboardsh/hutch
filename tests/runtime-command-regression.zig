@@ -54,11 +54,70 @@ fn run(
     return try child.wait(init.io);
 }
 
+const CapturedRun = struct {
+    term: std.process.Child.Term,
+    stdout: []const u8,
+    stderr: []const u8,
+};
+
+fn runConfigCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    launcher: []const u8,
+    engine: []const u8,
+    runtime: []const u8,
+    project_dir: []const u8,
+    fake_bin_dir: []const u8,
+    mode: []const u8,
+    config_json: []const u8,
+    invocation: []const []const u8,
+) !CapturedRun {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, launcher);
+    try argv.appendSlice(allocator, invocation);
+
+    var environment = try init.environ_map.clone(allocator);
+    defer environment.deinit();
+    try environment.put("HUTCH_ENGINE_BINARY", engine);
+    try environment.put("DASH_COTTONTAIL", runtime);
+    try environment.put("HUTCH_TEST_FIXTURE_MODE", mode);
+    try environment.put("HUTCH_TEST_CONFIG_JSON", config_json);
+    try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
+    try environment.put("CI", "1");
+
+    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+    const existing_path = environment.get(path_key) orelse environment.get("PATH") orelse "";
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}",
+        .{ fake_bin_dir, std.fs.path.delimiter, existing_path },
+    );
+    try environment.put(path_key, path);
+
+    const result = try std.process.run(allocator, init.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = project_dir },
+        .environ_map = &environment,
+        .stderr_limit = .limited(1024 * 1024),
+        .stdout_limit = .limited(1024 * 1024),
+    });
+    return .{
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
 fn expectExit(term: std.process.Child.Term, expected: u8) !void {
     switch (term) {
         .exited => |actual| if (actual != expected) return error.UnexpectedExitCode,
         else => return error.UnexpectedTermination,
     }
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, haystack, needle) == null) return error.ExpectedTextMissing;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -126,4 +185,130 @@ pub fn main(init: std.process.Init) !void {
         &hutch_options,
         entrypoint,
     ), 0);
+
+    const fixture_root = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}hutch-config-runner-{d}",
+        .{ temp_dir, std.fs.path.sep, std.Thread.getCurrentId() },
+    );
+    std.Io.Dir.cwd().deleteTree(init.io, fixture_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, fixture_root) catch {};
+    const fake_bin = try std.fs.path.join(allocator, &.{ fixture_root, "fake-bin" });
+    try std.Io.Dir.cwd().createDirPath(init.io, fake_bin);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "hutch.config.ts" }),
+        .data = "export default {};\n",
+    });
+    // Any attempt by the task runner to parse package.json makes the config
+    // invocations fail. The configured npm/pnpm commands still receive it as
+    // their own project input if they choose to read it.
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
+        .data = "{ this is intentionally invalid package json\n",
+    });
+
+    for ([_][]const u8{ "npm", "pnpm" }) |name| {
+        const fake_command = try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}{s}{s}",
+            .{ fake_bin, std.fs.path.sep, name, if (builtin.os.tag == .windows) ".cmd" else "" },
+        );
+        if (builtin.os.tag == .windows) {
+            const wrapper = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{runtime});
+            try std.Io.Dir.cwd().writeFile(init.io, .{
+                .sub_path = fake_command,
+                .data = wrapper,
+            });
+        } else {
+            try std.Io.Dir.copyFile(
+                std.Io.Dir.cwd(),
+                runtime,
+                std.Io.Dir.cwd(),
+                fake_command,
+                init.io,
+                .{ .permissions = .executable_file, .make_path = true },
+            );
+        }
+    }
+
+    const config_json =
+        \\{"scripts":{"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"]}}
+    ;
+    const listed = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        config_json,
+        &.{"run"},
+    );
+    try expectExit(listed.term, 0);
+    try expectContains(listed.stdout, "npm-install\n");
+    try expectContains(listed.stdout, "pnpm-dev\n");
+
+    const npm_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-npm",
+        config_json,
+        &.{ "npm-install", "two words", "$literal" },
+    );
+    try expectExit(npm_run.term, 0);
+
+    const pnpm_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pnpm",
+        config_json,
+        &.{ "run", "pnpm-dev", "--filter", "app one" },
+    );
+    try expectExit(pnpm_run.term, 0);
+
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
+        .data = "{\"scripts\":{\"package-only\":\"exit 0\"}}\n",
+    });
+    const package_only_list = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        "{\"scripts\":{}}",
+        &.{"run"},
+    );
+    try expectExit(package_only_list.term, 0);
+    if (package_only_list.stdout.len != 0) return error.PackageScriptsWereListed;
+
+    const package_only_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        config_json,
+        &.{"package-only"},
+    );
+    try expectExit(package_only_run.term, 1);
+    try expectContains(package_only_run.stderr, "Script not found");
 }

@@ -239,9 +239,21 @@ for the release workflow.
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
 
-Scripts resolve from the nearest `hutch.config.ts` first and then
-`package.json` as a fallback (`package.json` is only needed for JavaScript
-projects). Hutch implements package management and project mutation
-directly. It invokes the selected Cottontail release for JavaScript execution,
-runtime compatibility APIs, and the compiler-backed build path retained during
-the current split.
+Scripts resolve exclusively from the nearest `hutch.config.ts`. A script may
+be a shell command string or a non-empty argv array; invocation arguments are
+appended to either form:
+
+```ts
+export default {
+  scripts: {
+    dev: ["npm", "run", "dev"],
+    deps: ["pnpm", "install"],
+    lint: "eslint .",
+  },
+};
+```
+
+Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
+emulate npm lifecycle variables when running these tasks. The configured
+package manager owns those semantics. Hutch's existing package-management
+commands remain available during the package-manager extraction.

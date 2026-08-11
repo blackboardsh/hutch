@@ -33,16 +33,15 @@ const help_text_template =
     \\  hutch --version
     \\
     \\Config:
-    \\  Scripts are resolved from hutch.config.ts, then package.json.
+    \\  Scripts are resolved only from hutch.config.ts.
+    \\  Script values may be shell strings or non-empty argv string arrays.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\  Package-manager commands are implemented by Hutch.
     \\
 ;
 
 const Config = struct {
-    raw_json: []const u8,
     root: std.json.Value,
-    dir: []const u8 = ".",
 };
 
 fn printHelp(writer: anytype) !void {
@@ -584,44 +583,8 @@ fn loadHutchConfig(
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, trimmed, .{});
 
     return .{
-        .raw_json = try allocator.dupe(u8, trimmed),
         .root = parsed,
     };
-}
-
-fn loadPackageJson(init: std.process.Init, allocator: std.mem.Allocator) !?Config {
-    var current: []const u8 = try std.Io.Dir.cwd().realPathFileAlloc(
-        init.io,
-        ".",
-        allocator,
-    );
-    while (true) {
-        const package_path = try pathJoin(allocator, &.{ current, "package.json" });
-        if (pathExists(init.io, package_path)) {
-            const source = try std.Io.Dir.cwd().readFileAlloc(
-                init.io,
-                package_path,
-                allocator,
-                .limited(16 * 1024 * 1024),
-            );
-            const normalized = package_manager.lockfile.normalizeJsonc(
-                allocator,
-                source,
-            ) catch return error.PackageJsonLoadFailed;
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
-                .duplicate_field_behavior = .use_last,
-            }) catch return error.PackageJsonLoadFailed;
-
-            return .{
-                .raw_json = source,
-                .root = parsed,
-                .dir = current,
-            };
-        }
-        const parent = std.fs.path.dirname(current) orelse return null;
-        if (std.mem.eql(u8, parent, current)) return null;
-        current = parent;
-    }
 }
 
 fn getObjectField(value: std.json.Value, name: []const u8) ?std.json.Value {
@@ -678,12 +641,35 @@ fn shellCommandWithArgs(
     return try command.toOwnedSlice(allocator);
 }
 
+fn configuredScriptEnvironment(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !std.process.Environ.Map {
+    var env = try init.environ_map.clone(allocator);
+    errdefer env.deinit();
+
+    // Keep the version-matched Hutch launcher available to recursive config
+    // tasks without adding package-manager-specific node_modules semantics.
+    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+    const existing_path = env.get(path_key) orelse env.get("PATH") orelse "";
+    const run_path = if (existing_path.len > 0)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}{s}",
+            .{ exe_dir, std.fs.path.delimiter, existing_path },
+        )
+    else
+        exe_dir;
+    try env.put(path_key, run_path);
+    return env;
+}
+
 fn runShellScript(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     script: []const u8,
     script_args: []const [:0]const u8,
-    lifecycle_name: ?[]const u8,
 ) !u8 {
     const command = try shellCommandWithArgs(allocator, script, script_args);
     const argv = if (builtin.os.tag == .windows)
@@ -691,32 +677,8 @@ fn runShellScript(
     else
         &[_][]const u8{ "/bin/sh", "-c", command };
 
-    var env = try init.environ_map.clone(allocator);
+    var env = try configuredScriptEnvironment(init, allocator);
     defer env.deinit();
-
-    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
-    const local_bin = try pathJoin(allocator, &.{ "node_modules", ".bin" });
-    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
-    const existing_path = env.get(path_key) orelse env.get("PATH") orelse "";
-    const run_path = if (existing_path.len > 0)
-        try std.fmt.allocPrint(
-            allocator,
-            "{s}{c}{s}{c}{s}",
-            .{ exe_dir, std.fs.path.delimiter, local_bin, std.fs.path.delimiter, existing_path },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "{s}{c}{s}",
-            .{ exe_dir, std.fs.path.delimiter, local_bin },
-        );
-    try env.put(path_key, run_path);
-
-    if (lifecycle_name) |name| {
-        try env.put("npm_lifecycle_event", name);
-        try env.put("npm_lifecycle_script", script);
-        try env.put("npm_command", "run-script");
-    }
 
     var child = try std.process.spawn(init.io, .{
         .argv = argv,
@@ -730,6 +692,60 @@ fn runShellScript(
     return termExitCode(try child.wait(init.io));
 }
 
+fn runArgvScript(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    script_argv: std.json.Array,
+    script_args: []const [:0]const u8,
+    stderr: anytype,
+) !u8 {
+    if (script_argv.items.len == 0) {
+        try stderr.writeAll("hutch: script argv must not be empty\n");
+        return 1;
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    for (script_argv.items) |arg| {
+        if (arg != .string) {
+            try stderr.writeAll("hutch: script argv entries must be strings\n");
+            return 1;
+        }
+        try argv.append(allocator, arg.string);
+    }
+    for (script_args) |arg| try argv.append(allocator, arg);
+
+    var env = try configuredScriptEnvironment(init, allocator);
+    defer env.deinit();
+    var child = std.process.spawn(init.io, .{
+        .argv = argv.items,
+        .environ_map = &env,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        try stderr.print("hutch: could not run configured command {s}: {s}\n", .{
+            argv.items[0],
+            @errorName(err),
+        });
+        return 1;
+    };
+    defer child.kill(init.io);
+    return termExitCode(try child.wait(init.io));
+}
+
+fn isConfiguredScriptValue(value: std.json.Value) bool {
+    return switch (value) {
+        .string => true,
+        .array => |argv| valid: {
+            if (argv.items.len == 0) break :valid false;
+            for (argv.items) |arg| if (arg != .string) break :valid false;
+            break :valid true;
+        },
+        else => false,
+    };
+}
+
 fn printScripts(writer: anytype, config: Config) !bool {
     const scripts = getObjectField(config.root, "scripts") orelse return false;
 
@@ -738,7 +754,7 @@ fn printScripts(writer: anytype, config: Config) !bool {
             var found = false;
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                if (entry.value_ptr.* == .string) {
+                if (isConfiguredScriptValue(entry.value_ptr.*)) {
                     try writer.print("{s}\n", .{entry.key_ptr.*});
                     found = true;
                 }
@@ -764,136 +780,20 @@ fn runConfiguredScriptIfExists(
     const scripts = getObjectField(config.root, "scripts") orelse return null;
     const script = getObjectField(scripts, script_name) orelse return null;
 
-    if (script != .string) {
-        try stderr.print("hutch: script must be a string: {s}\n", .{script_name});
-        return 1;
-    }
-    if (try loadPackageJson(init, allocator)) |package| {
-        if (!try ensurePackageDependencies(init, package, stderr)) return 1;
-    }
-
-    const command = script.string;
-    if (scriptLooksLikeEntrypoint(command)) {
-        return try runCottontailScript(init, allocator, cottontail_path, command, script_args);
-    }
-
-    return try runShellScript(init, allocator, command, script_args, null);
-}
-
-fn packageHasDependencies(config: Config) bool {
-    for ([_][]const u8{ "dependencies", "devDependencies", "optionalDependencies" }) |field| {
-        const value = getObjectField(config.root, field) orelse continue;
-        if (value == .object and value.object.count() > 0) return true;
-    }
-    return false;
-}
-
-fn packageDependenciesInstalled(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    config: Config,
-) bool {
-    if (!packageHasDependencies(config)) return true;
-
-    const node_modules = pathJoin(allocator, &.{ config.dir, "node_modules" }) catch return false;
-    const node_modules_stat = std.Io.Dir.cwd().statFile(io, node_modules, .{}) catch return false;
-    if (node_modules_stat.kind != .directory) return false;
-
-    for ([_][]const u8{ "dependencies", "devDependencies" }) |field| {
-        const dependencies = getObjectField(config.root, field) orelse continue;
-        if (dependencies != .object) continue;
-        var iterator = dependencies.object.iterator();
-        while (iterator.next()) |entry| {
-            const package_json = pathJoin(
-                allocator,
-                &.{ node_modules, entry.key_ptr.*, "package.json" },
-            ) catch return false;
-            const stat = std.Io.Dir.cwd().statFile(io, package_json, .{}) catch return false;
-            if (stat.kind != .file) return false;
-        }
-    }
-    return true;
-}
-
-fn ensurePackageDependencies(
-    init: std.process.Init,
-    package: Config,
-    stderr: *std.Io.Writer,
-) !bool {
-    if (packageDependenciesInstalled(init.io, init.arena.allocator(), package)) {
-        return true;
-    }
-
-    try stderr.writeAll("hutch: installing package dependencies...\n");
-    try stderr.flush();
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    const package_dir = try init.arena.allocator().dupeZ(u8, package.dir);
-    const install_args = [_][:0]const u8{
-        "hutch",
-        "install",
-        "--cwd",
-        package_dir,
+    return switch (script) {
+        .string => |command| if (scriptLooksLikeEntrypoint(command))
+            try runCottontailScript(init, allocator, cottontail_path, command, script_args)
+        else
+            try runShellScript(init, allocator, command, script_args),
+        .array => |argv| try runArgvScript(init, allocator, argv, script_args, stderr),
+        else => {
+            try stderr.print(
+                "hutch: script must be a string or non-empty argv string array: {s}\n",
+                .{script_name},
+            );
+            return 1;
+        },
     };
-    const exit_code = try package_manager.cli.run(
-        init,
-        &install_args,
-        &stdout_file_writer.interface,
-        stderr,
-    );
-    return exit_code == 0;
-}
-
-fn runPackageStage(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    stage_name: []const u8,
-    command: []const u8,
-    script_args: []const [:0]const u8,
-    stderr: anytype,
-) !u8 {
-    try stderr.print("$ {s}\n", .{command});
-    try stderr.flush();
-    return runShellScript(
-        init,
-        allocator,
-        command,
-        script_args,
-        stage_name,
-    );
-}
-
-fn runPackageScriptIfExists(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    script_name: []const u8,
-    script_args: []const [:0]const u8,
-    stderr: *std.Io.Writer,
-    silent: bool,
-    force_runtime: bool,
-) !?u8 {
-    const package = (try loadPackageJson(init, allocator)) orelse return null;
-    const scripts = getObjectField(package.root, "scripts") orelse return null;
-    const script = getObjectField(scripts, script_name) orelse return null;
-
-    if (script != .string) {
-        try stderr.print("hutch: script must be a string: {s}\n", .{script_name});
-        return 1;
-    }
-
-    if (!try ensurePackageDependencies(
-        init,
-        package,
-        stderr,
-    )) return 1;
-
-    return try package_manager.run.runSingleIfExists(
-        init,
-        script_name,
-        script_args,
-        silent,
-        force_runtime,
-    );
 }
 
 const PackageScriptInvocation = struct {
@@ -1442,11 +1342,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (try package_manager.run.tryRun(init, args)) |exit_code| {
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
     const may_be_package_script = std.mem.eql(u8, command, "run") or
         std.mem.eql(u8, command, "--silent") or
         std.mem.eql(u8, command, "--bun") or
@@ -1517,19 +1412,6 @@ pub fn main(init: std.process.Init) !void {
                     if (exit_code != 0) std.process.exit(exit_code);
                     return;
                 }
-                if (try runPackageScriptIfExists(
-                    init,
-                    allocator,
-                    invocation.name,
-                    invocation.args,
-                    stderr,
-                    configured.silent,
-                    configured.force_runtime,
-                )) |exit_code| {
-                    try stderr.flush();
-                    if (exit_code != 0) std.process.exit(exit_code);
-                    return;
-                }
             }
             if (invocation.if_present) return;
             if (resolved_entrypoint != null and
@@ -1592,24 +1474,12 @@ pub fn main(init: std.process.Init) !void {
                 },
             };
             if (config) |loaded| {
-                if (try printScripts(stdout, loaded)) {
-                    try stdout.flush();
-                    return;
-                }
+                _ = try printScripts(stdout, loaded);
+                try stdout.flush();
             }
-            if (try loadPackageJson(init, allocator)) |package| {
-                if (try printScripts(stdout, package)) {
-                    try stdout.flush();
-                    return;
-                }
-            }
+            return;
         } else {
             if (try runConfiguredScriptIfExists(init, allocator, cottontail_path, args[2], args[3..], stderr)) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-            if (try runPackageScriptIfExists(init, allocator, args[2], args[3..], stderr, false, false)) |exit_code| {
                 try stderr.flush();
                 if (exit_code != 0) std.process.exit(exit_code);
                 return;
@@ -1660,12 +1530,10 @@ pub fn main(init: std.process.Init) !void {
                     return;
                 },
                 .start_dev => {
-                    const exit_code = (try runPackageScriptIfExists(
+                    const exit_code = (try package_manager.run.runSingleIfExists(
                         init,
-                        allocator,
                         "dev",
                         &.{},
-                        stderr,
                         false,
                         false,
                     )) orelse {
@@ -1761,13 +1629,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (packageScriptEligible(command)) {
-        if (try runPackageScriptIfExists(init, allocator, command, args[2..], stderr, false, false)) |exit_code| {
-            try stderr.flush();
-            if (exit_code != 0) std.process.exit(exit_code);
-            return;
-        }
-    }
     if (local_command_exists) {
         const exit_code = try package_manager.run.runSingleCommand(
             init,
@@ -1799,7 +1660,8 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "argv string arrays") != null);
 }
 
 test "test is a reserved Cottontail command and preserves every argument" {
@@ -1894,66 +1756,6 @@ test "hutch x electrobun init aliases the canonical init command" {
 
     const versioned = [_][:0]const u8{ "hutch", "x", "electrobun@2.0.0", "init" };
     try std.testing.expect(electrobunInitAliasArgs(&versioned) == null);
-}
-
-test "package dependency detection drives clean checkout bootstrap" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const with_dependencies = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        \\{"dependencies":{"electrobun":"latest"}}
-    ,
-        .{},
-    );
-    try std.testing.expect(packageHasDependencies(.{
-        .raw_json = "",
-        .root = with_dependencies,
-    }));
-
-    const without_dependencies = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        \\{"scripts":{"dev":"hutch electrobun dev"}}
-    ,
-        .{},
-    );
-    try std.testing.expect(!packageHasDependencies(.{
-        .raw_json = "",
-        .root = without_dependencies,
-    }));
-}
-
-test "package dependency preflight detects incomplete node_modules" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const allocator = std.testing.allocator;
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const parsed = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        \\{"dependencies":{"electrobun":"1.0.0"},"optionalDependencies":{"optional-native":"1.0.0"}}
-    ,
-        .{},
-    );
-    const config: Config = .{ .raw_json = "", .root = parsed, .dir = root };
-    try std.testing.expect(!packageDependenciesInstalled(io, arena.allocator(), config));
-
-    try tmp.dir.createDirPath(io, "node_modules/electrobun");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "node_modules/electrobun/package.json",
-        .data = "{}\n",
-    });
-    try std.testing.expect(packageDependenciesInstalled(io, arena.allocator(), config));
-
-    try tmp.dir.deleteFile(io, "node_modules/electrobun/package.json");
-    try std.testing.expect(!packageDependenciesInstalled(io, arena.allocator(), config));
 }
 
 test "package manager commands accept leading Bun configuration flags" {
