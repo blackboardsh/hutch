@@ -452,9 +452,22 @@ fn validateVersion(kind: Kind, version: []const u8) !void {
             return error.InvalidToolchainVersion;
         }
     }
-    if (kind != .odin) {
+    if (kind == .odin) {
+        try validateExactOdinVersion(version);
+    } else {
         _ = std.SemanticVersion.parse(version) catch return error.InvalidToolchainVersion;
     }
+}
+
+fn validateExactOdinVersion(version: []const u8) !void {
+    if (std.SemanticVersion.parse(version)) |_| return else |_| {}
+    if (version.len != 11 and version.len != 12) return error.InvalidToolchainVersion;
+    if (!std.mem.startsWith(u8, version, "dev-") or version[8] != '-') return error.InvalidToolchainVersion;
+    for (version[4..8]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidToolchainVersion;
+    for (version[9..11]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidToolchainVersion;
+    const month = std.fmt.parseInt(u8, version[9..11], 10) catch return error.InvalidToolchainVersion;
+    if (month < 1 or month > 12) return error.InvalidToolchainVersion;
+    if (version.len == 12 and !std.ascii.isLower(version[11])) return error.InvalidToolchainVersion;
 }
 
 fn platformKey() ![]const u8 {
@@ -477,6 +490,9 @@ test "toolchain versions cannot escape their cache path" {
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.rust, "../1.88.0"));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, "stable"));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, "1.26"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "latest"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "stable"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "dev-2026-13"));
     try validateVersion(.zig, "0.16.0");
     try validateVersion(.rust, "1.88.0");
     try validateVersion(.go, "1.26.4");

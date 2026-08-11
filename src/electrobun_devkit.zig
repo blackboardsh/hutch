@@ -670,24 +670,24 @@ fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u
     const toolchain = try requiredObjectField(toolchains, name);
     const version = try requiredString(toolchain, "defaultVersion");
     if (std.mem.eql(u8, name, "odin")) {
-        try validateOpaqueVersion(version);
+        try validateExactOdinVersion(version);
     } else {
         _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunToolchainVersion;
     }
     return version;
 }
 
-fn validateOpaqueVersion(version: []const u8) !void {
-    if (version.len == 0 or version.len > 128 or
-        std.mem.eql(u8, version, ".") or std.mem.eql(u8, version, ".."))
-    {
+fn validateExactOdinVersion(version: []const u8) !void {
+    if (std.SemanticVersion.parse(version)) |_| return else |_| {}
+    if (version.len != 11 and version.len != 12) return error.InvalidElectrobunToolchainVersion;
+    if (!std.mem.startsWith(u8, version, "dev-") or version[8] != '-') {
         return error.InvalidElectrobunToolchainVersion;
     }
-    for (version) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-' and byte != '+') {
-            return error.InvalidElectrobunToolchainVersion;
-        }
-    }
+    for (version[4..8]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidElectrobunToolchainVersion;
+    for (version[9..11]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidElectrobunToolchainVersion;
+    const month = std.fmt.parseInt(u8, version[9..11], 10) catch return error.InvalidElectrobunToolchainVersion;
+    if (month < 1 or month > 12) return error.InvalidElectrobunToolchainVersion;
+    if (version.len == 12 and !std.ascii.isLower(version[11])) return error.InvalidElectrobunToolchainVersion;
 }
 
 fn nativeSdkPaths(
@@ -995,6 +995,7 @@ test "native compiler defaults use exact versions" {
     try std.testing.expectError(error.InvalidElectrobunToolchainVersion, toolchainVersion(toolchains.object, "zig"));
     try std.testing.expectError(error.InvalidElectrobunToolchainVersion, toolchainVersion(toolchains.object, "go"));
     try std.testing.expectEqualStrings("dev-2026-07a", try toolchainVersion(toolchains.object, "odin"));
+    try std.testing.expectError(error.InvalidElectrobunToolchainVersion, validateExactOdinVersion("latest"));
 }
 
 const test_manifest_template =
