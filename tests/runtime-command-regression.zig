@@ -643,4 +643,19 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(logged_config.term, 0);
     try expectContains(logged_config.stdout, "config console output\n");
+
+    const non_object_config = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        "[]",
+        &.{ "run", "--if-configured", "install" },
+    );
+    try expectExit(non_object_config.term, 1);
+    try expectContains(non_object_config.stderr, "InvalidHutchConfig");
 }

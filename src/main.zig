@@ -297,6 +297,7 @@ fn loadHutchConfig(
     );
     const trimmed = std.mem.trim(u8, result, " \r\n\t");
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, trimmed, .{});
+    if (parsed != .object) return error.InvalidHutchConfig;
 
     return .{
         .root = parsed,
