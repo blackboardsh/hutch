@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
+const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
 const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
@@ -91,9 +92,10 @@ const AppBundlePaths = struct {
 };
 
 const PlatformPaths = struct {
-    package_root: []const u8,
     shared_dist_dir: []const u8,
-    platform_dist_dir: []const u8,
+    electrobun_version: []const u8,
+    devkit: ?electrobun_devkit.Resolution,
+    projection: ?electrobun_devkit.Projection,
     launcher: []const u8,
     bun_binary: []const u8,
     main_js: []const u8,
@@ -195,14 +197,23 @@ pub fn run(
         return 0;
     }
 
+    if (std.mem.eql(u8, command, "sync")) {
+        const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        try prepareProject(&ctx, config);
+        ctx.writeStdout("electrobun sync complete: {s}/.hutch/devkit\n", .{ctx.project_root});
+        return 0;
+    }
+
     if (std.mem.eql(u8, command, "build")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        try prepareProject(&ctx, config);
         try runBuild(&ctx, config);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "run")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        try prepareProject(&ctx, config);
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuiltApp(&ctx, config, inspector);
         return 0;
@@ -211,12 +222,14 @@ pub fn run(
     if (std.mem.eql(u8, command, "dev")) {
         if (hasFlag(args[1..], "--watch")) {
             const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+            try prepareProject(&ctx, config);
             const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
             try runDevWatch(&ctx, config, inspector);
             return 0;
         }
 
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
+        try prepareProject(&ctx, config);
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuild(&ctx, config);
         try runBuiltApp(&ctx, config, inspector);
@@ -237,6 +250,7 @@ fn printHelp(writer: anytype) !void {
         \\Usage:
         \\  hutch electrobun init [project-name] [--template=name] [--beta] [--offline]
         \\  hutch electrobun config [--env=dev|canary|production|stable]
+        \\  hutch electrobun sync [--env=dev|canary|production|stable]
         \\  hutch electrobun build [--env=dev|canary|production|stable]
         \\  hutch electrobun run [--env=dev|canary|production|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\  hutch electrobun dev [--env=dev|canary|production|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
@@ -525,6 +539,22 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
     };
 }
 
+fn prepareProject(ctx: *const Context, config: CommandContext) !void {
+    const platform_paths = try getPlatformPaths(ctx, config.root);
+    switch (getMainProcess(config.root)) {
+        .zig => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig),
+        .rust => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust),
+        .go => {
+            _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
+            if (builtin.os.tag == .windows) {
+                _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+            }
+        },
+        .odin => _ = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin),
+        .bun, .cottontail => {},
+    }
+}
+
 fn runBuild(ctx: *const Context, config: CommandContext) !void {
     const build_root = try buildOutputRoot(ctx, config);
     try recreateDir(ctx, build_root);
@@ -570,7 +600,7 @@ const BundleHashEntry = struct {
 };
 
 fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
-    const platform_paths = try getPlatformPaths(ctx);
+    const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
     const hash = try hashBundle(ctx, bundle.bundle_root);
     try writeVersionMetadata(ctx, config, bundle, hash);
@@ -1604,7 +1634,7 @@ fn dmgVolumeName(ctx: *const Context, config: CommandContext) ![]const u8 {
 }
 
 fn createWindowsInstaller(ctx: *const Context, config: CommandContext, state: ReleaseState) ![]const u8 {
-    const platform_paths = try getPlatformPaths(ctx);
+    const platform_paths = try getPlatformPaths(ctx, config.root);
     const setup_name = try windowsSetupFileName(ctx, config);
     const setup_path = try std.fs.path.join(ctx.allocator, &.{ state.bundle.build_root, setup_name });
     try copyPath(ctx, platform_paths.extractor, setup_path);
@@ -1722,7 +1752,7 @@ fn embedWindowsIcon(ctx: *const Context, executable_path: []const u8, icon_path:
 }
 
 fn createLinuxInstaller(ctx: *const Context, config: CommandContext, state: ReleaseState) ![]const u8 {
-    const platform_paths = try getPlatformPaths(ctx);
+    const platform_paths = try getPlatformPaths(ctx, config.root);
     const app_file_name = try artifactAppFileName(ctx, config);
     const installer_name = try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, "-Setup" });
     const staging = try std.fs.path.join(ctx.allocator, &.{ state.bundle.build_root, try std.mem.concat(ctx.allocator, u8, &.{ installer_name, "-staging" }) });
@@ -2207,8 +2237,27 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         project_dir,
         .{ .offline = offline },
     );
+    ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
+    try prepareInstalledProject(ctx, project_dir);
     ctx.writeStdout("Created Electrobun project at {s}\n", .{project_dir});
     ctx.writeStdout("Next steps:\n  cd {s}\n  hutch run dev\n", .{project_name.?});
+}
+
+fn prepareInstalledProject(ctx: *const Context, project_dir: []const u8) !void {
+    const absolute_project = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, project_dir, ctx.allocator);
+    const child_ctx = Context{
+        .init = ctx.init,
+        .io = ctx.io,
+        .allocator = ctx.allocator,
+        .environ_map = ctx.environ_map,
+        .self_exe_path = ctx.self_exe_path,
+        .cottontail_home = ctx.cottontail_home,
+        .cottontail_binary = ctx.cottontail_binary,
+        .project_root = absolute_project,
+    };
+    defer cleanupCliTempDir(&child_ctx);
+    const config = try loadConfig(&child_ctx, .dev);
+    try prepareProject(&child_ctx, config);
 }
 
 fn validateProjectName(name: []const u8) !void {
@@ -2257,14 +2306,15 @@ fn runDevWatch(
 }
 
 fn buildCottontailApp(ctx: *const Context, config: CommandContext) !void {
+    const platform_paths = try getPlatformPaths(ctx, config.root);
     const build_root = try buildOutputRoot(ctx, config);
     const app_dir = try std.fs.path.join(ctx.allocator, &.{ build_root, "app" });
     try std.Io.Dir.cwd().createDirPath(ctx.io, app_dir);
 
     const main_source = try resolveMainEntrypoint(ctx, config.root, .cottontail);
     const main_output = try std.fs.path.join(ctx.allocator, &.{ app_dir, "main.js" });
-    try buildMainEntrypoint(ctx, config.root, .cottontail, main_source, main_output);
-    try buildViews(ctx, config.root, app_dir);
+    try buildMainEntrypoint(ctx, config.root, platform_paths, .cottontail, main_source, main_output);
+    try buildViews(ctx, config.root, platform_paths, app_dir);
     try copyStaticAssets(ctx, config.root, app_dir);
 }
 
@@ -2285,9 +2335,8 @@ fn runCottontailApp(ctx: *const Context, config: CommandContext) !void {
     try env_map.put("COTTONTAIL_ELECTROBUN_IDENTIFIER", try getAppIdentifier(ctx, config.root));
     try env_map.put("COTTONTAIL_ELECTROBUN_CHANNEL", buildEnvironmentName(config.build_env));
 
-    if (try resolveElectrobunDist(ctx)) |dist_dir| {
-        try env_map.put("COTTONTAIL_ELECTROBUN_DIST", dist_dir);
-    }
+    const platform_paths = try getPlatformPaths(ctx, config.root);
+    try env_map.put("COTTONTAIL_ELECTROBUN_DIST", platform_paths.shared_dist_dir);
 
     const cottontail_binary = try resolveCottontailBinary(ctx);
 
@@ -2399,47 +2448,51 @@ fn writeZigMainBuildScript(ctx: *const Context, build_script_path: []const u8, r
 
 fn resolveBuildToolchain(
     ctx: *const Context,
+    config_root: std.json.Value,
     platform_paths: PlatformPaths,
     kind: toolchain_store.Kind,
 ) !toolchain_store.Resolution {
-    const local_root = try std.fs.path.join(ctx.allocator, &.{
-        platform_paths.package_root,
-        "vendors",
-        kind.name(),
-    });
-    const local_binary = switch (kind) {
-        .zig => try std.fs.path.join(ctx.allocator, &.{ local_root, executableFileName("zig") }),
-        .rust => try std.fs.path.join(ctx.allocator, &.{ local_root, "bin", executableFileName("rustc") }),
-        .go => try std.fs.path.join(ctx.allocator, &.{ local_root, "bin", executableFileName("go") }),
-        .odin => try std.fs.path.join(ctx.allocator, &.{ local_root, executableFileName("odin") }),
+    const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+    const default_version = switch (kind) {
+        .zig => devkit.toolchains.zig,
+        .rust => devkit.toolchains.rust,
+        .go => devkit.toolchains.go,
+        .odin => devkit.toolchains.odin,
     };
-    if (pathExists(ctx.io, local_binary)) {
-        return .{
-            .binary = local_binary,
-            .root = local_root,
-            .version = "local",
-            .system = false,
-        };
-    }
-    return toolchain_store.resolve(
+    const version = try configuredToolchainVersion(config_root, kind, default_version);
+    return toolchain_store.resolveVersion(
         ctx.init,
         ctx.allocator,
-        platform_paths.shared_dist_dir,
         kind,
+        version,
     ) catch |err| {
         ctx.writeStderr(
-            "hutch electrobun: could not resolve the {s} toolchain: {s}\n",
-            .{ kind.name(), @errorName(err) },
+            "hutch electrobun: could not resolve the {s} {s} toolchain: {s}\n",
+            .{ kind.name(), version, @errorName(err) },
         );
         return err;
     };
 }
 
+fn configuredToolchainVersion(
+    root: std.json.Value,
+    kind: toolchain_store.Kind,
+    default_version: []const u8,
+) ![]const u8 {
+    const build = getObjectField(root, "build") orelse return default_version;
+    const language_value = build.get(kind.name()) orelse return default_version;
+    if (language_value != .object) return error.InvalidConfig;
+    const version_value = language_value.object.get("version") orelse return default_version;
+    if (version_value != .string or version_value.string.len == 0) return error.InvalidConfig;
+    return version_value.string;
+}
+
 fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const zig_toolchain = try resolveBuildToolchain(ctx, platform_paths, .zig);
+    const zig_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
     const zig_binary = zig_toolchain.binary;
 
-    const zig_sdk_path = try std.fs.path.join(ctx.allocator, &.{ platform_paths.shared_dist_dir, "zig-sdk", "electrobun.zig" });
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    const zig_sdk_path = projection.zig_entrypoint;
     if (!pathExists(ctx.io, zig_sdk_path)) return error.ZigSdkNotFound;
 
     const entrypoint = try resolveMainEntrypoint(ctx, config.root, .zig);
@@ -2503,10 +2556,11 @@ fn rustTargetName() []const u8 {
 }
 
 fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const rust_toolchain = try resolveBuildToolchain(ctx, platform_paths, .rust);
+    const rust_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust);
     const rust_binary = rust_toolchain.binary;
 
-    const rust_sdk_path = try std.fs.path.join(ctx.allocator, &.{ platform_paths.shared_dist_dir, "rust-sdk", "electrobun.rs" });
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    const rust_sdk_path = projection.rust_manifest;
     if (!pathExists(ctx.io, rust_sdk_path)) return error.RustSdkNotFound;
 
     const entrypoint = try resolveMainEntrypoint(ctx, config.root, .rust);
@@ -2567,10 +2621,11 @@ fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform
 }
 
 fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const go_toolchain = try resolveBuildToolchain(ctx, platform_paths, .go);
+    const go_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
     const go_binary = go_toolchain.binary;
 
-    const go_sdk_path = try std.fs.path.join(ctx.allocator, &.{ platform_paths.shared_dist_dir, "go-sdk" });
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    const go_sdk_path = projection.go_root;
     if (!pathExists(ctx.io, go_sdk_path)) return error.GoSdkNotFound;
 
     const entrypoint = try resolveMainEntrypoint(ctx, config.root, .go);
@@ -2611,7 +2666,7 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
     if (go_toolchain.root) |go_root| try env_map.put("GOROOT", go_root);
     try env_map.put("GOTOOLCHAIN", "local");
     if (builtin.os.tag == .windows) {
-        const zig_binary = (try resolveBuildToolchain(ctx, platform_paths, .zig)).binary;
+        const zig_binary = (try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)).binary;
         try env_map.put("CC", try std.fmt.allocPrint(ctx.allocator, "{s} cc", .{zig_binary}));
     }
 
@@ -2635,11 +2690,14 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
 }
 
 fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const odin_toolchain = try resolveBuildToolchain(ctx, platform_paths, .odin);
+    const odin_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin);
     const odin_binary = odin_toolchain.binary;
 
-    const odin_sdk_collection = try std.fs.path.join(ctx.allocator, &.{ platform_paths.shared_dist_dir, "odin-sdk" });
-    const odin_sdk_path = try std.fs.path.join(ctx.allocator, &.{ odin_sdk_collection, "electrobun", "electrobun.odin" });
+    const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    const odin_sdk_collection = projection.odin_collection;
+    const odin_sdk_path = projection.odin_entrypoint;
+    const odin_collection_name = devkit.sdks.odin.collection_name;
     if (!pathExists(ctx.io, odin_sdk_path)) return error.OdinSdkNotFound;
 
     const entrypoint = try resolveMainEntrypoint(ctx, config.root, .odin);
@@ -2657,7 +2715,7 @@ fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform
         "build",
         entrypoint_dir,
         try std.fmt.allocPrint(ctx.allocator, "-out:{s}", .{odin_out_bin}),
-        try std.fmt.allocPrint(ctx.allocator, "-collection:electrobun_sdk={s}", .{odin_sdk_collection}),
+        try std.fmt.allocPrint(ctx.allocator, "-collection:{s}={s}", .{ odin_collection_name, odin_sdk_collection }),
     });
     if (config.build_env != .dev) {
         try argv.append(ctx.allocator, "-o:size");
@@ -2702,25 +2760,9 @@ fn copyBundledPreloadScripts(
 }
 
 fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
-    var platform_paths = try getPlatformPaths(ctx);
+    const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
     const main_process = getMainProcess(config.root);
-
-    if (bundleUsesCef(config.root) and !pathExists(ctx.io, platform_paths.cef_dir)) {
-        const version = try electrobunPackageVersion(ctx, platform_paths.package_root);
-        const platform_root = electrobun_artifacts.ensureCef(
-            ctx.init,
-            ctx.allocator,
-            version,
-        ) catch |err| {
-            ctx.writeStderr(
-                "hutch electrobun: could not install CEF for Electrobun {s}: {s}\n",
-                .{ version, @errorName(err) },
-            );
-            return err;
-        };
-        platform_paths.cef_dir = try std.fs.path.join(ctx.allocator, &.{ platform_root, "cef" });
-    }
 
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.exec_dir);
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.resources_dir);
@@ -2779,7 +2821,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
             const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
             try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
             const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
-            try buildMainEntrypoint(ctx, config.root, .bun, main_source, main_output);
+            try buildMainEntrypoint(ctx, config.root, platform_paths, .bun, main_source, main_output);
         },
         .zig => {
             const main_binary = try buildZigMainExecutable(ctx, config, platform_paths, bundle);
@@ -2802,11 +2844,11 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
             const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
             try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
             const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
-            try buildMainEntrypoint(ctx, config.root, .cottontail, main_source, main_output);
+            try buildMainEntrypoint(ctx, config.root, platform_paths, .cottontail, main_source, main_output);
         },
     }
 
-    try buildViews(ctx, config.root, bundle.app_code_dir);
+    try buildViews(ctx, config.root, platform_paths, bundle.app_code_dir);
     try copyStaticAssets(ctx, config.root, bundle.app_code_dir);
     try installBundleAssets(ctx, config, bundle, true);
 
@@ -3054,7 +3096,14 @@ fn jsonStringLiteral(ctx: *const Context, value: []const u8) ![]const u8 {
     return try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .string = value }, .{});
 }
 
-fn buildMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process: MainProcess, source_path: []const u8, output_path: []const u8) !void {
+fn buildMainEntrypoint(
+    ctx: *const Context,
+    root: std.json.Value,
+    platform_paths: PlatformPaths,
+    main_process: MainProcess,
+    source_path: []const u8,
+    output_path: []const u8,
+) !void {
     const build = getObjectField(root, "build") orelse return error.InvalidConfig;
     const options = switch (main_process) {
         .cottontail => getObjectFieldFromObject(build, "cottontail") orelse getObjectFieldFromObject(build, "main") orelse getObjectFieldFromObject(build, "bun"),
@@ -3078,11 +3127,11 @@ fn buildMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process: 
     if (main_process == .bun) {
         try addExternalStrings(ctx, &spec, &.{ "bun", "bun:ffi" });
     }
-    try addElectrobunImportAliases(ctx, &spec, main_process, getObjectFieldFromObject(build, "carrot") != null);
+    try addElectrobunImportAliases(ctx, platform_paths, &spec, main_process, getObjectFieldFromObject(build, "carrot") != null);
     try runCottontailBuild(ctx, .{ .object = spec });
 }
 
-fn buildViews(ctx: *const Context, root: std.json.Value, app_dir: []const u8) !void {
+fn buildViews(ctx: *const Context, root: std.json.Value, platform_paths: PlatformPaths, app_dir: []const u8) !void {
     const build = getObjectField(root, "build") orelse return;
     const views = getObjectFieldFromObject(build, "views") orelse return;
 
@@ -3106,7 +3155,7 @@ fn buildViews(ctx: *const Context, root: std.json.Value, app_dir: []const u8) !v
         try spec.put(ctx.allocator, "outfile", .{ .string = output_file });
 
         try appendSharedEsbuildOptions(ctx, &spec, view_value.object, .view);
-        try addElectrobunImportAliases(ctx, &spec, null, getObjectFieldFromObject(build, "carrot") != null);
+        try addElectrobunImportAliases(ctx, platform_paths, &spec, null, getObjectFieldFromObject(build, "carrot") != null);
         try runCottontailBuild(ctx, .{ .object = spec });
     }
 }
@@ -3170,14 +3219,14 @@ fn appendSharedEsbuildOptions(
 
 fn addElectrobunImportAliases(
     ctx: *const Context,
+    platform_paths: PlatformPaths,
     spec: *std.json.ObjectMap,
     main_process: ?MainProcess,
     use_runtime_sdk_aliases: bool,
 ) !void {
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return;
-
-    const default_main_sdk = try defaultElectrobunMainSdk(ctx, package_root);
-    const default_view_sdk = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "browser", "index.ts" });
+    const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+    const default_main_sdk = devkit.sdks.javascript.main;
+    const default_view_sdk = devkit.sdks.javascript.browser;
     const main_sdk = if (use_runtime_sdk_aliases)
         (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_MAIN_MODULE")) orelse
             (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_BUN_MODULE")) orelse
@@ -3212,12 +3261,6 @@ fn addElectrobunImportAliases(
     try spec.put(ctx.allocator, "alias", .{ .object = alias });
 }
 
-fn defaultElectrobunMainSdk(ctx: *const Context, package_root: []const u8) ![]const u8 {
-    const canonical = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "main", "index.ts" });
-    if (pathExists(ctx.io, canonical)) return canonical;
-    return std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "bun", "index.ts" });
-}
-
 fn putElectrobunMainAliases(
     allocator: std.mem.Allocator,
     alias: *std.json.ObjectMap,
@@ -3245,39 +3288,6 @@ test "Electrobun build aliases use the runtime-neutral main SDK" {
         const value = aliases.get(specifier) orelse return error.MissingElectrobunAlias;
         try std.testing.expectEqualStrings("/sdk/main/index.ts", value.string);
     }
-}
-
-test "Electrobun SDK resolution supports packages from both namespace layouts" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    const package_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    const ctx = Context{
-        .io = io,
-        .allocator = allocator,
-        .environ_map = &env_map,
-        .self_exe_path = "",
-        .cottontail_home = "",
-        .cottontail_binary = "",
-        .project_root = package_root,
-    };
-
-    try tmp.dir.createDirPath(io, "dist/api/sdks/bun");
-    try tmp.dir.writeFile(io, .{ .sub_path = "dist/api/sdks/bun/index.ts", .data = "export {};" });
-    const legacy = try defaultElectrobunMainSdk(&ctx, package_root);
-    try std.testing.expect(std.mem.endsWith(u8, legacy, "dist/api/sdks/bun/index.ts"));
-
-    try tmp.dir.createDirPath(io, "dist/api/sdks/main");
-    try tmp.dir.writeFile(io, .{ .sub_path = "dist/api/sdks/main/index.ts", .data = "export {};" });
-    const canonical = try defaultElectrobunMainSdk(&ctx, package_root);
-    try std.testing.expect(std.mem.endsWith(u8, canonical, "dist/api/sdks/main/index.ts"));
 }
 
 fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {
@@ -3818,151 +3828,114 @@ fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
     return ctx.cottontail_binary;
 }
 
-fn resolveElectrobunPackageRoot(ctx: *const Context) !?[]const u8 {
-    if (ctx.environ_map.get("COTTONTAIL_ELECTROBUN_PACKAGE")) |package_root| {
-        if (pathExists(ctx.io, package_root)) return package_root;
-    }
-
-    const exe_dir = std.fs.path.dirname(ctx.self_exe_path) orelse ".";
-    const executable_candidates = [_][]const u8{
-        exe_dir,
-        try std.fs.path.join(ctx.allocator, &.{ exe_dir, ".." }),
-    };
-    for (executable_candidates) |candidate| {
-        if (pathExists(ctx.io, try std.fs.path.join(ctx.allocator, &.{ candidate, "package.json" }))) return candidate;
-    }
-
-    const sibling_repo = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "..", "electrobun", "package" });
-    if (pathExists(ctx.io, try std.fs.path.join(ctx.allocator, &.{ sibling_repo, "package.json" }))) return sibling_repo;
-
-    var current = ctx.project_root;
-
-    while (true) {
-        const candidate = try std.fs.path.join(ctx.allocator, &.{ current, "node_modules", "electrobun" });
-        if (pathExists(ctx.io, try std.fs.path.join(ctx.allocator, &.{ candidate, "package.json" }))) return candidate;
-
-        const parent = std.fs.path.dirname(current) orelse break;
-        if (std.mem.eql(u8, parent, current)) break;
-        current = parent;
-    }
-
-    return null;
-}
-
-fn resolveElectrobunDist(ctx: *const Context) !?[]const u8 {
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return null;
-    const candidate = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist" });
-    if (pathExists(ctx.io, candidate)) return candidate;
-    return null;
-}
-
-fn electrobunPackageVersion(ctx: *const Context, package_root: []const u8) ![]const u8 {
-    const package_json_path = try std.fs.path.join(ctx.allocator, &.{ package_root, "package.json" });
-    const source = try std.Io.Dir.cwd().readFileAlloc(
-        ctx.io,
-        package_json_path,
-        ctx.allocator,
-        .limited(1024 * 1024),
-    );
-    const package_json = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        ctx.allocator,
-        source,
-        .{ .duplicate_field_behavior = .@"error" },
-    );
-    const version = getStringField(package_json, "version") orelse
-        return error.ElectrobunPackageVersionMissing;
-    if (version.len == 0) return error.ElectrobunPackageVersionMissing;
-    return version;
-}
-
-fn getPlatformPaths(ctx: *const Context) !PlatformPaths {
-    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return error.ElectrobunPackageNotFound;
-    const shared_dist_dir = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist" });
-    const platform_dist_dir = blk: {
-        // Local package builds place a complete, current host runtime in dist/.
-        // Prefer it over a potentially stale downloaded dist-<os>-<arch>/ cache.
-        const shared_launcher = try std.fs.path.join(ctx.allocator, &.{ shared_dist_dir, launcherFileName() });
-        if (pathExists(ctx.io, shared_launcher)) break :blk shared_dist_dir;
-
-        const candidate = try std.fmt.allocPrint(ctx.allocator, "{s}/dist-{s}-{s}", .{
-            package_root,
-            osName(),
-            archName(),
-        });
-        const candidate_launcher = try std.fs.path.join(ctx.allocator, &.{ candidate, launcherFileName() });
-        if (pathExists(ctx.io, candidate_launcher)) break :blk candidate;
-
-        const version = try electrobunPackageVersion(ctx, package_root);
-        break :blk electrobun_artifacts.ensureCore(
-            ctx.init,
-            ctx.allocator,
-            version,
-        ) catch |err| {
+fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
+    const version = try electrobun_devkit.configuredVersion(config_root);
+    const core_root = if (ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| blk: {
+        if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
+        break :blk std.Io.Dir.cwd().realPathFileAlloc(ctx.io, configured, ctx.allocator) catch |err| {
             ctx.writeStderr(
-                "hutch electrobun: could not install native artifacts for Electrobun {s}: {s}\n",
-                .{ version, @errorName(err) },
+                "hutch electrobun: local devkit root {s} is unavailable: {s}\n",
+                .{ configured, @errorName(err) },
             );
             return err;
         };
+    } else electrobun_artifacts.ensureCore(
+        ctx.init,
+        ctx.allocator,
+        version,
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not install the Electrobun {s} devkit: {s}\n",
+            .{ version, @errorName(err) },
+        );
+        return err;
     };
+    const devkit = electrobun_devkit.load(
+        ctx.io,
+        ctx.allocator,
+        core_root,
+        version,
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: Electrobun {s} has an invalid native devkit: {s}\n",
+            .{ version, @errorName(err) },
+        );
+        return err;
+    };
+    const projection = electrobun_devkit.project(
+        ctx.io,
+        ctx.allocator,
+        ctx.project_root,
+        devkit,
+        .{ .force = ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") != null },
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not project the Electrobun {s} devkit: {s}\n",
+            .{ version, @errorName(err) },
+        );
+        return err;
+    };
+    var platform_paths = try platformPathsFromDevkit(ctx, devkit, projection);
+    try ensureRequiredPlatformArtifacts(ctx, config_root, &platform_paths);
+    return platform_paths;
+}
 
+fn ensureRequiredPlatformArtifacts(
+    ctx: *const Context,
+    config_root: std.json.Value,
+    platform_paths: *PlatformPaths,
+) !void {
+    if (!bundleUsesCef(config_root) or pathExists(ctx.io, platform_paths.cef_dir)) return;
+    if (ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") != null) {
+        ctx.writeStderr(
+            "hutch electrobun: local devkit root does not contain its required cef directory\n",
+            .{},
+        );
+        return error.ElectrobunLocalDevkitCefNotFound;
+    }
+
+    const version = platform_paths.electrobun_version;
+    const platform_root = electrobun_artifacts.ensureCef(
+        ctx.init,
+        ctx.allocator,
+        version,
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not install CEF for Electrobun {s}: {s}\n",
+            .{ version, @errorName(err) },
+        );
+        return err;
+    };
+    platform_paths.cef_dir = try std.fs.path.join(ctx.allocator, &.{ platform_root, "cef" });
+    if (!pathExists(ctx.io, platform_paths.cef_dir)) return error.ElectrobunCefNotFound;
+}
+
+fn platformPathsFromDevkit(
+    ctx: *const Context,
+    devkit: electrobun_devkit.Resolution,
+    projection: electrobun_devkit.Projection,
+) !PlatformPaths {
     return .{
-        .package_root = package_root,
-        .shared_dist_dir = shared_dist_dir,
-        .platform_dist_dir = platform_dist_dir,
-        .launcher = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, launcherFileName() }),
-        .bun_binary = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, bunBinaryFileName() }),
-        .main_js = try std.fs.path.join(ctx.allocator, &.{ shared_dist_dir, "main.js" }),
-        .preload_full_js = try std.fs.path.join(ctx.allocator, &.{ shared_dist_dir, "preload-full.js" }),
-        .preload_sandboxed_js = try std.fs.path.join(ctx.allocator, &.{ shared_dist_dir, "preload-sandboxed.js" }),
-        .core_lib = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "ElectrobunCore.dll",
-            .macos => "libElectrobunCore.dylib",
-            else => "libElectrobunCore.so",
-        } }),
-        .native_wrapper = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "libNativeWrapper.dll",
-            .macos => "libNativeWrapper.dylib",
-            else => "libNativeWrapper.so",
-        } }),
-        .native_wrapper_cef = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .linux => "libNativeWrapper_cef.so",
-            .windows => "libNativeWrapper.dll",
-            .macos => "libNativeWrapper.dylib",
-            else => "libNativeWrapper.so",
-        } }),
-        .libasar = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "libasar.dll",
-            .macos => "libasar.dylib",
-            else => "libasar.so",
-        } }),
-        .process_helper = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "process_helper.exe",
-            else => "process_helper",
-        } }),
-        .cef_dir = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, "cef" }),
-        .wgpu_lib = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "webgpu_dawn.dll",
-            .macos => "libwebgpu_dawn.dylib",
-            else => "libwebgpu_dawn.so",
-        } }),
-        .extractor = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "extractor.exe",
-            else => "extractor",
-        } }),
-        .bsdiff = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "bsdiff.exe",
-            else => "bsdiff",
-        } }),
-        .bspatch = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "bspatch.exe",
-            else => "bspatch",
-        } }),
-        .zig_zstd = try std.fs.path.join(ctx.allocator, &.{ platform_dist_dir, switch (builtin.os.tag) {
-            .windows => "zig-zstd.exe",
-            else => "zig-zstd",
-        } }),
+        .shared_dist_dir = devkit.root,
+        .electrobun_version = devkit.version,
+        .devkit = devkit,
+        .projection = projection,
+        .launcher = devkit.runtime.launcher,
+        .bun_binary = devkit.runtime.bun,
+        .main_js = devkit.runtime.main,
+        .preload_full_js = devkit.runtime.preload_full,
+        .preload_sandboxed_js = devkit.runtime.preload_sandboxed,
+        .core_lib = devkit.runtime.core_library,
+        .native_wrapper = devkit.runtime.native_wrapper,
+        .native_wrapper_cef = devkit.runtime.native_wrapper_cef,
+        .libasar = devkit.runtime.asar_library,
+        .process_helper = devkit.runtime.process_helper,
+        .cef_dir = try std.fs.path.join(ctx.allocator, &.{ devkit.root, "cef" }),
+        .wgpu_lib = devkit.runtime.wgpu_library,
+        .extractor = devkit.runtime.extractor,
+        .bsdiff = devkit.runtime.bsdiff,
+        .bspatch = devkit.runtime.bspatch,
+        .zig_zstd = devkit.runtime.zig_zstd,
     };
 }
 
@@ -4610,9 +4583,10 @@ test "preload scripts are resources rather than code-directory files" {
         .app_code_dir = resources_dir,
     };
     const platform_paths = PlatformPaths{
-        .package_root = absolute_root,
         .shared_dist_dir = absolute_root,
-        .platform_dist_dir = absolute_root,
+        .electrobun_version = "2.0.0-test",
+        .devkit = null,
+        .projection = null,
         .launcher = "",
         .bun_binary = "",
         .main_js = "",
@@ -4694,9 +4668,10 @@ test "bundled CEF layouts match the native wrapper contract" {
         .app_code_dir = absolute_root,
     };
     const platform_paths = PlatformPaths{
-        .package_root = absolute_root,
         .shared_dist_dir = absolute_root,
-        .platform_dist_dir = absolute_root,
+        .electrobun_version = "2.0.0-test",
+        .devkit = null,
+        .projection = null,
         .launcher = "",
         .bun_binary = "",
         .main_js = "",

@@ -1,0 +1,176 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createServer } from "node:http";
+import os from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import {
+  createCoreFixture,
+  executableName,
+  hostContract,
+  writeFixtureFile,
+} from "./v2-devkit-fixture.js";
+
+const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+function resolveCottontail() {
+  const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
+  if (configured) return resolve(configured);
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
+    cwd: hutchRoot,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return result.stdout.trim();
+}
+
+function run(command, args, options) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(command, args, options);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolveRun({ status, stdout, stderr }));
+  });
+}
+
+test("v2 sync and build use only the cached devkit, without an npm package", { timeout: 120_000 }, async () => {
+  const fixture = mkdtempSync(join(os.tmpdir(), "hutch-v2-devkit-"));
+  const project = join(fixture, "project");
+  const coreFiles = join(fixture, "core-files");
+  const archive = join(fixture, "electrobun-core.tar.gz");
+  const dashHome = join(fixture, "dash-home");
+  const host = hostContract();
+  const version = "2.0.0-test.1";
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+
+  try {
+    createCoreFixture(coreFiles, version, host);
+    const packed = spawnSync("tar", ["-czf", archive, "-C", coreFiles, "."], { encoding: "utf8" });
+    assert.equal(packed.status, 0, packed.stderr || packed.stdout);
+
+    writeFixtureFile(join(project, "src", "bun", "index.ts"), "import { devkitMarker } from 'electrobun/main';\nconsole.log(devkitMarker);\n");
+    writeFixtureFile(join(project, "electrobun.config.ts"), `
+import type { ElectrobunConfig } from "electrobun";
+export default {
+  electrobun: { version: "${version}" },
+  app: { name: "V2Devkit", identifier: "dev.electrobun.v2-devkit", version: "0.0.0" },
+  build: {
+    mainProcess: "cottontail",
+    cottontail: { entrypoint: "src/bun/index.ts" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+} satisfies ElectrobunConfig;
+`);
+    assert.equal(existsSync(join(project, "package.json")), false);
+    assert.equal(existsSync(join(project, "node_modules")), false);
+
+    let requests = 0;
+    const server = createServer((_request, response) => {
+      requests += 1;
+      response.writeHead(200, { "content-type": "application/gzip" });
+      response.end(readFileSync(archive));
+    });
+    await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+
+    try {
+      const env = {
+        ...process.env,
+        COTTONTAIL_BINARY: cottontail,
+        DASH_COTTONTAIL: cottontail,
+        DASH_HOME: dashHome,
+        ELECTROBUN_RELEASES_BASE_URL: `http://127.0.0.1:${address.port}/releases/download`,
+        HUTCH_ENGINE_BINARY: engine,
+        HUTCH_NO_UPDATE_CHECK: "1",
+      };
+      const first = await run(hutch, ["electrobun", "sync"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      assert.equal(requests, 1);
+      assert.match(first.stdout, /electrobun sync complete/);
+
+      const cacheRoot = join(dashHome, "products", "electrobun", version, host.key);
+      assert.ok(existsSync(join(cacheRoot, "native-devkit.json")));
+      assert.ok(existsSync(join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts")));
+      assert.ok(existsSync(join(project, ".hutch", "devkit", "go-sdk", "go.mod")));
+      assert.match(readFileSync(join(project, ".hutch", "devkit", "tsconfig.json"), "utf8"), /electrobun\/main/);
+
+      const build = await run(hutch, ["electrobun", "build", "--env=dev"], {
+        cwd: project,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(build.status, 0, build.stderr || build.stdout);
+      assert.equal(requests, 1, "build should reuse the exact core and projected devkit");
+      const bundledMain = process.platform === "darwin"
+        ? join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev.app", "Contents", "Resources", "app", "bun", "index.js")
+        : join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev", "Resources", "app", "bun", "index.js");
+      assert.match(readFileSync(bundledMain, "utf8"), /V2_DEVKIT_ALIAS/);
+      assert.equal(existsSync(join(project, "node_modules")), false);
+
+      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(join(project, ".hutch", "devkit"), { recursive: true, force: true });
+      const configPath = join(project, "electrobun.config.ts");
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, "utf8").replaceAll("bundleCEF: false", "bundleCEF: true"),
+      );
+      const missingLocalCef = await run(hutch, ["electrobun", "sync"], {
+        cwd: project,
+        env: { ...env, HUTCH_ELECTROBUN_DEVKIT_ROOT: coreFiles },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(missingLocalCef.status, 1);
+      assert.match(missingLocalCef.stderr, /ElectrobunLocalDevkitCefNotFound/);
+
+      writeFixtureFile(join(coreFiles, "cef", "icudtl.dat"), "cef");
+      const localSync = await run(hutch, ["electrobun", "sync"], {
+        cwd: project,
+        env: { ...env, HUTCH_ELECTROBUN_DEVKIT_ROOT: coreFiles },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(localSync.status, 0, localSync.stderr || localSync.stdout);
+      assert.equal(requests, 1, "an explicit local devkit root must bypass release downloads");
+      assert.ok(existsSync(join(project, ".hutch", "devkit", "projection.json")));
+
+      writeFixtureFile(
+        join(coreFiles, "api", "sdks", "main", "index.ts"),
+        "export const devkitMarker = 'LOCAL_SDK_EDIT';\n",
+      );
+      const refreshedLocalSync = await run(hutch, ["electrobun", "sync"], {
+        cwd: project,
+        env: { ...env, HUTCH_ELECTROBUN_DEVKIT_ROOT: coreFiles },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(refreshedLocalSync.status, 0, refreshedLocalSync.stderr || refreshedLocalSync.stdout);
+      assert.match(
+        readFileSync(join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts"), "utf8"),
+        /LOCAL_SDK_EDIT/,
+      );
+    } finally {
+      await new Promise((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});

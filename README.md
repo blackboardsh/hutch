@@ -107,6 +107,29 @@ delegates `npx electrobun init` and `bunx electrobun init` to
 Starter templates come from the selected production or canary Electrobun
 catalog rather than from an npm package bundle.
 
+Every v2 project pins its exact product version in `electrobun.config.ts`:
+
+```ts
+export default {
+  electrobun: { version: "2.0.0-beta.1" },
+  // app and build configuration...
+};
+```
+
+`hutch electrobun init` prepares the extracted project before reporting
+success. `hutch electrobun sync` repeats that preparation without building the
+app. Both resolve the exact core and SDK release, optional CEF payload, and the
+native compiler required by `build.mainProcess`. They atomically generate the
+package-shaped editor/build facade at `.hutch/devkit`; projects should ignore
+`.hutch/` and may extend `./.hutch/devkit/tsconfig.json`. Electrobun itself is
+not an npm dependency. Third-party JavaScript dependencies remain owned by the
+external package manager invoked by a project script.
+
+For development against an unpublished local core, set
+`HUTCH_ELECTROBUN_DEVKIT_ROOT` to its absolute directory containing the exact
+version/host `native-devkit.json`. Local syncs always refresh the facade so SDK
+edits are visible immediately.
+
 ## Electrobun Packaging
 
 `hutch electrobun build --env=dev` creates a runnable inner application bundle.
@@ -220,7 +243,7 @@ for the release workflow.
 - `hutch <script-name> [args...]`
 - `hutch run [script-name] [args...]`
 - `hutch build [args...]`
-- `hutch electrobun <init|build|run|dev> [args...]`
+- `hutch electrobun <init|sync|build|run|dev> [args...]`
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
 

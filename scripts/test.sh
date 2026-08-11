@@ -16,5 +16,6 @@ node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/electrobun/init-scaffold.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/non-index-main-entrypoint.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/published-platform-artifact.test.js" \
-  "$SCRIPT_DIR/../tests/electrobun/tsconfig-path-alias-bundle.test.js"
+  "$SCRIPT_DIR/../tests/electrobun/tsconfig-path-alias-bundle.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/v2-devkit-sync.test.js"
 node --test "$SCRIPT_DIR/zig-hostname-connect-patch.test.js"

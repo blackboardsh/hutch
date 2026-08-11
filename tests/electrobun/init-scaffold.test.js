@@ -15,12 +15,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import {
+  createCoreFixture,
+  executableName,
+} from "./v2-devkit-fixture.js";
 
 const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-
-function executableName(name) {
-  return process.platform === "win32" ? `${name}.exe` : name;
-}
 
 function run(command, args, options) {
   return new Promise((resolveResult, reject) => {
@@ -36,6 +36,18 @@ function run(command, args, options) {
   });
 }
 
+function resolveCottontail() {
+  const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
+  if (configured) return resolve(configured);
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
+    cwd: hutchRoot,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return result.stdout.trim();
+}
+
 test("hutch electrobun init lists and downloads the active remote template channel", async () => {
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
@@ -47,13 +59,28 @@ test("hutch electrobun init lists and downloads the active remote template chann
   const templateRoot = join(archiveSource, "hello-world");
   const archivePath = join(fixture, "hello-world.tar.gz");
   const workspace = join(fixture, "workspace");
+  const coreRoot = join(fixture, "core");
   const projectName = "sample-app";
+  const version = "2.0.0";
+  const cottontail = resolveCottontail();
 
   mkdirSync(join(templateRoot, "src"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   const projectRoot = join(realpathSync(workspace), projectName);
-  writeFileSync(join(templateRoot, "package.json"), '{"name":"hello-world"}\n');
-  writeFileSync(join(templateRoot, "electrobun.config.ts"), "export default {};\n");
+  createCoreFixture(coreRoot, version);
+  writeFileSync(join(templateRoot, "electrobun.config.ts"), `
+export default {
+  electrobun: { version: "${version}" },
+  app: { name: "HelloWorld", identifier: "dev.electrobun.hello-world", version: "0.0.0" },
+  build: {
+    mainProcess: "cottontail",
+    cottontail: { entrypoint: "src/index.ts" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+};
+`);
   writeFileSync(join(templateRoot, "src", "index.ts"), 'console.log("hello");\n');
   const tar = spawnSync("tar", ["-czf", archivePath, "-C", archiveSource, "hello-world"], {
     encoding: "utf8",
@@ -108,9 +135,11 @@ test("hutch electrobun init lists and downloads the active remote template chann
 
   const env = {
     ...process.env,
-    COTTONTAIL_BINARY: process.execPath,
+    COTTONTAIL_BINARY: cottontail,
+    DASH_COTTONTAIL: cottontail,
     DASH_HOME: join(fixture, "dash-home"),
     ELECTROBUN_TEMPLATES_BASE_URL: baseUrl,
+    HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
     HUTCH_ENGINE_BINARY: engine,
     HUTCH_NO_UPDATE_CHECK: "1",
   };
@@ -132,23 +161,19 @@ test("hutch electrobun init lists and downloads the active remote template chann
     assert.equal(
       result.stdout,
       "Downloading hello-world from Electrobun 2.0.0 (stable)...\n" +
+        "Preparing the Electrobun devkit and required toolchain...\n" +
         `Created Electrobun project at ${projectRoot}\n` +
         "Next steps:\n" +
         `  cd ${projectName}\n` +
         "  hutch run dev\n",
     );
-    assert.equal(
-      readFileSync(join(projectRoot, "package.json"), "utf8"),
-      '{"name":"hello-world"}\n',
-    );
+    assert.equal(existsSync(join(projectRoot, "package.json")), false);
     assert.equal(
       readFileSync(join(projectRoot, "src", "index.ts"), "utf8"),
       'console.log("hello");\n',
     );
-    assert.equal(
-      readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"),
-      "export default {};\n",
-    );
+    assert.match(readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
+    assert.ok(existsSync(join(projectRoot, ".hutch", "devkit", "projection.json")));
 
     const cached = await run(
       hutch,
@@ -162,7 +187,7 @@ test("hutch electrobun init lists and downloads the active remote template chann
       { cwd: workspace, env },
     );
     assert.equal(cached.status, 0, cached.stderr || cached.stdout);
-    assert.ok(existsSync(join(workspace, "cached-app", "package.json")));
+    assert.ok(existsSync(join(workspace, "cached-app", ".hutch", "devkit", "projection.json")));
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));
     rmSync(fixture, { recursive: true, force: true });

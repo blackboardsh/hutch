@@ -53,14 +53,14 @@ const Archive = struct {
     filename: []const u8,
 };
 
-pub fn resolve(
+pub fn resolveVersion(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    shared_dist_dir: []const u8,
     kind: Kind,
+    version: []const u8,
 ) !Resolution {
-    const version = try pinnedVersion(init.io, allocator, shared_dist_dir, kind);
-    if (try executableMatchesVersion(init, allocator, kind.systemExecutable(), kind, version)) {
+    try validateVersion(version);
+    if (try executableMatchesVersion(init.io, allocator, kind.systemExecutable(), kind, version)) {
         return .{
             .binary = kind.systemExecutable(),
             .root = null,
@@ -78,7 +78,7 @@ pub fn resolve(
         try platformKey(),
     });
     const binary = try cachedBinaryPath(allocator, root, kind);
-    if (try cachedToolchainMatches(init.io, allocator, root, binary, version)) {
+    if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
     }
 
@@ -92,9 +92,10 @@ pub fn resolve(
     });
     defer lock.close(init.io);
 
-    if (try cachedToolchainMatches(init.io, allocator, root, binary, version)) {
+    if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
     }
+    std.Io.Dir.cwd().deleteTree(init.io, root) catch {};
 
     const archive = try archiveFor(allocator, kind, version);
     std.debug.print(
@@ -105,7 +106,7 @@ pub fn resolve(
     try install(init, allocator, root, kind, version, archive.filename, bytes);
 
     const installed_binary = try cachedBinaryPath(allocator, root, kind);
-    if (!try executableMatchesVersion(init, allocator, installed_binary, kind, version)) {
+    if (!try executableMatchesVersion(init.io, allocator, installed_binary, kind, version)) {
         return error.ToolchainVersionMismatch;
     }
     return .{
@@ -114,39 +115,6 @@ pub fn resolve(
         .version = version,
         .system = false,
     };
-}
-
-fn pinnedVersion(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    shared_dist_dir: []const u8,
-    kind: Kind,
-) ![]const u8 {
-    const relative_path, const constant_name = switch (kind) {
-        .zig => .{ "api/shared/build-dependencies.ts", "ZIG_VERSION" },
-        .rust => .{ "api/shared/rust-version.ts", "RUST_VERSION" },
-        .go => .{ "api/shared/go-version.ts", "GO_VERSION" },
-        .odin => .{ "api/shared/odin-version.ts", "ODIN_VERSION" },
-    };
-    const path = try std.fs.path.join(allocator, &.{ shared_dist_dir, relative_path });
-    const source = try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        path,
-        allocator,
-        .limited(256 * 1024),
-    );
-    const declaration = try std.fmt.allocPrint(allocator, "export const {s}", .{constant_name});
-    const start = std.mem.indexOf(u8, source, declaration) orelse return error.ToolchainVersionMissing;
-    const equals = std.mem.indexOfPos(u8, source, start + declaration.len, "=") orelse
-        return error.ToolchainVersionMissing;
-    const quote = std.mem.indexOfAnyPos(u8, source, equals + 1, "\"'") orelse
-        return error.ToolchainVersionMissing;
-    const delimiter = source[quote];
-    const end = std.mem.indexOfScalarPos(u8, source, quote + 1, delimiter) orelse
-        return error.ToolchainVersionMissing;
-    const version = source[quote + 1 .. end];
-    try validateVersion(version);
-    return version;
 }
 
 fn install(
@@ -182,14 +150,28 @@ fn install(
         try std.Io.Dir.cwd().rename(extracted_root, std.Io.Dir.cwd(), temporary, init.io);
     }
 
-    const installed_binary = try cachedBinaryPath(allocator, temporary, kind);
-    if (!pathExists(init.io, installed_binary)) return error.ToolchainExecutableMissing;
-    if (builtin.os.tag != .windows) try makeExecutable(init.io, installed_binary);
-    const marker = try std.fs.path.join(allocator, &.{ temporary, ".hutch-toolchain" });
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker, .data = version });
+    try publishInstalledToolchain(init.io, allocator, root, temporary, kind, version);
+}
 
-    std.Io.Dir.cwd().deleteTree(init.io, root) catch {};
-    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), root, init.io);
+fn publishInstalledToolchain(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    temporary: []const u8,
+    kind: Kind,
+    version: []const u8,
+) !void {
+    const installed_binary = try cachedBinaryPath(allocator, temporary, kind);
+    if (!pathExists(io, installed_binary)) return error.ToolchainExecutableMissing;
+    if (builtin.os.tag != .windows) try makeExecutable(io, installed_binary);
+    if (!try executableMatchesVersion(io, allocator, installed_binary, kind, version)) {
+        return error.ToolchainVersionMismatch;
+    }
+
+    const marker = try std.fs.path.join(allocator, &.{ temporary, ".hutch-toolchain" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = version });
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), root, io);
 }
 
 fn extractArchive(
@@ -369,6 +351,7 @@ fn cachedToolchainMatches(
     allocator: std.mem.Allocator,
     root: []const u8,
     binary: []const u8,
+    kind: Kind,
     version: []const u8,
 ) !bool {
     if (!pathExists(io, binary)) return false;
@@ -379,11 +362,12 @@ fn cachedToolchainMatches(
         allocator,
         .limited(256),
     ) catch return false;
-    return std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), version);
+    if (!std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), version)) return false;
+    return executableMatchesVersion(io, allocator, binary, kind, version);
 }
 
 fn executableMatchesVersion(
-    init: std.process.Init,
+    io: std.Io,
     allocator: std.mem.Allocator,
     executable: []const u8,
     kind: Kind,
@@ -393,7 +377,7 @@ fn executableMatchesVersion(
     defer argv.deinit(allocator);
     try argv.append(allocator, executable);
     try argv.appendSlice(allocator, kind.versionArgs());
-    const result = std.process.run(allocator, init.io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv.items,
         .create_no_window = true,
     }) catch return false;
@@ -458,7 +442,11 @@ fn makeExecutable(io: std.Io, path: []const u8) !void {
 }
 
 fn validateVersion(version: []const u8) !void {
-    if (version.len == 0 or version.len > 128) return error.InvalidToolchainVersion;
+    if (version.len == 0 or version.len > 128 or
+        std.mem.eql(u8, version, ".") or std.mem.eql(u8, version, ".."))
+    {
+        return error.InvalidToolchainVersion;
+    }
     for (version) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-' and byte != '+') {
             return error.InvalidToolchainVersion;
@@ -480,23 +468,40 @@ fn pathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-test "toolchain pins are parsed from published Electrobun sources" {
+test "toolchain versions cannot escape their cache path" {
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion("."));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(".."));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion("../0.16.0"));
+    try validateVersion("0.16.0");
+    try validateVersion("dev-2026-07a");
+}
+
+test "a mismatched toolchain executable is never published" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "dist/api/shared");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "dist/api/shared/odin-version.ts",
-        .data = "export const ODIN_VERSION = \"dev-2026-07a\";\n",
-    });
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const relative = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path, "dist" });
-    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena.allocator());
-    try std.testing.expectEqualStrings(
-        "dev-2026-07a",
-        try pinnedVersion(io, arena.allocator(), absolute, .odin),
+
+    try tmp.dir.createDirPath(io, "candidate");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "candidate/zig",
+        .data = "#!/bin/sh\nprintf '0.15.0\\n'\n",
+    });
+    const relative = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena.allocator());
+    const candidate = try std.fs.path.join(arena.allocator(), &.{ fixture_root, "candidate" });
+    const published = try std.fs.path.join(arena.allocator(), &.{ fixture_root, "published" });
+
+    try std.testing.expectError(
+        error.ToolchainVersionMismatch,
+        publishInstalledToolchain(io, arena.allocator(), published, candidate, .zig, "0.16.0"),
     );
+    try std.testing.expect(!pathExists(io, published));
+    try std.testing.expect(pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, "zig" })));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(arena.allocator(), &.{ candidate, ".hutch-toolchain" })));
 }
 
 test "toolchain archive URLs follow upstream release naming" {
