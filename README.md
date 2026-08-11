@@ -101,17 +101,11 @@ the global store and must remain set when a non-default install root is used.
 
 Run `hutch electrobun init` to choose a release template interactively, then
 accept or replace its suggested project name. The chosen name controls the
-created directory and the printed next steps. The following spelling is a
-direct alias and does not install the Electrobun npm package:
-
-```sh
-hutch x electrobun init
-```
-
-The published Electrobun npm package also delegates `npx electrobun init` and
-`bunx electrobun init` to this command, installing the matching Hutch channel
-when needed. Starter templates always come from the latest production or
-canary Electrobun catalog rather than from an npm package version.
+created directory and the printed next steps. The thin Electrobun npm package
+delegates `npx electrobun init` and `bunx electrobun init` to
+`hutch electrobun init`, installing the matching Hutch channel when needed.
+Starter templates come from the selected production or canary Electrobun
+catalog rather than from an npm package bundle.
 
 ## Electrobun Packaging
 

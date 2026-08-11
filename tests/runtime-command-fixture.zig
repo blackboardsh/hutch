@@ -48,7 +48,9 @@ pub fn main(init: std.process.Init) !void {
             if (!std.mem.startsWith(u8, executable, "pnpm")) return error.UnexpectedConfigCommand;
             return expectArgs(args[1..], &.{ "run", "dev", "--filter", "app one" });
         }
-        if (std.mem.eql(u8, mode, "config-hutch")) {
+        if (std.mem.eql(u8, mode, "config-hutch") or
+            std.mem.eql(u8, mode, "config-hutch-shell"))
+        {
             try expectArgs(args[1..], &.{"--version"});
             try std.Io.File.stdout().writeStreamingAll(init.io, "0.0.0-test\n");
             return;
@@ -70,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "hutch-options")) {
         const entrypoint = init.environ_map.get("HUTCH_TEST_EXPECTED_ENTRYPOINT") orelse
             return error.MissingExpectedEntrypoint;
-        const expected = [_][]const u8{entrypoint};
+        const expected = [_][]const u8{ "run", "--silent", entrypoint };
         return expectArgs(args[1..], &expected);
     }
 

@@ -223,8 +223,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const config_json =
-        \\{"scripts":{"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"]}}
+        \\{"scripts":{"install":["npm","install","--offline"],"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"],"hutch-version-shell":"hutch --version"}}
     ;
+    // A bare non-path name is a configured task even when Cottontail could
+    // resolve a same-stem source file. Direct runtime entrypoints stay
+    // explicit (`hutch npm-install.ts` or `hutch ./npm-install`).
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "npm-install.ts" }),
+        .data = "throw new Error('configured task must win');\n",
+    });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "install.ts" }),
+        .data = "throw new Error('install must stay a configured task');\n",
+    });
     const listed = try runConfigCommand(
         init,
         allocator,
@@ -239,6 +250,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(listed.term, 0);
     try expectContains(listed.stdout, "npm-install\n");
+    try expectContains(listed.stdout, "install\n");
     try expectContains(listed.stdout, "pnpm-dev\n");
     try expectContains(listed.stdout, "hutch-version\n");
 
@@ -256,6 +268,34 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(npm_run.term, 0);
 
+    const install_bare = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-npm",
+        config_json,
+        &.{ "install", "two words", "$literal" },
+    );
+    try expectExit(install_bare.term, 0);
+
+    const install_run = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-npm",
+        config_json,
+        &.{ "run", "install", "two words", "$literal" },
+    );
+    try expectExit(install_run.term, 0);
+
     const pnpm_run = try runConfigCommand(
         init,
         allocator,
@@ -270,11 +310,40 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(pnpm_run.term, 0);
 
+    const split_launcher_dir = try std.fs.path.join(allocator, &.{ fixture_root, "launcher-only" });
+    const split_engine_dir = try std.fs.path.join(allocator, &.{ fixture_root, "engine-only" });
+    try std.Io.Dir.cwd().createDirPath(init.io, split_launcher_dir);
+    try std.Io.Dir.cwd().createDirPath(init.io, split_engine_dir);
+    const split_launcher = try std.fs.path.join(
+        allocator,
+        &.{ split_launcher_dir, std.fs.path.basename(launcher) },
+    );
+    const split_engine = try std.fs.path.join(
+        allocator,
+        &.{ split_engine_dir, std.fs.path.basename(engine) },
+    );
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        launcher,
+        std.Io.Dir.cwd(),
+        split_launcher,
+        init.io,
+        .{ .permissions = .executable_file, .make_path = true },
+    );
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        engine,
+        std.Io.Dir.cwd(),
+        split_engine,
+        init.io,
+        .{ .permissions = .executable_file, .make_path = true },
+    );
+
     const hutch_run = try runConfigCommand(
         init,
         allocator,
-        launcher,
-        engine,
+        split_launcher,
+        split_engine,
         runtime,
         fixture_root,
         fake_bin,
@@ -284,6 +353,21 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(hutch_run.term, 0);
     try expectContains(hutch_run.stdout, "0.0.0-test\n");
+
+    const hutch_shell_run = try runConfigCommand(
+        init,
+        allocator,
+        split_launcher,
+        split_engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-hutch-shell",
+        config_json,
+        &.{"hutch-version-shell"},
+    );
+    try expectExit(hutch_shell_run.term, 0);
+    try expectContains(hutch_shell_run.stdout, "0.0.0-test\n");
 
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ fixture_root, "package.json" }),
@@ -318,4 +402,19 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(package_only_run.term, 1);
     try expectContains(package_only_run.stderr, "Script not found");
+
+    const absent_install = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-list",
+        "{\"scripts\":{}}",
+        &.{"install"},
+    );
+    try expectExit(absent_install.term, 1);
+    try expectContains(absent_install.stderr, "Script not found");
 }

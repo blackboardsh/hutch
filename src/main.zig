@@ -4,7 +4,6 @@ const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const electrobun = @import("electrobun.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
-const runtime_entrypoint = @import("runtime_entrypoint.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -374,18 +373,22 @@ fn configuredScriptEnvironment(
     errdefer env.deinit();
 
     // Keep the version-matched Hutch launcher available to recursive config
-    // tasks without adding package-manager-specific node_modules semantics.
-    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    // tasks. Release installs place it next to the engine; split/custom layouts
+    // communicate its authoritative location explicitly.
+    const executable_dir = if (init.environ_map.get("HUTCH_LAUNCHER_PATH")) |launcher|
+        std.fs.path.dirname(launcher) orelse return error.InvalidConfiguredLauncherPath
+    else
+        try std.process.executableDirPathAlloc(init.io, allocator);
     const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
     const existing_path = env.get(path_key) orelse env.get("PATH") orelse "";
     const run_path = if (existing_path.len > 0)
         try std.fmt.allocPrint(
             allocator,
             "{s}{c}{s}",
-            .{ exe_dir, std.fs.path.delimiter, existing_path },
+            .{ executable_dir, std.fs.path.delimiter, existing_path },
         )
     else
-        exe_dir;
+        executable_dir;
     try env.put(path_key, run_path);
     return env;
 }
@@ -738,7 +741,8 @@ fn runNamedConfigScript(
     script_args: []const [:0]const u8,
     stderr: *std.Io.Writer,
 ) !?u8 {
-    const cottontail = resolveCottontail(init, allocator, script_args) catch |err| {
+    const no_args: [0][:0]const u8 = .{};
+    const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
         try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -868,6 +872,16 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const requested = args[2];
+        if (std.mem.startsWith(u8, requested, "-")) {
+            const exit_code = try runCottontailCommand(
+                init,
+                allocator,
+                cottontail.executable,
+                args[1..],
+            );
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         if (try runConfiguredScriptIfExists(
             init,
             allocator,
@@ -881,9 +895,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
 
-        if (try runtime_entrypoint.resolve(init.io, allocator, requested) == null and
-            !runtimeDiagnosticEligible(requested))
-        {
+        if (!pathExists(init.io, requested) and !runtimeDiagnosticEligible(requested)) {
             try stderr.print("error: Script not found \"{s}\"\n", .{requested});
             try stderr.flush();
             std.process.exit(1);
@@ -915,7 +927,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (try runtime_entrypoint.resolve(init.io, allocator, command) != null) {
+    if (pathExists(init.io, command) or runtimeDiagnosticEligible(command)) {
         const exit_code = try forwardToCottontail(
             init,
             allocator,
@@ -926,26 +938,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (!runtimeDiagnosticEligible(command)) {
-        if (findHutchConfig(init, allocator)) |_| {
-            if (try runNamedConfigScript(
-                init,
-                allocator,
-                command,
-                args[2..],
-                stderr,
-            )) |exit_code| {
-                try stderr.flush();
-                if (exit_code != 0) std.process.exit(exit_code);
-                return;
-            }
-        } else |err| switch (err) {
-            error.HutchConfigNotFound => {},
-            else => return err,
+    if (findHutchConfig(init, allocator)) |_| {
+        if (try runNamedConfigScript(
+            init,
+            allocator,
+            command,
+            args[2..],
+            stderr,
+        )) |exit_code| {
+            try stderr.flush();
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
         }
+    } else |err| switch (err) {
+        error.HutchConfigNotFound => {},
+        else => return err,
     }
 
-    if (std.mem.eql(u8, command, "build") or runtimeDiagnosticEligible(command)) {
+    if (std.mem.eql(u8, command, "build")) {
         const exit_code = try forwardToCottontail(
             init,
             allocator,
