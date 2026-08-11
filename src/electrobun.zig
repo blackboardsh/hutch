@@ -114,6 +114,11 @@ const PlatformPaths = struct {
     zig_zstd: []const u8,
 };
 
+const BundledRuntimeProvenance = struct {
+    electrobun_version: []const u8,
+    bun_runtime_version: []const u8,
+};
+
 const ReleaseState = struct {
     bundle: AppBundlePaths,
     hash: []const u8,
@@ -3721,7 +3726,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         try copyBundledCef(ctx, bundle, platform_paths, main_process);
     }
 
-    try writeBundledRuntimeMetadata(ctx, config, bundle);
+    try writeBundledRuntimeMetadata(ctx, config, bundle, platform_paths);
 
     switch (main_process) {
         .bun => {
@@ -5629,16 +5634,27 @@ test "bundled CEF layouts match the native wrapper contract" {
     }
 }
 
-fn bundledRuntimeMetadataJson(ctx: *const Context, config: CommandContext) ![]const u8 {
+fn bundledRuntimeMetadataJson(
+    ctx: *const Context,
+    config: CommandContext,
+    provenance: BundledRuntimeProvenance,
+) ![]const u8 {
     const runtime_value = getValueFieldFromObject(config.root.object, "runtime") orelse std.json.Value{ .object = .empty };
     const platform = platformBuildObject(config.root);
+    const main_process = getMainProcess(config.root);
 
     var available_renderers = std.json.Array.init(ctx.allocator);
     try available_renderers.append(.{ .string = "native" });
     if (bundleUsesCef(config.root)) try available_renderers.append(.{ .string = "cef" });
 
     var metadata: std.json.ObjectMap = .empty;
-    try metadata.put(ctx.allocator, "mainProcess", .{ .string = mainProcessName(getMainProcess(config.root)) });
+    try metadata.put(ctx.allocator, "mainProcess", .{ .string = mainProcessName(main_process) });
+    try metadata.put(ctx.allocator, "electrobunVersion", .{ .string = provenance.electrobun_version });
+    if (main_process == .bun) {
+        var runtime_versions: std.json.ObjectMap = .empty;
+        try runtime_versions.put(ctx.allocator, "bun", .{ .string = provenance.bun_runtime_version });
+        try metadata.put(ctx.allocator, "runtimeVersions", .{ .object = runtime_versions });
+    }
     try metadata.put(
         ctx.allocator,
         "defaultRenderer",
@@ -5664,11 +5680,20 @@ fn bundledRuntimeMetadataJson(ctx: *const Context, config: CommandContext) ![]co
     );
 }
 
-fn writeBundledRuntimeMetadata(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths) !void {
+fn writeBundledRuntimeMetadata(
+    ctx: *const Context,
+    config: CommandContext,
+    bundle: AppBundlePaths,
+    platform_paths: PlatformPaths,
+) !void {
     const identifier = try getAppIdentifier(ctx, config.root);
     const app_name = try appDisplayName(ctx, config);
     const version_name = try getAppVersion(ctx, config.root);
-    const build_json = try bundledRuntimeMetadataJson(ctx, config);
+    const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotPrepared;
+    const build_json = try bundledRuntimeMetadataJson(ctx, config, .{
+        .electrobun_version = devkit.version,
+        .bun_runtime_version = devkit.runtimes.bun,
+    });
     const version_json = try std.fmt.allocPrint(
         ctx.allocator,
         "{{\"version\":\"{s}\",\"hash\":\"dev\",\"channel\":\"{s}\",\"name\":\"{s}\",\"identifier\":\"{s}\",\"baseUrl\":\"\"}}",
@@ -5685,7 +5710,7 @@ fn writeBundledRuntimeMetadata(ctx: *const Context, config: CommandContext, bund
     });
 }
 
-test "bundled runtime metadata carries CEF debugging policy inputs" {
+test "bundled runtime metadata carries resolved provenance and CEF debugging policy inputs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5729,14 +5754,20 @@ test "bundled runtime metadata carries CEF debugging policy inputs" {
     ,
         .{},
     );
+    const provenance: BundledRuntimeProvenance = .{
+        .electrobun_version = "2.0.0-beta.1",
+        .bun_runtime_version = "1.3.13",
+    };
     const json = try bundledRuntimeMetadataJson(&ctx, .{
         .raw_json = "",
         .root = root,
         .build_env = .dev,
-    });
+    }, provenance);
     const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
 
     try std.testing.expectEqualStrings("dev", getStringField(metadata, "buildEnvironment").?);
+    try std.testing.expectEqualStrings("2.0.0-beta.1", getStringField(metadata, "electrobunVersion").?);
+    try std.testing.expect(metadata.object.get("runtimeVersions") == null);
     try std.testing.expectEqualStrings("cef", getStringField(metadata, "defaultRenderer").?);
     const renderers = metadata.object.get("availableRenderers").?;
     try std.testing.expectEqual(@as(usize, 2), renderers.array.items.len);
@@ -5765,10 +5796,29 @@ test "bundled runtime metadata carries CEF debugging policy inputs" {
         .raw_json = "",
         .root = packaged_root,
         .build_env = .production,
-    });
+    }, provenance);
     const packaged = try std.json.parseFromSliceLeaky(std.json.Value, allocator, packaged_json, .{});
     try std.testing.expectEqualStrings("production", getStringField(packaged, "buildEnvironment").?);
     try std.testing.expect(packaged.object.get("chromiumFlags") == null);
+
+    const bun_root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"build":{"mainProcess":"bun"},"runtime":{}}
+    ,
+        .{},
+    );
+    const bun_json = try bundledRuntimeMetadataJson(&ctx, .{
+        .raw_json = "",
+        .root = bun_root,
+        .build_env = .production,
+    }, provenance);
+    const bun_metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bun_json, .{});
+    const runtime_versions = bun_metadata.object.get("runtimeVersions").?;
+    try std.testing.expectEqualStrings(
+        "1.3.13",
+        getStringFieldFromObject(runtime_versions.object, "bun").?,
+    );
 }
 
 test "Windows runtime metadata validates and deduplicates auto-granted permissions" {

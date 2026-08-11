@@ -20,6 +20,10 @@ pub const ToolchainVersions = struct {
     odin: []const u8,
 };
 
+pub const RuntimeVersions = struct {
+    bun: []const u8,
+};
+
 pub const RuntimePaths = struct {
     main: []const u8,
     preload_full: []const u8,
@@ -100,6 +104,7 @@ pub const Resolution = struct {
     version: []const u8,
     source_manifest_sha256: []const u8,
     toolchains: ToolchainVersions,
+    runtimes: RuntimeVersions,
     runtime: RuntimePaths,
     sdks: SdkPaths,
 };
@@ -207,6 +212,11 @@ pub fn load(
         .odin = try toolchainVersion(toolchains, "odin"),
     };
 
+    const runtimes = try requiredObjectField(root, "runtimes");
+    const runtime_versions: RuntimeVersions = .{
+        .bun = try runtimeVersion(runtimes, "bun"),
+    };
+
     const layout = try requiredObjectField(root, "layout");
     const runtime = try requiredObjectField(layout, "runtime");
     const runtime_paths: RuntimePaths = .{
@@ -254,6 +264,7 @@ pub fn load(
         .version = manifest_version,
         .source_manifest_sha256 = try allocator.dupe(u8, &manifest_digest_hex),
         .toolchains = toolchain_versions,
+        .runtimes = runtime_versions,
         .runtime = runtime_paths,
         .sdks = sdk_paths,
     };
@@ -677,6 +688,14 @@ fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u
     return version;
 }
 
+fn runtimeVersion(runtimes: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const runtime = try requiredObjectField(runtimes, name);
+    const version = try requiredString(runtime, "version");
+    if (version.len > 128) return error.InvalidElectrobunRuntimeVersion;
+    _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunRuntimeVersion;
+    return version;
+}
+
 fn validateExactOdinVersion(version: []const u8) !void {
     if (std.SemanticVersion.parse(version)) |_| return else |_| {}
     if (version.len != 11 and version.len != 12) return error.InvalidElectrobunToolchainVersion;
@@ -1013,6 +1032,9 @@ const test_manifest_template =
     \\    "go": { "defaultVersion": "1.26.4" },
     \\    "odin": { "defaultVersion": "dev-2026-07a" }
     \\  },
+    \\  "runtimes": {
+    \\    "bun": { "version": "1.3.13" }
+    \\  },
     \\  "layout": {
     \\    "runtime": {
     \\      "main": "main.js",
@@ -1134,10 +1156,67 @@ test "package-free v2 devkit resolves runtime SDKs and toolchain defaults" {
 
     try std.testing.expectEqualStrings("2.0.0-beta.1", resolution.version);
     try std.testing.expectEqualStrings("0.16.0", resolution.toolchains.zig);
+    try std.testing.expectEqualStrings("1.3.13", resolution.runtimes.bun);
     try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.preload_full, "preload-full.js"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.javascript.main, "api/sdks/main/index.ts"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.go.root, "go-sdk"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.odin.collection, "odin-sdk"));
+}
+
+test "v2 devkit requires exact bundled Bun runtime provenance" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const root = try createTestDevkit(io, arena.allocator(), &tmp, "2.0.0");
+    const manifest_path = try std.fs.path.join(arena.allocator(), &.{ root, manifest_file_name });
+    const valid_source = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        manifest_path,
+        arena.allocator(),
+        .limited(max_manifest_bytes),
+    );
+
+    for ([_][]const u8{ "latest", "^1.3.13" }) |invalid_version| {
+        const replacement = try std.fmt.allocPrint(
+            arena.allocator(),
+            "\"version\": \"{s}\"",
+            .{invalid_version},
+        );
+        const malformed = try std.mem.replaceOwned(
+            u8,
+            arena.allocator(),
+            valid_source,
+            "\"version\": \"1.3.13\"",
+            replacement,
+        );
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = malformed });
+        try std.testing.expectError(
+            error.InvalidElectrobunRuntimeVersion,
+            load(io, arena.allocator(), root, "2.0.0"),
+        );
+    }
+
+    const runtimes_block =
+        \\  "runtimes": {
+        \\    "bun": { "version": "1.3.13" }
+        \\  },
+    ;
+    const missing = try std.mem.replaceOwned(
+        u8,
+        arena.allocator(),
+        valid_source,
+        runtimes_block,
+        "",
+    );
+    try std.testing.expect(missing.len < valid_source.len);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = missing });
+    try std.testing.expectError(
+        error.InvalidElectrobunDevkitManifest,
+        load(io, arena.allocator(), root, "2.0.0"),
+    );
 }
 
 test "v2 devkit projects an atomic package facade and TypeScript paths" {

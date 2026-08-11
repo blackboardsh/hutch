@@ -83,6 +83,9 @@ export function createCoreFixture(root, version, host = hostContract()) {
       go: { defaultVersion: "1.26.4" },
       odin: { defaultVersion: "dev-2026-07a" },
     },
+    runtimes: {
+      bun: { version: "1.3.13" },
+    },
     layout: {
       runtime,
       sdks: {
