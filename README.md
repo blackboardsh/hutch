@@ -89,6 +89,20 @@ The external `bun` package-manager executable comes from `PATH` (or the explicit
 inside an Electrobun devkit for `mainProcess: "bun"`; Hutch does not expose or
 repurpose that application runtime as a package manager.
 
+## Managed Cache Lifecycle
+
+Successful Electrobun preparation records the exact cached core/devkit and
+native toolchains in the generated project `.hutch/dependencies.lock` and in
+Hutch's global project registry. `hutch cache prune --dry-run` previews cached
+objects that are unreachable and older than the 30-day grace period;
+`hutch cache prune` atomically detaches and removes those objects. Missing
+projects retain their last known dependencies for the same grace period.
+
+`hutch cache clean --dry-run` is a zero-grace preview only. It deliberately
+cannot delete until that more aggressive policy has a separate safety review.
+Neither command interprets or removes npm, Bun, pnpm, Yarn, Cargo, or Go module
+caches; those remain owned by their respective tools.
+
 ## Updates
 
 ```sh
