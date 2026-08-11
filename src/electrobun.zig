@@ -2660,58 +2660,45 @@ fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform
 }
 
 fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
+    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
+    const main_package = try validateGoProject(
+        ctx.io,
+        ctx.allocator,
+        ctx.project_root,
+        config.root,
+        projection.go_root,
+        projection.go_manifest,
+        projection.go_module,
+    );
     const go_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
     const go_binary = go_toolchain.binary;
-
-    const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
-    const go_sdk_path = projection.go_root;
-    if (!pathExists(ctx.io, go_sdk_path)) return error.GoSdkNotFound;
-
-    const entrypoint = try resolveMainEntrypoint(ctx, config.root, .go);
-    if (!pathExists(ctx.io, entrypoint)) return error.GoEntrypointNotFound;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-go-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
     try recreateDir(ctx, temp_build_dir);
 
-    const go_path = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "gopath" });
-    const go_src_path = try std.fs.path.join(ctx.allocator, &.{ go_path, "src" });
-    const sdk_dest_path = try std.fs.path.join(ctx.allocator, &.{ go_src_path, "electrobun" });
-    const app_dest_path = try std.fs.path.join(ctx.allocator, &.{ go_src_path, "electrobun-app" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, go_src_path);
-    try copyPath(ctx, go_sdk_path, sdk_dest_path);
-    try copyPath(ctx, std.fs.path.dirname(entrypoint) orelse entrypoint, app_dest_path);
-
     const go_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
-    try argv.appendSlice(ctx.allocator, &.{ go_binary, "build", "-o", go_out_bin });
-    if (config.build_env != .dev) {
-        try argv.append(ctx.allocator, "-ldflags=-s -w");
-    }
-    try argv.append(ctx.allocator, "electrobun-app");
+    try appendGoBuildArguments(ctx.allocator, &argv, go_binary, go_out_bin, main_package, config.build_env);
 
     var env_map = std.process.Environ.Map.init(ctx.allocator);
     defer env_map.deinit();
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
-    try env_map.put("CGO_ENABLED", "1");
-    try env_map.put("GO111MODULE", "off");
-    try env_map.put("GOARCH", if (builtin.cpu.arch == .aarch64) "arm64" else "amd64");
-    try env_map.put("GOOS", switch (builtin.os.tag) {
-        .windows => "windows",
-        .macos => "darwin",
-        else => "linux",
-    });
-    try env_map.put("GOPATH", go_path);
-    if (go_toolchain.root) |go_root| try env_map.put("GOROOT", go_root);
-    try env_map.put("GOTOOLCHAIN", "local");
+    var zig_binary: ?[]const u8 = null;
     if (builtin.os.tag == .windows) {
-        const zig_binary = (try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)).binary;
-        try env_map.put("CC", try std.fmt.allocPrint(ctx.allocator, "{s} cc", .{zig_binary}));
+        zig_binary = (try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)).binary;
     }
+    try configureGoBuildEnvironment(
+        ctx.allocator,
+        &env_map,
+        hostGoBuildTarget(),
+        go_toolchain.root,
+        zig_binary,
+    );
 
     const result = try std.process.run(ctx.allocator, ctx.io, .{
         .argv = argv.items,
-        .cwd = .{ .path = temp_build_dir },
+        .cwd = .{ .path = ctx.project_root },
         .environ_map = &env_map,
         .create_no_window = true,
     });
@@ -2726,6 +2713,313 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
 
     if (!pathExists(ctx.io, go_out_bin)) return error.GoMainBinaryNotFound;
     return go_out_bin;
+}
+
+const GoBuildTarget = struct {
+    os: enum { darwin, linux, windows },
+    arch: enum { arm64, amd64 },
+};
+
+fn hostGoBuildTarget() GoBuildTarget {
+    return .{
+        .os = switch (builtin.os.tag) {
+            .windows => .windows,
+            .macos => .darwin,
+            else => .linux,
+        },
+        .arch = if (builtin.cpu.arch == .aarch64) .arm64 else .amd64,
+    };
+}
+
+fn configuredGoPackage(root: std.json.Value) ![]const u8 {
+    const build = getObjectField(root, "build") orelse return error.InvalidConfig;
+    const go_value = build.get("go") orelse return "./src/go";
+    if (go_value != .object) return error.InvalidGoPackage;
+    const package_value = go_value.object.get("package") orelse return "./src/go";
+    if (package_value != .string) return error.InvalidGoPackage;
+    const package = package_value.string;
+    try validateGoPackage(package);
+    return package;
+}
+
+fn validateGoPackage(package: []const u8) !void {
+    if (std.mem.eql(u8, package, ".")) return;
+    if (!std.mem.startsWith(u8, package, "./") or package.len == 2 or
+        std.mem.indexOfScalar(u8, package, '\\') != null)
+    {
+        return error.InvalidGoPackage;
+    }
+    var segments = std.mem.splitScalar(u8, package[2..], '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or
+            std.mem.eql(u8, segment, "..") or std.mem.eql(u8, segment, "..."))
+        {
+            return error.InvalidGoPackage;
+        }
+    }
+}
+
+fn absoluteGoPackagePath(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    package: []const u8,
+) ![]const u8 {
+    try validateGoPackage(package);
+    if (std.mem.eql(u8, package, ".")) return project_root;
+    return std.fs.path.join(allocator, &.{ project_root, package[2..] });
+}
+
+fn validateGoProject(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    root: std.json.Value,
+    sdk_root: []const u8,
+    sdk_manifest: []const u8,
+    sdk_module: []const u8,
+) ![]const u8 {
+    if (!pathExists(io, sdk_root) or !pathExists(io, sdk_manifest) or
+        !std.mem.eql(u8, sdk_module, "electrobun"))
+    {
+        return error.GoSdkNotFound;
+    }
+    const project_manifest = try std.fs.path.join(allocator, &.{ project_root, "go.mod" });
+    if (!pathExists(io, project_manifest)) return error.GoModuleNotFound;
+
+    const main_package = try configuredGoPackage(root);
+    const main_package_dir = try absoluteGoPackagePath(allocator, project_root, main_package);
+    const package_stat = std.Io.Dir.cwd().statFile(io, main_package_dir, .{}) catch
+        return error.GoMainPackageNotFound;
+    if (package_stat.kind != .directory) return error.GoMainPackageNotFound;
+    return main_package;
+}
+
+fn appendGoBuildArguments(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    go_binary: []const u8,
+    output: []const u8,
+    package: []const u8,
+    build_env: BuildEnvironment,
+) !void {
+    try validateGoPackage(package);
+    try argv.appendSlice(allocator, &.{
+        go_binary,
+        "build",
+        "-mod=readonly",
+        "-trimpath",
+        "-buildvcs=false",
+        "-o",
+        output,
+    });
+    if (build_env != .dev) try argv.append(allocator, "-ldflags=-s -w");
+    try argv.append(allocator, package);
+}
+
+fn quotedGoCompilerCommand(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    subcommand: []const u8,
+) ![]const u8 {
+    if (executable.len == 0 or std.mem.indexOfAny(u8, executable, "\"\r\n") != null) {
+        return error.InvalidGoCompilerPath;
+    }
+    return std.fmt.allocPrint(allocator, "\"{s}\" {s}", .{ executable, subcommand });
+}
+
+fn configureGoBuildEnvironment(
+    allocator: std.mem.Allocator,
+    environment: *std.process.Environ.Map,
+    target: GoBuildTarget,
+    go_root: ?[]const u8,
+    zig_binary: ?[]const u8,
+) !void {
+    const scrubbed = [_][]const u8{
+        "GO111MODULE",  "GOPATH",       "GOROOT",     "GOFLAGS",                  "GOEXPERIMENT",
+        "GOAMD64",      "GOARM64",      "GO386",      "GOARM",                    "GOMIPS",
+        "GOMIPS64",     "GOPPC64",      "GORISCV64",  "GOWASM",                   "CGO_CFLAGS",
+        "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS",              "CC",
+        "CXX",          "AR",           "PKG_CONFIG", "MACOSX_DEPLOYMENT_TARGET",
+    };
+    for (scrubbed) |name| _ = environment.swapRemove(name);
+
+    try environment.put("CGO_ENABLED", "1");
+    try environment.put("GOENV", "off");
+    try environment.put("GOWORK", "off");
+    try environment.put("GOTOOLCHAIN", "local");
+    try environment.put("GOOS", @tagName(target.os));
+    try environment.put("GOARCH", @tagName(target.arch));
+    switch (target.arch) {
+        .arm64 => try environment.put("GOARM64", "v8.0"),
+        .amd64 => try environment.put("GOAMD64", "v1"),
+    }
+    if (go_root) |root| try environment.put("GOROOT", root);
+
+    switch (target.os) {
+        .darwin => try environment.put("MACOSX_DEPLOYMENT_TARGET", "14.0"),
+        .linux => {},
+        .windows => {
+            const zig = zig_binary orelse return error.WindowsCgoCompilerNotFound;
+            const cc = try quotedGoCompilerCommand(allocator, zig, "cc");
+            defer allocator.free(cc);
+            const cxx = try quotedGoCompilerCommand(allocator, zig, "c++");
+            defer allocator.free(cxx);
+            try environment.put("CC", cc);
+            try environment.put("CXX", cxx);
+        },
+    }
+}
+
+test "Go v2 build arguments use the project module package" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const default_config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{\"build\":{}}",
+        .{},
+    );
+    try std.testing.expectEqualStrings("./src/go", try configuredGoPackage(default_config));
+    const invalid_config = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{\"build\":{\"go\":{\"package\":42}}}",
+        .{},
+    );
+    try std.testing.expectError(error.InvalidGoPackage, configuredGoPackage(invalid_config));
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendGoBuildArguments(
+        std.testing.allocator,
+        &argv,
+        "/toolchains/go/bin/go",
+        "/project/build/main",
+        "./src/go",
+        .production,
+    );
+    const expected = [_][]const u8{
+        "/toolchains/go/bin/go",
+        "build",
+        "-mod=readonly",
+        "-trimpath",
+        "-buildvcs=false",
+        "-o",
+        "/project/build/main",
+        "-ldflags=-s -w",
+        "./src/go",
+    };
+    try std.testing.expectEqual(expected.len, argv.items.len);
+    for (expected, argv.items) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+
+    for ([_][]const u8{ "src/go", "./", "./../outside", "./cmd/...", "/absolute" }) |invalid| {
+        try std.testing.expectError(error.InvalidGoPackage, validateGoPackage(invalid));
+    }
+}
+
+test "Go v2 build environment is deterministic and keeps system GOROOT implicit" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/usr/bin");
+    try environment.put("GOROOT", "/stale/go");
+    try environment.put("GOPATH", "/stale/gopath");
+    try environment.put("GO111MODULE", "off");
+    try environment.put("GOFLAGS", "-tags=machine-specific");
+    try environment.put("CGO_CFLAGS", "-march=native");
+    try configureGoBuildEnvironment(
+        std.testing.allocator,
+        &environment,
+        .{ .os = .darwin, .arch = .arm64 },
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("/usr/bin", environment.get("PATH").?);
+    try std.testing.expect(environment.get("GOROOT") == null);
+    try std.testing.expect(environment.get("GOPATH") == null);
+    try std.testing.expect(environment.get("GO111MODULE") == null);
+    try std.testing.expect(environment.get("GOFLAGS") == null);
+    try std.testing.expect(environment.get("CGO_CFLAGS") == null);
+    try std.testing.expectEqualStrings("1", environment.get("CGO_ENABLED").?);
+    try std.testing.expectEqualStrings("off", environment.get("GOENV").?);
+    try std.testing.expectEqualStrings("off", environment.get("GOWORK").?);
+    try std.testing.expectEqualStrings("local", environment.get("GOTOOLCHAIN").?);
+    try std.testing.expectEqualStrings("darwin", environment.get("GOOS").?);
+    try std.testing.expectEqualStrings("arm64", environment.get("GOARCH").?);
+    try std.testing.expectEqualStrings("v8.0", environment.get("GOARM64").?);
+    try std.testing.expectEqualStrings("14.0", environment.get("MACOSX_DEPLOYMENT_TARGET").?);
+}
+
+test "Go v2 Windows cgo compiler command quotes cached Zig paths" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try configureGoBuildEnvironment(
+        std.testing.allocator,
+        &environment,
+        .{ .os = .windows, .arch = .amd64 },
+        "C:\\Dash Cache\\go",
+        "C:\\Dash Cache\\zig\\zig.exe",
+    );
+
+    try std.testing.expectEqualStrings("windows", environment.get("GOOS").?);
+    try std.testing.expectEqualStrings("amd64", environment.get("GOARCH").?);
+    try std.testing.expectEqualStrings("v1", environment.get("GOAMD64").?);
+    try std.testing.expectEqualStrings("C:\\Dash Cache\\go", environment.get("GOROOT").?);
+    try std.testing.expectEqualStrings(
+        "\"C:\\Dash Cache\\zig\\zig.exe\" cc",
+        environment.get("CC").?,
+    );
+    try std.testing.expectEqualStrings(
+        "\"C:\\Dash Cache\\zig\\zig.exe\" c++",
+        environment.get("CXX").?,
+    );
+    try std.testing.expectError(
+        error.InvalidGoCompilerPath,
+        quotedGoCompilerCommand(std.testing.allocator, "C:\\bad\"path\\zig.exe", "cc"),
+    );
+}
+
+test "Go v2 project validation requires owned modules and a package directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/src/go");
+    try tmp.dir.createDirPath(io, "project/.hutch/devkit/go-sdk");
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/go.mod", .data = "module app\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/.hutch/devkit/go-sdk/go.mod", .data = "module electrobun\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "project" });
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const sdk_root = try std.fs.path.join(allocator, &.{ project_root, ".hutch", "devkit", "go-sdk" });
+    const sdk_manifest = try std.fs.path.join(allocator, &.{ sdk_root, "go.mod" });
+    const project_manifest = try std.fs.path.join(allocator, &.{ project_root, "go.mod" });
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{\"build\":{\"go\":{\"package\":\"./src/go\"}}}",
+        .{},
+    );
+    try std.testing.expectEqualStrings(
+        "./src/go",
+        try validateGoProject(io, allocator, project_root, root, sdk_root, sdk_manifest, "electrobun"),
+    );
+    try std.Io.Dir.cwd().deleteFile(io, project_manifest);
+    try std.testing.expectError(
+        error.GoModuleNotFound,
+        validateGoProject(io, allocator, project_root, root, sdk_root, sdk_manifest, "electrobun"),
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_manifest, .data = "module app\n" });
+    try std.Io.Dir.cwd().deleteFile(io, sdk_manifest);
+    try std.testing.expectError(
+        error.GoSdkNotFound,
+        validateGoProject(io, allocator, project_root, root, sdk_root, sdk_manifest, "electrobun"),
+    );
 }
 
 fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
@@ -3504,12 +3798,7 @@ fn resolveMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process
             }
             break :blk "src/rust/main.rs";
         },
-        .go => blk: {
-            if (getObjectFieldFromObject(build, "go")) |object| {
-                if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
-            }
-            break :blk "src/go/main.go";
-        },
+        .go => return error.GoMainProcessUsesPackage,
         .odin => blk: {
             if (getObjectFieldFromObject(build, "odin")) |object| {
                 if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
@@ -3684,7 +3973,18 @@ fn collectWatchRoots(ctx: *const Context, root: std.json.Value) !std.ArrayList([
     const build = getObjectField(root, "build") orelse return roots;
 
     const main_process = getMainProcess(root);
-    if (main_process != .zig) {
+    if (main_process == .go) {
+        const main_package = try configuredGoPackage(root);
+        try appendWatchRoot(
+            ctx,
+            &roots,
+            try absoluteGoPackagePath(ctx.allocator, ctx.project_root, main_package),
+        );
+        for ([_][]const u8{ "go.mod", "go.sum" }) |module_file| {
+            const path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, module_file });
+            if (pathExists(ctx.io, path)) try appendWatchRoot(ctx, &roots, path);
+        }
+    } else if (main_process != .zig) {
         const main_entry = try resolveMainEntrypoint(ctx, root, main_process);
         try appendWatchRoot(ctx, &roots, dirnameOrSelf(main_entry));
     }

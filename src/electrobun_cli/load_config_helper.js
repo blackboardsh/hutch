@@ -32,7 +32,7 @@ const defaultConfig = {
       entrypoint: "src/rust/main.rs",
     },
     go: {
-      entrypoint: "src/go/main.go",
+      package: "./src/go",
     },
     odin: {
       entrypoint: "src/odin/main.odin",
