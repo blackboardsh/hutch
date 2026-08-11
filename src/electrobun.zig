@@ -538,6 +538,13 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 
     const trimmed = std.mem.trim(u8, result.stdout, " \r\n\t");
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, trimmed, .{});
+    validateRemovedBunVersionConfig(parsed) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because the exact electrobun.version devkit pins the Bun runtime\n",
+            .{},
+        );
+        return err;
+    };
     _ = getMainProcess(parsed) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: build.mainProcess must be bun, cottontail, zig, rust, go, or odin\n",
@@ -4502,6 +4509,13 @@ fn getMainProcess(root: std.json.Value) !MainProcess {
         error.UnsupportedMainProcess;
 }
 
+fn validateRemovedBunVersionConfig(root: std.json.Value) !void {
+    const build = getObjectField(root, "build") orelse return;
+    if (build.get("bunVersion") != null or build.get("bunnyBun") != null) {
+        return error.LegacyBunVersionConfig;
+    }
+}
+
 fn mainProcessName(main_process: MainProcess) []const u8 {
     return switch (main_process) {
         .bun => "bun",
@@ -6011,6 +6025,39 @@ test "Electrobun rejects unknown and non-string main processes" {
         );
         try std.testing.expectError(error.InvalidMainProcess, getMainProcess(config));
     }
+}
+
+test "Electrobun rejects removed Bun version fields without rejecting unknown build fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    inline for (.{ "bunVersion", "bunnyBun" }) |field| {
+        const source = try std.fmt.allocPrint(
+            arena.allocator(),
+            \\{{"build":{{"{s}":null}}}}
+        ,
+            .{field},
+        );
+        const config = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena.allocator(),
+            source,
+            .{},
+        );
+        try std.testing.expectError(
+            error.LegacyBunVersionConfig,
+            validateRemovedBunVersionConfig(config),
+        );
+    }
+
+    const forward_compatible = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"build":{"futureBuildOption":true}}
+    ,
+        .{},
+    );
+    try validateRemovedBunVersionConfig(forward_compatible);
 }
 
 test "Zig toolchain versions use the devkit default or exact project overrides" {

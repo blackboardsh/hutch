@@ -1030,7 +1030,10 @@ pub fn main(init: std.process.Init) !void {
             cottontail.executable,
             cottontail.root,
         ) catch |err| switch (err) {
-            error.InvalidMainProcess, error.UnsupportedMainProcess => 1,
+            error.InvalidMainProcess,
+            error.UnsupportedMainProcess,
+            error.LegacyBunVersionConfig,
+            => 1,
             else => return err,
         };
         if (exit_code != 0) std.process.exit(exit_code);

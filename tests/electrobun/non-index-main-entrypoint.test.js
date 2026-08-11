@@ -164,6 +164,58 @@ test("v2 Electrobun rejects invalid main processes without falling back to Bun",
   }
 });
 
+test("v2 Electrobun rejects removed Bun version fields but permits unknown build fields", { timeout: 60_000 }, () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const fixture = mkdtempSync(join(scratchRoot, "legacy-bun-version-config-"));
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+  const diagnostic = "hutch electrobun: build.bunVersion and build.bunnyBun were removed in v2; delete them because the exact electrobun.version devkit pins the Bun runtime\n";
+  const env = {
+    ...process.env,
+    COTTONTAIL_BINARY: cottontail,
+    DASH_COTTONTAIL: cottontail,
+    HUTCH_ENGINE_BINARY: engine,
+    HUTCH_NO_UPDATE_CHECK: "1",
+  };
+  delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+
+  try {
+    for (const field of ["bunVersion", "bunnyBun"]) {
+      writeFixtureFile(
+        join(fixture, "electrobun.config.ts"),
+        `export default { build: { mainProcess: "bun", ${field}: "1.3.8" } };\n`,
+      );
+      const result = spawnSync(hutch, ["electrobun", "config"], {
+        cwd: fixture,
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.equal(result.stdout, "");
+      assert.equal(result.stderr, diagnostic);
+    }
+
+    writeFixtureFile(
+      join(fixture, "electrobun.config.ts"),
+      'export default { build: { mainProcess: "bun", futureBuildOption: true } };\n',
+    );
+    const forwardCompatible = spawnSync(hutch, ["electrobun", "config"], {
+      cwd: fixture,
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(
+      forwardCompatible.status,
+      0,
+      forwardCompatible.stderr || forwardCompatible.stdout,
+    );
+    assert.equal(JSON.parse(forwardCompatible.stdout).build.futureBuildOption, true);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("v2 Electrobun keeps external package-manager Bun separate from its bundled Bun runtime", { timeout: 120_000 }, () => {
   mkdirSync(scratchRoot, { recursive: true });
   const fixture = mkdtempSync(join(scratchRoot, "non-index-main-entrypoint-"));
