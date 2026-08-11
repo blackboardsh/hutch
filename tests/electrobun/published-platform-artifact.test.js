@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -47,7 +48,15 @@ function run(command, args, options) {
   });
 }
 
-test("exact Electrobun config pins download and reuse verified native artifacts", { timeout: 120_000 }, async () => {
+async function waitForPath(path, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+}
+
+test("exact Electrobun artifacts are cached and same-project builds serialize", { timeout: 120_000 }, async () => {
   const fixture = mkdtempSync(join(os.tmpdir(), "hutch-published-electrobun-"));
   const project = join(fixture, "project");
   const coreFiles = join(fixture, "core-files");
@@ -67,6 +76,35 @@ test("exact Electrobun config pins download and reuse verified native artifacts"
     const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 
     writeFixtureFile(join(project, "src", "bun", "index.ts"), "console.log('published artifact fixture');\n");
+    writeFixtureFile(join(project, "claim-build-window.mjs"), `
+import { closeSync, existsSync, openSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const sentinel = process.env.HUTCH_BUILD_SENTINEL;
+if (sentinel) {
+  const descriptor = openSync(sentinel, "wx");
+  closeSync(descriptor);
+  if (process.env.HUTCH_BUILD_LEADER === "1") {
+    const canary = join(process.env.ELECTROBUN_BUILD_DIR, ".serialization-canary");
+    writeFileSync(canary, "");
+    writeFileSync(process.env.HUTCH_BUILD_LEADER_READY, "");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5_000));
+    if (!existsSync(canary)) throw new Error("a concurrent build deleted the active build directory");
+  } else {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  }
+}
+`);
+    writeFixtureFile(join(project, "release-build-window.mjs"), `
+import { unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const sentinel = process.env.HUTCH_BUILD_SENTINEL;
+if (sentinel) unlinkSync(sentinel);
+const completionDirectory = process.env.HUTCH_BUILD_COMPLETION_DIR;
+const runId = process.env.HUTCH_BUILD_RUN_ID;
+if (completionDirectory && runId) writeFileSync(join(completionDirectory, runId), "");
+`);
     writeFixtureFile(join(project, "electrobun.config.ts"), `
 export default {
   electrobun: { version: "${version}" },
@@ -77,6 +115,10 @@ export default {
     mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
     win: { bundleCEF: false, bundleWGPU: false },
     linux: { bundleCEF: false, bundleWGPU: false },
+  },
+  scripts: {
+    preBuild: "claim-build-window.mjs",
+    postPackage: "release-build-window.mjs",
   },
 };
 `);
@@ -149,6 +191,14 @@ export default {
         HUTCH_ENGINE_BINARY: engine,
         HUTCH_NO_UPDATE_CHECK: "1",
       };
+      for (const name of [
+        "HUTCH_BUILD_SENTINEL",
+        "HUTCH_BUILD_COMPLETION_DIR",
+        "HUTCH_BUILD_RUN_ID",
+        "HUTCH_BUILD_LEADER",
+        "HUTCH_BUILD_LEADER_READY",
+        "HUTCH_ELECTROBUN_BUILD_LOCK",
+      ]) delete env[name];
       const cacheRoot = join(dashHome, "products", "electrobun", version, names.key);
       const indexCache = join(
         dashHome,
@@ -241,6 +291,54 @@ export default {
       assert.equal(second.status, 0, second.stderr || second.stdout);
       assert.equal(indexRequests, 3, "offline cache hits must not refresh the artifact index");
       assert.equal(coreRequests, 2, "offline cache hits must reuse the verified core cache");
+
+      rmSync(join(project, "build"), { recursive: true, force: true });
+      rmSync(join(project, ".hutch", "locks"), { recursive: true, force: true });
+      const sentinel = join(fixture, "build-active");
+      const leaderReady = join(fixture, "build-leader-ready");
+      const completionDir = join(fixture, "build-completions");
+      mkdirSync(completionDir);
+      const concurrentEnv = {
+        ...env,
+        HUTCH_BUILD_SENTINEL: sentinel,
+        HUTCH_BUILD_COMPLETION_DIR: completionDir,
+        HUTCH_ELECTROBUN_DEVKIT_ROOT: coreFiles,
+      };
+      const buildRun = (runId, extraEnv = {}) => run(
+        hutch,
+        ["electrobun", "build", "--env=dev"],
+        {
+          cwd: project,
+          env: {
+            ...concurrentEnv,
+            DASH_HOME: join(fixture, `concurrent-dash-home-${runId}`),
+            HUTCH_BUILD_RUN_ID: runId,
+            ...extraEnv,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      const leader = buildRun("0", {
+        HUTCH_BUILD_LEADER: "1",
+        HUTCH_BUILD_LEADER_READY: leaderReady,
+      });
+      await waitForPath(leaderReady);
+      const followers = Array.from({ length: 3 }, (_, index) => buildRun(String(index + 1)));
+      const settled = await Promise.allSettled([leader, ...followers]);
+      for (const result of settled) {
+        assert.equal(result.status, "fulfilled", String(result.reason));
+      }
+      const concurrent = settled.map((result) => result.value);
+      for (const result of concurrent) {
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+      }
+      assert.equal(indexRequests, 3, "local concurrent builds must not refresh the artifact index");
+      assert.equal(coreRequests, 2, "local concurrent builds must not download artifacts");
+      assert.equal(existsSync(sentinel), false, "the final build must release its serialization sentinel");
+      assert.ok(existsSync(join(project, ".hutch", "locks", "electrobun-build.lock")));
+      for (let index = 0; index < concurrent.length; index += 1) {
+        assert.ok(existsSync(join(completionDir, String(index))), `missing completion for build ${index}`);
+      }
     } finally {
       await new Promise((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
     }

@@ -4,6 +4,7 @@ const cache_store = @import("cache_store.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
+const project_state = @import("project_state.zig");
 const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const windows_icon = @import("windows_icon.zig");
@@ -50,6 +51,8 @@ const BuiltAppLaunchCommand = struct {
     force_console: bool,
 };
 
+const build_lock_environment_variable = "HUTCH_ELECTROBUN_BUILD_LOCK";
+
 const Context = struct {
     init: std.process.Init,
     io: std.Io,
@@ -59,6 +62,7 @@ const Context = struct {
     cottontail_home: []const u8,
     cottontail_binary: []const u8,
     project_root: []const u8,
+    build_lock_key: ?[]const u8 = null,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         var buffer: [2048]u8 = undefined;
@@ -90,6 +94,19 @@ const AppBundlePaths = struct {
     resources_dir: []const u8,
     frameworks_dir: ?[]const u8,
     app_code_dir: []const u8,
+};
+
+const BuildReadLease = struct {
+    file: std.Io.File,
+
+    fn close(self: BuildReadLease, ctx: *const Context) void {
+        self.file.close(ctx.io);
+    }
+};
+
+const RunningBuiltApp = struct {
+    child: std.process.Child,
+    lease: BuildReadLease,
 };
 
 const PlatformPaths = struct {
@@ -205,21 +222,19 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "sync")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-        try prepareProject(&ctx, config);
+        try prepareProjectWithBuildLock(&ctx, config);
         ctx.writeStdout("electrobun sync complete: {s}/.hutch/devkit\n", .{ctx.project_root});
         return 0;
     }
 
     if (std.mem.eql(u8, command, "build")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-        try prepareProject(&ctx, config);
         try runBuild(&ctx, config);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "run")) {
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-        try prepareProject(&ctx, config);
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuiltApp(&ctx, config, inspector);
         return 0;
@@ -228,17 +243,14 @@ pub fn run(
     if (std.mem.eql(u8, command, "dev")) {
         if (hasFlag(args[1..], "--watch")) {
             const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-            try prepareProject(&ctx, config);
             const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
             try runDevWatch(&ctx, config, inspector);
             return 0;
         }
 
         const config = try loadConfig(&ctx, parseBuildEnvironment(args[1..]));
-        try prepareProject(&ctx, config);
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
-        try runBuild(&ctx, config);
-        try runBuiltApp(&ctx, config, inspector);
+        try buildAndRunBuiltApp(&ctx, config, inspector);
         return 0;
     }
 
@@ -600,6 +612,12 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     try cache_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
 }
 
+fn prepareProjectWithBuildLock(ctx: *const Context, config: CommandContext) !void {
+    const build_lock = try acquireProjectBuildLock(ctx);
+    defer build_lock.close(ctx.io);
+    try prepareProject(ctx, config);
+}
+
 fn appendManagedToolchain(
     ctx: *const Context,
     objects: *std.ArrayList(cache_store.ManagedObject),
@@ -611,8 +629,202 @@ fn appendManagedToolchain(
     }
 }
 
+fn openProjectBuildLocks(
+    ctx: *const Context,
+    options: std.Io.Dir.OpenOptions,
+) !std.Io.Dir {
+    var state = try project_state.open(ctx.io, ctx.project_root, .create, .{});
+    defer state.close(ctx.io);
+    return project_state.openChild(ctx.io, state, "locks", .create, options);
+}
+
+fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
+    if (ctx.environ_map.get(build_lock_environment_variable)) |owner| {
+        if (owner.len == 0) return error.InvalidElectrobunBuildLockMarker;
+        ctx.writeStderr(
+            "hutch electrobun: a hook cannot recursively build or run Electrobun while a project build lock is held\n",
+            .{},
+        );
+        return error.RecursiveElectrobunBuild;
+    }
+
+    var locks = try openProjectBuildLocks(ctx, .{});
+    defer locks.close(ctx.io);
+
+    // Create the persistent lock inode once with O_EXCL. In particular, this
+    // avoids Darwin's documented create-without-O_EXCL race. Never unlink the
+    // inode: all Hutch processes must coordinate on this exact file.
+    const initializer: ?std.Io.File = locks.createFile(ctx.io, "electrobun-build.lock", .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (initializer) |file| file.close(ctx.io);
+
+    return locks.openFile(ctx.io, "electrobun-build.lock", .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.WouldBlock => {
+            ctx.writeStdout("[electrobun] Waiting for the project build lock...\n", .{});
+            return locks.openFile(ctx.io, "electrobun-build.lock", .{
+                .mode = .read_write,
+                .lock = .exclusive,
+                .follow_symlinks = false,
+            });
+        },
+        else => return err,
+    };
+}
+
+fn openProjectBuildReaders(
+    ctx: *const Context,
+    mode: project_state.OpenMode,
+    options: std.Io.Dir.OpenOptions,
+) !std.Io.Dir {
+    var locks = try openProjectBuildLocks(ctx, .{});
+    defer locks.close(ctx.io);
+    return project_state.openChild(ctx.io, locks, "electrobun-readers", mode, options);
+}
+
+// The caller must hold the project build lock while publishing a reader. This
+// makes the transition from a completed build to a live app gap-free without
+// depending on platform-specific advisory-lock conversion semantics.
+fn acquireProjectBuildReadLease(ctx: *const Context) !BuildReadLease {
+    var readers = try openProjectBuildReaders(ctx, .create, .{});
+    defer readers.close(ctx.io);
+
+    for (0..32) |_| {
+        var random: [12]u8 = undefined;
+        ctx.io.random(&random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const lease_name = try std.fmt.allocPrint(ctx.allocator, "{s}.lease", .{suffix});
+        const file = readers.createFile(ctx.io, lease_name, .{
+            .read = true,
+            .truncate = false,
+            .exclusive = true,
+            .lock = .exclusive,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return .{ .file = file };
+    }
+    return error.BuildReadLeaseNameCollision;
+}
+
+// The caller holds the project build lock, so no new readers can appear while
+// this drains live apps. An unlocked lease belongs to a crashed supervisor and
+// is removed before the destructive build begins.
+fn waitForProjectBuildReaders(ctx: *const Context) !void {
+    var readers = openProjectBuildReaders(ctx, .existing, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer readers.close(ctx.io);
+
+    var leases: std.ArrayList(?[]const u8) = .empty;
+    {
+        var iterator = readers.iterate();
+        while (try iterator.next(ctx.io)) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".lease")) continue;
+            if (entry.kind != .file and entry.kind != .unknown) return error.InvalidBuildReadLease;
+            try leases.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
+        }
+    }
+
+    // Only the writer mutates the lease namespace, and only after closing the
+    // iterator. Readers merely release their OS lock, leaving a tombstone for
+    // this stable snapshot to collect under the gate.
+    var remaining = leases.items.len;
+    var announced = false;
+    while (remaining > 0) {
+        var active = false;
+        for (leases.items) |*lease| {
+            const lease_name = lease.* orelse continue;
+            const stale = readers.openFile(ctx.io, lease_name, .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.WouldBlock => {
+                    active = true;
+                    continue;
+                },
+                error.FileNotFound => {
+                    lease.* = null;
+                    remaining -= 1;
+                    continue;
+                },
+                else => return err,
+            };
+            stale.close(ctx.io);
+            readers.deleteFile(ctx.io, lease_name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            lease.* = null;
+            remaining -= 1;
+        }
+        if (!active) continue;
+        if (!announced) {
+            ctx.writeStdout("[electrobun] Waiting for the project build lock...\n", .{});
+            announced = true;
+        }
+        std.Io.sleep(ctx.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+    }
+}
+
+fn validateBuildLockIsolation(ctx: *const Context, config: CommandContext) !void {
+    const state_root = try std.fs.path.resolve(ctx.allocator, &.{ ctx.project_root, ".hutch" });
+    const build_root = try std.fs.path.resolve(ctx.allocator, &.{try buildOutputRoot(ctx, config)});
+    const artifact_root = try std.fs.path.resolve(ctx.allocator, &.{try artifactOutputRoot(ctx, config.root)});
+    if (projectPathsOverlap(state_root, build_root) or projectPathsOverlap(state_root, artifact_root)) {
+        ctx.writeStderr(
+            "hutch electrobun: buildFolder and artifactFolder must not overlap the reserved .hutch state directory\n",
+            .{},
+        );
+        return error.BuildOutputOverlapsHutchState;
+    }
+}
+
+fn projectPathsOverlap(left: []const u8, right: []const u8) bool {
+    return projectPathContains(left, right) or projectPathContains(right, left);
+}
+
+fn projectPathContains(parent: []const u8, child: []const u8) bool {
+    if (parent.len > child.len or !projectPathsEqual(parent, child[0..parent.len])) return false;
+    return parent.len == child.len or std.fs.path.isSep(child[parent.len]);
+}
+
+fn projectPathsEqual(left: []const u8, right: []const u8) bool {
+    return if (builtin.os.tag == .windows or builtin.os.tag == .macos)
+        std.ascii.eqlIgnoreCase(left, right)
+    else
+        std.mem.eql(u8, left, right);
+}
+
 fn runBuild(ctx: *const Context, config: CommandContext) !void {
     try validateOutputConfiguration(ctx, config);
+    try validateBuildLockIsolation(ctx, config);
+    const build_lock = try acquireProjectBuildLock(ctx);
+    defer build_lock.close(ctx.io);
+    try prepareProject(ctx, config);
+    try waitForProjectBuildReaders(ctx);
+
+    var locked_ctx = ctx.*;
+    locked_ctx.build_lock_key = ctx.project_root;
+    try runBuildUnlocked(&locked_ctx, config);
+}
+
+fn runBuildUnlocked(ctx: *const Context, config: CommandContext) !void {
     const build_root = try buildOutputRoot(ctx, config);
     try recreateDirWithin(ctx, ctx.project_root, build_root);
 
@@ -2192,8 +2404,71 @@ fn runBuiltApp(
 ) !void {
     const main_process = try getMainProcess(config.root);
     switch (main_process) {
-        .bun, .cottontail, .zig, .rust, .go, .odin => try runBundledElectrobunApp(ctx, config, inspector),
+        .bun, .cottontail, .zig, .rust, .go, .odin => {
+            var running = try spawnBuiltAppWithReadLease(ctx, config, inspector);
+            try waitForBuiltApp(ctx, &running);
+        },
     }
+}
+
+fn buildAndRunBuiltApp(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !void {
+    var running = try buildAndSpawnBuiltApp(ctx, config, inspector);
+    try waitForBuiltApp(ctx, &running);
+}
+
+fn buildAndSpawnBuiltApp(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !RunningBuiltApp {
+    try validateOutputConfiguration(ctx, config);
+    try validateBuildLockIsolation(ctx, config);
+    const build_lock = try acquireProjectBuildLock(ctx);
+    defer build_lock.close(ctx.io);
+    try prepareProject(ctx, config);
+    try waitForProjectBuildReaders(ctx);
+
+    var locked_ctx = ctx.*;
+    locked_ctx.build_lock_key = ctx.project_root;
+    try runBuildUnlocked(&locked_ctx, config);
+
+    const read_lease = try acquireProjectBuildReadLease(ctx);
+    errdefer read_lease.close(ctx);
+    const child = try spawnBuiltApp(ctx, config, inspector);
+
+    return .{
+        .child = child,
+        .lease = read_lease,
+    };
+}
+
+fn spawnBuiltAppWithReadLease(
+    ctx: *const Context,
+    config: CommandContext,
+    inspector: ?MainProcessInspector,
+) !RunningBuiltApp {
+    try validateOutputConfiguration(ctx, config);
+    try validateBuildLockIsolation(ctx, config);
+    const build_lock = try acquireProjectBuildLock(ctx);
+    defer build_lock.close(ctx.io);
+    try prepareProject(ctx, config);
+    const read_lease = try acquireProjectBuildReadLease(ctx);
+    errdefer read_lease.close(ctx);
+    return .{
+        .child = try spawnBuiltApp(ctx, config, inspector),
+        .lease = read_lease,
+    };
+}
+
+fn waitForBuiltApp(ctx: *const Context, running: *RunningBuiltApp) !void {
+    defer running.lease.close(ctx);
+
+    const term = try running.child.wait(ctx.io);
+    if (termExitCode(term) != 0) return error.RunFailed;
 }
 
 fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
@@ -2356,7 +2631,7 @@ fn prepareInstalledProject(ctx: *const Context, project_dir: []const u8) !void {
     };
     defer cleanupCliTempDir(&child_ctx);
     const config = try loadConfig(&child_ctx, .dev);
-    try prepareProject(&child_ctx, config);
+    try prepareProjectWithBuildLock(&child_ctx, config);
 }
 
 fn validateProjectName(name: []const u8) !void {
@@ -2377,13 +2652,8 @@ fn runDevWatch(
     config: CommandContext,
     inspector: ?MainProcessInspector,
 ) !void {
-    try runBuild(ctx, config);
-
-    var child = try spawnBuiltApp(ctx, config, inspector);
-    defer {
-        child.kill(ctx.io);
-        _ = child.wait(ctx.io) catch {};
-    }
+    var running: ?RunningBuiltApp = try buildAndSpawnBuiltApp(ctx, config, inspector);
+    defer if (running) |*app| abandonBuiltApp(ctx, app);
 
     var last_signature = try watchSignature(ctx, config.root);
     ctx.writeStdout("[electrobun dev --watch] Watching for changes...\n", .{});
@@ -2396,12 +2666,40 @@ fn runDevWatch(
         last_signature = next_signature;
         ctx.writeStdout("[electrobun dev --watch] Change detected, rebuilding...\n", .{});
 
-        child.kill(ctx.io);
-        _ = child.wait(ctx.io) catch {};
-
-        try runBuild(ctx, config);
-        child = try spawnBuiltApp(ctx, config, inspector);
+        if (running) |*app| stopBuiltAppForRebuild(ctx, app);
+        running = null;
+        running = try buildAndSpawnBuiltApp(ctx, config, inspector);
     }
+}
+
+fn stopBuiltAppForRebuild(ctx: *const Context, running: *RunningBuiltApp) void {
+    if (builtin.os.tag == .windows) {
+        // The released Electrobun launcher does not put its runtime child in a
+        // Windows Job Object, so terminating only the launcher can orphan a
+        // process that still reads the bundle. Keep the read lease until the
+        // launcher and app exit naturally before permitting a destructive
+        // watch rebuild.
+        ctx.writeStdout(
+            "[electrobun dev --watch] Close the running app to rebuild safely on Windows...\n",
+            .{},
+        );
+        _ = running.child.wait(ctx.io) catch {};
+        running.lease.close(ctx);
+        return;
+    }
+
+    // On POSIX the Electrobun launcher forwards termination to its runtime
+    // child and waits for it before exiting.
+    running.child.kill(ctx.io);
+    running.lease.close(ctx);
+}
+
+fn abandonBuiltApp(ctx: *const Context, running: *RunningBuiltApp) void {
+    // This path only runs while unwinding watch mode after an error. A normal
+    // Windows watch rebuild uses stopBuiltAppForRebuild so it never releases
+    // the lease while an orphaned runtime is still consuming the bundle.
+    running.child.kill(ctx.io);
+    running.lease.close(ctx);
 }
 
 fn buildCottontailApp(ctx: *const Context, config: CommandContext) !void {
@@ -3937,20 +4235,6 @@ fn buildCarrotOutput(ctx: *const Context, config: CommandContext, bundle: AppBun
     return carrot_dir;
 }
 
-fn runBundledElectrobunApp(
-    ctx: *const Context,
-    config: CommandContext,
-    inspector: ?MainProcessInspector,
-) !void {
-    var child = try spawnBuiltApp(ctx, config, inspector);
-    defer child.kill(ctx.io);
-
-    const term = try child.wait(ctx.io);
-    if (termExitCode(term) != 0) {
-        return error.RunFailed;
-    }
-}
-
 fn buildCottontailLauncherScript(ctx: *const Context, bundle: AppBundlePaths) !void {
     const output_path = try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "main.js" });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
@@ -3978,6 +4262,7 @@ fn spawnBuiltApp(
             );
             var environment = try ctx.environ_map.clone(ctx.allocator);
             defer environment.deinit();
+            _ = environment.swapRemove(build_lock_environment_variable);
             if (command.bun_inspect) |value| {
                 try environment.put("BUN_INSPECT", value);
             }
@@ -4032,7 +4317,6 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
     try env_map.put("ELECTROBUN_APP_VERSION", try getAppVersion(ctx, config.root));
     try env_map.put("ELECTROBUN_APP_IDENTIFIER", try getAppIdentifier(ctx, config.root));
     try env_map.put("ELECTROBUN_ARTIFACT_DIR", try artifactOutputRoot(ctx, config.root));
-
     if (extra_env) |map| {
         var it = map.iterator();
         while (it.next()) |entry| {
@@ -4783,6 +5067,17 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
     }
 }
 
+test "Electrobun build outputs cannot overlap the project state namespace" {
+    const state = "/project/.hutch";
+    try std.testing.expect(projectPathsOverlap(state, state));
+    try std.testing.expect(projectPathsOverlap(state, "/project/.hutch/subdir"));
+    try std.testing.expect(projectPathsOverlap(state, "/project"));
+    try std.testing.expect(!projectPathsOverlap(state, "/project/.hutch-cache"));
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) {
+        try std.testing.expect(projectPathsOverlap(state, "/project/.HUTCH/subdir"));
+    }
+}
+
 test "output mutation refuses project roots parents and symlink escapes" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
@@ -4952,6 +5247,7 @@ fn inheritCurrentEnvironmentFromContext(ctx: *const Context, env_map: *std.proce
     while (it.next()) |entry| {
         try env_map.put(entry.key_ptr.*, entry.value_ptr.*);
     }
+    if (ctx.build_lock_key) |key| try env_map.put(build_lock_environment_variable, key);
 }
 
 fn watchSignature(ctx: *const Context, root: std.json.Value) !u64 {
@@ -5066,6 +5362,8 @@ fn shouldIgnoreWatchPath(ctx: *const Context, root: std.json.Value, full_path: [
     if (std.mem.indexOf(u8, full_path, "/node_modules/") != null) return true;
     if (std.mem.indexOf(u8, full_path, "\\node_modules\\") != null) return true;
     if (std.mem.indexOf(u8, full_path, "/.cottontail-tmp/") != null) return true;
+    if (std.mem.indexOf(u8, full_path, "/.hutch/") != null) return true;
+    if (std.mem.indexOf(u8, full_path, "\\.hutch\\") != null) return true;
 
     const build = getObjectField(root, "build") orelse return false;
     const build_folder = getStringFieldFromObject(build, "buildFolder") orelse "build";
@@ -6605,6 +6903,7 @@ test "Zig builds scrub environment overrides that can replace the resolved compi
         .cottontail_home = "/cottontail",
         .cottontail_binary = "/cottontail/bin/cottontail",
         .project_root = "/project",
+        .build_lock_key = "/project",
     };
     var sanitized = std.process.Environ.Map.init(allocator);
     defer sanitized.deinit();
@@ -6612,6 +6911,7 @@ test "Zig builds scrub environment overrides that can replace the resolved compi
     try prepareZigBuildEnvironment(&ctx, &sanitized);
 
     try std.testing.expectEqualStrings("/tools", sanitized.get("PATH").?);
+    try std.testing.expectEqualStrings("/project", sanitized.get(build_lock_environment_variable).?);
     for ([_][]const u8{
         "ZIG_LIB_DIR",
         "ZIG_LOCAL_CACHE_DIR",

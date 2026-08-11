@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const project_state = @import("project_state.zig");
 const release_store = @import("release_store.zig");
 const toolchain_store = @import("toolchain_store.zig");
 
@@ -274,8 +275,9 @@ fn registerProjectAt(
     try project_lock.put(allocator, "kind", .{ .string = project_lock_kind });
     try project_lock.put(allocator, "objects", .{ .array = object_values });
     const project_lock_bytes = try stringifyJson(allocator, .{ .object = project_lock });
-    const project_lock_path = try std.fs.path.join(allocator, &.{ canonical_project_root, ".hutch", "dependencies.lock" });
-    try atomicWrite(io, allocator, project_lock_path, project_lock_bytes);
+    var project_state_dir = try project_state.open(io, canonical_project_root, .create, .{});
+    defer project_state_dir.close(io);
+    try project_state.atomicWrite(io, allocator, project_state_dir, "dependencies.lock", project_lock_bytes);
 
     var lock_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(project_lock_bytes, &lock_digest, .{});
@@ -562,9 +564,19 @@ fn projectLockObjectsIfMatches(
     canonical_root: []const u8,
     expected_sha256: []const u8,
 ) !?[]const ManagedObject {
-    const lock_path = try std.fs.path.join(allocator, &.{ canonical_root, ".hutch", "dependencies.lock" });
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, lock_path, allocator, .limited(max_state_file_bytes)) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return null,
+    var project_state_dir = project_state.open(io, canonical_root, .existing, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer project_state_dir.close(io);
+    const bytes = project_state.readFileAlloc(
+        io,
+        allocator,
+        project_state_dir,
+        "dependencies.lock",
+        .limited(max_state_file_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
         else => return err,
     };
     var digest: [32]u8 = undefined;
@@ -1232,6 +1244,38 @@ test "project registration records a deterministic exact dependency graph" {
     try std.testing.expectEqual(@as(usize, 0), scanned.expired_paths.items.len);
     try std.testing.expectEqual(@as(?i64, 1_000), try readLastUsed(io, allocator, home, electrobun.relative_root));
     try std.testing.expectEqual(@as(?i64, 1_000), try readLastUsed(io, allocator, home, toolchain.relative_root));
+}
+
+test "project registration never follows a project .hutch symlink" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const project = try std.fs.path.join(allocator, &.{ root, "project" });
+    const outside = try std.fs.path.join(allocator, &.{ root, "outside-state" });
+    try std.Io.Dir.cwd().createDirPath(io, project);
+    try std.Io.Dir.cwd().createDirPath(io, outside);
+    const sentinel = try std.fs.path.join(allocator, &.{ outside, "sentinel" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "keep" });
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside,
+        try std.fs.path.join(allocator, &.{ project, ".hutch" }),
+        .{ .is_directory = true },
+    );
+
+    try std.testing.expectError(
+        error.InvalidProjectStatePath,
+        registerProjectAt(io, allocator, home, project, &.{testElectrobunObject()}, 1_000),
+    );
+    try std.testing.expect(pathExists(io, sentinel));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside, "dependencies.lock" })));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside, "locks" })));
 }
 
 test "resolver outputs become managed objects only inside DASH_HOME" {
