@@ -4140,20 +4140,32 @@ fn addElectrobunImportAliases(
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const default_main_sdk = devkit.sdks.javascript.main;
     const default_view_sdk = devkit.sdks.javascript.browser;
-    const main_sdk = if (use_runtime_sdk_aliases)
-        (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_MAIN_MODULE")) orelse
-            (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_BUN_MODULE")) orelse
-            default_main_sdk
-    else
-        default_main_sdk;
-    const view_sdk = if (use_runtime_sdk_aliases)
-        (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_VIEW_MODULE")) orelse default_view_sdk
-    else
-        default_view_sdk;
 
     var alias: std.json.ObjectMap = .empty;
-    try putElectrobunMainAliases(ctx.allocator, &alias, main_sdk);
-    try alias.put(ctx.allocator, "electrobun/view", .{ .string = view_sdk });
+    try putElectrobunManifestAliases(ctx.allocator, &alias, devkit.sdks.javascript.exports);
+
+    if (use_runtime_sdk_aliases) {
+        const main_sdk = (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_MAIN_MODULE")) orelse
+            (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_BUN_MODULE"));
+        if (main_sdk) |runtime_main_sdk| {
+            try overrideElectrobunSdkRootAliases(
+                ctx.allocator,
+                &alias,
+                devkit.sdks.javascript.exports,
+                default_main_sdk,
+                runtime_main_sdk,
+            );
+        }
+        if (try optionalEnvProjectPath(ctx, "DASH_RUNTIME_SDK_VIEW_MODULE")) |runtime_view_sdk| {
+            try overrideElectrobunSdkRootAliases(
+                ctx.allocator,
+                &alias,
+                devkit.sdks.javascript.exports,
+                default_view_sdk,
+                runtime_view_sdk,
+            );
+        }
+    }
 
     // Cottontail's Bun.build resolves its Bun and Node compatibility modules
     // from the runtime blob embedded in the binary. Only Electrobun SDK imports
@@ -4174,33 +4186,77 @@ fn addElectrobunImportAliases(
     try spec.put(ctx.allocator, "alias", .{ .object = alias });
 }
 
-fn putElectrobunMainAliases(
+fn putElectrobunManifestAliases(
     allocator: std.mem.Allocator,
     alias: *std.json.ObjectMap,
-    main_sdk: []const u8,
+    exports: []const electrobun_devkit.JavaScriptExport,
 ) !void {
-    try alias.put(allocator, "electrobun", .{ .string = main_sdk });
-    try alias.put(allocator, "electrobun/main", .{ .string = main_sdk });
-    try alias.put(allocator, "electrobun/bun", .{ .string = main_sdk });
-    try alias.put(allocator, "electrobun/cottontail", .{ .string = main_sdk });
+    for (exports) |item| {
+        const specifier = if (std.mem.eql(u8, item.specifier, "."))
+            "electrobun"
+        else if (std.mem.startsWith(u8, item.specifier, "./") and item.specifier.len > 2)
+            try std.mem.concat(allocator, u8, &.{ "electrobun/", item.specifier[2..] })
+        else
+            return error.InvalidElectrobunDevkitManifest;
+        try alias.put(allocator, specifier, .{ .string = item.absolute_path });
+    }
 }
 
-test "Electrobun build aliases use the runtime-neutral main SDK" {
+fn overrideElectrobunSdkRootAliases(
+    allocator: std.mem.Allocator,
+    alias: *std.json.ObjectMap,
+    exports: []const electrobun_devkit.JavaScriptExport,
+    manifest_root: []const u8,
+    runtime_root: []const u8,
+) !void {
+    for (exports) |item| {
+        if (!std.mem.eql(u8, item.absolute_path, manifest_root)) continue;
+        const specifier = if (std.mem.eql(u8, item.specifier, "."))
+            "electrobun"
+        else
+            try std.mem.concat(allocator, u8, &.{ "electrobun/", item.specifier[2..] });
+        try alias.put(allocator, specifier, .{ .string = runtime_root });
+    }
+}
+
+test "Electrobun build aliases include every manifest export" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var aliases: std.json.ObjectMap = .empty;
-    try putElectrobunMainAliases(arena.allocator(), &aliases, "/sdk/main/index.ts");
+    const exports = [_]electrobun_devkit.JavaScriptExport{
+        .{ .specifier = ".", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
+        .{ .specifier = "./main/ui", .relative_path = "api/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
+        .{ .specifier = "./browser/ui", .relative_path = "api/browser/ui.ts", .absolute_path = "/sdk/browser/ui.ts" },
+    };
+    try putElectrobunManifestAliases(arena.allocator(), &aliases, &exports);
 
-    for ([_][]const u8{
-        "electrobun",
-        "electrobun/main",
-        "electrobun/bun",
-        "electrobun/cottontail",
-    }) |specifier| {
-        const value = aliases.get(specifier) orelse return error.MissingElectrobunAlias;
-        try std.testing.expectEqualStrings("/sdk/main/index.ts", value.string);
+    for ([_][2][]const u8{
+        .{ "electrobun", "/sdk/main.ts" },
+        .{ "electrobun/main/ui", "/sdk/main/ui.ts" },
+        .{ "electrobun/browser/ui", "/sdk/browser/ui.ts" },
+    }) |expected| {
+        const value = aliases.get(expected[0]) orelse return error.MissingElectrobunAlias;
+        try std.testing.expectEqualStrings(expected[1], value.string);
     }
+}
+
+test "Electrobun runtime SDK overrides are limited to manifest root exports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var aliases: std.json.ObjectMap = .empty;
+    const exports = [_]electrobun_devkit.JavaScriptExport{
+        .{ .specifier = ".", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
+        .{ .specifier = "./main", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
+        .{ .specifier = "./main/ui", .relative_path = "api/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
+    };
+    try putElectrobunManifestAliases(arena.allocator(), &aliases, &exports);
+    try overrideElectrobunSdkRootAliases(arena.allocator(), &aliases, &exports, "/sdk/main.ts", "/runtime/main.ts");
+
+    try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun").?.string);
+    try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun/main").?.string);
+    try std.testing.expectEqualStrings("/sdk/main/ui.ts", aliases.get("electrobun/main/ui").?.string);
 }
 
 fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {

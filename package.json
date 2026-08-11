@@ -10,7 +10,7 @@
     "package:release": "node scripts/package-release.js",
     "publish:release": "node scripts/upload-release-r2.js --all",
     "test:release": "node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js",
-    "test:electrobun": "node --test --test-concurrency=1 tests/electrobun/decorator-bundle.test.js tests/electrobun/init-scaffold.test.js tests/electrobun/non-index-main-entrypoint.test.js tests/electrobun/published-platform-artifact.test.js tests/electrobun/tsconfig-path-alias-bundle.test.js tests/electrobun/v2-devkit-sync.test.js",
+    "test:electrobun": "node --test --test-concurrency=1 tests/electrobun/decorator-bundle.test.js tests/electrobun/init-scaffold.test.js tests/electrobun/javascript-sdk-subpaths.test.js tests/electrobun/non-index-main-entrypoint.test.js tests/electrobun/published-platform-artifact.test.js tests/electrobun/tsconfig-path-alias-bundle.test.js tests/electrobun/v2-devkit-sync.test.js",
     "release": "node scripts/tag-release.js",
     "build": "bash scripts/build.sh",
     "build:release": "bash scripts/build.sh build -Doptimize=ReleaseSmall -Dcpu=baseline",

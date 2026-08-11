@@ -119,6 +119,7 @@ jobs:
           node --test --test-concurrency=1 \
             tests/electrobun/decorator-bundle.test.js \
             tests/electrobun/init-scaffold.test.js \
+            tests/electrobun/javascript-sdk-subpaths.test.js \
             tests/electrobun/non-index-main-entrypoint.test.js \
             tests/electrobun/published-platform-artifact.test.js \
             tests/electrobun/tsconfig-path-alias-bundle.test.js
