@@ -117,9 +117,22 @@ pub fn acquirePersistentFileLock(
         .lock_nonblocking = true,
         .follow_symlinks = open_options.follow_symlinks,
     }) catch |err| switch (err) {
-        error.WouldBlock => return .{
-            .file = try std.Io.Dir.cwd().openFile(io, lock_path, open_options),
-            .contended = true,
+        error.WouldBlock => {
+            if (builtin.os.tag == .windows) {
+                const waiting_file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
+                    .mode = open_options.mode,
+                    .follow_symlinks = open_options.follow_symlinks,
+                });
+                errdefer waiting_file.close(io);
+                while (!try waiting_file.tryLock(io, .exclusive)) {
+                    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+                }
+                return .{ .file = waiting_file, .contended = true };
+            }
+            return .{
+                .file = try std.Io.Dir.cwd().openFile(io, lock_path, open_options),
+                .contended = true,
+            };
         },
         else => return err,
     };

@@ -127,7 +127,7 @@ function runAsync(command, args, env) {
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`hutch exited ${code ?? signal}\n${stderr || stdout}`));
     });
