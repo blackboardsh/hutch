@@ -84,7 +84,7 @@ pub fn acquireUsageLock(
     init: std.process.Init,
     allocator: std.mem.Allocator,
 ) !GraphLock {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     return cache_locks.acquireGraph(init.io, allocator, home, .shared);
 }
 
@@ -105,7 +105,7 @@ pub fn managedElectrobunObjects(
     source_manifest_sha256: []const u8,
     uses_cef: bool,
 ) ![2]?ManagedObject {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     return managedElectrobunObjectsAt(
         init.io,
         allocator,
@@ -162,7 +162,7 @@ pub fn managedToolchainObject(
     kind: toolchain_store.Kind,
     resolution: toolchain_store.Resolution,
 ) !?ManagedObject {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     return managedToolchainObjectAt(init.io, allocator, home, kind, resolution);
 }
 
@@ -203,7 +203,7 @@ pub fn registerPreparedProject(
     canonical_project_root: []const u8,
     objects_input: []const ManagedObject,
 ) !void {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     return registerProjectAt(
         init.io,
         allocator,
@@ -325,7 +325,7 @@ pub fn prune(
     allocator: std.mem.Allocator,
     options: PruneOptions,
 ) !PruneResult {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     return pruneAt(init.io, allocator, home, options);
 }
 
@@ -1341,7 +1341,7 @@ test "project registration records a deterministic exact dependency graph" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
 
@@ -1377,7 +1377,7 @@ test "project registration never follows a project .hutch symlink" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     const outside = try std.fs.path.join(allocator, &.{ root, "outside-state" });
     try std.Io.Dir.cwd().createDirPath(io, project);
@@ -1400,7 +1400,7 @@ test "project registration never follows a project .hutch symlink" {
     try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside, "locks" })));
 }
 
-test "resolver outputs become managed objects only inside DASH_HOME" {
+test "resolver outputs become managed objects only inside the hutch home" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1408,7 +1408,7 @@ test "resolver outputs become managed objects only inside DASH_HOME" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const electrobun_fixture = testElectrobunObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun_fixture);
     const core_only = try managedElectrobunObjectsAt(
@@ -1477,7 +1477,7 @@ test "prune removes only stale unreachable managed objects" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
 
@@ -1524,7 +1524,7 @@ test "removing the last CEF reference prunes only CEF while core remains" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const core_project = try std.fs.path.join(allocator, &.{ root, "core-project" });
     const cef_project = try std.fs.path.join(allocator, &.{ root, "cef-project" });
     try std.Io.Dir.cwd().createDirPath(io, core_project);
@@ -1579,7 +1579,7 @@ test "core pruning cannot bypass an independently recent CEF grace period" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const core = testElectrobunObject();
     const cef = testElectrobunCefObject();
     const core_root = try createTestCandidate(io, allocator, home, core);
@@ -1612,7 +1612,7 @@ test "missing last-used state receives grace before an object can be pruned" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const toolchain = testToolchainObject();
     const toolchain_root = try createTestCandidate(io, allocator, home, toolchain);
 
@@ -1637,7 +1637,7 @@ test "zero-grace dry-run previews without mutating artifacts or state" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const electrobun = testElectrobunObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
 
@@ -1660,7 +1660,7 @@ test "missing projects retain shadow roots for grace then expire" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
     const electrobun = testElectrobunObject();
@@ -1684,7 +1684,7 @@ test "a live shadow registration defers all pruning for its grace window" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
     try registerProjectAt(io, allocator, home, project, &.{testElectrobunObject()}, 1);
@@ -1717,7 +1717,7 @@ test "a verified project lock is the live reachability source of truth" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
     const electrobun = testElectrobunObject();
@@ -1748,7 +1748,7 @@ test "corrupt registration fails closed before artifact mutation" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const electrobun = testElectrobunObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
     const registrations = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
@@ -1773,7 +1773,7 @@ test "expired registrations are fully validated before removal" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const project = try std.fs.path.join(allocator, &.{ root, "project" });
     try std.Io.Dir.cwd().createDirPath(io, project);
     const electrobun = testElectrobunObject();
@@ -1803,7 +1803,7 @@ test "registration symlinks fail closed before artifact mutation" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const electrobun = testElectrobunObject();
     const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
     const registrations = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
@@ -1833,7 +1833,7 @@ test "managed object discovery never follows directory symlinks" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     try std.Io.Dir.cwd().createDirPath(io, home);
     const outside = try std.fs.path.join(allocator, &.{ root, "outside-toolchains", "zig", "9.9.9", "macos-arm64" });
     try std.Io.Dir.cwd().createDirPath(io, outside);
@@ -1854,7 +1854,7 @@ test "managed object discovery never follows directory symlinks" {
     try std.testing.expect(pathExists(io, link));
 }
 
-test "a state namespace escaping DASH_HOME blocks deletion" {
+test "a state namespace escaping the hutch home blocks deletion" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1863,7 +1863,7 @@ test "a state namespace escaping DASH_HOME blocks deletion" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     try std.Io.Dir.cwd().createDirPath(io, home);
     const outside_state = try std.fs.path.join(allocator, &.{ root, "outside-state" });
     try std.Io.Dir.cwd().createDirPath(io, outside_state);
@@ -1893,7 +1893,7 @@ test "a dangling projects namespace cannot hide registrations" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const projects_root = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
     try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(projects_root).?);
     try std.Io.Dir.cwd().symLink(
@@ -1921,7 +1921,7 @@ test "an in-home trash alias cannot delete third-party cache data" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     const npm_cache = try std.fs.path.join(allocator, &.{ home, "cache", "npm" });
     const third_party_file = try std.fs.path.join(allocator, &.{ npm_cache, "cache-v2", "111111111111111111111111", "keep" });
     try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(third_party_file).?);
@@ -1940,7 +1940,7 @@ test "an in-home trash alias cannot delete third-party cache data" {
     try std.testing.expect(pathExists(io, third_party_file));
 }
 
-test "a trash namespace escaping DASH_HOME blocks deletion" {
+test "a trash namespace escaping the hutch home blocks deletion" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1949,7 +1949,7 @@ test "a trash namespace escaping DASH_HOME blocks deletion" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const root = try testAbsoluteRoot(io, allocator, &tmp);
-    const home = try std.fs.path.join(allocator, &.{ root, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
     try std.Io.Dir.cwd().createDirPath(io, home);
     const outside_trash = try std.fs.path.join(allocator, &.{ root, "outside-trash" });
     try std.Io.Dir.cwd().createDirPath(io, outside_trash);

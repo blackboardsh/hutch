@@ -156,7 +156,7 @@ pub fn resolve(
     selector: version_selector.Selector,
     options: Options,
 ) !Resolution {
-    const home = try dashHome(init, allocator);
+    const home = try hutchHome(init, allocator);
     if (!options.refresh) {
         if (try activeMatchingResolution(
             init.io,
@@ -252,7 +252,7 @@ pub fn activateChannel(
     if (!std.mem.eql(u8, channel, "production") and !std.mem.eql(u8, channel, "canary")) {
         return error.InvalidReleaseChannel;
     }
-    const home = try dashHome(init, allocator);
+    const home = try hutchHome(init, allocator);
     const pointer = try std.fs.path.join(allocator, &.{
         home,
         "channels",
@@ -272,7 +272,7 @@ pub fn checkForUpdate(
     if (!std.mem.eql(u8, channel, "production") and !std.mem.eql(u8, channel, "canary")) {
         return error.InvalidReleaseChannel;
     }
-    const home = try dashHome(init, allocator);
+    const home = try hutchHome(init, allocator);
     const current = (try activeResolution(
         init.io,
         allocator,
@@ -329,26 +329,128 @@ pub fn skipUpdate(
     revision: []const u8,
 ) !void {
     try validateRevision(revision);
-    const home = try dashHome(init, allocator);
+    const home = try hutchHome(init, allocator);
     const path = try updateSkipPath(allocator, home, product, channel);
     const contents = try std.mem.concat(allocator, u8, &.{ revision, "\n" });
     try writeCacheFile(init.io, allocator, path, contents);
 }
 
-pub fn dashHome(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
-    if (init.environ_map.get("DASH_HOME")) |home| {
-        if (home.len == 0) return error.InvalidDashHome;
+/// Resolves Hutch's home directory.
+///
+/// Resolution order:
+///   1. `HUTCH_HOME`
+///   2. `DASH_HOME` (deprecated fallback, kept so existing installs and the
+///      separate Dash Desktop product keep working)
+///   3. `~/.hutch` (`HOME`, or `USERPROFILE` on Windows)
+pub fn hutchHome(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    return hutchHomeFromEnviron(init.environ_map, allocator);
+}
+
+fn hutchHomeFromEnviron(
+    environ_map: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    if (environ_map.get("HUTCH_HOME")) |home| {
+        if (home.len == 0) return error.InvalidHutchHome;
         return allocator.dupe(u8, home);
     }
-    if (init.environ_map.get("HOME")) |home| {
-        return std.fs.path.join(allocator, &.{ home, ".dash" });
+    if (environ_map.get("DASH_HOME")) |home| {
+        if (home.len == 0) return error.InvalidHutchHome;
+        return allocator.dupe(u8, home);
+    }
+    if (environ_map.get("HOME")) |home| {
+        return std.fs.path.join(allocator, &.{ home, ".hutch" });
     }
     if (builtin.os.tag == .windows) {
-        if (init.environ_map.get("USERPROFILE")) |home| {
-            return std.fs.path.join(allocator, &.{ home, ".dash" });
+        if (environ_map.get("USERPROFILE")) |home| {
+            return std.fs.path.join(allocator, &.{ home, ".hutch" });
         }
     }
     return error.MissingHomeDirectory;
+}
+
+test "HUTCH_HOME wins over the deprecated DASH_HOME fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", "/users/example");
+    try environ_map.put("DASH_HOME", "/legacy/dash");
+    try environ_map.put("HUTCH_HOME", "/explicit/hutch");
+
+    try std.testing.expectEqualStrings(
+        "/explicit/hutch",
+        try hutchHomeFromEnviron(&environ_map, allocator),
+    );
+}
+
+test "DASH_HOME remains a fallback when HUTCH_HOME is unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", "/users/example");
+    try environ_map.put("DASH_HOME", "/legacy/dash");
+
+    try std.testing.expectEqualStrings(
+        "/legacy/dash",
+        try hutchHomeFromEnviron(&environ_map, allocator),
+    );
+}
+
+test "the default home is ~/.hutch when no override is set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", "/users/example");
+
+    try std.testing.expectEqualStrings(
+        try std.fs.path.join(allocator, &.{ "/users/example", ".hutch" }),
+        try hutchHomeFromEnviron(&environ_map, allocator),
+    );
+}
+
+test "an empty home override is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", "/users/example");
+
+    try environ_map.put("DASH_HOME", "");
+    try std.testing.expectError(
+        error.InvalidHutchHome,
+        hutchHomeFromEnviron(&environ_map, allocator),
+    );
+
+    try environ_map.put("HUTCH_HOME", "");
+    try std.testing.expectError(
+        error.InvalidHutchHome,
+        hutchHomeFromEnviron(&environ_map, allocator),
+    );
+}
+
+test "a missing home directory has no fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    try std.testing.expectError(
+        error.MissingHomeDirectory,
+        hutchHomeFromEnviron(&environ_map, allocator),
+    );
 }
 
 pub fn platformKey() ![]const u8 {

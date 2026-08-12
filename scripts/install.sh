@@ -2,7 +2,7 @@
 set -eu
 
 artifacts_base_url="${DASH_ARTIFACTS_BASE_URL:-https://hutch.blackboard.sh}"
-dash_home="${DASH_HOME:-$HOME/.dash}"
+hutch_home="${HUTCH_HOME:-${DASH_HOME:-$HOME/.hutch}}"
 channel="production"
 version=""
 build=""
@@ -16,7 +16,7 @@ Usage:
   install.sh [--channel production|stable|canary]
   install.sh --version <semver> [--channel production|stable|canary]
   install.sh --build <full-revision> [--channel production|stable|canary]
-  install.sh [--dash-home <path>]
+  install.sh [--hutch-home <path>]
   install.sh [--no-modify-path]
 EOF
 }
@@ -35,8 +35,8 @@ while [ "$#" -gt 0 ]; do
       build="${2:?missing value for --build}"
       shift 2
       ;;
-    --dash-home)
-      dash_home="${2:?missing value for --dash-home}"
+    --hutch-home|--dash-home)
+      hutch_home="${2:?missing value for $1}"
       shift 2
       ;;
     --no-modify-path)
@@ -165,7 +165,7 @@ if [ "$actual_size" != "$expected_size" ]; then
   exit 1
 fi
 
-install_root="$dash_home/products/hutch/$release_version/$revision/$platform"
+install_root="$hutch_home/products/hutch/$release_version/$revision/$platform"
 install_parent="$(dirname "$install_root")"
 extract_root="$tmp_dir/extracted"
 mkdir -p "$extract_root" "$install_parent"
@@ -181,8 +181,8 @@ printf '%s' "$expected_sha256" > "$extract_root/.dash-installed"
 rm -rf "$install_root"
 mv "$extract_root" "$install_root"
 
-channel_dir="$dash_home/channels/hutch"
-bin_dir="$dash_home/bin"
+channel_dir="$hutch_home/channels/hutch"
+bin_dir="$hutch_home/bin"
 mkdir -p "$channel_dir" "$bin_dir"
 pointer_tmp="$channel_dir/$channel.tmp"
 printf '%s\n' "$install_root" > "$pointer_tmp"

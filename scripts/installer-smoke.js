@@ -43,7 +43,7 @@ assert(
 const archiveBytes = readFileSync(archivePath);
 const archiveSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 const temporary = mkdtempSync(join(tmpdir(), "hutch-installer-smoke-"));
-const dashHome = join(temporary, "home");
+const hutchHome = join(temporary, "home");
 const shellHome = join(temporary, "shell-home");
 const stableAliasHome = join(temporary, "stable-alias-home");
 
@@ -160,7 +160,7 @@ function runCapture(command, args, options) {
 
 function assertActiveInstall() {
   const installedRoot = join(
-    dashHome,
+    hutchHome,
     "products",
     "hutch",
     metadata.version,
@@ -177,7 +177,7 @@ function assertActiveInstall() {
     encoding: "utf8",
     env: {
       ...process.env,
-      DASH_HOME: dashHome,
+      HUTCH_HOME: hutchHome,
       HUTCH_ACTIVE_CHANNEL: channel,
       DASH_RELEASE_OFFLINE: "1",
     },
@@ -202,19 +202,19 @@ try {
       join(hutchRoot, "scripts", "install.ps1"),
       "-Channel",
       channel,
-      "-DashHome",
-      dashHome,
+      "-HutchHome",
+      hutchHome,
       "-ArtifactsBaseUrl",
       baseUrl,
     ]);
     assertActiveInstall();
     const commandName = channel === "canary" ? "hutch-canary.exe" : "hutch.exe";
     const output = execFileSync(
-      join(dashHome, "bin", commandName),
+      join(hutchHome, "bin", commandName),
       ["--version"],
       {
         encoding: "utf8",
-        env: { ...process.env, DASH_HOME: dashHome },
+        env: { ...process.env, HUTCH_HOME: hutchHome },
       },
     ).trim();
     assert.equal(output, metadata.version);
@@ -228,7 +228,7 @@ try {
       join(hutchRoot, "scripts", "install.ps1"),
       "-Channel",
       "stable",
-      "-DashHome",
+      "-HutchHome",
       stableAliasHome,
       "-ArtifactsBaseUrl",
       baseUrl,
@@ -245,17 +245,17 @@ try {
       join(hutchRoot, "scripts", "install.sh"),
       "--channel",
       channel,
-      "--dash-home",
-      dashHome,
+      "--hutch-home",
+      hutchHome,
     ], installerEnvironment);
     await run("sh", [
       join(hutchRoot, "scripts", "install.sh"),
       "--channel",
       channel,
-      "--dash-home",
-      dashHome,
+      "--hutch-home",
+      hutchHome,
     ], installerEnvironment);
-    const pathLine = `export PATH='${join(dashHome, "bin")}':"$PATH"`;
+    const pathLine = `export PATH='${join(hutchHome, "bin")}':"$PATH"`;
     const shellProfile = readFileSync(join(shellHome, ".zshrc"), "utf8");
     assert.equal(
       shellProfile.split(pathLine).length - 1,
@@ -265,11 +265,11 @@ try {
     assertActiveInstall();
     const commandName = channel === "canary" ? "hutch-canary" : "hutch";
     const output = execFileSync(
-      join(dashHome, "bin", commandName),
+      join(hutchHome, "bin", commandName),
       ["--version"],
       {
         encoding: "utf8",
-        env: { ...process.env, DASH_HOME: dashHome },
+        env: { ...process.env, HUTCH_HOME: hutchHome },
       },
     ).trim();
     assert.equal(output, metadata.version);
@@ -278,7 +278,7 @@ try {
       join(hutchRoot, "scripts", "install.sh"),
       "--channel",
       "stable",
-      "--dash-home",
+      "--hutch-home",
       stableAliasHome,
       "--no-modify-path",
     ], installerEnvironment);
@@ -310,6 +310,7 @@ try {
         encoding: "utf8",
         env: {
           ...process.env,
+          // The deprecated DASH_HOME fallback must still resolve the store.
           DASH_HOME: stableAliasHome,
           DASH_RELEASE_OFFLINE: "1",
           HUTCH_ACTIVE_CHANNEL: "stable",
@@ -336,7 +337,7 @@ try {
     cwd: pinProject,
     env: {
       ...process.env,
-      DASH_HOME: pinHome,
+      HUTCH_HOME: pinHome,
       HUTCH_ACTIVE_CHANNEL: "production",
       DASH_ARTIFACTS_BASE_URL: baseUrl,
       HUTCH_NO_UPDATE_CHECK: "1",

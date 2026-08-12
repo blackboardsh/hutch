@@ -36,9 +36,9 @@ On Windows:
 
 Pass `-Channel canary` to install `hutch-canary.exe`. Both installers also accept
 an exact semantic version or full build revision. Releases are stored side by
-side under `~/.dash/products`. The installer atomically refreshes the native
+side under `~/.hutch/products`. The installer atomically refreshes the native
 channel launcher, while `hutch self update` advances the engine pointer used on
-the next invocation. The Unix installer adds `~/.dash/bin` to the detected
+the next invocation. The Unix installer adds `~/.hutch/bin` to the detected
 zsh, bash, fish, or POSIX shell profile and prints the command that activates it
 in the current terminal. Pass `--no-modify-path` to only print that command.
 `stable` is accepted as an installer channel alias for `production`.
@@ -144,8 +144,10 @@ DASH_USE_LOCAL_COTTONTAIL=1 ./zig-out/bin/hutch examples/smoke.js
 ```
 
 `DASH_COTTONTAIL` and `COTTONTAIL_BINARY` override the runtime;
-`HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `DASH_HOME` changes
-the global store and must remain set when a non-default install root is used.
+`HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `HUTCH_HOME` changes
+the global store (default `~/.hutch`) and must remain set when a non-default
+install root is used. `DASH_HOME` is a deprecated fallback that is still honored
+when `HUTCH_HOME` is unset.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
 
 ## Electrobun Projects

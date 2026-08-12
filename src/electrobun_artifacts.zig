@@ -99,7 +99,7 @@ fn ensure(
     kind: Kind,
 ) ![]const u8 {
     try validateVersion(version);
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     const platform = try platformKey();
     const root = try std.fs.path.join(allocator, &.{
         home,

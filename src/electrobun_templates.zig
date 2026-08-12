@@ -78,7 +78,7 @@ pub fn load(
     options: LoadOptions,
 ) !Catalog {
     const base_url = try baseUrl(init, allocator);
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     const cache_path = try std.fs.path.join(allocator, &.{
         home,
         "cache",
@@ -203,7 +203,7 @@ fn loadArchive(
     template: Template,
     options: LoadOptions,
 ) ![]const u8 {
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     const cache_path = try std.fs.path.join(allocator, &.{
         home,
         "cache",

@@ -146,7 +146,7 @@ test "a shared object lease excludes cache detachment until process release" {
     const allocator = arena.allocator();
     const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
-    const home = try std.fs.path.join(allocator, &.{ fixture, "dash-home" });
+    const home = try std.fs.path.join(allocator, &.{ fixture, "hutch-home" });
     const root = try std.fs.path.join(allocator, &.{
         home,
         "products",

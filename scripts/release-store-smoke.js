@@ -38,7 +38,7 @@ const packageName = `cottontail-v${version}-${platform}`;
 const packageRoot = join(temporary, packageName);
 const binRoot = join(packageRoot, "bin");
 const archivePath = join(temporary, "cottontail.tar.gz");
-const dashHome = join(temporary, "home");
+const hutchHome = join(temporary, "home");
 
 mkdirSync(binRoot, { recursive: true });
 writeFileSync(join(binRoot, executableName), "release store fixture\n");
@@ -141,7 +141,7 @@ try {
   });
   const environment = {
     ...process.env,
-    DASH_HOME: dashHome,
+    HUTCH_HOME: hutchHome,
     HUTCH_ACTIVE_CHANNEL: "canary",
     DASH_ARTIFACTS_BASE_URL: `http://127.0.0.1:${server.address().port}`,
   };
@@ -160,8 +160,8 @@ try {
     3,
     "concurrent cold resolvers must share one channel manifest, release manifest, and archive download",
   );
-  const channelCache = join(dashHome, "cache", "cottontail", "channels");
-  const releaseCache = join(dashHome, "cache", "cottontail", "releases");
+  const channelCache = join(hutchHome, "cache", "cottontail", "channels");
+  const releaseCache = join(hutchHome, "cache", "cottontail", "releases");
   assert.deepEqual(
     readdirSync(channelCache).sort(),
     ["canary.json", "canary.json.lock"],

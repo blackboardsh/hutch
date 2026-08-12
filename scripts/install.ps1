@@ -3,7 +3,12 @@ param(
   [string]$Channel = "production",
   [string]$Version = "",
   [string]$Build = "",
-  [string]$DashHome = $(if ($env:DASH_HOME) { $env:DASH_HOME } else { Join-Path $HOME ".dash" }),
+  [Alias("DashHome")]
+  [string]$HutchHome = $(
+    if ($env:HUTCH_HOME) { $env:HUTCH_HOME }
+    elseif ($env:DASH_HOME) { $env:DASH_HOME }
+    else { Join-Path $HOME ".hutch" }
+  ),
   [string]$ArtifactsBaseUrl = $(if ($env:DASH_ARTIFACTS_BASE_URL) { $env:DASH_ARTIFACTS_BASE_URL } else { "https://hutch.blackboard.sh" })
 )
 
@@ -71,14 +76,14 @@ try {
     throw "Hutch installer: archive metadata does not match the release manifest"
   }
 
-  $installRoot = Join-Path $DashHome "products\hutch\$($manifest.version)\$($manifest.revision)\$platform"
+  $installRoot = Join-Path $HutchHome "products\hutch\$($manifest.version)\$($manifest.revision)\$platform"
   New-Item -ItemType Directory -Force -Path (Split-Path $installRoot) | Out-Null
   if (Test-Path $installRoot) { Remove-Item -Recurse -Force $installRoot }
   Set-Content -NoNewline -Path (Join-Path $extractRoot ".dash-installed") -Value $artifact.sha256
   Move-Item -Path $extractRoot -Destination $installRoot
 
-  $channelDir = Join-Path $DashHome "channels\hutch"
-  $binDir = Join-Path $DashHome "bin"
+  $channelDir = Join-Path $HutchHome "channels\hutch"
+  $binDir = Join-Path $HutchHome "bin"
   New-Item -ItemType Directory -Force -Path $channelDir, $binDir | Out-Null
   Set-Content -Path (Join-Path $channelDir $Channel) -Value $installRoot
 

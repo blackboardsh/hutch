@@ -90,7 +90,7 @@ pub fn resolveVersion(
         };
     }
 
-    const home = try release_store.dashHome(init, allocator);
+    const home = try release_store.hutchHome(init, allocator);
     const root = try cacheRoot(allocator, home, kind, version);
     const binary = try cachedBinaryPath(allocator, root, kind);
     if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
