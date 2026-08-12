@@ -399,24 +399,63 @@ fn fetchArtifactBytes(
 ) ![]const u8 {
     const buffer = try allocator.alloc(u8, expected_size);
     errdefer allocator.free(buffer);
-    var writer: std.Io.Writer = .fixed(buffer);
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
-    defer client.deinit();
-    client.initDefaultProxies(allocator, init.environ_map) catch {};
+    const end = try fetchArtifactWithRetry(init, allocator, url, buffer, error.ElectrobunArtifactSizeMismatch);
+    if (end != expected_size) return error.ElectrobunArtifactSizeMismatch;
+    return buffer[0..end];
+}
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &writer,
-        .keep_alive = builtin.os.tag != .windows,
-    }) catch |err| switch (err) {
-        error.WriteFailed => return error.ElectrobunArtifactSizeMismatch,
-        else => |e| return e,
-    };
-    const status: u16 = @intFromEnum(result.status);
-    if (status < 200 or status >= 300) return error.ReleaseDownloadFailed;
-    if (writer.end != expected_size) return error.ElectrobunArtifactSizeMismatch;
-    return buffer[0..writer.end];
+const artifact_download_attempts = 3;
+
+/// Artifact downloads are immutable and verified afterwards, so transient
+/// transport errors (a keep-alive connection the server closed mid-handshake,
+/// a reset) and throttling statuses (403/429/5xx) are safe to retry. The final
+/// failure names the URL so field reports are actionable.
+fn fetchArtifactWithRetry(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    buffer: []u8,
+    overflow_error: anyerror,
+) !usize {
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var writer: std.Io.Writer = .fixed(buffer);
+        var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+        defer client.deinit();
+        client.initDefaultProxies(allocator, init.environ_map) catch {};
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &writer,
+            .keep_alive = builtin.os.tag != .windows,
+        }) catch |err| switch (err) {
+            error.WriteFailed => return overflow_error,
+            else => |e| {
+                if (attempt >= artifact_download_attempts) {
+                    std.debug.print(
+                        "hutch electrobun: download failed after {d} attempts ({s}): {s}\n",
+                        .{ attempt, @errorName(e), url },
+                    );
+                    return e;
+                }
+                std.Io.sleep(init.io, .fromSeconds(@intCast(attempt)), .awake) catch {};
+                continue;
+            },
+        };
+        const status: u16 = @intFromEnum(result.status);
+        if (status >= 200 and status < 300) return writer.end;
+        const retryable = status == 403 or status == 429 or status >= 500;
+        if (retryable and attempt < artifact_download_attempts) {
+            std.Io.sleep(init.io, .fromSeconds(@intCast(attempt)), .awake) catch {};
+            continue;
+        }
+        std.debug.print(
+            "hutch electrobun: download failed with HTTP {d} after {d} attempt(s): {s}\n",
+            .{ status, attempt, url },
+        );
+        return error.ReleaseDownloadFailed;
+    }
 }
 
 fn fetchBoundedBytes(
@@ -428,24 +467,10 @@ fn fetchBoundedBytes(
     const capacity = std.math.add(usize, max_size, 1) catch return error.OutOfMemory;
     const buffer = try allocator.alloc(u8, capacity);
     errdefer allocator.free(buffer);
-    var writer: std.Io.Writer = .fixed(buffer);
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
-    defer client.deinit();
-    client.initDefaultProxies(allocator, init.environ_map) catch {};
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &writer,
-        .keep_alive = builtin.os.tag != .windows,
-    }) catch |err| switch (err) {
-        error.WriteFailed => return error.ReleaseDownloadTooLarge,
-        else => |e| return e,
-    };
-    const status: u16 = @intFromEnum(result.status);
-    if (status < 200 or status >= 300) return error.ReleaseDownloadFailed;
-    if (writer.end > max_size) return error.ReleaseDownloadTooLarge;
-    return buffer[0..writer.end];
+    const end = try fetchArtifactWithRetry(init, allocator, url, buffer, error.ReleaseDownloadTooLarge);
+    if (end > max_size) return error.ReleaseDownloadTooLarge;
+    return buffer[0..end];
 }
 
 fn installCore(
