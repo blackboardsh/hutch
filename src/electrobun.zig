@@ -4649,6 +4649,7 @@ test "Electrobun build aliases include every manifest export" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    const projection_root = "/project/.hutch/devkit";
     var aliases: std.json.ObjectMap = .empty;
     const exports = [_]electrobun_devkit.JavaScriptExport{
         .{ .specifier = ".", .relative_path = "js-sdk/main.ts", .absolute_path = "/sdk/main.ts" },
@@ -4658,18 +4659,22 @@ test "Electrobun build aliases include every manifest export" {
     try putElectrobunManifestAliases(
         arena.allocator(),
         &aliases,
-        "/project/.hutch/devkit",
+        projection_root,
         "js-sdk",
         &exports,
     );
 
     for ([_][2][]const u8{
-        .{ "electrobun", "/project/.hutch/devkit/api/main.ts" },
-        .{ "electrobun/main/ui", "/project/.hutch/devkit/api/main/ui.ts" },
-        .{ "electrobun/browser/ui", "/project/.hutch/devkit/api/browser/ui.ts" },
+        .{ "electrobun", "main.ts" },
+        .{ "electrobun/main/ui", "main/ui.ts" },
+        .{ "electrobun/browser/ui", "browser/ui.ts" },
     }) |expected| {
         const value = aliases.get(expected[0]) orelse return error.MissingElectrobunAlias;
-        try std.testing.expectEqualStrings(expected[1], value.string);
+        const expected_path = try std.fs.path.join(
+            arena.allocator(),
+            &.{ projection_root, "api", expected[1] },
+        );
+        try std.testing.expectEqualStrings(expected_path, value.string);
     }
 }
 
@@ -4683,10 +4688,11 @@ test "Electrobun runtime SDK overrides are limited to manifest root exports" {
         .{ .specifier = "./main", .relative_path = "api/main.ts", .absolute_path = "/sdk/main.ts" },
         .{ .specifier = "./main/ui", .relative_path = "api/main/ui.ts", .absolute_path = "/sdk/main/ui.ts" },
     };
+    const projection_root = "/project/.hutch/devkit";
     try putElectrobunManifestAliases(
         arena.allocator(),
         &aliases,
-        "/project/.hutch/devkit",
+        projection_root,
         "api",
         &exports,
     );
@@ -4694,10 +4700,11 @@ test "Electrobun runtime SDK overrides are limited to manifest root exports" {
 
     try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun").?.string);
     try std.testing.expectEqualStrings("/runtime/main.ts", aliases.get("electrobun/main").?.string);
-    try std.testing.expectEqualStrings(
-        "/project/.hutch/devkit/api/main/ui.ts",
-        aliases.get("electrobun/main/ui").?.string,
+    const expected_main_ui = try std.fs.path.join(
+        arena.allocator(),
+        &.{ projection_root, "api", "main/ui.ts" },
     );
+    try std.testing.expectEqualStrings(expected_main_ui, aliases.get("electrobun/main/ui").?.string);
 }
 
 fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {
