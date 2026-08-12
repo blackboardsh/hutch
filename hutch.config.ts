@@ -1,4 +1,4 @@
-// @hutch cli=0.7.1 cottontail=0.4.1
+// @hutch cli=0.7.2 cottontail=0.4.1
 export default {
   scripts: {
     smoke: ["hutch", "examples/smoke.js"],
