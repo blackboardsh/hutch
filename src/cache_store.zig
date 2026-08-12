@@ -320,6 +320,204 @@ fn stringifyJson(allocator: std.mem.Allocator, value: std.json.Value) ![]const u
     return std.mem.concat(allocator, u8, &.{ bytes, "\n" });
 }
 
+/// A managed object as discovered by a read-only inventory pass.
+pub const InventoryObject = struct {
+    kind: ManagedObject.Kind,
+    relative_root: []const u8,
+    absolute_root: []const u8,
+    version: []const u8,
+    platform: []const u8,
+    toolchain_kind: ?[]const u8 = null,
+    last_used_unix_seconds: ?i64 = null,
+    /// Referenced by at least one project registration or verified project lock.
+    reachable: bool = false,
+    /// A live process holds the object lease, so the object cannot be detached
+    /// right now. An unreadable lock file is reported the same way, because a
+    /// pruner could not detach it either.
+    in_use: bool = false,
+};
+
+pub const InventoryProject = struct {
+    canonical_root: []const u8,
+    registration_path: []const u8,
+    project_exists: bool,
+    /// The project's own `.hutch/dependencies.lock` matched the digest recorded
+    /// in the global registration, so it is the live source of truth.
+    lock_verified: bool,
+    last_seen_unix_seconds: i64,
+    objects: []const ManagedObject,
+};
+
+pub const Inventory = struct {
+    objects: []const InventoryObject,
+    projects: []const InventoryProject,
+    /// Entries that could not be read or parsed. An inventory reports damage
+    /// instead of failing, because it never mutates the store.
+    issues: []const []const u8,
+};
+
+/// Read-only view of the managed cache graph.
+///
+/// Unlike `prune`, this never takes the graph lock and never creates state
+/// directories, so it is safe against a store that is missing, read-only, or
+/// concurrently mutated. The result is a best-effort snapshot.
+pub fn inventory(init: std.process.Init, allocator: std.mem.Allocator) !Inventory {
+    const home = try release_store.hutchHome(init, allocator);
+    return inventoryAt(init.io, allocator, home);
+}
+
+fn inventoryAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !Inventory {
+    var issues: std.ArrayList([]const u8) = .empty;
+    var projects: std.ArrayList(InventoryProject) = .empty;
+    var reachable: std.ArrayList([]const u8) = .empty;
+    try inventoryRegistrations(io, allocator, home, &projects, &reachable, &issues);
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    collectElectrobunCandidates(io, allocator, home, &candidates) catch |err| {
+        try appendIssue(allocator, &issues, "products/electrobun", err);
+    };
+    collectToolchainCandidates(io, allocator, home, &candidates) catch |err| {
+        try appendIssue(allocator, &issues, "toolchains", err);
+    };
+    std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
+
+    var objects: std.ArrayList(InventoryObject) = .empty;
+    for (candidates.items) |candidate| {
+        try objects.append(allocator, .{
+            .kind = candidate.kind,
+            .relative_root = candidate.relative_root,
+            .absolute_root = candidate.absolute_root,
+            .version = candidate.version,
+            .platform = candidate.platform,
+            .toolchain_kind = candidate.toolchain_kind,
+            .last_used_unix_seconds = readLastUsed(io, allocator, home, candidate.relative_root) catch blk: {
+                try appendIssue(allocator, &issues, candidate.relative_root, error.InvalidLastUsedMarker);
+                break :blk null;
+            },
+            .reachable = candidateIsReachable(reachable.items, candidate),
+            .in_use = objectInUse(io, allocator, candidate.lock_root) catch false,
+        });
+    }
+
+    return .{
+        .objects = try objects.toOwnedSlice(allocator),
+        .projects = try projects.toOwnedSlice(allocator),
+        .issues = try issues.toOwnedSlice(allocator),
+    };
+}
+
+fn inventoryRegistrations(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    projects: *std.ArrayList(InventoryProject),
+    reachable: *std.ArrayList([]const u8),
+    issues: *std.ArrayList([]const u8),
+) !void {
+    const projects_root = try std.fs.path.join(allocator, &.{ home, state_relative_root, "projects" });
+    var directory = std.Io.Dir.cwd().openDir(io, projects_root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            try appendIssue(allocator, issues, projects_root, err);
+            return;
+        },
+    };
+    defer directory.close(io);
+
+    var iterator = directory.iterate();
+    while (iterator.next(io) catch |err| {
+        try appendIssue(allocator, issues, projects_root, err);
+        return;
+    }) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fs.path.join(allocator, &.{ projects_root, entry.name });
+        const project = inventoryRegistration(io, allocator, path) catch |err| {
+            try appendIssue(allocator, issues, path, err);
+            continue;
+        };
+        for (project.objects) |object| {
+            if (!containsPath(reachable.items, object.relative_root)) {
+                try reachable.append(allocator, object.relative_root);
+            }
+        }
+        try projects.append(allocator, project);
+    }
+
+    std.mem.sort(InventoryProject, projects.items, {}, inventoryProjectLessThan);
+}
+
+fn inventoryProjectLessThan(_: void, lhs: InventoryProject, rhs: InventoryProject) bool {
+    return std.mem.order(u8, lhs.canonical_root, rhs.canonical_root) == .lt;
+}
+
+fn inventoryRegistration(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !InventoryProject {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_state_file_bytes));
+    const registration = std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidCacheRegistration;
+    const object = try requiredObject(registration);
+    const registration_schema = try readableSchemaVersion(object);
+    if (!std.mem.eql(u8, try requiredString(object, "kind"), registration_kind)) {
+        return error.InvalidCacheRegistration;
+    }
+    const canonical_root = try requiredString(object, "canonicalRoot");
+    if (!std.fs.path.isAbsolute(canonical_root)) return error.InvalidCacheRegistration;
+    const lock_sha256 = try requiredString(object, "projectLockSha256");
+    try validateSha256(lock_sha256);
+    const last_seen = try requiredInteger(object, "lastSeenUnixSeconds");
+    const values = object.get("objects") orelse return error.InvalidCacheRegistration;
+    if (values != .array) return error.InvalidCacheRegistration;
+
+    var registered: std.ArrayList(ManagedObject) = .empty;
+    for (values.array.items) |value| {
+        try appendParsedManagedObjects(allocator, &registered, value, registration_schema);
+    }
+
+    const locked = projectLockObjectsIfMatches(io, allocator, canonical_root, lock_sha256) catch null;
+    return .{
+        .canonical_root = canonical_root,
+        .registration_path = path,
+        .project_exists = pathExists(io, canonical_root),
+        .lock_verified = locked != null,
+        .last_seen_unix_seconds = last_seen,
+        .objects = locked orelse try registered.toOwnedSlice(allocator),
+    };
+}
+
+/// Probes the object lease without waiting. A held lease means some process is
+/// using the object right now.
+fn objectInUse(io: std.Io, allocator: std.mem.Allocator, lock_root: []const u8) !bool {
+    const lock_path = try std.mem.concat(allocator, u8, &.{ lock_root, ".lock" });
+    if (!pathExists(io, lock_path)) return false;
+    const exclusive = (try cache_locks.tryAcquireObjectExclusive(io, allocator, lock_root)) orelse return true;
+    exclusive.close(io);
+    return false;
+}
+
+fn appendIssue(
+    allocator: std.mem.Allocator,
+    issues: *std.ArrayList([]const u8),
+    subject: []const u8,
+    err: anyerror,
+) !void {
+    try issues.append(allocator, try std.fmt.allocPrint(
+        allocator,
+        "{s}: {s}",
+        .{ subject, @errorName(err) },
+    ));
+}
+
 pub fn prune(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1969,4 +2167,65 @@ test "a trash namespace escaping the hutch home blocks deletion" {
     }));
     try std.testing.expect(pathExists(io, toolchain_root));
     try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ outside_trash, "cache-v2" })));
+}
+
+test "a read-only inventory reports reachability, leases, and missing projects" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "hutch-home" });
+    const live_project = try std.fs.path.join(allocator, &.{ root, "live-project" });
+    const gone_project = try std.fs.path.join(allocator, &.{ root, "gone-project" });
+    try std.Io.Dir.cwd().createDirPath(io, live_project);
+    try std.Io.Dir.cwd().createDirPath(io, gone_project);
+
+    const electrobun = testElectrobunObject();
+    const toolchain = testToolchainObject();
+    const electrobun_root = try createTestCandidate(io, allocator, home, electrobun);
+    _ = try createTestCandidate(io, allocator, home, toolchain);
+    try registerProjectAt(io, allocator, home, live_project, &.{electrobun}, 1_000);
+    try registerProjectAt(io, allocator, home, gone_project, &.{toolchain}, 1_000);
+    // The project directory disappears, but its registration remains.
+    try std.Io.Dir.cwd().deleteTree(io, gone_project);
+
+    const lease = try cache_locks.acquireObjectLease(io, allocator, home, electrobun_root);
+    const held = try inventoryAt(io, allocator, home);
+    lease.close(io);
+
+    try std.testing.expectEqual(@as(usize, 0), held.issues.len);
+    try std.testing.expectEqual(@as(usize, 2), held.objects.len);
+    try std.testing.expectEqualStrings(electrobun.relative_root, held.objects[0].relative_root);
+    try std.testing.expect(held.objects[0].reachable);
+    try std.testing.expect(held.objects[0].in_use);
+    try std.testing.expectEqual(@as(?i64, 1_000), held.objects[0].last_used_unix_seconds);
+    try std.testing.expectEqualStrings(toolchain.relative_root, held.objects[1].relative_root);
+    try std.testing.expect(held.objects[1].reachable);
+    try std.testing.expect(!held.objects[1].in_use);
+
+    try std.testing.expectEqual(@as(usize, 2), held.projects.len);
+    try std.testing.expectEqualStrings(gone_project, held.projects[0].canonical_root);
+    try std.testing.expect(!held.projects[0].project_exists);
+    // A missing project falls back to its last registered graph.
+    try std.testing.expect(!held.projects[0].lock_verified);
+    try std.testing.expectEqualStrings(
+        toolchain.relative_root,
+        held.projects[0].objects[0].relative_root,
+    );
+    try std.testing.expectEqualStrings(live_project, held.projects[1].canonical_root);
+    try std.testing.expect(held.projects[1].project_exists);
+    try std.testing.expect(held.projects[1].lock_verified);
+
+    // Releasing the lease makes the object detachable again, and the inventory
+    // never mutated the store: prune still sees both objects as reachable.
+    const released = try inventoryAt(io, allocator, home);
+    try std.testing.expect(!released.objects[0].in_use);
+
+    const preview = try pruneAt(io, allocator, home, .{ .dry_run = true, .now_unix_seconds = 1_001 });
+    try std.testing.expectEqual(@as(usize, 2), preview.scanned);
+    try std.testing.expectEqual(@as(usize, 2), preview.reachable);
+    try std.testing.expectEqual(@as(usize, 0), preview.eligible);
 }

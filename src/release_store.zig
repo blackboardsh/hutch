@@ -335,6 +335,37 @@ pub fn skipUpdate(
     try writeCacheFile(init.io, allocator, path, contents);
 }
 
+/// Which rule produced the resolved Hutch home. Diagnostic commands report
+/// this so an unexpected store location is always attributable.
+pub const HomeSource = enum {
+    hutch_home,
+    dash_home,
+    default_home,
+
+    /// The environment variable that selected the home, or `null` when the
+    /// default `~/.hutch` path was used.
+    pub fn environmentVariable(self: HomeSource) ?[]const u8 {
+        return switch (self) {
+            .hutch_home => "HUTCH_HOME",
+            .dash_home => "DASH_HOME",
+            .default_home => null,
+        };
+    }
+
+    pub fn label(self: HomeSource) []const u8 {
+        return self.environmentVariable() orelse "default";
+    }
+
+    pub fn deprecated(self: HomeSource) bool {
+        return self == .dash_home;
+    }
+};
+
+pub const ResolvedHome = struct {
+    path: []const u8,
+    source: HomeSource,
+};
+
 /// Resolves Hutch's home directory.
 ///
 /// Resolution order:
@@ -346,27 +377,78 @@ pub fn hutchHome(init: std.process.Init, allocator: std.mem.Allocator) ![]const 
     return hutchHomeFromEnviron(init.environ_map, allocator);
 }
 
+/// Same resolution as `hutchHome`, additionally reporting which rule applied.
+pub fn resolveHutchHome(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !ResolvedHome {
+    return resolveHutchHomeFromEnviron(init.environ_map, allocator);
+}
+
 fn hutchHomeFromEnviron(
     environ_map: *const std.process.Environ.Map,
     allocator: std.mem.Allocator,
 ) ![]const u8 {
+    return (try resolveHutchHomeFromEnviron(environ_map, allocator)).path;
+}
+
+fn resolveHutchHomeFromEnviron(
+    environ_map: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) !ResolvedHome {
     if (environ_map.get("HUTCH_HOME")) |home| {
         if (home.len == 0) return error.InvalidHutchHome;
-        return allocator.dupe(u8, home);
+        return .{ .path = try allocator.dupe(u8, home), .source = .hutch_home };
     }
     if (environ_map.get("DASH_HOME")) |home| {
         if (home.len == 0) return error.InvalidHutchHome;
-        return allocator.dupe(u8, home);
+        return .{ .path = try allocator.dupe(u8, home), .source = .dash_home };
     }
     if (environ_map.get("HOME")) |home| {
-        return std.fs.path.join(allocator, &.{ home, ".hutch" });
+        return .{
+            .path = try std.fs.path.join(allocator, &.{ home, ".hutch" }),
+            .source = .default_home,
+        };
     }
     if (builtin.os.tag == .windows) {
         if (environ_map.get("USERPROFILE")) |home| {
-            return std.fs.path.join(allocator, &.{ home, ".hutch" });
+            return .{
+                .path = try std.fs.path.join(allocator, &.{ home, ".hutch" }),
+                .source = .default_home,
+            };
         }
     }
     return error.MissingHomeDirectory;
+}
+
+test "the resolved home reports the rule that selected it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", "/users/example");
+
+    const default_home = try resolveHutchHomeFromEnviron(&environ_map, allocator);
+    try std.testing.expectEqual(HomeSource.default_home, default_home.source);
+    try std.testing.expectEqualStrings("default", default_home.source.label());
+    try std.testing.expect(default_home.source.environmentVariable() == null);
+    try std.testing.expect(!default_home.source.deprecated());
+
+    try environ_map.put("DASH_HOME", "/legacy/dash");
+    const legacy = try resolveHutchHomeFromEnviron(&environ_map, allocator);
+    try std.testing.expectEqual(HomeSource.dash_home, legacy.source);
+    try std.testing.expectEqualStrings("/legacy/dash", legacy.path);
+    try std.testing.expectEqualStrings("DASH_HOME", legacy.source.label());
+    try std.testing.expect(legacy.source.deprecated());
+
+    try environ_map.put("HUTCH_HOME", "/explicit/hutch");
+    const explicit = try resolveHutchHomeFromEnviron(&environ_map, allocator);
+    try std.testing.expectEqual(HomeSource.hutch_home, explicit.source);
+    try std.testing.expectEqualStrings("/explicit/hutch", explicit.path);
+    try std.testing.expectEqualStrings("HUTCH_HOME", explicit.source.label());
+    try std.testing.expect(!explicit.source.deprecated());
 }
 
 test "HUTCH_HOME wins over the deprecated DASH_HOME fallback" {

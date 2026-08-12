@@ -8,6 +8,7 @@ const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
+const status_cli = @import("status_cli.zig");
 const version_selector = @import("version_selector.zig");
 
 const version = @import("version.zig").version;
@@ -26,6 +27,7 @@ const help_text_template =
     \\  hutch test [files/options...]
     \\  hutch build [args...]
     \\  hutch cache <prune|clean> [--dry-run]
+    \\  hutch status [--json]
     \\  hutch self <path|version|update> [selector]
     \\  hutch cottontail <path|version|update> [selector]
     \\  hutch --help
@@ -1370,6 +1372,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "status")) {
+        const exit_code = try status_cli.run(init, args[2..], stdout, stderr);
+        try stdout.flush();
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "cache")) {
         const exit_code = try cache_cli.run(init, args[2..], stdout, stderr);
         try stdout.flush();
@@ -1615,6 +1625,7 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch pm") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "packageManager") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch cache <prune|clean>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch status [--json]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);

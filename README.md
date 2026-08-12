@@ -95,6 +95,22 @@ carriage-return, or line-feed arguments, so Hutch rejects those values instead
 of changing them. Shell-string tasks refuse batch shims entirely; use `hutch
 pm`, an argv-form task such as `["npm", "run", "dev"]`, or a native executable.
 
+## Store Status
+
+`hutch status` prints everything Hutch manages on disk: the resolved home and
+which rule selected it (`HUTCH_HOME`, the deprecated `DASH_HOME`, or the default
+`~/.hutch`), every installed product release with its per-install disk usage and
+active channel pointers, every installed toolchain, the managed cache objects
+with their reachability and live leases, and the projects registered against
+those objects. A project whose directory no longer exists is marked. Sizes are
+recursive file totals; symlinks are counted but never followed, so a launcher
+symlink cannot pull an out-of-store tree into a total.
+
+`hutch status --json` emits the same data as a machine-readable document with a
+`schemaVersion` field. Both forms only read the store: `status` never creates,
+moves, or deletes state, and reports unreadable entries under `Issues` rather
+than failing.
+
 ## Managed Cache Lifecycle
 
 Successful Electrobun preparation records the exact cached core/devkit,
@@ -313,6 +329,8 @@ for the release workflow.
 - `hutch electrobun <init|sync|build|run|dev> [args...]`
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
+- `hutch status [--json]`
+- `hutch cache <prune|clean> [--dry-run]`
 
 Scripts resolve exclusively from the nearest `hutch.config.ts`. A string is
 command text parsed and executed by the selected Cottontail release's Bun.$
