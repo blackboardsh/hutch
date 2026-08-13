@@ -52,6 +52,7 @@ const BuiltAppLaunchCommand = struct {
 };
 
 const build_lock_environment_variable = "HUTCH_ELECTROBUN_BUILD_LOCK";
+const bundled_uninstall_manager_file_name = "uninstall";
 
 const Context = struct {
     init: std.process.Init,
@@ -4088,6 +4089,18 @@ fn copyBundledPreloadScripts(
     );
 }
 
+fn copyBundledUninstallManager(
+    ctx: *const Context,
+    bundle: AppBundlePaths,
+    platform_paths: PlatformPaths,
+) !void {
+    try copyPath(
+        ctx,
+        platform_paths.extractor,
+        try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, bundled_uninstall_manager_file_name }),
+    );
+}
+
 fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
@@ -4104,6 +4117,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         try writeInfoPlist(ctx, config, bundle);
     }
 
+    try copyBundledUninstallManager(ctx, bundle, platform_paths);
     try copyPath(ctx, platform_paths.launcher, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() }));
     if (main_process == .bun) {
         try copyPath(ctx, platform_paths.bun_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
@@ -6399,6 +6413,72 @@ test "preload scripts are resources rather than code-directory files" {
     try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ resources_dir, "preload-sandboxed.js" })));
     try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ exec_dir, "preload-full.js" })));
     try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ exec_dir, "preload-sandboxed.js" })));
+}
+
+test "bundled extractor is an uninstall manager resource" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "platform");
+    try tmp.dir.createDirPath(io, "bundle/Resources");
+    try tmp.dir.writeFile(io, .{ .sub_path = "platform/extractor", .data = "EXTRACTOR" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const resources_dir = try std.fs.path.join(allocator, &.{ absolute_root, "bundle", "Resources" });
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = absolute_root,
+    };
+    const bundle = AppBundlePaths{
+        .build_root = absolute_root,
+        .bundle_root = absolute_root,
+        .exec_dir = absolute_root,
+        .resources_dir = resources_dir,
+        .frameworks_dir = null,
+        .app_code_dir = resources_dir,
+    };
+    const platform_paths = PlatformPaths{
+        .shared_dist_dir = absolute_root,
+        .electrobun_version = "2.0.0-test",
+        .devkit = null,
+        .projection = null,
+        .launcher = "",
+        .bun_binary = "",
+        .main_js = "",
+        .preload_full_js = "",
+        .preload_sandboxed_js = "",
+        .core_lib = "",
+        .native_wrapper = "",
+        .native_wrapper_cef = "",
+        .libasar = "",
+        .process_helper = "",
+        .cef_dir = "",
+        .wgpu_lib = "",
+        .extractor = try std.fs.path.join(allocator, &.{ absolute_root, "platform", "extractor" }),
+        .bsdiff = "",
+        .bspatch = "",
+        .zig_zstd = "",
+    };
+
+    try copyBundledUninstallManager(&ctx, bundle, platform_paths);
+
+    const uninstall_path = try std.fs.path.join(allocator, &.{ resources_dir, bundled_uninstall_manager_file_name });
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, uninstall_path, allocator, .limited(1024));
+    try std.testing.expectEqualStrings("EXTRACTOR", contents);
 }
 
 test "bundled CEF layouts match the native wrapper contract" {
