@@ -78,7 +78,14 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+stage_root=""
+cleanup() {
+  rm -rf "$tmp_dir"
+  if [ -n "$stage_root" ]; then
+    rm -rf "$stage_root"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
 manifest_path="$tmp_dir/manifest.json"
 
 download() {
@@ -167,30 +174,36 @@ fi
 
 install_root="$hutch_home/releases/hutch/$release_version/$revision/$platform"
 install_parent="$(dirname "$install_root")"
-extract_root="$tmp_dir/extracted"
-mkdir -p "$extract_root" "$install_parent"
-tar -xzf "$archive" --strip-components=1 -C "$extract_root"
-test -x "$extract_root/bin/hutch"
-test -x "$extract_root/bin/hutch-engine"
-test -f "$extract_root/hutch-release.json"
-grep -F "\"version\": \"$release_version\"" "$extract_root/hutch-release.json" >/dev/null
-grep -F "\"revision\": \"$revision\"" "$extract_root/hutch-release.json" >/dev/null
-grep -F "\"platform\": \"$platform\"" "$extract_root/hutch-release.json" >/dev/null
-printf '%s' "$expected_sha256" > "$extract_root/.dash-installed"
+mkdir -p "$install_parent"
+stage_root="$(mktemp -d "$install_parent/.hutch-install-$platform-XXXXXXXXXXXX")"
+tar -xzf "$archive" --strip-components=1 -C "$stage_root"
+test -x "$stage_root/bin/hutch"
+test -x "$stage_root/bin/hutch-engine"
+test -f "$stage_root/hutch-release.json"
+grep -F "\"version\": \"$release_version\"" "$stage_root/hutch-release.json" >/dev/null
+grep -F "\"revision\": \"$revision\"" "$stage_root/hutch-release.json" >/dev/null
+grep -F "\"platform\": \"$platform\"" "$stage_root/hutch-release.json" >/dev/null
+printf '%s' "$expected_sha256" > "$stage_root/.dash-installed"
 
-rm -rf "$install_root"
-mv "$extract_root" "$install_root"
+# The staged executable cannot publish its own directory on Windows. Run an
+# ordinary OS-temp copy so the engine can hold the graph/object transaction
+# while atomically renaming the sibling stage into its final release path.
+bootstrap_engine="$tmp_dir/hutch-engine"
+cp "$stage_root/bin/hutch-engine" "$bootstrap_engine"
+chmod 755 "$bootstrap_engine"
+HUTCH_HOME="$hutch_home" "$bootstrap_engine" self bootstrap-install "$channel" "$stage_root"
+test -x "$install_root/bin/hutch"
+test -x "$install_root/bin/hutch-engine"
 
 bin_dir="$hutch_home/bin"
 mkdir -p "$bin_dir"
-HUTCH_HOME="$hutch_home" "$install_root/bin/hutch-engine" self bootstrap-install "$channel"
 
 command_name="hutch"
 if [ "$channel" = "canary" ]; then
   command_name="hutch-canary"
 fi
 command_path="$bin_dir/$command_name"
-command_tmp="$command_path.tmp"
+command_tmp="$command_path.tmp.$$"
 cp "$install_root/bin/hutch" "$command_tmp"
 chmod 755 "$command_tmp"
 mv "$command_tmp" "$command_path"

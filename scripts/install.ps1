@@ -9,7 +9,8 @@ param(
     elseif ($env:DASH_HOME) { $env:DASH_HOME }
     else { Join-Path $HOME ".hutch" }
   ),
-  [string]$ArtifactsBaseUrl = $(if ($env:DASH_ARTIFACTS_BASE_URL) { $env:DASH_ARTIFACTS_BASE_URL } else { "https://hutch.blackboard.sh" })
+  [string]$ArtifactsBaseUrl = $(if ($env:DASH_ARTIFACTS_BASE_URL) { $env:DASH_ARTIFACTS_BASE_URL } else { "https://hutch.blackboard.sh" }),
+  [switch]$NoModifyPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +21,7 @@ if ($Version -and $Build) {
 
 $platform = "windows-x64"
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("hutch-install-" + [guid]::NewGuid())
+$stageRoot = $null
 New-Item -ItemType Directory -Force -Path $temporary | Out-Null
 
 try {
@@ -57,14 +59,17 @@ try {
     throw "Hutch installer: archive size mismatch"
   }
 
-  $extractRoot = Join-Path $temporary "extracted"
-  New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
-  & tar.exe -xzf $archive --strip-components=1 -C $extractRoot
+  $installRoot = Join-Path $HutchHome "releases\hutch\$($manifest.version)\$($manifest.revision)\$platform"
+  $installParent = Split-Path $installRoot
+  New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+  $stageRoot = Join-Path $installParent (".hutch-install-$platform-" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $stageRoot | Out-Null
+  & tar.exe -xzf $archive --strip-components=1 -C $stageRoot
   if ($LASTEXITCODE -ne 0) { throw "Hutch installer: archive extraction failed" }
 
-  $metadataPath = Join-Path $extractRoot "hutch-release.json"
-  $launcherPath = Join-Path $extractRoot "bin\hutch.exe"
-  $enginePath = Join-Path $extractRoot "bin\hutch-engine.exe"
+  $metadataPath = Join-Path $stageRoot "hutch-release.json"
+  $launcherPath = Join-Path $stageRoot "bin\hutch.exe"
+  $enginePath = Join-Path $stageRoot "bin\hutch-engine.exe"
   if (!(Test-Path $metadataPath) -or !(Test-Path $launcherPath) -or !(Test-Path $enginePath)) {
     throw "Hutch installer: archive is missing release files"
   }
@@ -76,42 +81,53 @@ try {
     throw "Hutch installer: archive metadata does not match the release manifest"
   }
 
-  $installRoot = Join-Path $HutchHome "releases\hutch\$($manifest.version)\$($manifest.revision)\$platform"
-  New-Item -ItemType Directory -Force -Path (Split-Path $installRoot) | Out-Null
-  if (Test-Path $installRoot) { Remove-Item -Recurse -Force $installRoot }
-  Set-Content -NoNewline -Path (Join-Path $extractRoot ".dash-installed") -Value $artifact.sha256
-  Move-Item -Path $extractRoot -Destination $installRoot
-
-  $binDir = Join-Path $HutchHome "bin"
-  New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+  [System.IO.File]::WriteAllBytes(
+    (Join-Path $stageRoot ".dash-installed"),
+    [System.Text.Encoding]::ASCII.GetBytes([string]$artifact.sha256)
+  )
+  $bootstrapEngine = Join-Path $temporary "hutch-engine.exe"
+  Copy-Item -Path $enginePath -Destination $bootstrapEngine
 
   $previousHutchHome = $env:HUTCH_HOME
   try {
     $env:HUTCH_HOME = $HutchHome
-    & (Join-Path $installRoot "bin\hutch-engine.exe") self bootstrap-install $Channel
+    & $bootstrapEngine self bootstrap-install $Channel $stageRoot
     if ($LASTEXITCODE -ne 0) { throw "Hutch installer: could not bootstrap release selection" }
   } finally {
     $env:HUTCH_HOME = $previousHutchHome
   }
 
+  $finalLauncherPath = Join-Path $installRoot "bin\hutch.exe"
+  $finalEnginePath = Join-Path $installRoot "bin\hutch-engine.exe"
+  if (!(Test-Path $finalLauncherPath) -or !(Test-Path $finalEnginePath)) {
+    throw "Hutch installer: bootstrap did not publish the release"
+  }
+
+  $binDir = Join-Path $HutchHome "bin"
+  New-Item -ItemType Directory -Force -Path $binDir | Out-Null
   $commandName = if ($Channel -eq "canary") { "hutch-canary.exe" } else { "hutch.exe" }
   $commandPath = Join-Path $binDir $commandName
-  $commandTemporary = "$commandPath.tmp"
-  Copy-Item -Force (Join-Path $installRoot "bin\hutch.exe") $commandTemporary
+  $commandTemporary = "$commandPath.tmp-$([guid]::NewGuid().ToString('N'))"
+  Copy-Item -Force $finalLauncherPath $commandTemporary
   Move-Item -Force $commandTemporary $commandPath
 
-  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  $pathEntries = @($userPath -split ";" | Where-Object { $_ })
-  if ($pathEntries -notcontains $binDir) {
-    [Environment]::SetEnvironmentVariable(
-      "Path",
-      (($pathEntries + $binDir) -join ";"),
-      "User"
-    )
-    Write-Host "Added $binDir to the user PATH. Open a new terminal to use it."
+  if (!$NoModifyPath) {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathEntries = @($userPath -split ";" | Where-Object { $_ })
+    if ($pathEntries -notcontains $binDir) {
+      [Environment]::SetEnvironmentVariable(
+        "Path",
+        (($pathEntries + $binDir) -join ";"),
+        "User"
+      )
+      Write-Host "Added $binDir to the user PATH. Open a new terminal to use it."
+    }
   }
 
   Write-Host "Installed Hutch $($manifest.version) ($Channel) at $installRoot"
 } finally {
+  if ($stageRoot) {
+    Remove-Item -Recurse -Force $stageRoot -ErrorAction SilentlyContinue
+  }
   Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
 }

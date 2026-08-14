@@ -371,66 +371,495 @@ pub fn activateChannel(
     });
 }
 
-/// Claims a freshly installed Hutch home and merges the currently executing
-/// archive into its selections. Installers call this hidden bootstrap entry
-/// point so shell and PowerShell never need to parse or merge JSON.
+/// Publishes a freshly extracted Hutch archive and merges it into the selected
+/// channel. Installers execute a temporary copy of the staged engine so the
+/// engine, rather than shell or PowerShell, owns the graph/object transaction.
 pub fn bootstrapInstalledHutch(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     channel_value: []const u8,
+    staged_root: []const u8,
+) !void {
+    const home = try hutchHome(init, allocator);
+    var forbidden_roots: [2][]const u8 = undefined;
+    var forbidden_roots_len: usize = 0;
+    for ([_][]const u8{ "HOME", "USERPROFILE" }) |name| {
+        const value = init.environ_map.get(name) orelse continue;
+        if (value.len == 0) continue;
+        forbidden_roots[forbidden_roots_len] = value;
+        forbidden_roots_len += 1;
+    }
+    try bootstrapInstalledHutchAt(
+        init.io,
+        allocator,
+        home,
+        channel_value,
+        staged_root,
+        forbidden_roots[0..forbidden_roots_len],
+    );
+}
+
+const StagedHutchArchive = struct {
+    canonical_root: []const u8,
+    version: []const u8,
+    revision: []const u8,
+    platform: []const u8,
+    archive_sha256: []const u8,
+};
+
+fn bootstrapInstalledHutchAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    channel_value: []const u8,
+    staged_root: []const u8,
+    forbidden_unmarked_roots: []const []const u8,
 ) !void {
     const channel = try version_selector.normalizeChannel(channel_value);
-    const home = try hutchHome(init, allocator);
-    const lifecycle = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
-    defer lifecycle.close(init.io);
-
-    const executable_dir = try std.process.executableDirPathAlloc(init.io, allocator);
-    const root = std.fs.path.dirname(executable_dir) orelse return error.InvalidInstallPath;
-    const metadata_path = try std.fs.path.join(allocator, &.{ root, Product.hutch.metadataFileName() });
-    const metadata_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        metadata_path,
-        allocator,
-        .limited(max_manifest_bytes),
-    );
-    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, metadata_bytes, .{
-        .duplicate_field_behavior = .@"error",
+    const staged = try validateStagedHutchArchive(io, allocator, home, staged_root);
+    const canonical_home = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    if (loadStoreIdentityAt(io, allocator, canonical_home)) |_| {} else |err| switch (err) {
+        error.FileNotFound => try validateUnmarkedInstallerHome(
+            io,
+            allocator,
+            home,
+            canonical_home,
+            staged,
+            forbidden_unmarked_roots,
+        ),
+        else => return err,
+    }
+    // Existing selection state must parse before the explicit installer claims
+    // or publishes anything. The locked writer below revalidates it again.
+    _ = try loadSelectionsAt(io, allocator, canonical_home);
+    _ = try ensureManagedHomeAt(io, allocator, canonical_home);
+    const final_root = try std.fs.path.join(allocator, &.{
+        canonical_home,
+        releases_directory_name,
+        Product.hutch.name(),
+        staged.version,
+        staged.revision,
+        staged.platform,
     });
-    if ((try jsonPositiveUsize(metadata, "schema")) != manifest_schema or
-        !std.mem.eql(u8, try jsonString(metadata, "kind"), "archive") or
-        !std.mem.eql(u8, try jsonString(metadata, "product"), Product.hutch.name()))
+
+    const graph = try cache_locks.acquireGraph(io, allocator, canonical_home, .shared);
+    defer graph.close(io);
+    const object_lock_path = try std.mem.concat(allocator, u8, &.{ final_root, ".lock" });
+    try cache_locks.initializePersistentFile(io, object_lock_path);
+    const object_lock = (try cache_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        final_root,
+    )) orelse return error.InstalledHutchReleaseBusy;
+    defer object_lock.close(io);
+
+    // Revalidate after waiting for all locks so a caller cannot swap or alter
+    // the stage while publication is queued behind a prune or another install.
+    const current_stage = try validateStagedHutchArchive(
+        io,
+        allocator,
+        canonical_home,
+        staged.canonical_root,
+    );
+    if (!sameHutchArchive(staged, current_stage)) return error.InstalledHutchStageChanged;
+
+    var published = false;
+    var detached_root: ?[]const u8 = null;
+    errdefer {
+        if (published) {
+            std.Io.Dir.cwd().rename(final_root, std.Io.Dir.cwd(), staged.canonical_root, io) catch {};
+        }
+        if (detached_root) |detached| {
+            std.Io.Dir.cwd().rename(detached, std.Io.Dir.cwd(), final_root, io) catch {};
+        }
+    }
+    const final_stat: ?std.Io.File.Stat = std.Io.Dir.cwd().statFile(io, final_root, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    var reuse_final = false;
+    if (final_stat) |stat| {
+        if (stat.kind == .directory) {
+            if (validateHutchArchiveRoot(io, allocator, final_root)) |installed| {
+                reuse_final = sameHutchArchive(staged, installed);
+            } else |_| {}
+        }
+        if (!reuse_final) {
+            const detached = try replacementRootPath(io, allocator, final_root);
+            std.Io.Dir.cwd().rename(final_root, std.Io.Dir.cwd(), detached, io) catch |err| switch (err) {
+                error.AccessDenied, error.PermissionDenied, error.FileBusy => return error.InstalledHutchReleaseBusy,
+                else => return err,
+            };
+            detached_root = detached;
+        }
+    }
+    if (!reuse_final) {
+        try std.Io.Dir.cwd().rename(staged.canonical_root, std.Io.Dir.cwd(), final_root, io);
+        published = true;
+        const installed = try validateHutchArchiveRoot(io, allocator, final_root);
+        if (!sameHutchArchive(staged, installed)) return error.InstalledHutchPublishMismatch;
+    }
+
+    try writeSelection(io, allocator, canonical_home, .hutch, channel, .{
+        .version = staged.version,
+        .revision = staged.revision,
+        .platform = staged.platform,
+    });
+
+    if (detached_root) |detached| {
+        deleteDetachedHutchRoot(io, detached);
+        detached_root = null;
+    }
+}
+
+fn replacementRootPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    final_root: []const u8,
+) ![]const u8 {
+    const parent = std.fs.path.dirname(final_root) orelse return error.InvalidInstallPath;
+    const platform = std.fs.path.basename(final_root);
+    for (0..32) |_| {
+        var random: [12]u8 = undefined;
+        io.random(&random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const candidate = try std.fmt.allocPrint(
+            allocator,
+            "{s}/.hutch-replaced-{s}-{s}",
+            .{ parent, platform, &suffix },
+        );
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => return candidate,
+            else => return err,
+        };
+    }
+    return error.InstalledHutchReplacementNameCollision;
+}
+
+fn deleteDetachedHutchRoot(io: std.Io, path: []const u8) void {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return;
+    switch (stat.kind) {
+        .directory => std.Io.Dir.cwd().deleteTree(io, path) catch {},
+        else => std.Io.Dir.cwd().deleteFile(io, path) catch {},
+    }
+}
+
+fn validateUnmarkedInstallerHome(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    requested_home: []const u8,
+    canonical_home: []const u8,
+    staged: StagedHutchArchive,
+    forbidden_roots: []const []const u8,
+) !void {
+    const requested_stat = try std.Io.Dir.cwd().statFile(io, requested_home, .{
+        .follow_symlinks = false,
+    });
+    if (requested_stat.kind != .directory) return error.UnsafeUnmarkedHutchHome;
+    const parent = std.fs.path.dirname(canonical_home) orelse return error.UnsafeUnmarkedHutchHome;
+    if (pathEqual(parent, canonical_home)) return error.UnsafeUnmarkedHutchHome;
+    for (forbidden_roots) |forbidden| {
+        const canonical_forbidden = std.Io.Dir.cwd().realPathFileAlloc(
+            io,
+            forbidden,
+            allocator,
+        ) catch continue;
+        if (pathEqual(canonical_home, canonical_forbidden)) {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+    }
+
+    var home_dir = try std.Io.Dir.cwd().openDir(io, canonical_home, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer home_dir.close(io);
+    var saw_releases = false;
+    var iterator = home_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const kind = try resolvedEntryKind(io, home_dir, entry);
+        if (std.mem.eql(u8, entry.name, releases_directory_name)) {
+            if (kind != .directory or saw_releases) return error.UnsafeUnmarkedHutchHome;
+            saw_releases = true;
+            try validateUnmarkedReleaseAncestry(io, allocator, canonical_home, staged);
+        } else if (std.mem.eql(u8, entry.name, state_directory_name)) {
+            if (kind != .directory) return error.UnsafeUnmarkedHutchHome;
+            try validateUnmarkedStatePlumbing(io, allocator, canonical_home);
+        } else {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+    }
+    if (!saw_releases) return error.UnsafeUnmarkedHutchHome;
+}
+
+fn validateUnmarkedReleaseAncestry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    staged: StagedHutchArchive,
+) !void {
+    const releases = try std.fs.path.join(allocator, &.{ home, releases_directory_name });
+    try requireOnlyDirectoryChild(io, releases, Product.hutch.name());
+    const product = try std.fs.path.join(allocator, &.{ releases, Product.hutch.name() });
+    try requireOnlyDirectoryChild(io, product, staged.version);
+    const version = try std.fs.path.join(allocator, &.{ product, staged.version });
+    try requireOnlyDirectoryChild(io, version, staged.revision);
+    const revision = try std.fs.path.join(allocator, &.{ version, staged.revision });
+
+    const stage_prefix = try std.fmt.allocPrint(
+        allocator,
+        ".hutch-install-{s}-",
+        .{staged.platform},
+    );
+    const object_lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{staged.platform});
+    var revision_dir = try std.Io.Dir.cwd().openDir(io, revision, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer revision_dir.close(io);
+    var saw_stage = false;
+    var iterator = revision_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const kind = try resolvedEntryKind(io, revision_dir, entry);
+        if (std.mem.startsWith(u8, entry.name, stage_prefix) and
+            entry.name.len > stage_prefix.len)
+        {
+            if (kind != .directory) return error.UnsafeUnmarkedHutchHome;
+            for (entry.name[stage_prefix.len..]) |byte| {
+                if (!std.ascii.isAlphanumeric(byte)) return error.UnsafeUnmarkedHutchHome;
+            }
+            if (pathEqual(entry.name, std.fs.path.basename(staged.canonical_root))) {
+                saw_stage = true;
+            }
+        } else if (std.mem.eql(u8, entry.name, object_lock_name)) {
+            if (kind != .file) return error.UnsafeUnmarkedHutchHome;
+        } else {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+    }
+    if (!saw_stage) return error.UnsafeUnmarkedHutchHome;
+}
+
+fn validateUnmarkedStatePlumbing(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !void {
+    const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+    try requireOnlyDirectoryChild(io, state, "locks");
+    const locks = try std.fs.path.join(allocator, &.{ state, "locks" });
+    var locks_dir = try std.Io.Dir.cwd().openDir(io, locks, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer locks_dir.close(io);
+    var iterator = locks_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const allowed = std.mem.eql(u8, entry.name, "graph.lock") or
+            std.mem.eql(u8, entry.name, store_lock_file_name) or
+            std.mem.eql(u8, entry.name, "selections.lock");
+        if (!allowed or try resolvedEntryKind(io, locks_dir, entry) != .file) {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+    }
+}
+
+fn requireOnlyDirectoryChild(
+    io: std.Io,
+    parent: []const u8,
+    expected_name: []const u8,
+) !void {
+    var directory = try std.Io.Dir.cwd().openDir(io, parent, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer directory.close(io);
+    var found = false;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (found or !std.mem.eql(u8, entry.name, expected_name) or
+            try resolvedEntryKind(io, directory, entry) != .directory)
+        {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+        found = true;
+    }
+    if (!found) return error.UnsafeUnmarkedHutchHome;
+}
+
+fn resolvedEntryKind(
+    io: std.Io,
+    directory: std.Io.Dir,
+    entry: std.Io.Dir.Entry,
+) !std.Io.File.Kind {
+    if (entry.kind != .unknown) return entry.kind;
+    return (try directory.statFile(io, entry.name, .{ .follow_symlinks = false })).kind;
+}
+
+fn sameHutchArchive(lhs: StagedHutchArchive, rhs: StagedHutchArchive) bool {
+    return std.mem.eql(u8, lhs.version, rhs.version) and
+        std.mem.eql(u8, lhs.revision, rhs.revision) and
+        std.mem.eql(u8, lhs.platform, rhs.platform) and
+        std.mem.eql(u8, lhs.archive_sha256, rhs.archive_sha256);
+}
+
+fn validateStagedHutchArchive(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    root: []const u8,
+) !StagedHutchArchive {
+    const archive = try validateHutchArchiveRoot(io, allocator, root);
+    const canonical_home = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    const expected_parent = try std.fs.path.join(allocator, &.{
+        canonical_home,
+        releases_directory_name,
+        Product.hutch.name(),
+        archive.version,
+        archive.revision,
+    });
+    const canonical_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, expected_parent, allocator);
+    const actual_parent = std.fs.path.dirname(archive.canonical_root) orelse
+        return error.InvalidInstalledHutchStage;
+    if (!pathEqual(actual_parent, canonical_parent)) return error.InvalidInstalledHutchStage;
+
+    const name = std.fs.path.basename(archive.canonical_root);
+    const prefix = try std.fmt.allocPrint(allocator, ".hutch-install-{s}-", .{archive.platform});
+    if (!std.mem.startsWith(u8, name, prefix) or name.len == prefix.len) {
+        return error.InvalidInstalledHutchStage;
+    }
+    for (name[prefix.len..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) return error.InvalidInstalledHutchStage;
+    }
+    return archive;
+}
+
+fn validateHutchArchiveRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) !StagedHutchArchive {
+    const root_stat = try std.Io.Dir.cwd().statFile(io, root, .{ .follow_symlinks = false });
+    if (root_stat.kind != .directory) return error.InvalidInstalledHutchArchive;
+    try validateArchiveTree(io, allocator, root, 0);
+
+    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator);
+    const metadata_path = try std.fs.path.join(allocator, &.{ root, Product.hutch.metadataFileName() });
+    const metadata_bytes = try readFileNoFollowAlloc(
+        io,
+        allocator,
+        metadata_path,
+        max_manifest_bytes,
+    );
+    const metadata = std.json.parseFromSliceLeaky(std.json.Value, allocator, metadata_bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidInstalledHutchArchive;
+    if ((jsonPositiveUsize(metadata, "schema") catch return error.InvalidInstalledHutchArchive) != manifest_schema or
+        !std.mem.eql(u8, jsonString(metadata, "kind") catch return error.InvalidInstalledHutchArchive, "archive") or
+        !std.mem.eql(u8, jsonString(metadata, "product") catch return error.InvalidInstalledHutchArchive, Product.hutch.name()))
     {
         return error.InvalidInstalledHutchArchive;
     }
-    const version = try jsonString(metadata, "version");
-    const parsed_version = try version_selector.parse(version);
+    const version = jsonString(metadata, "version") catch return error.InvalidInstalledHutchArchive;
+    const parsed_version = version_selector.parse(version) catch return error.InvalidInstalledHutchArchive;
     if (parsed_version.kind != .version) return error.InvalidInstalledHutchArchive;
-    const revision = try jsonString(metadata, "revision");
-    try validateRevision(revision);
-    const platform = try jsonString(metadata, "platform");
-    if (!std.mem.eql(u8, platform, try platformKey())) return error.ReleasePlatformMismatch;
-    const expected_root = try std.fs.path.join(allocator, &.{
-        home,
-        releases_directory_name,
-        Product.hutch.name(),
-        version,
-        revision,
-        platform,
-    });
-    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, root, allocator);
-    const canonical_expected = try std.Io.Dir.cwd().realPathFileAlloc(init.io, expected_root, allocator);
-    if (!pathEqual(canonical_root, canonical_expected)) return error.InvalidInstalledHutchArchive;
-    const resolution = (try installedResolutionAt(
-        init.io,
+    const revision = jsonString(metadata, "revision") catch return error.InvalidInstalledHutchArchive;
+    validateRevision(revision) catch return error.InvalidInstalledHutchArchive;
+    const platform = jsonString(metadata, "platform") catch return error.InvalidInstalledHutchArchive;
+    if (!std.mem.eql(u8, platform, platformKey() catch return error.InvalidInstalledHutchArchive)) {
+        return error.ReleasePlatformMismatch;
+    }
+
+    const launcher_name = if (builtin.os.tag == .windows) "hutch.exe" else "hutch";
+    const expected_launcher = try std.fmt.allocPrint(allocator, "bin/{s}", .{launcher_name});
+    const expected_engine = try std.fmt.allocPrint(
         allocator,
+        "bin/{s}",
+        .{Product.hutch.executableFileName()},
+    );
+    if (!std.mem.eql(u8, jsonString(metadata, "launcher") catch return error.InvalidInstalledHutchArchive, expected_launcher) or
+        !std.mem.eql(u8, jsonString(metadata, "executable") catch return error.InvalidInstalledHutchArchive, expected_engine))
+    {
+        return error.InvalidInstalledHutchArchive;
+    }
+
+    try requireNonEmptyRegularFile(io, try std.fs.path.join(allocator, &.{ root, "bin", launcher_name }));
+    try requireNonEmptyRegularFile(io, try std.fs.path.join(allocator, &.{
         root,
-        .hutch,
-        version,
-        revision,
-        platform,
-    )) orelse return error.InvalidInstalledHutchArchive;
-    _ = try ensureManagedHomeAt(init.io, allocator, home);
-    try activateChannel(init, allocator, .hutch, channel, resolution);
+        "bin",
+        Product.hutch.executableFileName(),
+    }));
+    const marker_path = try std.fs.path.join(allocator, &.{ root, ".dash-installed" });
+    const marker = try readFileNoFollowAlloc(io, allocator, marker_path, 128);
+    if (marker.len != 64) return error.InvalidInstalledHutchArchive;
+    validateSha256(marker) catch return error.InvalidInstalledHutchArchive;
+
+    return .{
+        .canonical_root = canonical_root,
+        .version = version,
+        .revision = revision,
+        .platform = platform,
+        .archive_sha256 = marker,
+    };
+}
+
+fn validateArchiveTree(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    depth: usize,
+) !void {
+    if (depth >= 64) return error.InvalidInstalledHutchArchive;
+    var directory = std.Io.Dir.cwd().openDir(io, root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.InvalidInstalledHutchArchive;
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        var kind = entry.kind;
+        if (kind == .unknown) {
+            kind = (try directory.statFile(io, entry.name, .{ .follow_symlinks = false })).kind;
+        }
+        switch (kind) {
+            .file => {},
+            .directory => {
+                const child = try std.fs.path.join(allocator, &.{ root, entry.name });
+                try validateArchiveTree(io, allocator, child, depth + 1);
+            },
+            else => return error.InvalidInstalledHutchArchive,
+        }
+    }
+}
+
+fn requireNonEmptyRegularFile(io: std.Io, path: []const u8) !void {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file or stat.size == 0) return error.InvalidInstalledHutchArchive;
+}
+
+fn readFileNoFollowAlloc(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemainingAlignedSentinel(
+        allocator,
+        .limited(max_bytes),
+        .of(u8),
+        null,
+    ) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
 }
 
 pub fn checkForUpdate(
@@ -980,6 +1409,15 @@ fn writeSelection(
 
     var selections = try loadSelectionsAt(io, allocator, home);
     try selections.set(product, channel, selection);
+    try writeSelectionsLocked(io, allocator, home, selections);
+}
+
+fn writeSelectionsLocked(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    selections: Selections,
+) !void {
     const encoded = try selectionsJson(allocator, selections);
     try writeAtomicFileLocked(io, try selectionsPath(allocator, home), encoded);
 }
@@ -2183,6 +2621,58 @@ test "selected and exact installed releases resolve without remote metadata" {
     try std.testing.expectEqualStrings(release_root, exact.root);
 }
 
+fn createTestStagedHutchArchive(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    version: []const u8,
+    revision: []const u8,
+    checksum: []const u8,
+    suffix: []const u8,
+) ![]const u8 {
+    const platform = try platformKey();
+    const parent = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        Product.hutch.name(),
+        version,
+        revision,
+    });
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+    const stage_name = try std.fmt.allocPrint(
+        allocator,
+        ".hutch-install-{s}-{s}",
+        .{ platform, suffix },
+    );
+    const stage = try std.fs.path.join(allocator, &.{ parent, stage_name });
+    const bin = try std.fs.path.join(allocator, &.{ stage, "bin" });
+    try std.Io.Dir.cwd().createDirPath(io, bin);
+
+    const launcher_name = if (builtin.os.tag == .windows) "hutch.exe" else "hutch";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ bin, launcher_name }),
+        .data = "launcher",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ bin, Product.hutch.executableFileName() }),
+        .data = "engine",
+    });
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"hutch\",\"channel\":\"production\",\"version\":\"{s}\",\"platform\":\"{s}\",\"revision\":\"{s}\",\"launcher\":\"bin/{s}\",\"executable\":\"bin/{s}\"}}\n",
+        .{ version, platform, revision, launcher_name, Product.hutch.executableFileName() },
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ stage, Product.hutch.metadataFileName() }),
+        .data = metadata,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ stage, ".dash-installed" }),
+        .data = checksum,
+    });
+    return stage;
+}
+
 test "a downloaded artifact identity does not trust marker and executable alone" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2249,4 +2739,241 @@ test "a downloaded artifact identity does not trust marker and executable alone"
     )).?;
     try std.testing.expectEqualStrings(release_root, installed.root);
     try std.testing.expectEqualStrings(checksum, installed.archive_sha256);
+}
+
+test "installer bootstrap atomically publishes a staged Hutch release" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const version = "0.8.0";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        version,
+        revision,
+        checksum,
+        "aaaaaaaaaaaa",
+    );
+
+    try bootstrapInstalledHutchAt(io, allocator, home, "stable", stage, &.{});
+
+    const final_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        Product.hutch.name(),
+        version,
+        revision,
+        try platformKey(),
+    });
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io, stage, .{}),
+    );
+    const installed = try validateHutchArchiveRoot(io, allocator, final_root);
+    try std.testing.expectEqualStrings(checksum, installed.archive_sha256);
+    _ = try loadStoreIdentityAt(io, allocator, home);
+    const selections = try loadSelectionsAt(io, allocator, home);
+    try std.testing.expectEqualStrings(version, selections.hutch_production.?.version);
+    try std.testing.expect(pathExists(io, try std.mem.concat(allocator, u8, &.{ final_root, ".lock" })));
+}
+
+test "installer bootstrap fails closed on damaged selections before publication" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    _ = try ensureManagedHomeAt(io, allocator, home);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try selectionsPath(allocator, home),
+        .data = "{ damaged selections\n",
+    });
+    const version = "0.8.0";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        version,
+        revision,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbb",
+    );
+
+    try std.testing.expectError(
+        error.InvalidSelectionsState,
+        bootstrapInstalledHutchAt(io, allocator, home, "production", stage, &.{}),
+    );
+    try std.Io.Dir.cwd().access(io, stage, .{});
+    const final_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        Product.hutch.name(),
+        version,
+        revision,
+        try platformKey(),
+    });
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(io, final_root, .{}),
+    );
+    try std.testing.expect(pathExists(io, try storeMarkerPath(allocator, home)));
+}
+
+test "installer bootstrap rejects symlinks anywhere in a staged archive" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        "0.8.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cccccccccccc",
+    );
+    const outside = try std.fs.path.join(allocator, &.{ fixture, "outside" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outside, .data = "outside" });
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside,
+        try std.fs.path.join(allocator, &.{ stage, "unsafe-link" }),
+        .{},
+    );
+
+    try std.testing.expectError(
+        error.InvalidInstalledHutchArchive,
+        bootstrapInstalledHutchAt(io, allocator, home, "production", stage, &.{}),
+    );
+}
+
+test "installer bootstrap refuses to claim an arbitrary unmarked home" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const sentinel = try std.fs.path.join(allocator, &.{ home, "must-survive.txt" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "keep" });
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        "0.8.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "dddddddddddd",
+    );
+
+    try std.testing.expectError(
+        error.UnsafeUnmarkedHutchHome,
+        bootstrapInstalledHutchAt(io, allocator, home, "production", stage, &.{}),
+    );
+    try std.testing.expectEqualStrings(
+        "keep",
+        try std.Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(16)),
+    );
+    try std.testing.expect(!pathExists(io, try storeMarkerPath(allocator, home)));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ home, state_directory_name })));
+}
+
+test "installer bootstrap never claims the user home itself" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const home = try testAbsoluteRoot(io, allocator, &tmp);
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        "0.8.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "eeeeeeeeeeee",
+    );
+
+    try std.testing.expectError(
+        error.UnsafeUnmarkedHutchHome,
+        bootstrapInstalledHutchAt(io, allocator, home, "production", stage, &.{home}),
+    );
+    try std.testing.expect(!pathExists(io, try storeMarkerPath(allocator, home)));
+}
+
+test "installer bootstrap repairs a damaged exact release under its object lock" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const version = "0.8.0";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const first_stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        version,
+        revision,
+        checksum,
+        "ffffffffffff",
+    );
+    try bootstrapInstalledHutchAt(io, allocator, home, "production", first_stage, &.{});
+    const final_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        Product.hutch.name(),
+        version,
+        revision,
+        try platformKey(),
+    });
+    try std.Io.Dir.cwd().deleteFile(
+        io,
+        try std.fs.path.join(allocator, &.{ final_root, "bin", Product.hutch.executableFileName() }),
+    );
+    const repair_stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        version,
+        revision,
+        checksum,
+        "gggggggggggg",
+    );
+
+    try bootstrapInstalledHutchAt(io, allocator, home, "canary", repair_stage, &.{});
+    _ = try validateHutchArchiveRoot(io, allocator, final_root);
+    const selections = try loadSelectionsAt(io, allocator, home);
+    try std.testing.expectEqualStrings(revision, selections.hutch_canary.?.revision);
 }

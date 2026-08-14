@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -46,6 +47,8 @@ const temporary = mkdtempSync(join(tmpdir(), "hutch-installer-smoke-"));
 const hutchHome = join(temporary, "home");
 const shellHome = join(temporary, "shell-home");
 const stableAliasHome = join(temporary, "stable-alias-home");
+const concurrentHome = join(temporary, "concurrent-home");
+const unsafeHome = join(temporary, "unsafe-home");
 
 const server = createServer((request, response) => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -194,6 +197,37 @@ function assertActiveInstall(home, activeChannel) {
   );
 }
 
+function assertNoInstallerStages(home) {
+  const revisionRoot = join(
+    home,
+    "releases",
+    "hutch",
+    metadata.version,
+    metadata.revision,
+  );
+  const entries = readdirSync(revisionRoot);
+  assert(
+    entries.every((name) =>
+      !name.startsWith(".hutch-install-") && !name.startsWith(".hutch-replaced-")),
+    `installer left a staging directory in ${revisionRoot}: ${entries.join(", ")}`,
+  );
+}
+
+function assertConcurrentInstallerResults(results) {
+  assert(
+    results.some((result) => result.status === "fulfilled"),
+    "at least one concurrent installer must publish the release",
+  );
+  for (const result of results) {
+    if (result.status === "fulfilled") continue;
+    assert.match(
+      String(result.reason),
+      /currently in use|InstalledHutchReleaseBusy/,
+      "a contending installer may only fail because the exact release is leased",
+    );
+  }
+}
+
 try {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -202,6 +236,29 @@ try {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
   if (process.platform === "win32") {
+    const concurrentArgs = [
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      join(hutchRoot, "scripts", "install.ps1"),
+      "-Channel",
+      channel,
+      "-HutchHome",
+      concurrentHome,
+      "-ArtifactsBaseUrl",
+      baseUrl,
+      "-NoModifyPath",
+    ];
+    const concurrentResults = await Promise.allSettled([
+      runCapture("powershell.exe", concurrentArgs, { env: process.env }),
+      runCapture("powershell.exe", concurrentArgs, { env: process.env }),
+    ]);
+    assertConcurrentInstallerResults(concurrentResults);
+    assertActiveInstall(concurrentHome, channel);
+    assertNoInstallerStages(concurrentHome);
+
     await run("powershell.exe", [
       "-NoLogo",
       "-NoProfile",
@@ -250,6 +307,22 @@ try {
       HOME: shellHome,
       SHELL: "/bin/zsh",
     };
+    const concurrentArgs = [
+      join(hutchRoot, "scripts", "install.sh"),
+      "--channel",
+      channel,
+      "--hutch-home",
+      concurrentHome,
+      "--no-modify-path",
+    ];
+    const concurrentResults = await Promise.allSettled([
+      runCapture("sh", concurrentArgs, { env: installerEnvironment }),
+      runCapture("sh", concurrentArgs, { env: installerEnvironment }),
+    ]);
+    assertConcurrentInstallerResults(concurrentResults);
+    assertActiveInstall(concurrentHome, channel);
+    assertNoInstallerStages(concurrentHome);
+
     await run("sh", [
       join(hutchRoot, "scripts", "install.sh"),
       "--channel",
@@ -292,6 +365,43 @@ try {
       "--no-modify-path",
     ], installerEnvironment);
   }
+
+  mkdirSync(unsafeHome, { recursive: true });
+  const unsafeSentinel = join(unsafeHome, "must-survive.txt");
+  writeFileSync(unsafeSentinel, "keep\n");
+  const unsafeEnvironment = {
+    ...process.env,
+    DASH_ARTIFACTS_BASE_URL: baseUrl,
+    HOME: unsafeHome,
+    USERPROFILE: unsafeHome,
+  };
+  const unsafeAttempt = process.platform === "win32"
+    ? runCapture("powershell.exe", [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        join(hutchRoot, "scripts", "install.ps1"),
+        "-Channel",
+        channel,
+        "-HutchHome",
+        unsafeHome,
+        "-ArtifactsBaseUrl",
+        baseUrl,
+        "-NoModifyPath",
+      ], { env: unsafeEnvironment })
+    : runCapture("sh", [
+        join(hutchRoot, "scripts", "install.sh"),
+        "--channel",
+        channel,
+        "--hutch-home",
+        unsafeHome,
+        "--no-modify-path",
+      ], { env: unsafeEnvironment });
+  await assert.rejects(unsafeAttempt, /refusing to claim an unmarked Hutch home/);
+  assert.equal(readFileSync(unsafeSentinel, "utf8"), "keep\n");
+  assert.equal(existsSync(join(unsafeHome, "state", "store.json")), false);
 
   assertActiveInstall(stableAliasHome, "production");
   const stableCommand = join(

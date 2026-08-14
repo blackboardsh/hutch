@@ -1064,11 +1064,21 @@ fn runReleaseCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    if (product == .hutch and args.len == 2 and
+    if (product == .hutch and args.len == 3 and
         std.mem.eql(u8, args[0], "bootstrap-install"))
     {
-        release_store.bootstrapInstalledHutch(init, allocator, args[1]) catch |err| {
-            try stderr.print("hutch: could not bootstrap installed Hutch: {s}\n", .{@errorName(err)});
+        release_store.bootstrapInstalledHutch(init, allocator, args[1], args[2]) catch |err| {
+            if (err == error.InstalledHutchReleaseBusy) {
+                try stderr.writeAll(
+                    "hutch: could not install Hutch because this exact release is currently in use; close running Hutch processes and retry\n",
+                );
+            } else if (err == error.UnsafeUnmarkedHutchHome) {
+                try stderr.writeAll(
+                    "hutch: refusing to claim an unmarked Hutch home that is a user/root directory or contains unrelated files\n",
+                );
+            } else {
+                try stderr.print("hutch: could not bootstrap installed Hutch: {s}\n", .{@errorName(err)});
+            }
             return 1;
         };
         return 0;
