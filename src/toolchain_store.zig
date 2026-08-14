@@ -93,22 +93,48 @@ pub fn resolveVersion(
     const home = try release_store.hutchHome(init, allocator);
     const root = try toolchainRoot(allocator, home, kind, version);
     const binary = try installedBinaryPath(allocator, root, kind);
-    if (try installedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
+    const initial_state = try installedToolchainState(
+        init.io,
+        allocator,
+        root,
+        binary,
+        kind,
+        version,
+    );
+    if (initial_state == .valid) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
     }
+
+    return resolveAfterInstalledMiss(init, allocator, home, root, binary, kind, version);
+}
+
+fn resolveAfterInstalledMiss(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    root: []const u8,
+    binary: []const u8,
+    kind: Kind,
+    version: []const u8,
+) !Resolution {
     const parent = std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
-    if (try installedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
+    const locked_state = try installedToolchainState(init.io, allocator, root, binary, kind, version);
+    if (locked_state == .valid) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
     }
     if (environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE")) {
-        return error.ToolchainNotInstalled;
+        return offlineError(locked_state);
     }
-    std.Io.Dir.cwd().deleteTree(init.io, root) catch {};
+    switch (locked_state) {
+        .valid => unreachable,
+        .missing => {},
+        .damaged => std.Io.Dir.cwd().deleteTree(init.io, root) catch {},
+    }
 
     const archive = try archiveFor(allocator, kind, version);
     std.debug.print(
@@ -387,15 +413,22 @@ fn installedBinaryPath(allocator: std.mem.Allocator, root: []const u8, kind: Kin
     };
 }
 
-fn installedToolchainMatches(
+const InstalledState = enum {
+    missing,
+    damaged,
+    valid,
+};
+
+fn installedToolchainState(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
     binary: []const u8,
     kind: Kind,
     version: []const u8,
-) !bool {
-    if (!pathExists(io, binary)) return false;
+) !InstalledState {
+    if (!pathExists(io, root)) return .missing;
+    if (!pathExists(io, binary)) return .damaged;
     if (kind == .rust) {
         const cargo_binary = try rustCargoBinary(allocator, .{
             .binary = binary,
@@ -403,8 +436,8 @@ fn installedToolchainMatches(
             .version = version,
             .system = false,
         });
-        if (!pathExists(io, cargo_binary)) return false;
-        if (!try cargoMatchesVersion(io, allocator, cargo_binary, version)) return false;
+        if (!pathExists(io, cargo_binary)) return .damaged;
+        if (!try cargoMatchesVersion(io, allocator, cargo_binary, version)) return .damaged;
     }
     const marker = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" });
     const value = std.Io.Dir.cwd().readFileAlloc(
@@ -412,9 +445,18 @@ fn installedToolchainMatches(
         marker,
         allocator,
         .limited(256),
-    ) catch return false;
-    if (!std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), version)) return false;
-    return executableMatchesVersion(io, allocator, binary, kind, version);
+    ) catch return .damaged;
+    if (!std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), version)) return .damaged;
+    if (!try executableMatchesVersion(io, allocator, binary, kind, version)) return .damaged;
+    return .valid;
+}
+
+fn offlineError(state: InstalledState) anyerror {
+    return switch (state) {
+        .missing => error.ToolchainNotInstalledOffline,
+        .damaged => error.ToolchainDamagedOffline,
+        .valid => unreachable,
+    };
 }
 
 fn cargoMatchesVersion(
@@ -748,6 +790,228 @@ test "toolchain archive URLs follow upstream release naming" {
     defer std.testing.allocator.free(archive.url);
     defer std.testing.allocator.free(archive.filename);
     try std.testing.expect(std.mem.indexOf(u8, archive.url, "/dev-2026-07a/odin-") != null);
+}
+
+test "offline toolchain resolution reuses a valid installed toolchain" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const home = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    try environ_map.put("HUTCH_HOME", home);
+    try environ_map.put("DASH_RELEASE_OFFLINE", "1");
+    try environ_map.put("HTTPS_PROXY", "http://127.0.0.1:1");
+
+    const version = "dev-2099-12z";
+    const root = try toolchainRoot(arena.allocator(), home, .odin, version);
+    const binary = try installedBinaryPath(arena.allocator(), root, .odin);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = binary,
+        .data = "#!/bin/sh\nprintf 'version dev-2099-12-nightly:fixture\\n'\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena.allocator(), &.{ root, ".hutch-toolchain" }),
+        .data = version,
+    });
+
+    const resolution = try resolveVersion(
+        testProcessInit(&arena, &environ_map),
+        arena.allocator(),
+        .odin,
+        version,
+    );
+    try std.testing.expect(!resolution.system);
+    try std.testing.expectEqualStrings(root, resolution.root.?);
+    try std.testing.expectEqualStrings(binary, resolution.binary);
+}
+
+test "offline toolchain resolution rejects missing and damaged installs before HTTP" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const home = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    try environ_map.put("HUTCH_HOME", home);
+    try environ_map.put("DASH_RELEASE_OFFLINE", "yes");
+    // If the offline guard regresses, network access fails locally rather than
+    // reaching an upstream toolchain host.
+    try environ_map.put("HTTPS_PROXY", "http://127.0.0.1:1");
+
+    const version = "dev-2099-11z";
+    try std.testing.expectError(
+        error.ToolchainNotInstalledOffline,
+        resolveVersion(
+            testProcessInit(&arena, &environ_map),
+            arena.allocator(),
+            .odin,
+            version,
+        ),
+    );
+
+    const root = try toolchainRoot(arena.allocator(), home, .odin, version);
+    try std.testing.expect(!pathExists(io, root));
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    const marker = try std.fs.path.join(arena.allocator(), &.{ root, ".hutch-toolchain" });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = marker,
+        .data = version,
+    });
+    try std.testing.expectError(
+        error.ToolchainDamagedOffline,
+        resolveVersion(
+            testProcessInit(&arena, &environ_map),
+            arena.allocator(),
+            .odin,
+            version,
+        ),
+    );
+    try std.testing.expect(pathExists(io, root));
+    try std.testing.expect(pathExists(io, marker));
+}
+
+test "offline toolchain resolution revalidates after waiting for an installer" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const home = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    try environ_map.put("HUTCH_HOME", home);
+    try environ_map.put("DASH_RELEASE_OFFLINE", "1");
+    try environ_map.put("HTTPS_PROXY", "http://127.0.0.1:1");
+
+    const version = "dev-2099-10z";
+    const root = try toolchainRoot(arena.allocator(), home, .odin, version);
+    const binary = try installedBinaryPath(arena.allocator(), root, .odin);
+    const parent = std.fs.path.dirname(root).?;
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+    const lock_path = try std.mem.concat(arena.allocator(), u8, &.{ root, ".lock" });
+    const publisher_lock = try release_store.acquirePersistentFileLock(io, lock_path);
+    var publisher_lock_open = true;
+    errdefer if (publisher_lock_open) publisher_lock.close(io);
+
+    var context = OfflineWaitContext{
+        .environ_map = &environ_map,
+        .home = home,
+        .root = root,
+        .binary = binary,
+        .version = version,
+        .lock_path = lock_path,
+    };
+    const resolver_thread = try std.Thread.spawn(.{}, OfflineWaitContext.run, .{&context});
+    var resolver_thread_joined = false;
+    defer {
+        if (publisher_lock_open) {
+            publisher_lock.close(io);
+            publisher_lock_open = false;
+        }
+        if (!resolver_thread_joined) resolver_thread.join();
+    }
+    try context.contended.wait(io);
+
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = binary,
+        .data = "#!/bin/sh\nprintf 'version dev-2099-10-nightly:fixture\\n'\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena.allocator(), &.{ root, ".hutch-toolchain" }),
+        .data = version,
+    });
+    publisher_lock.close(io);
+    publisher_lock_open = false;
+    resolver_thread.join();
+    resolver_thread_joined = true;
+
+    if (context.failure) |err| return err;
+    try std.testing.expect(context.resolved_installed);
+}
+
+const OfflineWaitContext = struct {
+    environ_map: *std.process.Environ.Map,
+    home: []const u8,
+    root: []const u8,
+    binary: []const u8,
+    version: []const u8,
+    lock_path: []const u8,
+    contended: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+    resolved_installed: bool = false,
+
+    fn run(context: *@This()) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const probe = std.Io.Dir.cwd().openFile(std.testing.io, context.lock_path, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                context.contended.set(std.testing.io);
+                return context.resolve(&arena);
+            },
+            else => {
+                context.failure = err;
+                context.contended.set(std.testing.io);
+                return;
+            },
+        };
+        probe.close(std.testing.io);
+        context.failure = error.ExpectedToolchainLockContention;
+        context.contended.set(std.testing.io);
+    }
+
+    fn resolve(context: *@This(), arena: *std.heap.ArenaAllocator) void {
+        const resolution = resolveAfterInstalledMiss(
+            testProcessInit(arena, context.environ_map),
+            arena.allocator(),
+            context.home,
+            context.root,
+            context.binary,
+            .odin,
+            context.version,
+        ) catch |err| {
+            context.failure = err;
+            return;
+        };
+        context.resolved_installed = !resolution.system;
+    }
+};
+
+fn testProcessInit(
+    arena: *std.heap.ArenaAllocator,
+    environ_map: *std.process.Environ.Map,
+) std.process.Init {
+    return .{
+        .minimal = .{
+            .environ = .empty,
+            .args = .{ .vector = &.{} },
+        },
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = environ_map,
+        .preopens = .empty,
+    };
 }
 
 test "zig archive naming flips at 0.14.1" {

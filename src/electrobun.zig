@@ -2899,10 +2899,20 @@ fn resolveBuildToolchain(
         kind,
         version,
     ) catch |err| {
-        ctx.writeStderr(
-            "hutch electrobun: could not resolve the {s} {s} toolchain: {s}\n",
-            .{ kind.name(), version, @errorName(err) },
-        );
+        switch (err) {
+            error.ToolchainNotInstalledOffline => ctx.writeStderr(
+                "hutch electrobun: {s} {s} is not installed; offline mode cannot download it\n",
+                .{ kind.name(), version },
+            ),
+            error.ToolchainDamagedOffline => ctx.writeStderr(
+                "hutch electrobun: the installed {s} {s} toolchain is damaged; disable offline mode to replace it\n",
+                .{ kind.name(), version },
+            ),
+            else => ctx.writeStderr(
+                "hutch electrobun: could not resolve the {s} {s} toolchain: {s}\n",
+                .{ kind.name(), version, @errorName(err) },
+            ),
+        }
         return err;
     };
 }
