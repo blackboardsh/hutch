@@ -166,17 +166,15 @@ function relativeRoot(home, path) {
   return relative(home, path).split(sep).join("/");
 }
 
-function writeLastUsed(home, managedRoot, seconds) {
+function writeUnreachableSince(home, managedRoot, seconds) {
   const relativePath = relativeRoot(home, managedRoot);
   const digest = createHash("sha256").update(relativePath).digest("hex");
-  const stateRoot = join(home, "state", "last-used");
+  const stateRoot = join(home, "state", "unreachable-since");
   const path = join(stateRoot, `${digest}.timestamp`);
   mkdirSync(stateRoot, { recursive: true });
   writeFileSync(path, `${seconds}\n`);
   const date = new Date(seconds * 1000);
   utimesSync(path, date, date);
-  utimesSync(join(managedRoot, ".hutch-toolchain"), date, date);
-  utimesSync(managedRoot, date, date);
   return path;
 }
 
@@ -302,14 +300,14 @@ test("manual prune has zero grace and unresolved projects protect nothing", () =
     const toolchainRoot = createToolchain(home, "0.14.1");
     const oldToolchainRoot = createToolchain(home, "0.13.0");
     const now = Math.floor(Date.now() / 1000);
-    writeLastUsed(home, toolchainRoot, now);
-    const oldLastUsed = writeLastUsed(
+    writeUnreachableSince(home, toolchainRoot, now);
+    const oldUnreachableSince = writeUnreachableSince(
       home,
       oldToolchainRoot,
       now - automaticRetentionSeconds - 24 * 60 * 60,
     );
-    const oldLastUsedContents = readFileSync(oldLastUsed, "utf8");
-    const oldLastUsedMtime = statSync(oldLastUsed).mtimeMs;
+    const oldUnreachableSinceContents = readFileSync(oldUnreachableSince, "utf8");
+    const oldUnreachableSinceMtime = statSync(oldUnreachableSince).mtimeMs;
     createMissingProjectRegistration(home, join(root, "missing-project"), [
       {
         type: "release",
@@ -336,8 +334,8 @@ test("manual prune has zero grace and unresolved projects protect nothing", () =
     assert(existsSync(cottontailRoot), "dry-run must retain an unused Cottontail release");
     assert(existsSync(toolchainRoot), "dry-run must retain an unused toolchain");
     assert(existsSync(oldToolchainRoot), "dry-run must suppress the automatic retention sweep");
-    assert.equal(readFileSync(oldLastUsed, "utf8"), oldLastUsedContents);
-    assert.equal(statSync(oldLastUsed).mtimeMs, oldLastUsedMtime);
+    assert.equal(readFileSync(oldUnreachableSince, "utf8"), oldUnreachableSinceContents);
+    assert.equal(statSync(oldUnreachableSince).mtimeMs, oldUnreachableSinceMtime);
     assert.match(preview.stdout, /cottontail/);
     assert.match(preview.stdout, /toolchains[\\/]zig/);
 
@@ -359,8 +357,8 @@ test("every invocation lazily prunes objects older than ten days", () => {
     const oldRoot = createToolchain(home, "0.14.1");
     const youngRoot = createToolchain(home, "0.14.2");
     const now = Math.floor(Date.now() / 1000);
-    writeLastUsed(home, oldRoot, now - automaticRetentionSeconds - 24 * 60 * 60);
-    writeLastUsed(home, youngRoot, now - automaticRetentionSeconds + 24 * 60 * 60);
+    writeUnreachableSince(home, oldRoot, now - automaticRetentionSeconds - 24 * 60 * 60);
+    writeUnreachableSince(home, youngRoot, now - automaticRetentionSeconds + 24 * 60 * 60);
 
     const launcher = join(currentRoot, "bin", `hutch${executableSuffix}`);
     const version = run(launcher, ["--version"], home, { cwd: root });
