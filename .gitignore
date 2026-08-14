@@ -2,6 +2,7 @@
 .env
 .dev.vars
 node_modules/
+.hutch/
 
 .cottontail-tmp/
 .cottontail-compat-*
