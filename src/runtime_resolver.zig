@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
+const cache_locks = @import("cache_locks.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -10,6 +11,11 @@ pub const Resolution = struct {
     version: ?[]const u8 = null,
     revision: ?[]const u8 = null,
     local: bool,
+    lease: ?cache_locks.ObjectLease = null,
+
+    pub fn close(self: Resolution, io: std.Io) void {
+        if (self.lease) |lease| lease.close(io);
+    }
 };
 
 pub fn resolveCottontail(
@@ -17,42 +23,41 @@ pub fn resolveCottontail(
     allocator: std.mem.Allocator,
     command_args: []const [:0]const u8,
 ) !Resolution {
-    if (init.environ_map.get("DASH_COTTONTAIL") orelse
+    const resolution = if (init.environ_map.get("DASH_COTTONTAIL") orelse
         init.environ_map.get("COTTONTAIL_BINARY")) |configured|
-    {
-        return localResolution(init.io, allocator, configured);
-    }
+        try localResolution(init.io, allocator, configured)
+    else if (environmentFlagEnabled(init.environ_map, "DASH_USE_LOCAL_COTTONTAIL"))
+        try resolveLocalCheckout(init, allocator)
+    else managed: {
+        const selector = if (init.environ_map.get("DASH_COTTONTAIL_SELECTOR")) |configured|
+            try version_selector.parse(configured)
+        else selector: {
+            const pragma = try bootstrap_pragma.discover(init, allocator, command_args);
+            if (pragma.cottontail) |selected| break :selector selected;
+            const channel = init.environ_map.get("HUTCH_ACTIVE_CHANNEL") orelse "production";
+            break :selector try version_selector.parse(channel);
+        };
 
-    if (environmentFlagEnabled(init.environ_map, "DASH_USE_LOCAL_COTTONTAIL")) {
-        return resolveLocalCheckout(init, allocator);
-    }
-
-    const selector = if (init.environ_map.get("DASH_COTTONTAIL_SELECTOR")) |configured|
-        try version_selector.parse(configured)
-    else blk: {
-        const pragma = try bootstrap_pragma.discover(init, allocator, command_args);
-        if (pragma.cottontail) |selected| break :blk selected;
-        const channel = init.environ_map.get("HUTCH_ACTIVE_CHANNEL") orelse "production";
-        break :blk try version_selector.parse(channel);
+        const release = try release_store.resolveLeased(
+            init,
+            allocator,
+            .cottontail,
+            selector,
+            .{
+                .refresh = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_REFRESH"),
+                .offline = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE"),
+            },
+        );
+        break :managed Resolution{
+            .root = release.resolution.root,
+            .executable = release.resolution.executable,
+            .version = release.resolution.version,
+            .revision = release.resolution.revision,
+            .local = false,
+            .lease = release.lease,
+        };
     };
-
-    const release = try release_store.resolve(
-        init,
-        allocator,
-        .cottontail,
-        selector,
-        .{
-            .refresh = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_REFRESH"),
-            .offline = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE"),
-        },
-    );
-    return .{
-        .root = release.root,
-        .executable = release.executable,
-        .version = release.version,
-        .revision = release.revision,
-        .local = false,
-    };
+    return resolution;
 }
 
 fn resolveLocalCheckout(

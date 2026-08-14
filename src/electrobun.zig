@@ -1,10 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cache_locks = @import("cache_locks.zig");
 const cache_store = @import("cache_store.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
 const project_state = @import("project_state.zig");
+const release_store = @import("release_store.zig");
 const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const windows_icon = @import("windows_icon.zig");
@@ -54,6 +56,11 @@ const BuiltAppLaunchCommand = struct {
 const build_lock_environment_variable = "HUTCH_ELECTROBUN_BUILD_LOCK";
 const bundled_uninstall_manager_file_name = "uninstall";
 
+const ManagedRootLease = struct {
+    root: []const u8,
+    lease: ?cache_locks.ObjectLease,
+};
+
 const Context = struct {
     init: std.process.Init,
     io: std.Io,
@@ -65,6 +72,9 @@ const Context = struct {
     project_root: []const u8,
     electrobun_version: ?[]const u8 = null,
     build_lock_key: ?[]const u8 = null,
+    managed_root_leases: ?*std.ArrayList(ManagedRootLease) = null,
+    cached_managed_devkit: ?*?electrobun_devkit.Resolution = null,
+    automatic_prune_completed: ?*bool = null,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         var buffer: [2048]u8 = undefined;
@@ -193,11 +203,22 @@ pub fn run(
     if (args.len == 0 or isHelpFlag(args[0])) {
         try printHelp(stdout);
         try stdout.flush();
+        cache_store.pruneAutomatic(init, init.arena.allocator());
         return 0;
     }
 
     const self_exe_path = try std.process.executablePathAlloc(init.io, init.arena.allocator());
     const project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
+
+    var managed_root_leases: std.ArrayList(ManagedRootLease) = .empty;
+    defer {
+        for (managed_root_leases.items) |managed| {
+            if (managed.lease) |lease| lease.close(init.io);
+        }
+        managed_root_leases.deinit(init.arena.allocator());
+    }
+    var cached_managed_devkit: ?electrobun_devkit.Resolution = null;
+    var automatic_prune_completed = false;
 
     const ctx = Context{
         .init = init,
@@ -209,6 +230,9 @@ pub fn run(
         .cottontail_binary = cottontail_binary,
         .project_root = project_root,
         .electrobun_version = electrobun_version,
+        .managed_root_leases = &managed_root_leases,
+        .cached_managed_devkit = &cached_managed_devkit,
+        .automatic_prune_completed = &automatic_prune_completed,
     };
     defer cleanupCliTempDir(&ctx);
 
@@ -216,6 +240,7 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "config")) {
         const config = try loadConfigAfterProductDevkit(&ctx, parseBuildEnvironment(args[1..]));
+        pruneAutomaticOnce(&ctx);
         ctx.writeStdout("{s}\n", .{config.raw_json});
         return 0;
     }
@@ -225,6 +250,7 @@ pub fn run(
             ctx.writeStderr("hutch electrobun init: {s}\n", .{@errorName(err)});
             return 1;
         };
+        pruneAutomaticOnce(&ctx);
         return 0;
     }
 
@@ -265,7 +291,16 @@ pub fn run(
     try stderr.print("hutch electrobun: unknown command: {s}\n", .{command});
     try printHelp(stderr);
     try stderr.flush();
+    pruneAutomaticOnce(&ctx);
     return 1;
+}
+
+fn pruneAutomaticOnce(ctx: *const Context) void {
+    if (ctx.automatic_prune_completed) |completed| {
+        if (completed.*) return;
+        completed.* = true;
+    }
+    cache_store.pruneAutomatic(ctx.init, ctx.allocator);
 }
 
 fn printHelp(writer: anytype) !void {
@@ -641,7 +676,7 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     const graph_lock = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
     defer graph_lock.close(ctx.io);
 
-    const platform_paths = try getPlatformPaths(ctx, config.root);
+    const platform_paths = try getPlatformPathsUnderGraph(ctx, config.root);
     var objects: std.ArrayList(cache_store.ManagedObject) = .empty;
     if (platform_paths.devkit) |devkit| {
         const managed = try cache_store.managedElectrobunObjects(
@@ -656,16 +691,28 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             if (object) |value| try objects.append(ctx.allocator, value);
         }
     }
+    if (try cache_store.managedReleaseObject(
+        ctx.init,
+        ctx.allocator,
+        .hutch,
+        ctx.self_exe_path,
+    )) |object| try objects.append(ctx.allocator, object);
+    if (try cache_store.managedReleaseObject(
+        ctx.init,
+        ctx.allocator,
+        .cottontail,
+        ctx.cottontail_home,
+    )) |object| try objects.append(ctx.allocator, object);
     switch (main_process) {
-        .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)),
-        .rust => try appendManagedToolchain(ctx, &objects, .rust, try resolveBuildToolchain(ctx, config.root, platform_paths, .rust)),
+        .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .zig)),
+        .rust => try appendManagedToolchain(ctx, &objects, .rust, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .rust)),
         .go => {
-            try appendManagedToolchain(ctx, &objects, .go, try resolveBuildToolchain(ctx, config.root, platform_paths, .go));
+            try appendManagedToolchain(ctx, &objects, .go, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .go));
             if (builtin.os.tag == .windows) {
-                try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchain(ctx, config.root, platform_paths, .zig));
+                try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .zig));
             }
         },
-        .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchain(ctx, config.root, platform_paths, .odin)),
+        .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .odin)),
         .bun, .cottontail => {},
     }
     try cache_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
@@ -674,16 +721,22 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
 fn prepareProjectWithBuildLock(ctx: *const Context, config: CommandContext) !void {
     const build_lock = try acquireProjectBuildLock(ctx);
     defer build_lock.close(ctx.io);
+    try prepareProjectForCommand(ctx, config);
+}
+
+fn prepareProjectForCommand(ctx: *const Context, config: CommandContext) !void {
     try prepareProject(ctx, config);
+    pruneAutomaticOnce(ctx);
 }
 
 fn appendManagedToolchain(
     ctx: *const Context,
     objects: *std.ArrayList(cache_store.ManagedObject),
     kind: toolchain_store.Kind,
-    resolution: toolchain_store.Resolution,
+    leased: toolchain_store.LeasedResolution,
 ) !void {
-    if (try cache_store.managedToolchainObject(ctx.init, ctx.allocator, kind, resolution)) |object| {
+    defer leased.close(ctx.io);
+    if (try cache_store.managedToolchainObject(ctx.init, ctx.allocator, kind, leased.resolution)) |object| {
         try objects.append(ctx.allocator, object);
     }
 }
@@ -881,7 +934,7 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
     try validateBuildLockIsolation(ctx, config);
     const build_lock = try acquireProjectBuildLock(ctx);
     defer build_lock.close(ctx.io);
-    try prepareProject(ctx, config);
+    try prepareProjectForCommand(ctx, config);
     try waitForProjectBuildReaders(ctx);
 
     var locked_ctx = projectBuildLockContext(ctx);
@@ -2500,7 +2553,7 @@ fn buildAndSpawnBuiltApp(
     try validateBuildLockIsolation(ctx, config);
     const build_lock = try acquireProjectBuildLock(ctx);
     defer build_lock.close(ctx.io);
-    try prepareProject(ctx, config);
+    try prepareProjectForCommand(ctx, config);
     try waitForProjectBuildReaders(ctx);
 
     var locked_ctx = projectBuildLockContext(ctx);
@@ -2525,7 +2578,7 @@ fn spawnBuiltAppWithReadLease(
     try validateBuildLockIsolation(ctx, config);
     const build_lock = try acquireProjectBuildLock(ctx);
     defer build_lock.close(ctx.io);
-    try prepareProject(ctx, config);
+    try prepareProjectForCommand(ctx, config);
     const read_lease = try acquireProjectBuildReadLease(ctx);
     errdefer read_lease.close(ctx);
     return .{
@@ -2893,7 +2946,26 @@ fn resolveBuildToolchain(
     config_root: std.json.Value,
     platform_paths: PlatformPaths,
     kind: toolchain_store.Kind,
-) !toolchain_store.Resolution {
+) !toolchain_store.LeasedResolution {
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, false);
+}
+
+fn resolveBuildToolchainUnderGraph(
+    ctx: *const Context,
+    config_root: std.json.Value,
+    platform_paths: PlatformPaths,
+    kind: toolchain_store.Kind,
+) !toolchain_store.LeasedResolution {
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, true);
+}
+
+fn resolveBuildToolchainWithMode(
+    ctx: *const Context,
+    config_root: std.json.Value,
+    platform_paths: PlatformPaths,
+    kind: toolchain_store.Kind,
+    graph_held: bool,
+) !toolchain_store.LeasedResolution {
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const default_version = switch (kind) {
         .zig => devkit.toolchains.zig,
@@ -2902,12 +2974,10 @@ fn resolveBuildToolchain(
         .odin => devkit.toolchains.odin,
     };
     const version = try configuredToolchainVersion(config_root, kind, default_version);
-    return toolchain_store.resolveVersion(
-        ctx.init,
-        ctx.allocator,
-        kind,
-        version,
-    ) catch |err| {
+    return (if (graph_held)
+        toolchain_store.resolveVersionUnderGraph(ctx.init, ctx.allocator, kind, version)
+    else
+        toolchain_store.resolveVersion(ctx.init, ctx.allocator, kind, version)) catch |err| {
         switch (err) {
             error.ToolchainNotInstalledOffline => ctx.writeStderr(
                 "hutch electrobun: {s} {s} is not installed; offline mode cannot download it\n",
@@ -3026,7 +3096,9 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
     const zig_sdk_path = projection.zig_entrypoint;
     if (!pathExists(ctx.io, zig_sdk_path)) return error.ZigSdkNotFound;
 
-    const zig_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+    const leased_zig_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+    defer leased_zig_toolchain.close(ctx.io);
+    const zig_toolchain = leased_zig_toolchain.resolution;
     const zig_binary = zig_toolchain.binary;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
@@ -3429,7 +3501,9 @@ test "Rust compiler wrappers cannot override the resolved rustc" {
 }
 
 fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const rust_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust);
+    const leased_rust_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .rust);
+    defer leased_rust_toolchain.close(ctx.io);
+    const rust_toolchain = leased_rust_toolchain.resolution;
     const cargo_binary = try toolchain_store.rustCargoBinary(ctx.allocator, rust_toolchain);
 
     const projection = platform_paths.projection orelse return error.ElectrobunDevkitNotProjected;
@@ -3518,7 +3592,9 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
         projection.go_manifest,
         projection.go_module,
     );
-    const go_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
+    const leased_go_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .go);
+    defer leased_go_toolchain.close(ctx.io);
+    const go_toolchain = leased_go_toolchain.resolution;
     const go_binary = go_toolchain.binary;
 
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-go-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
@@ -3533,8 +3609,12 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
     defer env_map.deinit();
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     var zig_binary: ?[]const u8 = null;
+    var leased_zig_toolchain: ?toolchain_store.LeasedResolution = null;
+    defer if (leased_zig_toolchain) |leased| leased.close(ctx.io);
     if (builtin.os.tag == .windows) {
-        zig_binary = (try resolveBuildToolchain(ctx, config.root, platform_paths, .zig)).binary;
+        const leased = try resolveBuildToolchain(ctx, config.root, platform_paths, .zig);
+        zig_binary = leased.resolution.binary;
+        leased_zig_toolchain = leased;
     }
     try configureGoBuildEnvironment(
         ctx.allocator,
@@ -4038,7 +4118,9 @@ test "Go v2 project validation requires owned modules and a package directory" {
 }
 
 fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
-    const odin_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin);
+    const leased_odin_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin);
+    defer leased_odin_toolchain.close(ctx.io);
+    const odin_toolchain = leased_odin_toolchain.resolution;
     const odin_binary = odin_toolchain.binary;
 
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
@@ -5640,14 +5722,53 @@ fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
 }
 
 fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
-    var platform_paths = try resolveProductPlatformPaths(ctx);
+    const graph = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    defer graph.close(ctx.io);
+    return getPlatformPathsUnderGraph(ctx, config_root);
+}
+
+fn getPlatformPathsUnderGraph(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
+    var platform_paths = try resolveProductPlatformPathsUnderGraph(ctx);
     try ensureRequiredPlatformArtifacts(ctx, config_root, &platform_paths);
     return platform_paths;
 }
 
 fn resolveProductPlatformPaths(ctx: *const Context) !PlatformPaths {
+    const graph = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    defer graph.close(ctx.io);
+    return resolveProductPlatformPathsUnderGraph(ctx);
+}
+
+fn resolveProductPlatformPathsUnderGraph(ctx: *const Context) !PlatformPaths {
     const version = ctx.electrobun_version orelse return error.ElectrobunVersionMissing;
-    const core_root = if (ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| blk: {
+    const devkit = if (ctx.cached_managed_devkit) |cached| cached.* orelse create: {
+        const loaded = try loadProductDevkitUnderGraph(ctx, version);
+        cached.* = loaded;
+        break :create loaded;
+    } else try loadProductDevkitUnderGraph(ctx, version);
+    const projection = electrobun_devkit.project(
+        ctx.io,
+        ctx.allocator,
+        ctx.project_root,
+        devkit,
+        .{ .force = ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") != null },
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not project the Electrobun {s} devkit: {s}\n",
+            .{ version, @errorName(err) },
+        );
+        return err;
+    };
+    return platformPathsFromDevkit(ctx, devkit, projection);
+}
+
+fn loadProductDevkitUnderGraph(
+    ctx: *const Context,
+    version: []const u8,
+) !electrobun_devkit.Resolution {
+    const managed = ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") == null;
+    const core_root = if (!managed) blk: {
+        const configured = ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT").?;
         if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
         break :blk std.Io.Dir.cwd().realPathFileAlloc(ctx.io, configured, ctx.allocator) catch |err| {
             ctx.writeStderr(
@@ -5656,11 +5777,7 @@ fn resolveProductPlatformPaths(ctx: *const Context) !PlatformPaths {
             );
             return err;
         };
-    } else electrobun_artifacts.ensureCore(
-        ctx.init,
-        ctx.allocator,
-        version,
-    ) catch |err| {
+    } else electrobun_artifacts.ensureCore(ctx.init, ctx.allocator, version) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: could not install the Electrobun {s} devkit: {s}\n",
             .{ version, @errorName(err) },
@@ -5679,20 +5796,35 @@ fn resolveProductPlatformPaths(ctx: *const Context) !PlatformPaths {
         );
         return err;
     };
-    const projection = electrobun_devkit.project(
-        ctx.io,
-        ctx.allocator,
-        ctx.project_root,
-        devkit,
-        .{ .force = ctx.init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT") != null },
-    ) catch |err| {
-        ctx.writeStderr(
-            "hutch electrobun: could not project the Electrobun {s} devkit: {s}\n",
-            .{ version, @errorName(err) },
-        );
-        return err;
-    };
-    return platformPathsFromDevkit(ctx, devkit, projection);
+    if (managed) try retainManagedRootLeaseUnderGraph(ctx, devkit.root);
+    return devkit;
+}
+
+fn retainManagedRootLeaseUnderGraph(ctx: *const Context, root: []const u8) !void {
+    const managed_leases = ctx.managed_root_leases orelse return;
+    for (managed_leases.items) |*managed| {
+        if (!projectPathsEqual(managed.root, root)) continue;
+        if (managed.lease == null) {
+            const home = try release_store.hutchHome(ctx.init, ctx.allocator);
+            managed.lease = try cache_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root);
+        }
+        return;
+    }
+    const home = try release_store.hutchHome(ctx.init, ctx.allocator);
+    try managed_leases.append(ctx.allocator, .{
+        .root = try ctx.allocator.dupe(u8, root),
+        .lease = try cache_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root),
+    });
+}
+
+fn suspendManagedRootLeaseUnderGraph(ctx: *const Context, root: []const u8) void {
+    const managed_leases = ctx.managed_root_leases orelse return;
+    for (managed_leases.items) |*managed| {
+        if (!projectPathsEqual(managed.root, root)) continue;
+        if (managed.lease) |lease| lease.close(ctx.io);
+        managed.lease = null;
+        return;
+    }
 }
 
 fn ensureRequiredPlatformArtifacts(
@@ -5711,6 +5843,9 @@ fn ensureRequiredPlatformArtifacts(
     }
 
     const version = platform_paths.electrobun_version;
+    const managed_root = (platform_paths.devkit orelse
+        return error.ElectrobunDevkitNotResolved).root;
+    suspendManagedRootLeaseUnderGraph(ctx, managed_root);
     const platform_root = electrobun_artifacts.ensureCef(
         ctx.init,
         ctx.allocator,
@@ -5722,6 +5857,7 @@ fn ensureRequiredPlatformArtifacts(
         );
         return err;
     };
+    try retainManagedRootLeaseUnderGraph(ctx, managed_root);
     platform_paths.cef_dir = try std.fs.path.join(ctx.allocator, &.{ platform_root, "cef" });
     if (!pathExists(ctx.io, platform_paths.cef_dir)) return error.ElectrobunCefNotFound;
 }

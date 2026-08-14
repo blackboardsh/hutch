@@ -69,6 +69,17 @@ pub const Resolution = struct {
     installed: bool,
 };
 
+/// A validated managed release together with the shared sibling lock that
+/// keeps it attached to the store while a caller uses it.
+pub const LeasedResolution = struct {
+    resolution: Resolution,
+    lease: cache_locks.ObjectLease,
+
+    pub fn close(self: LeasedResolution, io: std.Io) void {
+        self.lease.close(io);
+    }
+};
+
 pub const AvailableUpdate = struct {
     current_version: []const u8,
     current_revision: []const u8,
@@ -252,9 +263,51 @@ pub fn resolve(
     selector: version_selector.Selector,
     options: Options,
 ) !Resolution {
+    // Diagnostic and update callers historically receive a bare Resolution.
+    // Keep its lease open for the short-lived Hutch process rather than
+    // reintroducing a detach window after returning the path.
+    const leased = try resolveLeased(init, allocator, product, selector, options);
+    return leased.resolution;
+}
+
+pub fn resolveLeased(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: Product,
+    selector: version_selector.Selector,
+    options: Options,
+) !LeasedResolution {
     const home = try hutchHome(init, allocator);
     const lifecycle = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
     defer lifecycle.close(init.io);
+
+    const resolution = try resolveUnderGraph(
+        init,
+        allocator,
+        home,
+        product,
+        selector,
+        options,
+    );
+    return .{
+        .resolution = resolution,
+        .lease = try cache_locks.acquireObjectLease(
+            init.io,
+            allocator,
+            home,
+            resolution.root,
+        ),
+    };
+}
+
+fn resolveUnderGraph(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    selector: version_selector.Selector,
+    options: Options,
+) !Resolution {
     if (!options.refresh) {
         if (try activeMatchingResolution(
             init.io,
@@ -322,6 +375,134 @@ pub fn resolve(
         try activateChannel(init, allocator, product, channel, result);
     }
     return result;
+}
+
+/// Returns a shared lease when `executable` is the validated engine of an
+/// installed Hutch release. Paths genuinely outside the managed Hutch release
+/// tree return null; a path that claims that tree but is malformed or damaged
+/// is rejected instead of silently running without protection.
+pub fn leaseInstalledHutchExecutable(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+) !?cache_locks.ObjectLease {
+    const home = try hutchHome(init, allocator);
+    if (!try executableClaimsManagedHutchTree(
+        init.io,
+        allocator,
+        home,
+        executable,
+    )) return null;
+    _ = loadStoreIdentityAt(init.io, allocator, home) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const graph = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer graph.close(init.io);
+    return leaseInstalledHutchExecutableUnderGraph(
+        init.io,
+        allocator,
+        home,
+        executable,
+    );
+}
+
+fn executableClaimsManagedHutchTree(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    executable: []const u8,
+) !bool {
+    const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const lexical_home = try std.fs.path.resolve(allocator, &.{ canonical_cwd, home });
+    const lexical_executable = try std.fs.path.resolve(allocator, &.{ canonical_cwd, executable });
+    const product_root = try std.fs.path.join(allocator, &.{
+        lexical_home,
+        releases_directory_name,
+        Product.hutch.name(),
+    });
+    return pathHasParent(lexical_executable, product_root);
+}
+
+fn leaseInstalledHutchExecutableUnderGraph(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    executable: []const u8,
+) !?cache_locks.ObjectLease {
+    const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    const lexical_home = try std.fs.path.resolve(allocator, &.{ canonical_cwd, home });
+    const lexical_executable = try std.fs.path.resolve(allocator, &.{ canonical_cwd, executable });
+    const product_root = try std.fs.path.join(allocator, &.{
+        lexical_home,
+        releases_directory_name,
+        Product.hutch.name(),
+    });
+    if (!pathHasParent(lexical_executable, product_root)) return null;
+
+    if (!pathEqual(std.fs.path.basename(lexical_executable), Product.hutch.executableFileName())) {
+        return error.InvalidManagedHutchExecutable;
+    }
+    const bin_root = std.fs.path.dirname(lexical_executable) orelse
+        return error.InvalidManagedHutchExecutable;
+    if (!pathEqual(std.fs.path.basename(bin_root), "bin")) {
+        return error.InvalidManagedHutchExecutable;
+    }
+    const release_root = std.fs.path.dirname(bin_root) orelse
+        return error.InvalidManagedHutchExecutable;
+    const platform = std.fs.path.basename(release_root);
+    const revision_root = std.fs.path.dirname(release_root) orelse
+        return error.InvalidManagedHutchExecutable;
+    const revision = std.fs.path.basename(revision_root);
+    const version_root = std.fs.path.dirname(revision_root) orelse
+        return error.InvalidManagedHutchExecutable;
+    const version = std.fs.path.basename(version_root);
+    const actual_product_root = std.fs.path.dirname(version_root) orelse
+        return error.InvalidManagedHutchExecutable;
+    if (!pathEqual(product_root, actual_product_root)) {
+        return error.InvalidManagedHutchExecutable;
+    }
+
+    const parsed_version = version_selector.parse(version) catch
+        return error.InvalidManagedHutchExecutable;
+    if (parsed_version.kind != .version) return error.InvalidManagedHutchExecutable;
+    validateRevision(revision) catch return error.InvalidManagedHutchExecutable;
+    validatePlatformName(platform) catch return error.InvalidManagedHutchExecutable;
+    if (!std.mem.eql(u8, platform, platformKey() catch return error.InvalidManagedHutchExecutable)) {
+        return error.InvalidManagedHutchExecutable;
+    }
+
+    const executable_stat = std.Io.Dir.cwd().statFile(io, lexical_executable, .{
+        .follow_symlinks = false,
+    }) catch return error.InvalidManagedHutchExecutable;
+    if (executable_stat.kind != .file) return error.InvalidManagedHutchExecutable;
+
+    const resolution = (installedResolutionAt(
+        io,
+        allocator,
+        release_root,
+        .hutch,
+        version,
+        revision,
+        platform,
+    ) catch return error.InvalidManagedHutchExecutable) orelse
+        return error.InvalidManagedHutchExecutable;
+    const canonical_input = std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        lexical_executable,
+        allocator,
+    ) catch return error.InvalidManagedHutchExecutable;
+    const canonical_validated = std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        resolution.executable,
+        allocator,
+    ) catch return error.InvalidManagedHutchExecutable;
+    if (!pathEqual(canonical_input, canonical_validated)) {
+        return error.InvalidManagedHutchExecutable;
+    }
+
+    return cache_locks.acquireObjectLease(io, allocator, lexical_home, release_root) catch
+        return error.InvalidManagedHutchExecutable;
 }
 
 fn activeMatchingResolution(
@@ -2090,6 +2271,11 @@ fn pathEqual(lhs: []const u8, rhs: []const u8) bool {
         std.mem.eql(u8, lhs, rhs);
 }
 
+fn pathHasParent(child: []const u8, parent: []const u8) bool {
+    if (child.len <= parent.len or !pathEqual(child[0..parent.len], parent)) return false;
+    return std.fs.path.isSep(child[parent.len]);
+}
+
 fn validateSha256(value: []const u8) !void {
     if (value.len != 64) return error.InvalidReleaseChecksum;
     for (value) |byte| {
@@ -2976,4 +3162,74 @@ test "installer bootstrap repairs a damaged exact release under its object lock"
     _ = try validateHutchArchiveRoot(io, allocator, final_root);
     const selections = try loadSelectionsAt(io, allocator, home);
     try std.testing.expectEqualStrings(revision, selections.hutch_canary.?.revision);
+}
+
+test "a validated installed Hutch engine holds its release object lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    const version = "9.8.7";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const platform = try platformKey();
+    const release_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        "hutch",
+        version,
+        revision,
+        platform,
+    });
+    const bin = try std.fs.path.join(allocator, &.{ release_root, "bin" });
+    try std.Io.Dir.cwd().createDirPath(io, bin);
+    const executable = try std.fs.path.join(allocator, &.{ bin, Product.hutch.executableFileName() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = executable, .data = "fixture" });
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"hutch\",\"channel\":\"production\",\"version\":\"{s}\",\"revision\":\"{s}\",\"platform\":\"{s}\"}}\n",
+        .{ version, revision, platform },
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ release_root, Product.hutch.metadataFileName() }),
+        .data = metadata,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ release_root, ".dash-installed" }),
+        .data = checksum,
+    });
+
+    const graph = try cache_locks.acquireGraph(io, allocator, home, .shared);
+    const lease = (try leaseInstalledHutchExecutableUnderGraph(
+        io,
+        allocator,
+        home,
+        executable,
+    )).?;
+    graph.close(io);
+    try std.testing.expect((try cache_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        release_root,
+    )) == null);
+
+    lease.close(io);
+    const exclusive = (try cache_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        release_root,
+    )).?;
+    exclusive.close(io);
+
+    const external = try std.fs.path.join(allocator, &.{ fixture, "outside", "hutch-engine" });
+    try std.testing.expect((try leaseInstalledHutchExecutableUnderGraph(
+        io,
+        allocator,
+        home,
+        external,
+    )) == null);
 }

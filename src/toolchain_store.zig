@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cache_locks = @import("cache_locks.zig");
 const release_store = @import("release_store.zig");
 
 const max_archive_bytes = 1536 * 1024 * 1024;
@@ -48,6 +49,15 @@ pub const Resolution = struct {
     system: bool,
 };
 
+pub const LeasedResolution = struct {
+    resolution: Resolution,
+    lease: ?cache_locks.ObjectLease,
+
+    pub fn close(self: LeasedResolution, io: std.Io) void {
+        if (self.lease) |lease| lease.close(io);
+    }
+};
+
 pub fn rustCargoBinary(
     allocator: std.mem.Allocator,
     resolution: Resolution,
@@ -70,9 +80,43 @@ pub fn resolveVersion(
     allocator: std.mem.Allocator,
     kind: Kind,
     version: []const u8,
-) !Resolution {
+) !LeasedResolution {
     try validateVersion(kind, version);
-    const system_matches = try systemExecutableMatchesVersion(
+    if (try systemResolution(init, allocator, kind, version)) |system| return .{
+        .resolution = system,
+        .lease = null,
+    };
+
+    const home = try release_store.hutchHome(init, allocator);
+    const graph = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer graph.close(init.io);
+    return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
+}
+
+/// Resolves while the caller already holds the store graph shared. This is
+/// used by project preparation so it does not recursively acquire graph.lock.
+pub fn resolveVersionUnderGraph(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    version: []const u8,
+) !LeasedResolution {
+    try validateVersion(kind, version);
+    if (try systemResolution(init, allocator, kind, version)) |system| return .{
+        .resolution = system,
+        .lease = null,
+    };
+    const home = try release_store.hutchHome(init, allocator);
+    return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
+}
+
+fn systemResolution(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    version: []const u8,
+) !?Resolution {
+    const executable_matches = try systemExecutableMatchesVersion(
         init.io,
         allocator,
         kind.systemExecutable(),
@@ -81,16 +125,24 @@ pub fn resolveVersion(
     );
     const system_cargo_matches = kind != .rust or
         try cargoMatchesVersion(init.io, allocator, "cargo", version);
-    if (system_matches and system_cargo_matches) {
-        return .{
+    if (executable_matches and system_cargo_matches) {
+        return Resolution{
             .binary = kind.systemExecutable(),
             .root = null,
             .version = version,
             .system = true,
         };
     }
+    return null;
+}
 
-    const home = try release_store.hutchHome(init, allocator);
+fn resolveManagedVersionUnderGraph(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    kind: Kind,
+    version: []const u8,
+) !LeasedResolution {
     const root = try toolchainRoot(allocator, home, kind, version);
     const binary = try installedBinaryPath(allocator, root, kind);
     const initial_state = try installedToolchainState(
@@ -102,7 +154,12 @@ pub fn resolveVersion(
         version,
     );
     if (initial_state == .valid) {
-        return .{ .binary = binary, .root = root, .version = version, .system = false };
+        return leaseManagedResolutionUnderGraph(init.io, allocator, home, .{
+            .binary = binary,
+            .root = root,
+            .version = version,
+            .system = false,
+        });
     }
 
     return resolveAfterInstalledMiss(init, allocator, home, root, binary, kind, version);
@@ -116,16 +173,24 @@ fn resolveAfterInstalledMiss(
     binary: []const u8,
     kind: Kind,
     version: []const u8,
-) !Resolution {
+) !LeasedResolution {
     const parent = std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
-    defer lock.close(init.io);
+    var lock_open = true;
+    defer if (lock_open) lock.close(init.io);
 
     const locked_state = try installedToolchainState(init.io, allocator, root, binary, kind, version);
     if (locked_state == .valid) {
-        return .{ .binary = binary, .root = root, .version = version, .system = false };
+        lock.close(init.io);
+        lock_open = false;
+        return leaseManagedResolutionUnderGraph(init.io, allocator, home, .{
+            .binary = binary,
+            .root = root,
+            .version = version,
+            .system = false,
+        });
     }
     if (environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE")) {
         return offlineError(locked_state);
@@ -148,11 +213,27 @@ fn resolveAfterInstalledMiss(
     if (!try executableMatchesVersion(init.io, allocator, installed_binary, kind, version)) {
         return error.ToolchainVersionMismatch;
     }
-    return .{
+    const resolution: Resolution = .{
         .binary = installed_binary,
         .root = root,
         .version = version,
         .system = false,
+    };
+    lock.close(init.io);
+    lock_open = false;
+    return leaseManagedResolutionUnderGraph(init.io, allocator, home, resolution);
+}
+
+fn leaseManagedResolutionUnderGraph(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    resolution: Resolution,
+) !LeasedResolution {
+    const root = resolution.root orelse return error.ManagedToolchainRootMissing;
+    return .{
+        .resolution = resolution,
+        .lease = try cache_locks.acquireObjectLease(io, allocator, home, root),
     };
 }
 
@@ -682,6 +763,48 @@ test "Rust Cargo is selected from the resolved Rust toolchain" {
         "cargo",
         try rustCargoBinary(std.testing.allocator, system),
     );
+}
+
+test "a managed toolchain resolution retains its sibling object lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    const root = try std.fs.path.join(allocator, &.{
+        home,
+        "toolchains",
+        "zig",
+        "0.16.0",
+        try platformKey(),
+    });
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    const graph = try cache_locks.acquireGraph(io, allocator, home, .shared);
+    const leased = try leaseManagedResolutionUnderGraph(io, allocator, home, .{
+        .binary = try installedBinaryPath(allocator, root, .zig),
+        .root = root,
+        .version = "0.16.0",
+        .system = false,
+    });
+    graph.close(io);
+    try std.testing.expect((try cache_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        root,
+    )) == null);
+
+    leased.close(io);
+    const exclusive = (try cache_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        root,
+    )).?;
+    exclusive.close(io);
 }
 
 test "a mismatched toolchain executable is never published" {
