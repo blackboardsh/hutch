@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const managed_store = @import("cache_store.zig");
+const managed_store = @import("managed_store.zig");
 const release_store = @import("release_store.zig");
 
 const help_text =
@@ -8,14 +8,15 @@ const help_text =
     "  hutch status [--json]\n" ++
     "\n" ++
     "Reports the resolved Hutch home, installed releases and their selections,\n" ++
-    "installed toolchains, managed reachability state, and registered projects.\n" ++
+    "installed toolchains, managed-store reachability, and registered projects.\n" ++
     "\n" ++
     "Sizes are recursive file totals. Symlinks are counted but never followed,\n" ++
     "so a bin launcher can never pull an out-of-store tree into a total.\n" ++
-    "`status` only reads the store; it never creates, moves, or deletes state.\n";
+    "Like ordinary commands, `status` may run the lazy 10-day prune first;\n" ++
+    "the report itself is a read-only snapshot of the store.\n";
 
 /// The `--json` document version. Any incompatible field change bumps this.
-pub const json_schema_version = 2;
+pub const json_schema_version = 3;
 
 const max_walk_depth = 64;
 
@@ -219,7 +220,7 @@ pub fn formatBytes(buffer: *[32]u8, bytes: u64) []const u8 {
 
 // -- Report model ----------------------------------------------------------
 
-pub const ProductInstall = struct {
+pub const ReleaseInstall = struct {
     version: []const u8,
     /// Absent for releases stored without a revision level (Electrobun).
     revision: ?[]const u8 = null,
@@ -230,9 +231,9 @@ pub const ProductInstall = struct {
     selections: std.ArrayList([]const u8) = .empty,
 };
 
-pub const Product = struct {
+pub const ReleaseProduct = struct {
     name: []const u8,
-    installs: std.ArrayList(ProductInstall) = .empty,
+    installs: std.ArrayList(ReleaseInstall) = .empty,
     bytes: u64 = 0,
 };
 
@@ -255,13 +256,15 @@ pub const ReleaseSelection = struct {
     installed: bool,
 };
 
-pub const ManagedStateObject = struct {
+pub const ManagedStoreObject = struct {
     kind: managed_store.ManagedObject.Kind,
     relative_root: []const u8,
     version: []const u8,
     platform: []const u8,
     toolchain_kind: ?[]const u8 = null,
-    last_used_unix_seconds: ?i64 = null,
+    /// First observed unreachable by an automatic prune. Null while reachable
+    /// or before an automatic sweep has established the retention window.
+    unreachable_since_unix_seconds: ?i64 = null,
     reachable: bool = false,
     in_use: bool = false,
     /// Contained in another managed object, so its bytes are already counted
@@ -273,10 +276,10 @@ pub const ManagedStateObject = struct {
 pub const Report = struct {
     home: []const u8,
     home_source: release_store.HomeSource,
-    releases: std.ArrayList(Product) = .empty,
+    releases: std.ArrayList(ReleaseProduct) = .empty,
     selections: std.ArrayList(ReleaseSelection) = .empty,
     toolchains: std.ArrayList(Toolchain) = .empty,
-    managed_objects: std.ArrayList(ManagedStateObject) = .empty,
+    managed_objects: std.ArrayList(ManagedStoreObject) = .empty,
     projects: []const managed_store.InventoryProject = &.{},
     issues: Issues = .empty,
     releases_usage: Usage = .{},
@@ -295,7 +298,7 @@ pub fn collect(init: std.process.Init, allocator: std.mem.Allocator) !Report {
     try collectReleases(init.io, allocator, home.path, &report);
     try collectSelections(init, allocator, &report);
     try collectToolchains(init.io, allocator, home.path, &report);
-    try collectManagedState(init, allocator, &report);
+    try collectManagedStore(init, allocator, &report);
     return report;
 }
 
@@ -311,7 +314,7 @@ fn collectReleases(
     std.mem.sort([]const u8, names.items, {}, stringLessThan);
 
     for (names.items) |name| {
-        var product: Product = .{ .name = name };
+        var product: ReleaseProduct = .{ .name = name };
         const product_root = try std.fs.path.join(allocator, &.{ root, name });
 
         var versions: std.ArrayList([]const u8) = .empty;
@@ -326,7 +329,7 @@ fn collectReleases(
 
             for (children.items) |child| {
                 if (isPlatformKey(child)) {
-                    try appendProductInstall(io, allocator, &product, .{
+                    try appendReleaseInstall(io, allocator, &product, .{
                         .version = version,
                         .revision = null,
                         .platform = child,
@@ -354,7 +357,7 @@ fn collectReleases(
                 std.mem.sort([]const u8, platforms.items, {}, stringLessThan);
                 for (platforms.items) |platform| {
                     if (!isPlatformKey(platform)) continue;
-                    try appendProductInstall(io, allocator, &product, .{
+                    try appendReleaseInstall(io, allocator, &product, .{
                         .version = version,
                         .revision = child,
                         .platform = platform,
@@ -378,11 +381,11 @@ fn collectReleases(
     }
 }
 
-fn appendProductInstall(
+fn appendReleaseInstall(
     io: std.Io,
     allocator: std.mem.Allocator,
-    product: *Product,
-    install: ProductInstall,
+    product: *ReleaseProduct,
+    install: ReleaseInstall,
     issues: *Issues,
 ) !void {
     var measured = install;
@@ -510,7 +513,7 @@ fn attachSelection(
     return false;
 }
 
-fn collectManagedState(
+fn collectManagedStore(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     report: *Report,
@@ -523,13 +526,13 @@ fn collectManagedState(
     report.projects = found.projects;
 
     for (found.objects) |object| {
-        var entry: ManagedStateObject = .{
+        var entry: ManagedStoreObject = .{
             .kind = object.kind,
             .relative_root = object.relative_root,
             .version = object.version,
             .platform = object.platform,
             .toolchain_kind = object.toolchain_kind,
-            .last_used_unix_seconds = object.last_used_unix_seconds,
+            .unreachable_since_unix_seconds = object.unreachable_since_unix_seconds,
             .reachable = object.reachable,
             .in_use = object.in_use,
             .nested = hasManagedAncestor(found.objects, object.relative_root),
@@ -775,12 +778,16 @@ pub fn writeText(
     }
     try writer.print("  toolchains total {s}\n", .{try sizeText(allocator, report.toolchains_usage.bytes)});
 
-    try writer.writeAll("\nManaged state\n");
+    try writer.writeAll("\nManaged store\n");
+    try writer.print(
+        "  automatic retention {d} days from first becoming unreachable\n",
+        .{@divExact(managed_store.automatic_retention_seconds, 24 * 60 * 60)},
+    );
     if (report.managed_objects.items.len == 0) {
         try writer.writeAll("  (no managed objects)\n");
     } else {
         var table: Table = .{
-            .headers = &.{ "object", "type", "size", "state", "last used" },
+            .headers = &.{ "object", "type", "size", "state", "unreachable since" },
             .aligns = &.{ .left, .left, .right, .left, .left },
         };
         for (report.managed_objects.items) |object| {
@@ -788,11 +795,11 @@ pub fn writeText(
                 object.relative_root,
                 objectTypeName(object.kind),
                 try sizeText(allocator, object.bytes),
-                try managedStateText(allocator, object),
-                if (object.last_used_unix_seconds) |seconds|
+                try managedStoreStateText(allocator, object),
+                if (object.unreachable_since_unix_seconds) |seconds|
                     try std.fmt.allocPrint(allocator, "{d}", .{seconds})
                 else
-                    "never",
+                    "-",
             });
         }
         try table.write(allocator, writer, 2);
@@ -840,9 +847,9 @@ pub fn writeText(
     try writer.print("  on disk     {s}\n", .{try sizeText(allocator, report.totalBytes())});
 }
 
-fn managedStateText(allocator: std.mem.Allocator, object: ManagedStateObject) ![]const u8 {
+fn managedStoreStateText(allocator: std.mem.Allocator, object: ManagedStoreObject) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    try parts.append(allocator, if (object.reachable) "reachable" else "unreferenced");
+    try parts.append(allocator, if (object.reachable) "reachable" else "unreachable");
     if (object.in_use) try parts.append(allocator, "in use");
     if (object.nested) try parts.append(allocator, "nested");
     return joinStrings(allocator, parts.items, ", ");
@@ -946,16 +953,21 @@ fn jsonDocument(allocator: std.mem.Allocator, report: Report) !std.json.Value {
         try value.put(allocator, "reachable", .{ .bool = object.reachable });
         try value.put(allocator, "inUse", .{ .bool = object.in_use });
         try value.put(allocator, "nested", .{ .bool = object.nested });
-        try value.put(allocator, "lastUsedUnixSeconds", if (object.last_used_unix_seconds) |seconds|
+        try value.put(allocator, "unreachableSinceUnixSeconds", if (object.unreachable_since_unix_seconds) |seconds|
             .{ .integer = seconds }
         else
             .null);
         try objects.append(.{ .object = value });
     }
-    var managed_state: std.json.ObjectMap = .empty;
-    try managed_state.put(allocator, "objectCount", .{ .integer = @intCast(report.managed_objects.items.len) });
-    try managed_state.put(allocator, "bytes", .{ .integer = @intCast(report.managed_bytes) });
-    try managed_state.put(allocator, "objects", .{ .array = objects });
+    var managed_store_document: std.json.ObjectMap = .empty;
+    try managed_store_document.put(
+        allocator,
+        "automaticRetentionSeconds",
+        .{ .integer = managed_store.automatic_retention_seconds },
+    );
+    try managed_store_document.put(allocator, "objectCount", .{ .integer = @intCast(report.managed_objects.items.len) });
+    try managed_store_document.put(allocator, "bytes", .{ .integer = @intCast(report.managed_bytes) });
+    try managed_store_document.put(allocator, "objects", .{ .array = objects });
 
     var projects = std.json.Array.init(allocator);
     for (report.projects) |project| {
@@ -998,7 +1010,7 @@ fn jsonDocument(allocator: std.mem.Allocator, report: Report) !std.json.Value {
     try root.put(allocator, "releases", .{ .array = releases });
     try root.put(allocator, "selections", .{ .array = selections });
     try root.put(allocator, "toolchains", .{ .array = toolchains });
-    try root.put(allocator, "managedState", .{ .object = managed_state });
+    try root.put(allocator, "managedStore", .{ .object = managed_store_document });
     try root.put(allocator, "projects", .{ .array = projects });
     try root.put(allocator, "issues", .{ .array = issues });
     try root.put(allocator, "totals", .{ .object = totals });
@@ -1024,8 +1036,8 @@ fn testReport(allocator: std.mem.Allocator) !Report {
         .home = "/legacy/dash",
         .home_source = .dash_home,
     };
-    var product: Product = .{ .name = "hutch" };
-    var install: ProductInstall = .{
+    var product: ReleaseProduct = .{ .name = "hutch" };
+    var install: ReleaseInstall = .{
         .version = "0.6.4",
         .revision = "e7be5b833cef1d3cc5bdc01770d3fb936daf9733",
         .platform = "macos-arm64",
@@ -1065,28 +1077,21 @@ fn testReport(allocator: std.mem.Allocator) !Report {
         .version = "0.16.0",
         .platform = "macos-arm64",
         .toolchain_kind = "zig",
-        .last_used_unix_seconds = 1_700_000_000,
-        .reachable = true,
+        .unreachable_since_unix_seconds = 1_700_000_000,
+        .reachable = false,
         .in_use = false,
         .nested = false,
         .bytes = toolchain_usage.bytes,
     });
     report.managed_bytes = toolchain_usage.bytes;
 
-    const references = try allocator.dupe(managed_store.ManagedObject, &.{.{
-        .kind = .toolchain,
-        .relative_root = "toolchains/zig/0.16.0/macos-arm64",
-        .version = "0.16.0",
-        .platform = "macos-arm64",
-        .toolchain_kind = "zig",
-    }});
     report.projects = try allocator.dupe(managed_store.InventoryProject, &.{.{
         .canonical_root = "/workspace/app",
         .registration_path = "/legacy/dash/state/projects/abc.json",
         .project_exists = false,
         .lock_verified = false,
         .last_seen_unix_seconds = 1_700_000_001,
-        .objects = references,
+        .objects = &.{},
     }});
     return report;
 }
@@ -1120,13 +1125,16 @@ test "the resolved home and its source are reported in both formats" {
         "  source  DASH_HOME (deprecated; prefer HUTCH_HOME)\n",
     ) != null);
     // Every section is present even when a store has no entries of that type.
-    for ([_][]const u8{ "Releases", "Selections", "Toolchains", "Managed state", "Projects", "Total" }) |section| {
+    for ([_][]const u8{ "Releases", "Selections", "Toolchains", "Managed store", "Projects", "Total" }) |section| {
         try std.testing.expect(std.mem.indexOf(u8, rendered, section) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\nChannels\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\nCache\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[path missing]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "4.0 MiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "automatic retention 10 days") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "unreachable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "last used") == null);
 
     var default_home = report;
     default_home.home_source = .default_home;
@@ -1184,22 +1192,25 @@ test "the json document exposes every section with stable keys" {
     const toolchains = root.get("toolchains").?.array;
     try std.testing.expectEqualStrings("zig", toolchains.items[0].object.get("language").?.string);
 
-    const managed_state = root.get("managedState").?.object;
-    try std.testing.expectEqual(@as(i64, 1), managed_state.get("objectCount").?.integer);
-    const object = managed_state.get("objects").?.array.items[0].object;
+    const managed_store_document = root.get("managedStore").?.object;
+    try std.testing.expectEqual(
+        @as(i64, managed_store.automatic_retention_seconds),
+        managed_store_document.get("automaticRetentionSeconds").?.integer,
+    );
+    try std.testing.expectEqual(@as(i64, 1), managed_store_document.get("objectCount").?.integer);
+    const object = managed_store_document.get("objects").?.array.items[0].object;
     try std.testing.expectEqualStrings("toolchain", object.get("type").?.string);
-    try std.testing.expect(object.get("reachable").?.bool);
+    try std.testing.expect(!object.get("reachable").?.bool);
     try std.testing.expect(!object.get("inUse").?.bool);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000), object.get("lastUsedUnixSeconds").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), object.get("unreachableSinceUnixSeconds").?.integer);
+    try std.testing.expect(object.get("lastUsedUnixSeconds") == null);
+    try std.testing.expect(root.get("managedState") == null);
     try std.testing.expect(root.get("cache") == null);
 
     const project = root.get("projects").?.array.items[0].object;
     try std.testing.expectEqualStrings("/workspace/app", project.get("path").?.string);
     try std.testing.expect(!project.get("exists").?.bool);
-    try std.testing.expectEqualStrings(
-        "toolchains/zig/0.16.0/macos-arm64",
-        project.get("references").?.array.items[0].object.get("relativeRoot").?.string,
-    );
+    try std.testing.expectEqual(@as(usize, 0), project.get("references").?.array.items.len);
 
     const totals = root.get("totals").?.object;
     try std.testing.expectEqual(@as(i64, 4 * 1024 * 1024), totals.get("releasesBytes").?.integer);
@@ -1352,6 +1363,7 @@ test "status only accepts --json and help flags" {
     try std.testing.expect(isHelp("-h"));
     try std.testing.expect(!isHelp("--json"));
     try std.testing.expect(std.mem.indexOf(u8, help_text, "hutch status [--json]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "may run the lazy 10-day prune first") != null);
     try std.testing.expect(isRevision("0123456789abcdef0123456789abcdef01234567"));
     try std.testing.expect(isRevision("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     try std.testing.expect(!isRevision("0.6.4"));

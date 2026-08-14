@@ -17,6 +17,33 @@ pub const ObjectLease = struct {
     pub fn close(self: ObjectLease, io: std.Io) void {
         self.file.close(io);
     }
+
+    /// Keeps the lease alive across the POSIX exec paths used for Cottontail
+    /// and runtime handoff. Windows retains the lease in the spawning parent.
+    pub fn makeInheritable(self: ObjectLease, io: std.Io) !void {
+        _ = io;
+        if (builtin.os.tag == .windows) return;
+        const flags = while (true) {
+            const rc = std.posix.system.fcntl(self.file.handle, std.posix.F.GETFD, @as(usize, 0));
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => break @as(usize, @intCast(rc)),
+                .INTR => continue,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        };
+        while (true) {
+            const rc = std.posix.system.fcntl(
+                self.file.handle,
+                std.posix.F.SETFD,
+                flags & ~@as(usize, std.posix.FD_CLOEXEC),
+            );
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+    }
 };
 
 pub fn acquireGraph(
@@ -26,17 +53,44 @@ pub fn acquireGraph(
     mode: std.Io.File.Lock,
 ) !GraphLock {
     const state_root = try std.fs.path.join(allocator, &.{ home, state_relative_root });
-    try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidCacheStatePath);
+    try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidStoreStatePath);
     const locks_root = try std.fs.path.join(allocator, &.{ state_root, "locks" });
-    try ensureDirectoryWithin(io, allocator, home, locks_root, error.InvalidCacheStatePath);
+    try ensureDirectoryWithin(io, allocator, home, locks_root, error.InvalidStoreStatePath);
     const lock_path = try std.fs.path.join(allocator, &.{ locks_root, "graph.lock" });
     try initializePersistentFile(io, lock_path);
-    if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidCacheStatePath;
+    if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidStoreStatePath;
     return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
         .mode = .read_write,
         .lock = mode,
         .follow_symlinks = false,
     }) };
+}
+
+/// Acquires the store graph exclusively without waiting. Automatic
+/// maintenance uses this so an ordinary Hutch invocation never stalls behind
+/// an active resolver, build, or another maintenance command.
+pub fn tryAcquireGraphExclusive(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !?GraphLock {
+    const state_root = try std.fs.path.join(allocator, &.{ home, state_relative_root });
+    try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidStoreStatePath);
+    const locks_root = try std.fs.path.join(allocator, &.{ state_root, "locks" });
+    try ensureDirectoryWithin(io, allocator, home, locks_root, error.InvalidStoreStatePath);
+    const lock_path = try std.fs.path.join(allocator, &.{ locks_root, "graph.lock" });
+    try initializePersistentFile(io, lock_path);
+    if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidStoreStatePath;
+    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.WouldBlock, error.AccessDenied, error.PermissionDenied => return null,
+        else => return err,
+    };
+    return .{ .file = file };
 }
 
 /// The caller must hold the shared graph lock and must have already validated
@@ -164,5 +218,24 @@ test "a shared object lease excludes store detachment until process release" {
 
     lease.close(io);
     const exclusive = (try tryAcquireObjectExclusive(io, allocator, root)).?;
+    exclusive.close(io);
+}
+
+test "automatic graph acquisition never waits on a live user" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "hutch-home" });
+
+    const shared = try acquireGraph(io, allocator, home, .shared);
+    try std.testing.expect((try tryAcquireGraphExclusive(io, allocator, home)) == null);
+    shared.close(io);
+
+    const exclusive = (try tryAcquireGraphExclusive(io, allocator, home)).?;
     exclusive.close(io);
 }

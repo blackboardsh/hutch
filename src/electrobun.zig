@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const cache_locks = @import("cache_locks.zig");
-const cache_store = @import("cache_store.zig");
+const managed_store = @import("managed_store.zig");
+const store_locks = @import("store_locks.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
@@ -58,7 +58,7 @@ const bundled_uninstall_manager_file_name = "uninstall";
 
 const ManagedRootLease = struct {
     root: []const u8,
-    lease: ?cache_locks.ObjectLease,
+    lease: ?store_locks.ObjectLease,
 };
 
 const Context = struct {
@@ -203,7 +203,7 @@ pub fn run(
     if (args.len == 0 or isHelpFlag(args[0])) {
         try printHelp(stdout);
         try stdout.flush();
-        cache_store.pruneAutomatic(init, init.arena.allocator());
+        managed_store.pruneAutomatic(init, init.arena.allocator());
         return 0;
     }
 
@@ -300,7 +300,7 @@ fn pruneAutomaticOnce(ctx: *const Context) void {
         if (completed.*) return;
         completed.* = true;
     }
-    cache_store.pruneAutomatic(ctx.init, ctx.allocator);
+    managed_store.pruneAutomatic(ctx.init, ctx.allocator);
 }
 
 fn printHelp(writer: anytype) !void {
@@ -630,7 +630,7 @@ fn loadConfigAfterProductDevkit(ctx: *const Context, build_env: BuildEnvironment
     var locked_ctx = projectBuildLockContext(ctx);
     // Keep the core release attached from resolution through devkit loading,
     // projection, and the configuration process that consumes the projection.
-    const graph_lock = try cache_store.acquireUsageLock(locked_ctx.init, locked_ctx.allocator);
+    const graph_lock = try managed_store.acquireUsageLock(locked_ctx.init, locked_ctx.allocator);
     defer graph_lock.close(ctx.io);
     _ = try resolveProductPlatformPaths(&locked_ctx);
     return loadConfig(&locked_ctx, build_env);
@@ -673,13 +673,13 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         _ = try requireProjectZigBuildFile(ctx);
     }
 
-    const graph_lock = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    const graph_lock = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
     defer graph_lock.close(ctx.io);
 
     const platform_paths = try getPlatformPathsUnderGraph(ctx, config.root);
-    var objects: std.ArrayList(cache_store.ManagedObject) = .empty;
+    var objects: std.ArrayList(managed_store.ManagedObject) = .empty;
     if (platform_paths.devkit) |devkit| {
-        const managed = try cache_store.managedElectrobunObjects(
+        const managed = try managed_store.managedElectrobunObjects(
             ctx.init,
             ctx.allocator,
             devkit.root,
@@ -691,13 +691,13 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             if (object) |value| try objects.append(ctx.allocator, value);
         }
     }
-    if (try cache_store.managedReleaseObject(
+    if (try managed_store.managedReleaseObject(
         ctx.init,
         ctx.allocator,
         .hutch,
         ctx.self_exe_path,
     )) |object| try objects.append(ctx.allocator, object);
-    if (try cache_store.managedReleaseObject(
+    if (try managed_store.managedReleaseObject(
         ctx.init,
         ctx.allocator,
         .cottontail,
@@ -715,7 +715,7 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .odin)),
         .bun, .cottontail => {},
     }
-    try cache_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
+    try managed_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
 }
 
 fn prepareProjectWithBuildLock(ctx: *const Context, config: CommandContext) !void {
@@ -731,12 +731,12 @@ fn prepareProjectForCommand(ctx: *const Context, config: CommandContext) !void {
 
 fn appendManagedToolchain(
     ctx: *const Context,
-    objects: *std.ArrayList(cache_store.ManagedObject),
+    objects: *std.ArrayList(managed_store.ManagedObject),
     kind: toolchain_store.Kind,
     leased: toolchain_store.LeasedResolution,
 ) !void {
     defer leased.close(ctx.io);
-    if (try cache_store.managedToolchainObject(ctx.init, ctx.allocator, kind, leased.resolution)) |object| {
+    if (try managed_store.managedToolchainObject(ctx.init, ctx.allocator, kind, leased.resolution)) |object| {
         try objects.append(ctx.allocator, object);
     }
 }
@@ -5722,7 +5722,7 @@ fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
 }
 
 fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
-    const graph = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    const graph = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
     defer graph.close(ctx.io);
     return getPlatformPathsUnderGraph(ctx, config_root);
 }
@@ -5734,7 +5734,7 @@ fn getPlatformPathsUnderGraph(ctx: *const Context, config_root: std.json.Value) 
 }
 
 fn resolveProductPlatformPaths(ctx: *const Context) !PlatformPaths {
-    const graph = try cache_store.acquireUsageLock(ctx.init, ctx.allocator);
+    const graph = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
     defer graph.close(ctx.io);
     return resolveProductPlatformPathsUnderGraph(ctx);
 }
@@ -5806,14 +5806,14 @@ fn retainManagedRootLeaseUnderGraph(ctx: *const Context, root: []const u8) !void
         if (!projectPathsEqual(managed.root, root)) continue;
         if (managed.lease == null) {
             const home = try release_store.hutchHome(ctx.init, ctx.allocator);
-            managed.lease = try cache_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root);
+            managed.lease = try store_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root);
         }
         return;
     }
     const home = try release_store.hutchHome(ctx.init, ctx.allocator);
     try managed_leases.append(ctx.allocator, .{
         .root = try ctx.allocator.dupe(u8, root),
-        .lease = try cache_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root),
+        .lease = try store_locks.acquireObjectLease(ctx.io, ctx.allocator, home, root),
     });
 }
 

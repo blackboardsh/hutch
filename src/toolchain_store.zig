@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const cache_locks = @import("cache_locks.zig");
+const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
 
 const max_archive_bytes = 1536 * 1024 * 1024;
@@ -51,7 +51,7 @@ pub const Resolution = struct {
 
 pub const LeasedResolution = struct {
     resolution: Resolution,
-    lease: ?cache_locks.ObjectLease,
+    lease: ?store_locks.ObjectLease,
 
     pub fn close(self: LeasedResolution, io: std.Io) void {
         if (self.lease) |lease| lease.close(io);
@@ -88,7 +88,7 @@ pub fn resolveVersion(
     };
 
     const home = try release_store.hutchHome(init, allocator);
-    const graph = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    const graph = try store_locks.acquireGraph(init.io, allocator, home, .shared);
     defer graph.close(init.io);
     return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
 }
@@ -233,7 +233,7 @@ fn leaseManagedResolutionUnderGraph(
     const root = resolution.root orelse return error.ManagedToolchainRootMissing;
     return .{
         .resolution = resolution,
-        .lease = try cache_locks.acquireObjectLease(io, allocator, home, root),
+        .lease = try store_locks.acquireObjectLease(io, allocator, home, root),
     };
 }
 
@@ -784,7 +784,7 @@ test "a managed toolchain resolution retains its sibling object lease" {
     });
     try std.Io.Dir.cwd().createDirPath(io, root);
 
-    const graph = try cache_locks.acquireGraph(io, allocator, home, .shared);
+    const graph = try store_locks.acquireGraph(io, allocator, home, .shared);
     const leased = try leaseManagedResolutionUnderGraph(io, allocator, home, .{
         .binary = try installedBinaryPath(allocator, root, .zig),
         .root = root,
@@ -792,14 +792,14 @@ test "a managed toolchain resolution retains its sibling object lease" {
         .system = false,
     });
     graph.close(io);
-    try std.testing.expect((try cache_locks.tryAcquireObjectExclusive(
+    try std.testing.expect((try store_locks.tryAcquireObjectExclusive(
         io,
         allocator,
         root,
     )) == null);
 
     leased.close(io);
-    const exclusive = (try cache_locks.tryAcquireObjectExclusive(
+    const exclusive = (try store_locks.tryAcquireObjectExclusive(
         io,
         allocator,
         root,
@@ -951,9 +951,10 @@ test "offline toolchain resolution reuses a valid installed toolchain" {
         .odin,
         version,
     );
-    try std.testing.expect(!resolution.system);
-    try std.testing.expectEqualStrings(root, resolution.root.?);
-    try std.testing.expectEqualStrings(binary, resolution.binary);
+    defer resolution.close(io);
+    try std.testing.expect(!resolution.resolution.system);
+    try std.testing.expectEqualStrings(root, resolution.resolution.root.?);
+    try std.testing.expectEqualStrings(binary, resolution.resolution.binary);
 }
 
 test "offline toolchain resolution rejects missing and damaged installs before HTTP" {
@@ -1116,7 +1117,8 @@ const OfflineWaitContext = struct {
             context.failure = err;
             return;
         };
-        context.resolved_installed = !resolution.system;
+        defer resolution.close(std.testing.io);
+        context.resolved_installed = !resolution.resolution.system;
     }
 };
 

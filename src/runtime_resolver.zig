@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
-const cache_locks = @import("cache_locks.zig");
+const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -11,7 +11,7 @@ pub const Resolution = struct {
     version: ?[]const u8 = null,
     revision: ?[]const u8 = null,
     local: bool,
-    lease: ?cache_locks.ObjectLease = null,
+    lease: ?store_locks.ObjectLease = null,
 
     pub fn close(self: Resolution, io: std.Io) void {
         if (self.lease) |lease| lease.close(io);
@@ -57,6 +57,7 @@ pub fn resolveCottontail(
             .lease = release.lease,
         };
     };
+    if (resolution.lease) |lease| try lease.makeInheritable(init.io);
     return resolution;
 }
 

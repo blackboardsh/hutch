@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
-const cache_cli = @import("cache_cli.zig");
+const managed_store = @import("managed_store.zig");
+const prune_cli = @import("prune_cli.zig");
 const electrobun = @import("electrobun.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
+const reset_cli = @import("reset_cli.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const status_cli = @import("status_cli.zig");
 const version_selector = @import("version_selector.zig");
@@ -26,7 +28,8 @@ const help_text_template =
     \\  hutch run [--if-configured] [script-name] [args...]
     \\  hutch test [files/options...]
     \\  hutch build [args...]
-    \\  hutch cache <prune|clean> [--dry-run]
+    \\  hutch prune [--dry-run]
+    \\  hutch reset
     \\  hutch status [--json]
     \\  hutch self <path|version|update> [selector]
     \\  hutch cottontail <path|version|update> [selector]
@@ -58,6 +61,12 @@ fn isHelpFlag(arg: []const u8) bool {
 
 fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
+}
+
+fn isInstallerBootstrapInvocation(args: []const [:0]const u8) bool {
+    return args.len >= 3 and
+        std.mem.eql(u8, args[1], "self") and
+        std.mem.eql(u8, args[2], "bootstrap-install");
 }
 
 // When an explicit Cottontail resolution is configured, Hutch acts as the
@@ -123,7 +132,49 @@ fn resolveCottontail(
     allocator: std.mem.Allocator,
     command_args: []const [:0]const u8,
 ) !runtime_resolver.Resolution {
-    return runtime_resolver.resolveCottontail(init, allocator, command_args);
+    const resolution = try runtime_resolver.resolveCottontail(init, allocator, command_args);
+    // Registration is advisory reachability state. Read-only projects still
+    // run under live object leases; an unwritable `.hutch` must not break the
+    // user's command.
+    registerRuntimeProjectReleases(init, allocator, resolution) catch {};
+    // Electrobun registers its complete H+C+devkit+toolchain graph after all
+    // of those dependencies have resolved. Running automatic GC here would
+    // be too early on the first invocation of a project.
+    if (command_args.len == 0 or !std.mem.eql(u8, command_args[0], "electrobun")) {
+        managed_store.pruneAutomatic(init, allocator);
+    }
+    return resolution;
+}
+
+fn registerRuntimeProjectReleases(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cottontail: runtime_resolver.Resolution,
+) !void {
+    const config_path = (try bootstrap_pragma.findNearestConfig(init.io, allocator)) orelse return;
+    const project_root = std.fs.path.dirname(config_path) orelse return error.InvalidProjectRoot;
+
+    var releases: std.ArrayList(managed_store.ManagedObject) = .empty;
+    const current_engine = try std.process.executablePathAlloc(init.io, allocator);
+    if (try managed_store.managedReleaseObject(
+        init,
+        allocator,
+        .hutch,
+        current_engine,
+    )) |managed| try releases.append(allocator, managed);
+    if (try managed_store.managedReleaseObject(
+        init,
+        allocator,
+        .cottontail,
+        cottontail.root,
+    )) |managed| try releases.append(allocator, managed);
+
+    try managed_store.registerProjectReleases(
+        init,
+        allocator,
+        project_root,
+        releases.items,
+    );
 }
 
 fn runProcess(
@@ -1303,7 +1354,10 @@ fn resolvePackageManager(
             return null;
         };
     } else |err| switch (err) {
-        error.HutchConfigNotFound => return package_manager_adapter.defaultSelection(),
+        error.HutchConfigNotFound => {
+            managed_store.pruneAutomatic(init, allocator);
+            return package_manager_adapter.defaultSelection();
+        },
         else => return err,
     }
 }
@@ -1351,6 +1405,13 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
+    // A directly invoked engine does not have a launcher parent to retain its
+    // managed release. Keep this lease for the complete engine lifetime; the
+    // helper returns null for development binaries outside the owned store.
+    const current_hutch_lease = try managed_store.acquireCurrentHutchLease(init, allocator);
+    defer if (current_hutch_lease) |lease| lease.close(init.io);
+
+    const command: ?[]const u8 = if (args.len > 1) args[1] else null;
     if (args.len <= 1) {
         if (isBunCliFacade(init.environ_map)) {
             const exit_code = try forwardToCottontail(
@@ -1362,20 +1423,22 @@ pub fn main(init: std.process.Init) !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
+        managed_store.pruneAutomatic(init, allocator);
         try printHelp(stdout);
         try stdout.flush();
         return;
     }
 
-    const command = args[1];
+    const selected_command = command.?;
 
-    if (isHelpFlag(command)) {
+    if (isHelpFlag(selected_command)) {
+        managed_store.pruneAutomatic(init, allocator);
         try printHelp(stdout);
         try stdout.flush();
         return;
     }
 
-    if (isVersionFlag(command)) {
+    if (isVersionFlag(selected_command)) {
         if (isBunCliFacade(init.environ_map)) {
             const exit_code = try forwardToCottontail(
                 init,
@@ -1386,12 +1449,41 @@ pub fn main(init: std.process.Init) !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
+        managed_store.pruneAutomatic(init, allocator);
         try stdout.print("{s}\n", .{version});
         try stdout.flush();
         return;
     }
 
-    if (std.mem.eql(u8, command, "status")) {
+    if (std.mem.eql(u8, selected_command, "prune")) {
+        const exit_code = try prune_cli.run(init, args[2..], stdout, stderr);
+        try stdout.flush();
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (std.mem.eql(u8, selected_command, "reset")) {
+        const exit_code = try reset_cli.run(init, args[2..], stdout, stderr);
+        try stdout.flush();
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (std.mem.eql(u8, selected_command, "cache") or
+        std.mem.eql(u8, selected_command, "clean"))
+    {
+        try stderr.print(
+            "hutch: `{s}` is not a command; use `hutch prune` or `hutch reset`\n",
+            .{selected_command},
+        );
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, selected_command, "status")) {
+        managed_store.pruneAutomatic(init, allocator);
         const exit_code = try status_cli.run(init, args[2..], stdout, stderr);
         try stdout.flush();
         try stderr.flush();
@@ -1399,22 +1491,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "cache")) {
-        const exit_code = try cache_cli.run(init, args[2..], stdout, stderr);
-        try stdout.flush();
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    const is_release_command = std.mem.eql(u8, command, "self") or
-        std.mem.eql(u8, command, "cottontail");
+    const is_release_command = std.mem.eql(u8, selected_command, "self") or
+        std.mem.eql(u8, selected_command, "cottontail");
     if (!is_release_command) {
         try maybePromptForUpdates(init, allocator, stderr);
     }
 
     if (is_release_command) {
-        const product: release_store.Product = if (std.mem.eql(u8, command, "self"))
+        const product: release_store.Product = if (std.mem.eql(u8, selected_command, "self"))
             .hutch
         else
             .cottontail;
@@ -1426,16 +1510,19 @@ pub fn main(init: std.process.Init) !void {
             stdout,
             stderr,
         );
+        if (!isInstallerBootstrapInvocation(args)) {
+            managed_store.pruneAutomatic(init, allocator);
+        }
         try stdout.flush();
         try stderr.flush();
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
-    if (std.mem.startsWith(u8, command, "-") or
-        isReservedRuntimeCommand(command) or
+    if (std.mem.startsWith(u8, selected_command, "-") or
+        isReservedRuntimeCommand(selected_command) or
         (isBunCliFacade(init.environ_map) and
-            (std.mem.eql(u8, command, "getcompletes") or isFakeNodeInvocation(args))))
+            (std.mem.eql(u8, selected_command, "getcompletes") or isFakeNodeInvocation(args))))
     {
         const exit_code = try forwardToCottontail(
             init,
@@ -1447,11 +1534,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "install") or std.mem.eql(u8, command, "pm")) {
+    if (std.mem.eql(u8, selected_command, "install") or std.mem.eql(u8, selected_command, "pm")) {
         const exit_code = try runPackageManager(
             init,
             allocator,
-            if (std.mem.eql(u8, command, "install")) "install" else null,
+            if (std.mem.eql(u8, selected_command, "install")) "install" else null,
             args[2..],
             stderr,
         );
@@ -1460,7 +1547,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "run")) {
+    if (std.mem.eql(u8, selected_command, "run")) {
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -1533,7 +1620,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, command, "electrobun")) {
+    if (std.mem.eql(u8, selected_command, "electrobun")) {
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
@@ -1593,7 +1680,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (pathExists(init.io, command) or runtimeDiagnosticEligible(command)) {
+    if (pathExists(init.io, selected_command) or runtimeDiagnosticEligible(selected_command)) {
         const exit_code = try forwardToCottontail(
             init,
             allocator,
@@ -1608,7 +1695,7 @@ pub fn main(init: std.process.Init) !void {
         if (try runNamedConfigScript(
             init,
             allocator,
-            command,
+            selected_command,
             args[2..],
             stderr,
         )) |exit_code| {
@@ -1621,7 +1708,7 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     }
 
-    if (std.mem.eql(u8, command, "build")) {
+    if (std.mem.eql(u8, selected_command, "build")) {
         const exit_code = try forwardToCottontail(
             init,
             allocator,
@@ -1632,7 +1719,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try stderr.print("error: Script not found \"{s}\"\n", .{command});
+    try stderr.print("error: Script not found \"{s}\"\n", .{selected_command});
     try stderr.flush();
     std.process.exit(1);
 }
@@ -1643,7 +1730,9 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch pm") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "packageManager") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch cache <prune|clean>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch prune [--dry-run]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch reset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch cache") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch status [--json]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script-name>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch.config.ts") != null);

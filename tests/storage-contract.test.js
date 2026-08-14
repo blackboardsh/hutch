@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -80,10 +81,6 @@ function releaseRoot(home, product, version, revision) {
   return join(home, "releases", product, version, revision, platform);
 }
 
-function releaseRelativeRoot(product, version, revision) {
-  return ["releases", product, version, revision, platform].join("/");
-}
-
 function createRelease(home, {
   product,
   version,
@@ -131,6 +128,11 @@ function createRelease(home, {
 
 function installCurrentHutch(home) {
   markOwnedStore(home);
+  const locks = join(home, "state", "locks");
+  mkdirSync(locks, { recursive: true });
+  for (const name of ["store.lock", "selections.lock", "graph.lock"]) {
+    writeFileSync(join(locks, name), "");
+  }
   const root = createRelease(home, {
     product: "hutch",
     version: currentVersion,
@@ -166,12 +168,15 @@ function relativeRoot(home, path) {
   return relative(home, path).split(sep).join("/");
 }
 
-function writeUnreachableSince(home, managedRoot, seconds) {
+function unreachableSincePath(home, managedRoot) {
   const relativePath = relativeRoot(home, managedRoot);
   const digest = createHash("sha256").update(relativePath).digest("hex");
-  const stateRoot = join(home, "state", "unreachable-since");
-  const path = join(stateRoot, `${digest}.timestamp`);
-  mkdirSync(stateRoot, { recursive: true });
+  return join(home, "state", "unreachable-since", `${digest}.timestamp`);
+}
+
+function writeUnreachableSince(home, managedRoot, seconds) {
+  const path = unreachableSincePath(home, managedRoot);
+  mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${seconds}\n`);
   const date = new Date(seconds * 1000);
   utimesSync(path, date, date);
@@ -239,20 +244,73 @@ function walkFiles(root) {
   return output;
 }
 
-function createMissingProjectRegistration(home, missingProject, objects) {
+function snapshotTree(root) {
+  const entries = [];
+  function visit(path, relativePath) {
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) {
+      entries.push({ path: relativePath, type: "directory" });
+      for (const entry of readdirSync(path).sort()) {
+        visit(join(path, entry), relativePath ? `${relativePath}/${entry}` : entry);
+      }
+    } else if (stat.isSymbolicLink()) {
+      entries.push({ path: relativePath, type: "symlink", target: readlinkSync(path) });
+    } else if (stat.isFile()) {
+      const bytes = readFileSync(path);
+      entries.push({
+        path: relativePath,
+        type: "file",
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        mtimeMs: stat.mtimeMs,
+      });
+    } else {
+      entries.push({ path: relativePath, type: `other:${stat.mode}` });
+    }
+  }
+  for (const entry of readdirSync(root).sort()) visit(join(root, entry), entry);
+  return entries;
+}
+
+function createMissingProjectRegistration(home, missingProject) {
   const name = `${createHash("sha256").update(missingProject).digest("hex")}.json`;
   const projects = join(home, "state", "projects");
   mkdirSync(projects, { recursive: true });
   writeFileSync(
     join(projects, name),
     `${JSON.stringify({
-      schemaVersion: 2,
+      schemaVersion: 1,
       kind: "hutch-project-registration",
       canonicalRoot: missingProject,
       projectLockSha256: "0".repeat(64),
       lastSeenUnixSeconds: Math.floor(Date.now() / 1000),
-      objects,
     }, null, 2)}\n`,
+  );
+}
+
+function registerProjectObjects(home, project, objects) {
+  const canonicalRoot = realpathSync(project);
+  const projectState = join(project, ".hutch");
+  mkdirSync(projectState, { recursive: true });
+  const lockBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    kind: "hutch-project-dependencies",
+    objects,
+  })}\n`;
+  writeFileSync(join(projectState, "dependencies.lock"), lockBytes);
+
+  const projects = join(home, "state", "projects");
+  mkdirSync(projects, { recursive: true });
+  const registrationName = `${createHash("sha256").update(canonicalRoot).digest("hex")}.json`;
+  writeFileSync(
+    join(projects, registrationName),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      kind: "hutch-project-registration",
+      canonicalRoot,
+      projectLockSha256: createHash("sha256").update(lockBytes).digest("hex"),
+      lastSeenUnixSeconds: Math.floor(Date.now() / 1000),
+    })}\n`,
   );
 }
 
@@ -282,12 +340,23 @@ test("top-level help exposes the complete maintenance CLI", () => {
 
     const legacyNamespace = run(builtEngine, ["cache", "prune", "--dry-run"], home);
     assert.notEqual(legacyNamespace.status, 0, "the old cache namespace must not remain callable");
+
+    const legacyClean = run(builtEngine, ["cache", "clean", "--dry-run"], home);
+    assert.notEqual(legacyClean.status, 0, "the old cache clean command must not remain callable");
+
+    const topLevelClean = run(builtEngine, ["clean"], home);
+    assert.notEqual(topLevelClean.status, 0, "clean was replaced by reset");
+
+    for (const flag of ["--yes", "--dry-run"]) {
+      const flaggedReset = run(builtEngine, ["reset", flag], home);
+      assert.notEqual(flaggedReset.status, 0, `reset must reject ${flag}`);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("manual prune has zero grace and unresolved projects protect nothing", () => {
+test("manual prune is immediate and unresolved projects protect nothing", () => {
   const { root, home } = fixture("hutch-storage-prune-");
   try {
     const currentRoot = installCurrentHutch(home);
@@ -308,29 +377,27 @@ test("manual prune has zero grace and unresolved projects protect nothing", () =
     );
     const oldUnreachableSinceContents = readFileSync(oldUnreachableSince, "utf8");
     const oldUnreachableSinceMtime = statSync(oldUnreachableSince).mtimeMs;
-    createMissingProjectRegistration(home, join(root, "missing-project"), [
-      {
-        type: "release",
-        product: "cottontail",
-        relativeRoot: releaseRelativeRoot("cottontail", "0.1.0", unusedRevision),
-        version: "0.1.0",
-        platform,
-        revision: unusedRevision,
-        archiveSha256,
-      },
-      {
-        type: "toolchain",
-        relativeRoot: relativeRoot(home, toolchainRoot),
-        version: "0.14.1",
-        platform,
-        toolchain: "zig",
-      },
-    ]);
+    createMissingProjectRegistration(home, join(root, "missing-project"));
+    const staleTrash = join(
+      home,
+      "state",
+      "trash",
+      "111111111111111111111111",
+      "leftover",
+    );
+    mkdirSync(dirname(staleTrash), { recursive: true });
+    writeFileSync(staleTrash, "must survive a preview");
     const project = projectWithPinnedHutch(root);
     const launcher = join(currentRoot, "bin", `hutch${executableSuffix}`);
 
+    const beforePreview = snapshotTree(home);
     const preview = run(launcher, ["prune", "--dry-run"], home, { cwd: project });
     assertSucceeded(preview);
+    assert.deepEqual(
+      snapshotTree(home),
+      beforePreview,
+      "dry-run must not add, remove, rewrite, or retimestamp store state",
+    );
     assert(existsSync(cottontailRoot), "dry-run must retain an unused Cottontail release");
     assert(existsSync(toolchainRoot), "dry-run must retain an unused toolchain");
     assert(existsSync(oldToolchainRoot), "dry-run must suppress the automatic retention sweep");
@@ -345,6 +412,99 @@ test("manual prune has zero grace and unresolved projects protect nothing", () =
     assert(!existsSync(toolchainRoot), "manual prune removes a fresh, unreferenced toolchain");
     assert(!existsSync(oldToolchainRoot), "manual prune removes an expired toolchain");
     assert(existsSync(currentRoot), "manual prune retains the selected Hutch release");
+    assert(!existsSync(staleTrash), "a real prune cleans detached trash");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("lazy pruning tracks each continuous period of unreachability", () => {
+  const { root, home } = fixture("hutch-storage-unreachable-since-");
+  try {
+    const currentRoot = installCurrentHutch(home);
+    const toolchainRoot = createToolchain(home, "0.14.3");
+    const marker = unreachableSincePath(home, toolchainRoot);
+    const launcher = join(currentRoot, "bin", `hutch${executableSuffix}`);
+
+    const first = run(launcher, ["--version"], home, { cwd: root });
+    assertSucceeded(first);
+    assert(existsSync(marker), "the first unreachable observation starts retention");
+    const firstContents = readFileSync(marker, "utf8");
+    assert.match(firstContents, /^\d+\n$/);
+
+    const fixedMtime = new Date(1_000_000);
+    utimesSync(marker, fixedMtime, fixedMtime);
+    const second = run(launcher, ["--version"], home, { cwd: root });
+    assertSucceeded(second);
+    assert.equal(readFileSync(marker, "utf8"), firstContents);
+    assert.equal(
+      statSync(marker).mtimeMs,
+      fixedMtime.getTime(),
+      "ordinary invocations must not restart an existing retention period",
+    );
+
+    const project = join(root, "live-project");
+    mkdirSync(project, { recursive: true });
+    registerProjectObjects(home, project, [{
+      type: "toolchain",
+      relativeRoot: relativeRoot(home, toolchainRoot),
+      version: "0.14.3",
+      platform,
+      toolchain: "zig",
+    }]);
+    const reachable = run(launcher, ["--version"], home, { cwd: root });
+    assertSucceeded(reachable);
+    assert(!existsSync(marker), "becoming reachable clears unreachable-since state");
+    assert(existsSync(toolchainRoot));
+
+    rmSync(project, { recursive: true, force: true });
+    const restartFloor = Math.floor(Date.now() / 1000) - 1;
+    const unreachableAgain = run(launcher, ["--version"], home, { cwd: root });
+    assertSucceeded(unreachableAgain);
+    assert(existsSync(marker), "a later unreachable period gets a fresh timestamp");
+    assert(Number.parseInt(readFileSync(marker, "utf8"), 10) >= restartFloor);
+
+    writeUnreachableSince(
+      home,
+      toolchainRoot,
+      Math.floor(Date.now() / 1000) - automaticRetentionSeconds - 1,
+    );
+    const expired = run(launcher, ["--version"], home, { cwd: root });
+    assertSucceeded(expired);
+    assert(!existsSync(toolchainRoot), "automatic pruning removes the object after ten days");
+    assert(!existsSync(marker), "pruning also removes unreachable-since state");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manual prune protects selected and currently executing Hutch releases independently", () => {
+  const { root, home } = fixture("hutch-storage-current-selection-");
+  try {
+    const currentRoot = installCurrentHutch(home);
+    const selectedRoot = createRelease(home, {
+      product: "hutch",
+      version: "9.9.9",
+      revision: unusedRevision,
+      executable: "hutch-engine",
+    });
+    const unusedRoot = createToolchain(home, "0.14.4");
+    writeSelections(home, {
+      hutch: {
+        production: {
+          version: "9.9.9",
+          revision: unusedRevision,
+          platform,
+        },
+      },
+    });
+
+    const currentEngine = join(currentRoot, "bin", `hutch-engine${executableSuffix}`);
+    const prune = run(currentEngine, ["prune"], home, { cwd: root });
+    assertSucceeded(prune);
+    assert(existsSync(currentRoot), "the executing managed Hutch remains usable when unselected");
+    assert(existsSync(selectedRoot), "an independently selected Hutch release remains installed");
+    assert(!existsSync(unusedRoot), "an unrelated unused object is still pruned");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

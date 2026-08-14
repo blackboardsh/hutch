@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
-const cache_locks = @import("cache_locks.zig");
 const project_state = @import("project_state.zig");
+const store_locks = @import("store_locks.zig");
 const version_selector = @import("version_selector.zig");
 
 const default_hutch_artifacts_base_url = "https://hutch.blackboard.sh";
@@ -73,7 +73,7 @@ pub const Resolution = struct {
 /// keeps it attached to the store while a caller uses it.
 pub const LeasedResolution = struct {
     resolution: Resolution,
-    lease: cache_locks.ObjectLease,
+    lease: store_locks.ObjectLease,
 
     pub fn close(self: LeasedResolution, io: std.Io) void {
         self.lease.close(io);
@@ -278,7 +278,7 @@ pub fn resolveLeased(
     options: Options,
 ) !LeasedResolution {
     const home = try hutchHome(init, allocator);
-    const lifecycle = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    const lifecycle = try store_locks.acquireGraph(init.io, allocator, home, .shared);
     defer lifecycle.close(init.io);
 
     const resolution = try resolveUnderGraph(
@@ -291,7 +291,7 @@ pub fn resolveLeased(
     );
     return .{
         .resolution = resolution,
-        .lease = try cache_locks.acquireObjectLease(
+        .lease = try store_locks.acquireObjectLease(
             init.io,
             allocator,
             home,
@@ -385,7 +385,7 @@ pub fn leaseInstalledHutchExecutable(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     executable: []const u8,
-) !?cache_locks.ObjectLease {
+) !?store_locks.ObjectLease {
     const home = try hutchHome(init, allocator);
     if (!try executableClaimsManagedHutchTree(
         init.io,
@@ -397,7 +397,7 @@ pub fn leaseInstalledHutchExecutable(
         error.FileNotFound => return null,
         else => return err,
     };
-    const graph = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    const graph = try store_locks.acquireGraph(init.io, allocator, home, .shared);
     defer graph.close(init.io);
     return leaseInstalledHutchExecutableUnderGraph(
         init.io,
@@ -429,7 +429,7 @@ fn leaseInstalledHutchExecutableUnderGraph(
     allocator: std.mem.Allocator,
     home: []const u8,
     executable: []const u8,
-) !?cache_locks.ObjectLease {
+) !?store_locks.ObjectLease {
     const canonical_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     const lexical_home = try std.fs.path.resolve(allocator, &.{ canonical_cwd, home });
     const lexical_executable = try std.fs.path.resolve(allocator, &.{ canonical_cwd, executable });
@@ -501,7 +501,7 @@ fn leaseInstalledHutchExecutableUnderGraph(
         return error.InvalidManagedHutchExecutable;
     }
 
-    return cache_locks.acquireObjectLease(io, allocator, lexical_home, release_root) catch
+    return store_locks.acquireObjectLease(io, allocator, lexical_home, release_root) catch
         return error.InvalidManagedHutchExecutable;
 }
 
@@ -623,11 +623,11 @@ fn bootstrapInstalledHutchAt(
         staged.platform,
     });
 
-    const graph = try cache_locks.acquireGraph(io, allocator, canonical_home, .shared);
+    const graph = try store_locks.acquireGraph(io, allocator, canonical_home, .shared);
     defer graph.close(io);
     const object_lock_path = try std.mem.concat(allocator, u8, &.{ final_root, ".lock" });
-    try cache_locks.initializePersistentFile(io, object_lock_path);
-    const object_lock = (try cache_locks.tryAcquireObjectExclusive(
+    try store_locks.initializePersistentFile(io, object_lock_path);
+    const object_lock = (try store_locks.tryAcquireObjectExclusive(
         io,
         allocator,
         final_root,
@@ -3203,7 +3203,7 @@ test "a validated installed Hutch engine holds its release object lease" {
         .data = checksum,
     });
 
-    const graph = try cache_locks.acquireGraph(io, allocator, home, .shared);
+    const graph = try store_locks.acquireGraph(io, allocator, home, .shared);
     const lease = (try leaseInstalledHutchExecutableUnderGraph(
         io,
         allocator,
@@ -3211,14 +3211,14 @@ test "a validated installed Hutch engine holds its release object lease" {
         executable,
     )).?;
     graph.close(io);
-    try std.testing.expect((try cache_locks.tryAcquireObjectExclusive(
+    try std.testing.expect((try store_locks.tryAcquireObjectExclusive(
         io,
         allocator,
         release_root,
     )) == null);
 
     lease.close(io);
-    const exclusive = (try cache_locks.tryAcquireObjectExclusive(
+    const exclusive = (try store_locks.tryAcquireObjectExclusive(
         io,
         allocator,
         release_root,

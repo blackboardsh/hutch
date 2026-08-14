@@ -1,11 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
+const store_locks = @import("store_locks.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
 
 const version = @import("version.zig").version;
+const launcher_storage_schema = "1";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -14,27 +16,64 @@ pub fn main(init: std.process.Init) !void {
     const channel = activeChannel(init, allocator) catch |err| {
         return exitWithError(init.io, "invalid active release channel", err);
     };
-    const pragma = bootstrap_pragma.discover(init, allocator, command_args) catch |err| {
-        return exitWithError(init.io, "invalid // @hutch pragma", err);
+    const selector = if (commandUsesGlobalSelector(command_args))
+        version_selector.parse(channel) catch unreachable
+    else selector: {
+        const pragma = bootstrap_pragma.discover(init, allocator, command_args) catch |err| {
+            return exitWithError(init.io, "invalid // @hutch pragma", err);
+        };
+        break :selector pragma.cli orelse version_selector.parse(channel) catch unreachable;
     };
-    const selector = pragma.cli orelse version_selector.parse(channel) catch unreachable;
 
-    const engine = resolveEngine(init, allocator, selector, channel) catch |err| {
+    var engine = resolveEngine(init, allocator, selector, channel) catch |err| {
         return exitWithError(init.io, "could not resolve Hutch", err);
     };
-    const exit_code = try runEngine(init, allocator, engine, channel, args);
+    defer engine.close(init.io);
+    const exit_code = try runEngine(init, allocator, &engine, channel, args);
     if (exit_code != 0) std.process.exit(exit_code);
 }
+
+/// Store-wide maintenance must run through the active global Hutch release.
+/// In particular, a project-local CLI pin (even a malformed one) must not
+/// choose the engine that prunes or resets the global store. Removed legacy
+/// maintenance spellings also route globally so only the current engine gets
+/// to reject them; an old project-pinned engine must never perform the old
+/// operation.
+fn commandUsesGlobalSelector(command_args: []const [:0]const u8) bool {
+    if (command_args.len == 0) return false;
+    return std.mem.eql(u8, command_args[0], "prune") or
+        std.mem.eql(u8, command_args[0], "reset") or
+        std.mem.eql(u8, command_args[0], "cache") or
+        std.mem.eql(u8, command_args[0], "clean");
+}
+
+const ResolvedEngine = struct {
+    executable: []const u8,
+    lease: ?store_locks.ObjectLease = null,
+
+    fn close(self: *ResolvedEngine, io: std.Io) void {
+        if (self.lease) |lease| lease.close(io);
+        self.lease = null;
+    }
+};
 
 fn resolveEngine(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     selector: version_selector.Selector,
     active_channel: []const u8,
-) ![]const u8 {
+) !ResolvedEngine {
     if (init.environ_map.get("HUTCH_ENGINE_BINARY")) |configured| {
         if (!pathExists(init.io, configured)) return error.ConfiguredHutchEngineNotFound;
-        return allocator.dupe(u8, configured);
+        const configured_lease = try release_store.leaseInstalledHutchExecutable(
+            init,
+            allocator,
+            configured,
+        );
+        return .{
+            .executable = try allocator.dupe(u8, configured),
+            .lease = configured_lease,
+        };
     }
 
     const adjacent = try adjacentEnginePath(init, allocator);
@@ -43,18 +82,30 @@ fn resolveEngine(
         .version => std.mem.eql(u8, selector.value, version),
         .build => false,
     };
-    if (uses_current_release and pathExists(init.io, adjacent)) return adjacent;
+    if (uses_current_release and pathExists(init.io, adjacent)) {
+        return .{
+            .executable = adjacent,
+            .lease = try release_store.leaseInstalledHutchExecutable(
+                init,
+                allocator,
+                adjacent,
+            ),
+        };
+    }
 
     const refresh = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_REFRESH");
     const offline = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE");
-    const resolved = try release_store.resolve(
+    const resolved = try release_store.resolveLeased(
         init,
         allocator,
         .hutch,
         selector,
         .{ .refresh = refresh, .offline = offline },
     );
-    return resolved.executable;
+    return .{
+        .executable = resolved.resolution.executable,
+        .lease = resolved.lease,
+    };
 }
 
 fn adjacentEnginePath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -68,23 +119,22 @@ fn adjacentEnginePath(init: std.process.Init, allocator: std.mem.Allocator) ![]c
 fn runEngine(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    engine: []const u8,
+    engine: *ResolvedEngine,
     channel: []const u8,
     original_args: []const [:0]const u8,
 ) !u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try appendEngineArguments(allocator, &argv, engine, original_args);
+    try appendEngineArguments(allocator, &argv, engine.executable, original_args);
 
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
     const launcher_path = try std.process.executablePathAlloc(init.io, allocator);
-    try environment.put("HUTCH_ACTIVE_CHANNEL", channel);
-    try environment.put("HUTCH_LAUNCHER_PATH", launcher_path);
-    try environment.put("HUTCH_LAUNCHER_VERSION", version);
+    try putLauncherEnvironment(&environment, channel, launcher_path);
 
     if (comptime builtin.os.tag != .windows) {
-        try process_replace.replace(allocator, engine, argv.items, &environment);
+        if (engine.lease) |lease| try lease.makeInheritable(init.io);
+        try process_replace.replace(allocator, engine.executable, argv.items, &environment);
         unreachable;
     }
 
@@ -97,6 +147,17 @@ fn runEngine(
     });
     defer child.kill(init.io);
     return termExitCode(try child.wait(init.io));
+}
+
+fn putLauncherEnvironment(
+    environment: *std.process.Environ.Map,
+    channel: []const u8,
+    launcher_path: []const u8,
+) !void {
+    try environment.put("HUTCH_ACTIVE_CHANNEL", channel);
+    try environment.put("HUTCH_LAUNCHER_PATH", launcher_path);
+    try environment.put("HUTCH_LAUNCHER_VERSION", version);
+    try environment.put("HUTCH_LAUNCHER_STORAGE_SCHEMA", launcher_storage_schema);
 }
 
 fn appendEngineArguments(
@@ -184,6 +245,38 @@ test "stable active channel uses the production release" {
         "production",
         try version_selector.normalizeChannel("stable"),
     );
+}
+
+test "launcher advertises the managed storage protocol" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putLauncherEnvironment(&environment, "canary", "/managed/bin/hutch-canary");
+
+    try std.testing.expectEqualStrings("canary", environment.get("HUTCH_ACTIVE_CHANNEL").?);
+    try std.testing.expectEqualStrings(
+        "/managed/bin/hutch-canary",
+        environment.get("HUTCH_LAUNCHER_PATH").?,
+    );
+    try std.testing.expectEqualStrings(version, environment.get("HUTCH_LAUNCHER_VERSION").?);
+    try std.testing.expectEqualStrings(
+        "1",
+        environment.get("HUTCH_LAUNCHER_STORAGE_SCHEMA").?,
+    );
+}
+
+test "global maintenance commands bypass project CLI selectors" {
+    const prune = [_][:0]const u8{ "prune", "--dry-run" };
+    const reset = [_][:0]const u8{"reset"};
+    const status = [_][:0]const u8{"status"};
+    const nested_legacy_prune = [_][:0]const u8{ "cache", "prune" };
+    const legacy_clean = [_][:0]const u8{"clean"};
+
+    try std.testing.expect(commandUsesGlobalSelector(&prune));
+    try std.testing.expect(commandUsesGlobalSelector(&reset));
+    try std.testing.expect(commandUsesGlobalSelector(&nested_legacy_prune));
+    try std.testing.expect(commandUsesGlobalSelector(&legacy_clean));
+    try std.testing.expect(!commandUsesGlobalSelector(&status));
+    try std.testing.expect(!commandUsesGlobalSelector(&.{}));
 }
 
 test "launcher preserves the complete test invocation for the engine" {
