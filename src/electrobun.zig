@@ -592,8 +592,13 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
 fn loadConfigAfterProductDevkit(ctx: *const Context, build_env: BuildEnvironment) !CommandContext {
     const build_lock = try acquireProjectBuildLock(ctx);
     defer build_lock.close(ctx.io);
-    _ = try resolveProductPlatformPaths(ctx);
-    return loadConfig(ctx, build_env);
+    var locked_ctx = projectBuildLockContext(ctx);
+    // Keep the core release attached from resolution through devkit loading,
+    // projection, and the configuration process that consumes the projection.
+    const graph_lock = try cache_store.acquireUsageLock(locked_ctx.init, locked_ctx.allocator);
+    defer graph_lock.close(ctx.io);
+    _ = try resolveProductPlatformPaths(&locked_ctx);
+    return loadConfig(&locked_ctx, build_env);
 }
 
 fn loadConfigForPreparedOperation(ctx: *const Context, build_env: BuildEnvironment) !CommandContext {
@@ -736,6 +741,12 @@ fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
     };
 }
 
+fn projectBuildLockContext(ctx: *const Context) Context {
+    var locked = ctx.*;
+    locked.build_lock_key = ctx.project_root;
+    return locked;
+}
+
 fn openProjectBuildReaders(
     ctx: *const Context,
     mode: project_state.OpenMode,
@@ -873,8 +884,7 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
     try prepareProject(ctx, config);
     try waitForProjectBuildReaders(ctx);
 
-    var locked_ctx = ctx.*;
-    locked_ctx.build_lock_key = ctx.project_root;
+    var locked_ctx = projectBuildLockContext(ctx);
     try runBuildUnlocked(&locked_ctx, config);
 }
 
@@ -2493,8 +2503,7 @@ fn buildAndSpawnBuiltApp(
     try prepareProject(ctx, config);
     try waitForProjectBuildReaders(ctx);
 
-    var locked_ctx = ctx.*;
-    locked_ctx.build_lock_key = ctx.project_root;
+    var locked_ctx = projectBuildLockContext(ctx);
     try runBuildUnlocked(&locked_ctx, config);
 
     const read_lease = try acquireProjectBuildReadLease(ctx);
@@ -7085,7 +7094,7 @@ test "Zig builds invoke the project build file with the projected SDK contract" 
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", argv.items[optimize_index]);
 }
 
-test "Zig builds scrub environment overrides that can replace the resolved compiler contract" {
+test "locked subprocesses inherit build ownership while scrubbing Zig overrides" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -7105,12 +7114,12 @@ test "Zig builds scrub environment overrides that can replace the resolved compi
         .cottontail_home = "/cottontail",
         .cottontail_binary = "/cottontail/bin/cottontail",
         .project_root = "/project",
-        .build_lock_key = "/project",
     };
+    var locked_ctx = projectBuildLockContext(&ctx);
     var sanitized = std.process.Environ.Map.init(allocator);
     defer sanitized.deinit();
 
-    try prepareZigBuildEnvironment(&ctx, &sanitized);
+    try prepareZigBuildEnvironment(&locked_ctx, &sanitized);
 
     try std.testing.expectEqualStrings("/tools", sanitized.get("PATH").?);
     try std.testing.expectEqualStrings("/project", sanitized.get(build_lock_environment_variable).?);

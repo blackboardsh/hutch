@@ -180,7 +180,8 @@ hutch cottontail update
 
 Interactive use checks for newer remote-channel releases at most every six
 hours. Each check fetches current metadata rather than reading a persistent
-metadata cache. The prompt can update, skip that specific revision, or defer.
+metadata cache; Hutch stores only the successful check timestamp. The prompt
+can update, skip that specific revision, or defer.
 CI, non-interactive commands, and `HUTCH_NO_UPDATE_CHECK=1` never prompt.
 
 Use `hutch self path`, `hutch self version`, `hutch cottontail path`, and

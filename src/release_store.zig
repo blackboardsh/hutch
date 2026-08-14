@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
 const cache_locks = @import("cache_locks.zig");
+const project_state = @import("project_state.zig");
 const version_selector = @import("version_selector.zig");
 
 const default_hutch_artifacts_base_url = "https://hutch.blackboard.sh";
@@ -13,6 +14,7 @@ const selections_schema_version = 1;
 const max_selections_bytes = 64 * 1024;
 const store_schema_version = 1;
 const max_store_marker_bytes = 64 * 1024;
+const update_check_interval_seconds: i64 = 6 * 60 * 60;
 
 pub const releases_directory_name = "releases";
 pub const state_directory_name = "state";
@@ -185,6 +187,54 @@ pub fn acquirePersistentFileLock(
     return .{ .file = file, .contended = false };
 }
 
+fn acquirePersistentFileLockAt(
+    io: std.Io,
+    directory: std.Io.Dir,
+    name: []const u8,
+) !PersistentFileLock {
+    const initializer: ?std.Io.File = directory.createFile(io, name, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => null,
+        else => return err,
+    };
+    if (initializer) |file| file.close(io);
+
+    const open_options: std.Io.Dir.OpenFileOptions = .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .follow_symlinks = false,
+    };
+    const file = directory.openFile(io, name, .{
+        .mode = open_options.mode,
+        .lock = open_options.lock,
+        .lock_nonblocking = true,
+        .follow_symlinks = open_options.follow_symlinks,
+    }) catch |err| switch (err) {
+        error.WouldBlock => {
+            if (builtin.os.tag == .windows) {
+                const waiting_file = try directory.openFile(io, name, .{
+                    .mode = open_options.mode,
+                    .follow_symlinks = open_options.follow_symlinks,
+                });
+                errdefer waiting_file.close(io);
+                while (!try waiting_file.tryLock(io, .exclusive)) {
+                    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+                }
+                return .{ .file = waiting_file, .contended = true };
+            }
+            return .{
+                .file = try directory.openFile(io, name, open_options),
+                .contended = true,
+            };
+        },
+        else => return err,
+    };
+    return .{ .file = file, .contended = false };
+}
+
 pub fn acquireFileLock(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -245,22 +295,21 @@ pub fn resolve(
         product.executableFileName(),
     });
 
-    if (try installationMatches(init.io, allocator, root, executable, artifact.sha256)) {
-        const result: Resolution = .{
-            .root = root,
-            .executable = executable,
-            .version = artifact.version,
-            .revision = artifact.revision,
-            .archive_sha256 = artifact.sha256,
-            .installed = false,
-        };
+    if (try installedArtifactResolution(
+        init.io,
+        allocator,
+        root,
+        product,
+        artifact,
+        platform,
+    )) |result| {
         if (selector.channel()) |channel| {
             try activateChannel(init, allocator, product, channel, result);
         }
         return result;
     }
 
-    try installArtifact(init, allocator, product, artifact, platform, root, executable);
+    try installArtifact(init, allocator, product, artifact, platform, root);
     const result: Resolution = .{
         .root = root,
         .executable = executable,
@@ -402,6 +451,12 @@ pub fn checkForUpdate(
         product,
         channel,
     )) orelse return null;
+    const check_path = try updateCheckPath(allocator, home, product, channel);
+    const check_lock = try acquireFileLock(init.io, allocator, check_path);
+    defer check_lock.close(init.io);
+    const now = unixSeconds(init.io);
+    if (!try updateCheckDueAt(init.io, allocator, check_path, now)) return null;
+
     const base_url = try artifactsBaseUrl(init, allocator, product);
     const channel_url = try std.fmt.allocPrint(
         allocator,
@@ -416,6 +471,8 @@ pub fn checkForUpdate(
         product,
         channel,
     );
+    const checked_at = try std.fmt.allocPrint(allocator, "{d}\n", .{now});
+    try writeAtomicFileLocked(init.io, check_path, checked_at);
     if (std.mem.eql(u8, current.revision, available.revision)) return null;
     if (try updateIsSkipped(
         init.io,
@@ -673,27 +730,51 @@ fn ensureManagedHomeAt(
     home: []const u8,
 ) !StoreIdentity {
     try std.Io.Dir.cwd().createDirPath(io, home);
-    const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
-    try std.Io.Dir.cwd().createDirPath(io, state);
-    const locks = try std.fs.path.join(allocator, &.{ state, "locks" });
-    try std.Io.Dir.cwd().createDirPath(io, locks);
-    const lock_path = try std.fs.path.join(allocator, &.{ locks, store_lock_file_name });
-    const lock = try acquirePersistentFileLock(io, lock_path);
+    var root_directory = try openStoreRootNoFollow(io, home);
+    defer root_directory.close(io);
+    root_directory.createDir(io, state_directory_name, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var state_directory = try openStoreStateNoFollow(io, root_directory);
+    defer state_directory.close(io);
+    state_directory.createDir(io, "locks", .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var locks_directory = try openStoreChildDirectoryNoFollow(
+        io,
+        state_directory,
+        "locks",
+        error.InvalidHutchStoreStatePath,
+    );
+    defer locks_directory.close(io);
+    const lock = try acquirePersistentFileLockAt(io, locks_directory, store_lock_file_name);
     defer lock.close(io);
 
-    if (loadStoreIdentityAt(io, allocator, home)) |identity| return identity else |err| switch (err) {
+    if (loadStoreIdentityFromOpenDirectories(
+        io,
+        allocator,
+        root_directory,
+        state_directory,
+    )) |identity| return identity else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
 
-    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    const canonical_root = try root_directory.realPathFileAlloc(io, ".", allocator);
     var marker: std.json.ObjectMap = .empty;
     try marker.put(allocator, "schemaVersion", .{ .integer = store_schema_version });
     try marker.put(allocator, "kind", .{ .string = "hutch-store" });
     try marker.put(allocator, "canonicalRoot", .{ .string = canonical_root });
     const encoded = try jsonBytes(allocator, .{ .object = marker });
-    const path = try storeMarkerPath(allocator, home);
-    try writeAtomicFileLocked(io, path, encoded);
+    try project_state.atomicWrite(
+        io,
+        allocator,
+        state_directory,
+        store_marker_file_name,
+        encoded,
+    );
     return .{ .canonical_root = canonical_root };
 }
 
@@ -702,16 +783,44 @@ fn loadStoreIdentityAt(
     allocator: std.mem.Allocator,
     home: []const u8,
 ) !StoreIdentity {
-    const path = try storeMarkerPath(allocator, home);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+    var root_directory = try openStoreRootNoFollow(io, home);
+    defer root_directory.close(io);
+    var state_directory = try openStoreStateNoFollow(io, root_directory);
+    defer state_directory.close(io);
+    return loadStoreIdentityFromOpenDirectories(
         io,
-        path,
         allocator,
-        .limited(max_store_marker_bytes),
+        root_directory,
+        state_directory,
     );
-    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+}
+
+fn loadStoreIdentityFromOpenDirectories(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root_directory: std.Io.Dir,
+    state_directory: std.Io.Dir,
+) !StoreIdentity {
+    const marker_stat = state_directory.statFile(io, store_marker_file_name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return err,
+        else => return error.InvalidHutchStoreMarker,
+    };
+    if (marker_stat.kind != .file) return error.InvalidHutchStoreMarker;
+    const bytes = project_state.readFileAlloc(
+        io,
+        allocator,
+        state_directory,
+        store_marker_file_name,
+        .limited(max_store_marker_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.OutOfMemory => return err,
+        else => return error.InvalidHutchStoreMarker,
+    };
+    const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
         .duplicate_field_behavior = .@"error",
-    });
+    }) catch return error.InvalidHutchStoreMarker;
     if (root != .object or root.object.count() != 3) return error.InvalidHutchStoreMarker;
     if ((jsonPositiveUsize(root, "schemaVersion") catch return error.InvalidHutchStoreMarker) != store_schema_version) {
         return error.UnsupportedHutchStoreSchema;
@@ -721,9 +830,57 @@ fn loadStoreIdentityAt(
     }
     const stored_root = jsonString(root, "canonicalRoot") catch return error.InvalidHutchStoreMarker;
     if (!std.fs.path.isAbsolute(stored_root)) return error.InvalidHutchStoreMarker;
-    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    const canonical_root = try root_directory.realPathFileAlloc(io, ".", allocator);
     if (!pathEqual(stored_root, canonical_root)) return error.HutchStoreRootMismatch;
     return .{ .canonical_root = canonical_root };
+}
+
+fn openStoreRootNoFollow(io: std.Io, home: []const u8) !std.Io.Dir {
+    const stat = std.Io.Dir.cwd().statFile(io, home, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return err,
+        else => return error.InvalidHutchStoreRoot,
+    };
+    if (stat.kind == .sym_link) return error.HutchStoreRootIsSymbolicLink;
+    if (stat.kind != .directory) return error.InvalidHutchStoreRoot;
+    return std.Io.Dir.cwd().openDir(io, home, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.SymLinkLoop => return error.HutchStoreRootIsSymbolicLink,
+        error.NotDir => return error.InvalidHutchStoreRoot,
+        else => return err,
+    };
+}
+
+fn openStoreStateNoFollow(io: std.Io, root: std.Io.Dir) !std.Io.Dir {
+    return openStoreChildDirectoryNoFollow(
+        io,
+        root,
+        state_directory_name,
+        error.InvalidHutchStoreStatePath,
+    );
+}
+
+fn openStoreChildDirectoryNoFollow(
+    io: std.Io,
+    parent: std.Io.Dir,
+    name: []const u8,
+    comptime invalid_error: anyerror,
+) !std.Io.Dir {
+    const stat = parent.statFile(io, name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return err,
+        else => return invalid_error,
+    };
+    if (stat.kind != .directory) return invalid_error;
+    return parent.openDir(io, name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => return invalid_error,
+        else => return err,
+    };
 }
 
 fn storeMarkerPath(allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
@@ -821,10 +978,7 @@ fn writeSelection(
     const lock = try acquirePersistentFileLock(io, lock_path);
     defer lock.close(io);
 
-    var selections = loadSelectionsAt(io, allocator, home) catch |err| switch (err) {
-        error.InvalidSelectionsState, error.UnsupportedSelectionsSchema => Selections{},
-        else => return err,
-    };
+    var selections = try loadSelectionsAt(io, allocator, home);
     try selections.set(product, channel, selection);
     const encoded = try selectionsJson(allocator, selections);
     try writeAtomicFileLocked(io, try selectionsPath(allocator, home), encoded);
@@ -1349,6 +1503,43 @@ fn updateSkipPath(
     });
 }
 
+fn updateCheckPath(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    channel: []const u8,
+) ![]const u8 {
+    return std.fs.path.join(allocator, &.{
+        home,
+        state_directory_name,
+        "update-checks",
+        product.name(),
+        channel,
+    });
+}
+
+fn updateCheckDueAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    now: i64,
+) !bool {
+    if (now < 0) return true;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(128),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    const value = std.mem.trim(u8, bytes, " \t\r\n");
+    const checked_at = std.fmt.parseInt(i64, value, 10) catch return true;
+    if (checked_at < 0 or checked_at > now) return true;
+    return now - checked_at >= update_check_interval_seconds;
+}
+
 fn updateIsSkipped(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1498,7 +1689,6 @@ fn installArtifact(
     artifact: Artifact,
     platform: []const u8,
     root: []const u8,
-    executable: []const u8,
 ) !void {
     const parent = std.fs.path.dirname(root) orelse return error.InvalidInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
@@ -1506,7 +1696,14 @@ fn installArtifact(
     const lock = try acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
-    if (try installationMatches(init.io, allocator, root, executable, artifact.sha256)) return;
+    if (try installedArtifactResolution(
+        init.io,
+        allocator,
+        root,
+        product,
+        artifact,
+        platform,
+    ) != null) return;
 
     std.debug.print(
         "hutch: downloading {s} {s} for {s}\n",
@@ -1546,22 +1743,25 @@ fn installArtifact(
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), root, init.io);
 }
 
-fn installationMatches(
+fn installedArtifactResolution(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
-    executable: []const u8,
-    checksum: []const u8,
-) !bool {
-    if (!pathExists(io, executable)) return false;
-    const marker = try std.fs.path.join(allocator, &.{ root, ".dash-installed" });
-    const contents = std.Io.Dir.cwd().readFileAlloc(
+    product: Product,
+    artifact: Artifact,
+    platform: []const u8,
+) !?Resolution {
+    const resolution = (try installedResolutionAt(
         io,
-        marker,
         allocator,
-        .limited(128),
-    ) catch return false;
-    return std.mem.eql(u8, contents, checksum);
+        root,
+        product,
+        artifact.version,
+        artifact.revision,
+        platform,
+    )) orelse return null;
+    if (!std.mem.eql(u8, resolution.archive_sha256, artifact.sha256)) return null;
+    return resolution;
 }
 
 fn validateArchiveMetadata(
@@ -1622,6 +1822,10 @@ fn environmentFlagEnabled(environment: *const std.process.Environ.Map, name: []c
     return std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true") or
         std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn unixSeconds(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
 test "release manifests select and validate the current platform artifact" {
@@ -1737,6 +1941,88 @@ test "selections merge exact identities without creating cache channel or owners
     try std.testing.expect(!pathExists(io, try storeMarkerPath(allocator, home)));
 }
 
+test "selection writes preserve corrupt and unsupported state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+    try std.Io.Dir.cwd().createDirPath(io, state);
+    const path = try selectionsPath(allocator, home);
+    const selection: Selection = .{
+        .version = "0.8.0",
+        .revision = "0123456789abcdef0123456789abcdef01234567",
+        .platform = "macos-arm64",
+    };
+
+    const corrupt = "{not-json\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = corrupt });
+    try std.testing.expectError(
+        error.InvalidSelectionsState,
+        writeSelection(io, allocator, home, .hutch, "production", selection),
+    );
+    const corrupt_after = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_selections_bytes),
+    );
+    try std.testing.expectEqualStrings(corrupt, corrupt_after);
+
+    const unsupported =
+        "{\"schemaVersion\":2,\"kind\":\"hutch-selections\",\"products\":{}}\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = unsupported });
+    try std.testing.expectError(
+        error.UnsupportedSelectionsSchema,
+        writeSelection(io, allocator, home, .cottontail, "canary", selection),
+    );
+    const unsupported_after = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_selections_bytes),
+    );
+    try std.testing.expectEqualStrings(unsupported, unsupported_after);
+}
+
+test "interactive update checks persist only a six-hour timestamp gate" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const path = try std.fs.path.join(allocator, &.{ root, "state", "update-check" });
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+
+    try std.testing.expect(try updateCheckDueAt(io, allocator, path, 100_000));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "100000\n" });
+    try std.testing.expect(!try updateCheckDueAt(io, allocator, path, 100_000));
+    try std.testing.expect(!try updateCheckDueAt(
+        io,
+        allocator,
+        path,
+        100_000 + update_check_interval_seconds - 1,
+    ));
+    try std.testing.expect(try updateCheckDueAt(
+        io,
+        allocator,
+        path,
+        100_000 + update_check_interval_seconds,
+    ));
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "not-a-timestamp\n" });
+    try std.testing.expect(try updateCheckDueAt(io, allocator, path, 100_000));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "100001\n" });
+    try std.testing.expect(try updateCheckDueAt(io, allocator, path, 100_000));
+}
+
 test "the installer bootstrap marker strictly owns its canonical Hutch root" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1762,6 +2048,79 @@ test "the installer bootstrap marker strictly owns its canonical Hutch root" {
         error.HutchStoreRootMismatch,
         loadStoreIdentityAt(io, allocator, home),
     );
+}
+
+test "store identity never follows the home state or marker through symlinks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    _ = try ensureManagedHomeAt(io, allocator, home);
+
+    const home_link = try std.fs.path.join(allocator, &.{ root, "home-link" });
+    try std.Io.Dir.cwd().symLink(io, home, home_link, .{ .is_directory = true });
+    try std.testing.expectError(
+        error.HutchStoreRootIsSymbolicLink,
+        loadStoreIdentityAt(io, allocator, home_link),
+    );
+
+    const marker_path = try storeMarkerPath(allocator, home);
+    const outside_marker = try std.fs.path.join(allocator, &.{ root, "outside-marker.json" });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = outside_marker,
+        .data = "{}\n",
+    });
+    try std.Io.Dir.cwd().deleteFile(io, marker_path);
+    try std.Io.Dir.cwd().symLink(io, outside_marker, marker_path, .{});
+    try std.testing.expectError(
+        error.InvalidHutchStoreMarker,
+        loadStoreIdentityAt(io, allocator, home),
+    );
+
+    const other_home = try std.fs.path.join(allocator, &.{ root, "other-home" });
+    const outside_state = try std.fs.path.join(allocator, &.{ root, "outside-state" });
+    try std.Io.Dir.cwd().createDirPath(io, other_home);
+    try std.Io.Dir.cwd().createDirPath(io, outside_state);
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside_state,
+        try std.fs.path.join(allocator, &.{ other_home, state_directory_name }),
+        .{ .is_directory = true },
+    );
+    try std.testing.expectError(
+        error.InvalidHutchStoreStatePath,
+        ensureManagedHomeAt(io, allocator, other_home),
+    );
+    try std.testing.expect(!pathExists(
+        io,
+        try std.fs.path.join(allocator, &.{ outside_state, store_marker_file_name }),
+    ));
+
+    const locks_home = try std.fs.path.join(allocator, &.{ root, "locks-home" });
+    const locks_state = try std.fs.path.join(allocator, &.{ locks_home, state_directory_name });
+    const outside_locks = try std.fs.path.join(allocator, &.{ root, "outside-locks" });
+    try std.Io.Dir.cwd().createDirPath(io, locks_state);
+    try std.Io.Dir.cwd().createDirPath(io, outside_locks);
+    try std.Io.Dir.cwd().symLink(
+        io,
+        outside_locks,
+        try std.fs.path.join(allocator, &.{ locks_state, "locks" }),
+        .{ .is_directory = true },
+    );
+    try std.testing.expectError(
+        error.InvalidHutchStoreStatePath,
+        ensureManagedHomeAt(io, allocator, locks_home),
+    );
+    try std.testing.expect(!pathExists(
+        io,
+        try std.fs.path.join(allocator, &.{ outside_locks, store_lock_file_name }),
+    ));
 }
 
 test "selected and exact installed releases resolve without remote metadata" {
@@ -1822,4 +2181,72 @@ test "selected and exact installed releases resolve without remote metadata" {
         platform,
     )).?;
     try std.testing.expectEqualStrings(release_root, exact.root);
+}
+
+test "a downloaded artifact identity does not trust marker and executable alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const version = "9.8.7";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const platform = try platformKey();
+    const release_root = try std.fs.path.join(allocator, &.{ fixture, "release" });
+    const bin = try std.fs.path.join(allocator, &.{ release_root, "bin" });
+    try std.Io.Dir.cwd().createDirPath(io, bin);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ bin, Product.cottontail.executableFileName() }),
+        .data = "fixture",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ release_root, ".dash-installed" }),
+        .data = checksum,
+    });
+    const artifact: Artifact = .{
+        .version = version,
+        .revision = revision,
+        .archive_url = "https://artifacts.test/cottontail.tar.gz",
+        .sha256 = checksum,
+        .size = 42,
+    };
+    const metadata_path = try std.fs.path.join(allocator, &.{
+        release_root,
+        Product.cottontail.metadataFileName(),
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data = "{\"schema\":1,\"kind\":\"archive\",\"product\":\"hutch\",\"version\":\"9.8.7\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\",\"platform\":\"macos-arm64\"}\n",
+    });
+    try std.testing.expect((try installedArtifactResolution(
+        io,
+        allocator,
+        release_root,
+        .cottontail,
+        artifact,
+        platform,
+    )) == null);
+
+    const valid_metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"cottontail\",\"version\":\"{s}\",\"revision\":\"{s}\",\"platform\":\"{s}\"}}\n",
+        .{ version, revision, platform },
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data = valid_metadata,
+    });
+    const installed = (try installedArtifactResolution(
+        io,
+        allocator,
+        release_root,
+        .cottontail,
+        artifact,
+        platform,
+    )).?;
+    try std.testing.expectEqualStrings(release_root, installed.root);
+    try std.testing.expectEqualStrings(checksum, installed.archive_sha256);
 }

@@ -611,7 +611,7 @@ fn isPlatformKey(name: []const u8) bool {
 }
 
 fn isRevision(name: []const u8) bool {
-    if (name.len != 40) return false;
+    if (name.len != 40 and name.len != 64) return false;
     for (name) |byte| {
         if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
     }
@@ -1353,6 +1353,7 @@ test "status only accepts --json and help flags" {
     try std.testing.expect(!isHelp("--json"));
     try std.testing.expect(std.mem.indexOf(u8, help_text, "hutch status [--json]") != null);
     try std.testing.expect(isRevision("0123456789abcdef0123456789abcdef01234567"));
+    try std.testing.expect(isRevision("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
     try std.testing.expect(!isRevision("0.6.4"));
     try std.testing.expect(!isRevision("0123456789ABCDEF0123456789abcdef01234567"));
     try std.testing.expect(isPlatformKey("macos-arm64"));
