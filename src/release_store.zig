@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
+const no_follow_file = @import("no_follow_file.zig");
 const project_state = @import("project_state.zig");
 const store_locks = @import("store_locks.zig");
 const version_selector = @import("version_selector.zig");
@@ -1026,9 +1027,8 @@ fn readFileNoFollowAlloc(
     path: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{
+    var file = try no_follow_file.openForRead(std.Io.Dir.cwd(), io, path, .{
         .allow_directory = false,
-        .follow_symlinks = false,
     });
     defer file.close(io);
     var reader = file.reader(io, &.{});

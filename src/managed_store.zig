@@ -2150,12 +2150,16 @@ fn ensureTestStore(
     const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = marker,
-        .data = try std.fmt.allocPrint(
-            allocator,
-            "{{\"schemaVersion\":1,\"kind\":\"hutch-store\",\"canonicalRoot\":\"{s}\"}}\n",
-            .{canonical},
-        ),
+        .data = try testStoreMarkerJson(allocator, canonical),
     });
+}
+
+fn testStoreMarkerJson(allocator: std.mem.Allocator, canonical_root: []const u8) ![]const u8 {
+    var marker_value: std.json.ObjectMap = .empty;
+    try marker_value.put(allocator, "schemaVersion", .{ .integer = 1 });
+    try marker_value.put(allocator, "kind", .{ .string = "hutch-store" });
+    try marker_value.put(allocator, "canonicalRoot", .{ .string = canonical_root });
+    return stringifyJson(allocator, .{ .object = marker_value });
 }
 
 fn testElectrobunObject() ManagedObject {
@@ -2202,6 +2206,19 @@ fn testReleaseObject(product: []const u8) ManagedObject {
         .revision = test_release_revision,
         .archive_sha256 = test_release_sha256,
     };
+}
+
+test "test store markers JSON-encode Windows paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const windows_root = "C:\\Users\\runneradmin\\.hutch";
+    const bytes = try testStoreMarkerJson(allocator, windows_root);
+    const marker = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
+    try std.testing.expectEqualStrings(
+        windows_root,
+        marker.object.get("canonicalRoot").?.string,
+    );
 }
 
 test "project graph schema records exact objects without legacy expansion" {

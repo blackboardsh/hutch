@@ -1,4 +1,5 @@
 const std = @import("std");
+const no_follow_file = @import("no_follow_file.zig");
 
 pub const OpenMode = enum {
     existing,
@@ -81,9 +82,8 @@ pub fn readFileAlloc(
     limit: std.Io.Limit,
 ) ![]u8 {
     try validateName(name);
-    var file = try directory.openFile(io, name, .{
+    var file = try no_follow_file.openForRead(directory, io, name, .{
         .allow_directory = false,
-        .follow_symlinks = false,
     });
     defer file.close(io);
     var reader = file.reader(io, &.{});

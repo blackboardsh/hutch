@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const no_follow_file = @import("no_follow_file.zig");
 const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
@@ -828,9 +829,8 @@ fn replaceAliasWithDirectory(
 }
 
 fn copyFileAtomic(io: std.Io, source: []const u8, destination: []const u8) !void {
-    const source_file = try std.Io.Dir.cwd().openFile(io, source, .{
+    const source_file = try no_follow_file.openForRead(std.Io.Dir.cwd(), io, source, .{
         .mode = .read_only,
-        .follow_symlinks = false,
     });
     defer source_file.close(io);
     const source_stat = try source_file.stat(io);
