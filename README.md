@@ -36,9 +36,10 @@ On Windows:
 
 Pass `-Channel canary` to install `hutch-canary.exe`. Both installers also accept
 an exact semantic version or full build revision. Releases are stored side by
-side under `~/.hutch/products`. The installer atomically refreshes the native
-channel launcher, while `hutch self update` advances the engine pointer used on
-the next invocation. The Unix installer adds `~/.hutch/bin` to the detected
+side under `~/.hutch/releases`. The installer atomically refreshes the native
+launcher and records the selected exact release in
+`~/.hutch/state/selections.json`; `hutch self update` advances that selection
+for the next invocation. The Unix installer adds `~/.hutch/bin` to the detected
 zsh, bash, fish, or POSIX shell profile and prints the command that activates it
 in the current terminal. Pass `--no-modify-path` to only print that command.
 `stable` is accepted as an installer channel alias for `production`.
@@ -98,35 +99,77 @@ pm`, an argv-form task such as `["npm", "run", "dev"]`, or a native executable.
 ## Store Status
 
 `hutch status` prints everything Hutch manages on disk: the resolved home and
-which rule selected it (`HUTCH_HOME`, the deprecated `DASH_HOME`, or the default
-`~/.hutch`), every installed product release with its per-install disk usage and
-active channel pointers, every installed toolchain, the managed cache objects
-with their reachability and live leases, and the projects registered against
-those objects. A project whose directory no longer exists is marked. Sizes are
-recursive file totals; symlinks are counted but never followed, so a launcher
-symlink cannot pull an out-of-store tree into a total.
+which rule selected it (`HUTCH_HOME` or the default `~/.hutch`), every installed
+release with its per-install disk usage and local selection, every installed
+toolchain, object reachability and live leases, and the projects registered
+against those objects. A project whose directory no longer exists is marked.
+Sizes are recursive file totals; symlinks are counted but never followed, so a
+launcher symlink cannot pull an out-of-store tree into a total.
 
 `hutch status --json` emits the same data as a machine-readable document with a
-`schemaVersion` field. Both forms only read the store: `status` never creates,
-moves, or deletes state, and reports unreadable entries under `Issues` rather
-than failing.
+`schemaVersion` field. Like every ordinary Hutch invocation, `status` first
+applies the 10-day lazy cleanup described below, then reports the remaining
+store. It does not perform the zero-grace manual prune. Unreadable entries are
+reported under `Issues` rather than failing the whole status command.
 
-## Managed Cache Lifecycle
+## Store and Cleanup
 
-Successful Electrobun preparation records the exact cached core/devkit,
-optional CEF payload, and native toolchains in the generated project
+Hutch's home has four durable top-level directories:
+
+```text
+~/.hutch/
+|-- bin/                  # production and canary launchers
+|-- releases/
+|   |-- hutch/            # installed Hutch engines
+|   |-- cottontail/       # installed Cottontail runtimes
+|   `-- electrobun/       # installed Electrobun cores and devkits
+|-- toolchains/           # exact managed compilers
+`-- state/
+    |-- selections.json   # local names mapped to exact installed releases
+    |-- projects/         # registered project dependency records
+    |-- leases/           # objects in active use
+    |-- locks/
+    |-- trash/
+    `-- tmp/
+```
+
+Remote release channels are resolved from fresh network metadata. Hutch does
+not keep persistent copies of remote channel manifests, catalogs, artifact
+indexes, or template indexes, and it does not create local channel directory
+trees. Downloads may pass through `state/tmp/` while they are verified and
+installed; only verified releases, toolchains, and authoritative local state
+remain afterward.
+
+Successful Electrobun preparation records the exact core/devkit, optional CEF
+payload, and native toolchains in the generated project
 `.hutch/dependencies.lock` and in Hutch's global project registry. Core and CEF
 are independent managed objects, so a project that stops using CEF no longer
 keeps that large payload reachable merely because it still uses the same core.
-`hutch cache prune --dry-run` previews cached objects that are unreachable and
-older than the 30-day grace period;
-`hutch cache prune` atomically detaches and removes those objects. Missing
-projects retain their last known dependencies for the same grace period.
+The currently executing Hutch release, local selections, resolvable registered
+projects, and live leases protect the objects they use. A missing project or a
+project whose dependency record cannot be resolved protects nothing.
 
-`hutch cache clean --dry-run` is a zero-grace preview only. It deliberately
-cannot delete until that more aggressive policy has a separate safety review.
+Every ordinary Hutch invocation lazily removes releases and toolchains that
+have remained unreachable for more than 10 days. `hutch prune --dry-run`
+previews all currently unreachable objects without mutating Hutch state.
+`hutch prune` performs the same reachability check with no age threshold and
+immediately removes everything it reports.
+
+`hutch reset` immediately recreates the entire Hutch home without prompting.
+It reseeds the launcher, engine, and exact Hutch selection used for the reset so
+the current Hutch command remains usable; every other installed release,
+toolchain, selection, registration, lease, and temporary object is removed.
 Neither command interprets or removes npm, Bun, pnpm, Yarn, Cargo, or Go module
-caches; those remain owned by their respective tools.
+caches, and neither changes project files.
+
+Offline resolution is deliberately narrow. An already-installed exact release,
+including one named by a local selection, and an already-installed toolchain can
+be reused without the network. Resolving anything missing requires a fresh
+network lookup and download. `hutch electrobun init` always requires the network
+because template catalogs and archives are not persisted. A build can run
+offline when every exact Hutch, Cottontail, and Electrobun release and every
+managed toolchain it needs are already installed; dependencies owned by an
+external package manager are a separate concern.
 
 ## Updates
 
@@ -135,9 +178,10 @@ hutch self update
 hutch cottontail update
 ```
 
-Interactive use checks for newer active-channel releases at most every six
-hours. The prompt can update, skip that specific revision, or defer. CI,
-non-interactive commands, and `HUTCH_NO_UPDATE_CHECK=1` never prompt.
+Interactive use checks for newer remote-channel releases at most every six
+hours. Each check fetches current metadata rather than reading a persistent
+metadata cache. The prompt can update, skip that specific revision, or defer.
+CI, non-interactive commands, and `HUTCH_NO_UPDATE_CHECK=1` never prompt.
 
 Use `hutch self path`, `hutch self version`, `hutch cottontail path`, and
 `hutch cottontail version` to inspect the selected installations. Each command
@@ -160,10 +204,9 @@ DASH_USE_LOCAL_COTTONTAIL=1 ./zig-out/bin/hutch examples/smoke.js
 ```
 
 `DASH_COTTONTAIL` and `COTTONTAIL_BINARY` override the runtime;
-`HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `HUTCH_HOME` changes
-the global store (default `~/.hutch`) and must remain set when a non-default
-install root is used. `DASH_HOME` is a deprecated fallback that is still honored
-when `HUTCH_HOME` is unset.
+`HUTCH_ENGINE_BINARY` overrides the engine (not the launcher). `HUTCH_HOME`
+changes the global store (default `~/.hutch`) and must remain set when a
+non-default install root is used.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
 
 ## Electrobun Projects
@@ -172,19 +215,17 @@ Run `hutch electrobun init` to choose a release template interactively, then
 accept or replace its suggested project name. The chosen name controls the
 created directory and the printed next steps. After preparing the project,
 init runs its `install` task from `hutch.config.ts` when one is configured.
-Pass `--skip-install` to leave that step to another orchestrator. `--offline`
-and `DASH_RELEASE_OFFLINE=1` only disable network access for Dash-managed
-catalogs, templates, product artifacts, SDKs, runtimes, and toolchains; they do
-not suppress the configured external install task or govern its network access.
-Only `--skip-install` prints `hutch run --if-configured install` as the explicit
-next step.
+Pass `--skip-install` to leave that step to another orchestrator. Init requires
+network access to fetch the current catalog and chosen template. Only
+`--skip-install` prints `hutch run --if-configured install` as the explicit next
+step.
 The thin Electrobun npm package
 delegates `npx electrobun init` and `bunx electrobun init` to
 `hutch electrobun init`, installing the matching Hutch channel when needed.
 Starter templates come from the selected production or canary Electrobun
 catalog rather than from an npm package bundle.
 
-Every v2 project pins its exact product version in `hutch.config.ts`:
+Every v2 project pins its exact Electrobun release in `hutch.config.ts`:
 
 ```ts
 export default {
@@ -194,7 +235,7 @@ export default {
 ```
 
 `electrobun.config.ts` owns application, build, packaging, and release settings;
-it cannot select the Electrobun product or SDK version.
+it cannot select the Electrobun framework or SDK version.
 
 `hutch electrobun init` prepares the extracted project before reporting
 success. `hutch electrobun sync` repeats that preparation without building the
@@ -309,9 +350,9 @@ hutch/install.ps1
 ```
 
 Archives contain only `bin/hutch`, `bin/hutch-engine`, and release metadata. The
-mutable channel pointer is written after every immutable archive and manifest.
-Every published object remains under the `hutch/` bucket prefix. Tags are the
-only workflow trigger.
+mutable remote channel manifest is written after every immutable archive and
+manifest. Every published object remains under the `hutch/` bucket prefix. Tags
+are the only workflow trigger.
 
 The GitHub repository requires `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, and
 `R2_SECRET_ACCESS_KEY` Actions secrets. Those credentials must have object-write
@@ -330,7 +371,8 @@ for the release workflow.
 - `hutch self <path|version|update> [selector]`
 - `hutch cottontail <path|version|update> [selector]`
 - `hutch status [--json]`
-- `hutch cache <prune|clean> [--dry-run]`
+- `hutch prune [--dry-run]`
+- `hutch reset`
 
 Scripts resolve exclusively from the nearest `hutch.config.ts`. A string is
 command text parsed and executed by the selected Cottontail release's Bun.$
