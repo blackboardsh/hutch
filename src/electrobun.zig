@@ -274,7 +274,7 @@ fn printHelp(writer: anytype) !void {
         \\Electrobun app build commands orchestrated by Hutch.
         \\
         \\Usage:
-        \\  hutch electrobun init [project-name] [--template=name] [--beta] [--offline] [--skip-install]
+        \\  hutch electrobun init [project-name] [--template=name] [--beta] [--skip-install]
         \\  hutch electrobun config [--env=dev|canary|production|stable]
         \\  hutch electrobun sync [--env=dev|canary|production|stable]
         \\  hutch electrobun build [--env=dev|canary|production|stable]
@@ -285,7 +285,8 @@ fn printHelp(writer: anytype) !void {
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
-        \\  - --offline and DASH_RELEASE_OFFLINE require cached Dash-managed assets; they do not suppress external install tasks.
+        \\  - init requires network access; release metadata and template archives are never retained.
+        \\  - DASH_RELEASE_OFFLINE prevents all Hutch-managed network access for installed projects.
         \\  - init runs the template's configured install task when present; pass --skip-install to suppress it.
         \\  - Main-process inspection supports Bun and Cottontail only.
         \\  - ELECTROBUN_INSPECT accepts an inspector flag (for example --inspect-wait=9229) or an address.
@@ -2542,7 +2543,13 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     var template_name: ?[]const u8 = null;
     var project_name: ?[]const u8 = null;
     var channel = try electrobun_templates.activeChannel(ctx.environ_map);
-    var asset_offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE");
+    if (environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE")) {
+        ctx.writeStderr(
+            "hutch electrobun init: template initialization requires network access; unset DASH_RELEASE_OFFLINE\n",
+            .{},
+        );
+        return error.ElectrobunInitRequiresNetwork;
+    }
     var skip_install = false;
 
     for (args) |arg| {
@@ -2553,9 +2560,15 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         } else if (std.mem.startsWith(u8, arg, "--channel=")) {
             channel = try electrobun_templates.parseChannel(arg["--channel=".len..]);
         } else if (std.mem.eql(u8, arg, "--offline")) {
-            asset_offline = true;
+            ctx.writeStderr(
+                "hutch electrobun init: template initialization requires network access; --offline is not supported\n",
+                .{},
+            );
+            return error.ElectrobunInitRequiresNetwork;
         } else if (std.mem.eql(u8, arg, "--skip-install")) {
             skip_install = true;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownInitOption;
         } else if (!std.mem.startsWith(u8, arg, "--")) {
             if (project_name == null) {
                 project_name = arg;
@@ -2565,20 +2578,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         }
     }
 
-    const catalog = electrobun_templates.load(
-        ctx.init,
-        ctx.allocator,
-        channel,
-        .{ .offline = asset_offline },
-    ) catch |err| {
-        if (err == error.TemplateCatalogUnavailable and channel == .stable) {
-            ctx.writeStderr(
-                "no stable Electrobun templates published yet - run with --beta for the latest beta templates\n",
-                .{},
-            );
-        }
-        return err;
-    };
+    const catalog = try electrobun_templates.load(ctx.init, ctx.allocator, channel);
 
     if (template_name == null) {
         if (project_name) |name| {
@@ -2641,10 +2641,9 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         ctx.allocator,
         template,
         project_dir,
-        .{ .offline = asset_offline },
     );
     ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
-    try prepareInstalledProject(ctx, project_dir, asset_offline);
+    try prepareInstalledProject(ctx, project_dir, false);
     if (!skip_install) {
         ctx.writeStdout("Running hutch.config.ts install task if configured...\n", .{});
         try runOptionalConfiguredTask(ctx, project_dir, "install");

@@ -91,20 +91,22 @@ pub fn resolveVersion(
     }
 
     const home = try release_store.hutchHome(init, allocator);
-    const root = try cacheRoot(allocator, home, kind, version);
-    const binary = try cachedBinaryPath(allocator, root, kind);
-    if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
+    const root = try toolchainRoot(allocator, home, kind, version);
+    const binary = try installedBinaryPath(allocator, root, kind);
+    if (try installedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
     }
-
     const parent = std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
-    if (try cachedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
+    if (try installedToolchainMatches(init.io, allocator, root, binary, kind, version)) {
         return .{ .binary = binary, .root = root, .version = version, .system = false };
+    }
+    if (environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE")) {
+        return error.ToolchainNotInstalled;
     }
     std.Io.Dir.cwd().deleteTree(init.io, root) catch {};
 
@@ -114,9 +116,9 @@ pub fn resolveVersion(
         .{ kind.name(), version, try platformKey() },
     );
     const bytes = try release_store.fetchBytes(init, allocator, archive.url, max_archive_bytes);
-    try install(init, allocator, root, kind, version, archive.filename, bytes);
+    try install(init, allocator, home, root, kind, version, archive.filename, bytes);
 
-    const installed_binary = try cachedBinaryPath(allocator, root, kind);
+    const installed_binary = try installedBinaryPath(allocator, root, kind);
     if (!try executableMatchesVersion(init.io, allocator, installed_binary, kind, version)) {
         return error.ToolchainVersionMismatch;
     }
@@ -131,6 +133,7 @@ pub fn resolveVersion(
 fn install(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    home: []const u8,
     root: []const u8,
     kind: Kind,
     version: []const u8,
@@ -139,10 +142,7 @@ fn install(
 ) !void {
     const extraction = try std.mem.concat(allocator, u8, &.{ root, ".extract-tmp" });
     const temporary = try std.mem.concat(allocator, u8, &.{ root, ".install-tmp" });
-    const archive_path = try std.fs.path.join(allocator, &.{
-        std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath,
-        try std.mem.concat(allocator, u8, &.{ ".", archive_filename, ".tmp" }),
-    });
+    const archive_path = try temporaryArchivePath(init.io, allocator, home, archive_filename);
     std.Io.Dir.cwd().deleteTree(init.io, extraction) catch {};
     std.Io.Dir.cwd().deleteTree(init.io, temporary) catch {};
     std.Io.Dir.cwd().deleteFile(init.io, archive_path) catch {};
@@ -164,6 +164,23 @@ fn install(
     try publishInstalledToolchain(init.io, allocator, root, temporary, kind, version);
 }
 
+fn temporaryArchivePath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    archive_filename: []const u8,
+) ![]const u8 {
+    var random: [12]u8 = undefined;
+    io.random(&random);
+    const suffix = std.fmt.bytesToHex(random, .lower);
+    const temporary_root = try std.fs.path.join(allocator, &.{ home, "state", "tmp" });
+    try std.Io.Dir.cwd().createDirPath(io, temporary_root);
+    return std.fs.path.join(allocator, &.{
+        temporary_root,
+        try std.fmt.allocPrint(allocator, "toolchain-{s}-{s}.tmp", .{ archive_filename, &suffix }),
+    });
+}
+
 fn publishInstalledToolchain(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -172,7 +189,7 @@ fn publishInstalledToolchain(
     kind: Kind,
     version: []const u8,
 ) !void {
-    const installed_binary = try cachedBinaryPath(allocator, temporary, kind);
+    const installed_binary = try installedBinaryPath(allocator, temporary, kind);
     if (!pathExists(io, installed_binary)) return error.ToolchainExecutableMissing;
     if (builtin.os.tag != .windows) try makeExecutable(io, installed_binary);
     if (!try executableMatchesVersion(io, allocator, installed_binary, kind, version)) {
@@ -363,14 +380,14 @@ fn rustHostTriple() []const u8 {
     };
 }
 
-fn cachedBinaryPath(allocator: std.mem.Allocator, root: []const u8, kind: Kind) ![]const u8 {
+fn installedBinaryPath(allocator: std.mem.Allocator, root: []const u8, kind: Kind) ![]const u8 {
     return switch (kind) {
         .rust, .go => std.fs.path.join(allocator, &.{ root, "bin", kind.executableName() }),
         .zig, .odin => std.fs.path.join(allocator, &.{ root, kind.executableName() }),
     };
 }
 
-fn cachedToolchainMatches(
+fn installedToolchainMatches(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -464,7 +481,7 @@ fn systemExecutableMatchesVersion(
     // Odin's `version` output identifies only the dated build month plus a
     // source revision, not the exact immutable release tag suffix (`a`, `b`,
     // ...). A same-month system binary therefore cannot prove it satisfies a
-    // `dev-YYYY-MM[a-z]?` pin. Exact dated pins always use the URL-keyed cache;
+    // `dev-YYYY-MM[a-z]?` pin. Exact dated pins always use the URL-keyed install;
     // executable output remains an archive sanity check there.
     if (kind == .odin and std.mem.startsWith(u8, version, "dev-")) return false;
     return executableMatchesVersion(io, allocator, executable, kind, version);
@@ -541,7 +558,7 @@ fn validateExactOdinVersion(version: []const u8) !void {
     if (version.len == 12 and !std.ascii.isLower(version[11])) return error.InvalidToolchainVersion;
 }
 
-fn cacheRoot(
+fn toolchainRoot(
     allocator: std.mem.Allocator,
     home: []const u8,
     kind: Kind,
@@ -571,7 +588,14 @@ fn pathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-test "toolchain versions cannot escape their cache path" {
+fn environmentFlagEnabled(environment: *const std.process.Environ.Map, name: []const u8) bool {
+    const value = environment.get(name) orelse return false;
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+test "toolchain versions cannot escape their toolchain path" {
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.zig, "."));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.go, ".."));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.rust, "../1.88.0"));
@@ -587,16 +611,16 @@ test "toolchain versions cannot escape their cache path" {
 }
 
 test "Rust Cargo is selected from the resolved Rust toolchain" {
-    const cached = Resolution{
-        .binary = "/cache/rust/bin/rustc",
-        .root = "/cache/rust",
+    const installed = Resolution{
+        .binary = "/toolchains/rust/bin/rustc",
+        .root = "/toolchains/rust",
         .version = "1.88.0",
         .system = false,
     };
-    const cargo = try rustCargoBinary(std.testing.allocator, cached);
+    const cargo = try rustCargoBinary(std.testing.allocator, installed);
     defer std.testing.allocator.free(cargo);
     const expected = try std.fs.path.join(std.testing.allocator, &.{
-        "/cache/rust",
+        "/toolchains/rust",
         "bin",
         if (builtin.os.tag == .windows) "cargo.exe" else "cargo",
     });
@@ -754,10 +778,10 @@ test "zig archive naming flips at 0.14.1" {
         builtin.os.tag == .windows);
 }
 
-test "toolchain versions resolve to isolated cache roots without downloading" {
-    const first = try cacheRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.14.1");
+test "toolchain versions resolve to isolated toolchain roots without downloading" {
+    const first = try toolchainRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.14.1");
     defer std.testing.allocator.free(first);
-    const second = try cacheRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.15.2");
+    const second = try toolchainRoot(std.testing.allocator, "/tmp/hutch-test-home", .zig, "0.15.2");
     defer std.testing.allocator.free(second);
 
     try std.testing.expect(!std.mem.eql(u8, first, second));

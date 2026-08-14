@@ -76,16 +76,23 @@ try {
     throw "Hutch installer: archive metadata does not match the release manifest"
   }
 
-  $installRoot = Join-Path $HutchHome "products\hutch\$($manifest.version)\$($manifest.revision)\$platform"
+  $installRoot = Join-Path $HutchHome "releases\hutch\$($manifest.version)\$($manifest.revision)\$platform"
   New-Item -ItemType Directory -Force -Path (Split-Path $installRoot) | Out-Null
   if (Test-Path $installRoot) { Remove-Item -Recurse -Force $installRoot }
   Set-Content -NoNewline -Path (Join-Path $extractRoot ".dash-installed") -Value $artifact.sha256
   Move-Item -Path $extractRoot -Destination $installRoot
 
-  $channelDir = Join-Path $HutchHome "channels\hutch"
   $binDir = Join-Path $HutchHome "bin"
-  New-Item -ItemType Directory -Force -Path $channelDir, $binDir | Out-Null
-  Set-Content -Path (Join-Path $channelDir $Channel) -Value $installRoot
+  New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+  $previousHutchHome = $env:HUTCH_HOME
+  try {
+    $env:HUTCH_HOME = $HutchHome
+    & (Join-Path $installRoot "bin\hutch-engine.exe") self bootstrap-install $Channel
+    if ($LASTEXITCODE -ne 0) { throw "Hutch installer: could not bootstrap release selection" }
+  } finally {
+    $env:HUTCH_HOME = $previousHutchHome
+  }
 
   $commandName = if ($Channel -eq "canary") { "hutch-canary.exe" } else { "hutch.exe" }
   $commandPath = Join-Path $binDir $commandName

@@ -9,7 +9,7 @@ const max_archive_bytes = 16 * 1024 * 1024;
 
 pub const Channel = enum {
     // Electrobun has exactly two channels. `name()` is used for the R2 path
-    // (electrobun/templates/channels/<name>.json) and the local cache path.
+    // (electrobun/templates/channels/<name>.json).
     stable,
     beta,
 
@@ -48,10 +48,6 @@ pub const Catalog = struct {
     }
 };
 
-pub const LoadOptions = struct {
-    offline: bool = false,
-};
-
 pub fn parseChannel(value: []const u8) !Channel {
     // Accept the new stable/beta names plus the legacy production/canary aliases
     // so older callers and env values keep working.
@@ -75,53 +71,15 @@ pub fn load(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     channel: Channel,
-    options: LoadOptions,
 ) !Catalog {
     const base_url = try baseUrl(init, allocator);
-    const home = try release_store.hutchHome(init, allocator);
-    const cache_path = try std.fs.path.join(allocator, &.{
-        home,
-        "cache",
-        "electrobun",
-        "templates",
-        "channels",
-        try std.mem.concat(allocator, u8, &.{ channel.name(), ".json" }),
-    });
-    const cache_lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
-    defer cache_lock.close(init.io);
-
-    const cached = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        cache_path,
+    const url = try std.fmt.allocPrint(
         allocator,
-        .limited(max_manifest_bytes),
-    ) catch null;
-
-    // A contending cold initializer rechecks and consumes the catalog that
-    // the preceding writer published instead of issuing the same download.
-    if (cache_lock.contended) {
-        if (cached) |bytes| {
-            if (parseCatalog(allocator, bytes, base_url, channel)) |catalog| {
-                return catalog;
-            } else |_| {}
-        }
-    }
-
-    if (!options.offline) {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "{s}/channels/{s}.json",
-            .{ base_url, channel.name() },
-        );
-        if (release_store.fetchBytes(init, allocator, url, max_manifest_bytes)) |downloaded| {
-            const catalog = try parseCatalog(allocator, downloaded, base_url, channel);
-            try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
-            return catalog;
-        } else |_| {}
-    }
-
-    const bytes = cached orelse return error.TemplateCatalogUnavailable;
-    return parseCatalog(allocator, bytes, base_url, channel);
+        "{s}/channels/{s}.json",
+        .{ base_url, channel.name() },
+    );
+    const downloaded = try release_store.fetchBytes(init, allocator, url, max_manifest_bytes);
+    return parseCatalog(allocator, downloaded, base_url, channel);
 }
 
 pub fn install(
@@ -129,7 +87,6 @@ pub fn install(
     allocator: std.mem.Allocator,
     template: Template,
     destination: []const u8,
-    options: LoadOptions,
 ) !void {
     if (pathExists(init.io, destination)) return error.ProjectAlreadyExists;
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidProjectPath;
@@ -150,7 +107,7 @@ pub fn install(
     defer destination_lock.close(init.io);
     if (pathExists(init.io, destination)) return error.ProjectAlreadyExists;
 
-    const archive = try loadArchive(init, allocator, template, options);
+    const archive = try loadArchive(init, allocator, template);
     const temporary = try createTemplateTemporaryDirectory(
         init,
         allocator,
@@ -201,33 +158,7 @@ fn loadArchive(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     template: Template,
-    options: LoadOptions,
 ) ![]const u8 {
-    const home = try release_store.hutchHome(init, allocator);
-    const cache_path = try std.fs.path.join(allocator, &.{
-        home,
-        "cache",
-        "electrobun",
-        "templates",
-        "archives",
-        try std.mem.concat(allocator, u8, &.{ template.archive.sha256, ".tar.gz" }),
-    });
-    const cache_lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
-    defer cache_lock.close(init.io);
-
-    // Re-read after acquiring the lock so only the first cold initializer
-    // downloads and publishes this immutable content-addressed archive.
-    if (std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        cache_path,
-        allocator,
-        .limited(max_archive_bytes),
-    )) |cached| {
-        if (archiveMatches(cached, template.archive)) return cached;
-        std.Io.Dir.cwd().deleteFile(init.io, cache_path) catch {};
-    } else |_| {}
-
-    if (options.offline) return error.TemplateArchiveNotCached;
     const downloaded = try release_store.fetchBytes(
         init,
         allocator,
@@ -237,7 +168,6 @@ fn loadArchive(
     if (!archiveMatches(downloaded, template.archive)) {
         return error.TemplateArchiveIntegrityMismatch;
     }
-    try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
     return downloaded;
 }
 

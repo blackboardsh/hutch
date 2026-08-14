@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const state_relative_root = "state/cache-v2";
+pub const state_relative_root = "state";
 
 pub const GraphLock = struct {
     file: std.Io.File,
@@ -25,11 +25,11 @@ pub fn acquireGraph(
     home: []const u8,
     mode: std.Io.File.Lock,
 ) !GraphLock {
-    const state_parent = try std.fs.path.join(allocator, &.{ home, "state" });
-    try ensureDirectoryWithin(io, allocator, home, state_parent, error.InvalidCacheStatePath);
     const state_root = try std.fs.path.join(allocator, &.{ home, state_relative_root });
     try ensureDirectoryWithin(io, allocator, home, state_root, error.InvalidCacheStatePath);
-    const lock_path = try std.fs.path.join(allocator, &.{ state_root, "graph.lock" });
+    const locks_root = try std.fs.path.join(allocator, &.{ state_root, "locks" });
+    try ensureDirectoryWithin(io, allocator, home, locks_root, error.InvalidCacheStatePath);
+    const lock_path = try std.fs.path.join(allocator, &.{ locks_root, "graph.lock" });
     try initializePersistentFile(io, lock_path);
     if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidCacheStatePath;
     return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
@@ -137,7 +137,7 @@ fn ensureDirectoryWithin(
     if (!try pathResolvesWithin(io, allocator, home, path)) return invalid_path_error;
 }
 
-test "a shared object lease excludes cache detachment until process release" {
+test "a shared object lease excludes store detachment until process release" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -149,7 +149,7 @@ test "a shared object lease excludes cache detachment until process release" {
     const home = try std.fs.path.join(allocator, &.{ fixture, "hutch-home" });
     const root = try std.fs.path.join(allocator, &.{
         home,
-        "products",
+        "releases",
         "hutch",
         "1.0.0",
         "0123456789abcdef0123456789abcdef01234567",

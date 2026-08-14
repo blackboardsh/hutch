@@ -158,10 +158,10 @@ function runCapture(command, args, options) {
   });
 }
 
-function assertActiveInstall() {
+function assertActiveInstall(home, activeChannel) {
   const installedRoot = join(
-    hutchHome,
-    "products",
+    home,
+    "releases",
     "hutch",
     metadata.version,
     metadata.revision,
@@ -173,16 +173,25 @@ function assertActiveInstall() {
     process.platform === "win32" ? "hutch-engine.exe" : "hutch-engine",
   );
   const expected = engine;
-  const actual = execFileSync(engine, ["self", "path", channel], {
+  const actual = execFileSync(engine, ["self", "path", activeChannel], {
     encoding: "utf8",
     env: {
       ...process.env,
-      HUTCH_HOME: hutchHome,
-      HUTCH_ACTIVE_CHANNEL: channel,
+      HUTCH_HOME: home,
+      HUTCH_ACTIVE_CHANNEL: activeChannel,
       DASH_RELEASE_OFFLINE: "1",
     },
   }).trim();
   assert.equal(actual, expected);
+  assert.equal(existsSync(join(home, "cache")), false);
+  assert.equal(existsSync(join(home, "channels")), false);
+  const selections = JSON.parse(
+    readFileSync(join(home, "state", "selections.json"), "utf8"),
+  );
+  assert.deepEqual(
+    selections.products.hutch[activeChannel],
+    { version: metadata.version, revision: metadata.revision, platform },
+  );
 }
 
 try {
@@ -207,7 +216,7 @@ try {
       "-ArtifactsBaseUrl",
       baseUrl,
     ]);
-    assertActiveInstall();
+    assertActiveInstall(hutchHome, channel);
     const commandName = channel === "canary" ? "hutch-canary.exe" : "hutch.exe";
     const output = execFileSync(
       join(hutchHome, "bin", commandName),
@@ -262,7 +271,7 @@ try {
       1,
       "installer must add the Hutch PATH entry exactly once",
     );
-    assertActiveInstall();
+    assertActiveInstall(hutchHome, channel);
     const commandName = channel === "canary" ? "hutch-canary" : "hutch";
     const output = execFileSync(
       join(hutchHome, "bin", commandName),
@@ -284,14 +293,7 @@ try {
     ], installerEnvironment);
   }
 
-  const productionPointer = join(
-    stableAliasHome,
-    "channels",
-    "hutch",
-    "production",
-  );
-  assert(existsSync(productionPointer));
-  assert(!existsSync(join(stableAliasHome, "channels", "hutch", "stable")));
+  assertActiveInstall(stableAliasHome, "production");
   const stableCommand = join(
     stableAliasHome,
     "bin",
@@ -299,7 +301,14 @@ try {
   );
   assert(existsSync(stableCommand));
   if (metadata.channel === "production") {
-    const stableInstallRoot = readFileSync(productionPointer, "utf8").trim();
+    const stableInstallRoot = join(
+      stableAliasHome,
+      "releases",
+      "hutch",
+      metadata.version,
+      metadata.revision,
+      platform,
+    );
     const stableEngine = join(
       stableInstallRoot,
       "bin",

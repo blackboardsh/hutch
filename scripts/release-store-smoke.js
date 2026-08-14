@@ -9,7 +9,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -64,10 +63,23 @@ const tar = spawnSync(
 assert.equal(tar.status, 0, tar.stderr || tar.stdout);
 const archive = readFileSync(archivePath);
 const checksum = createHash("sha256").update(archive).digest("hex");
-let requestCount = 0;
+const concurrentResolverCount = 12;
+const requestCounts = { channel: 0, release: 0, archive: 0 };
+const pendingMetadataResponses = { channel: [], release: [] };
+
+function respondToMetadataBarrier(kind, response, body) {
+  requestCounts[kind] += 1;
+  pendingMetadataResponses[kind].push({ response, body });
+  if (pendingMetadataResponses[kind].length !== concurrentResolverCount) return;
+  setTimeout(() => {
+    for (const pending of pendingMetadataResponses[kind]) {
+      pending.response.writeHead(200, { "content-type": "application/json" });
+      pending.response.end(`${JSON.stringify(pending.body, null, 2)}\n`);
+    }
+  }, 75);
+}
 
 const server = createServer((request, response) => {
-  requestCount += 1;
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const bodies = {
     "/cottontail/channels/canary.json": {
@@ -99,12 +111,12 @@ const server = createServer((request, response) => {
       },
     },
   };
-  if (request.url in bodies) {
-    setTimeout(() => {
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(`${JSON.stringify(bodies[request.url], null, 2)}\n`);
-    }, 75);
+  if (request.url === "/cottontail/channels/canary.json") {
+    respondToMetadataBarrier("channel", response, bodies[request.url]);
+  } else if (request.url === `/cottontail/releases/${version}/manifest.json`) {
+    respondToMetadataBarrier("release", response, bodies[request.url]);
   } else if (request.url?.endsWith("/cottontail.tar.gz")) {
+    requestCounts.archive += 1;
     response.writeHead(200, {
       "content-type": "application/gzip",
       "content-length": archive.length,
@@ -146,31 +158,51 @@ try {
     DASH_ARTIFACTS_BASE_URL: `http://127.0.0.1:${server.address().port}`,
   };
   const coldResolvers = await Promise.all(
-    Array.from({ length: 12 }, () =>
+    Array.from({ length: concurrentResolverCount }, () =>
       runAsync(engine, ["cottontail", "path", "canary"], environment)),
   );
   const installed = coldResolvers[0].stdout.trim();
   for (const resolution of coldResolvers) {
     assert.equal(resolution.stdout.trim(), installed);
   }
-  assert(installed.endsWith(`bin${process.platform === "win32" ? "\\" : "/"}${executableName}`));
+  const installedRoot = join(
+    hutchHome,
+    "releases",
+    "cottontail",
+    version,
+    revision,
+    platform,
+  );
+  assert.equal(installed, join(installedRoot, "bin", executableName));
   assert(existsSync(installed));
-  assert.equal(
-    requestCount,
-    3,
-    "concurrent cold resolvers must share one channel manifest, release manifest, and archive download",
-  );
-  const channelCache = join(hutchHome, "cache", "cottontail", "channels");
-  const releaseCache = join(hutchHome, "cache", "cottontail", "releases");
   assert.deepEqual(
-    readdirSync(channelCache).sort(),
-    ["canary.json", "canary.json.lock"],
-    "the channel cache must retain only its manifest and persistent lock",
+    requestCounts,
+    {
+      channel: concurrentResolverCount,
+      release: concurrentResolverCount,
+      archive: 1,
+    },
+    "each invocation must fetch fresh metadata while concurrent installation shares one archive download",
+  );
+  assert.equal(existsSync(join(hutchHome, "cache")), false);
+  assert.equal(existsSync(join(hutchHome, "channels")), false);
+  assert.ok(existsSync(`${installedRoot}.lock`));
+  const selections = JSON.parse(
+    readFileSync(join(hutchHome, "state", "selections.json"), "utf8"),
   );
   assert.deepEqual(
-    readdirSync(releaseCache).sort(),
-    [`${version}.json`, `${version}.json.lock`],
-    "the release cache must retain only its manifest and persistent lock",
+    selections,
+    {
+      schemaVersion: 1,
+      kind: "hutch-selections",
+      products: {
+        hutch: {},
+        cottontail: {
+          canary: { version, revision, platform },
+        },
+      },
+    },
+    "the exact active release must be persisted as local selection state",
   );
 
   await new Promise((resolve) => server.close(resolve));
@@ -183,6 +215,11 @@ try {
   });
   assert.equal(offline.status, 0, offline.stderr || offline.stdout);
   assert.equal(offline.stdout.trim(), installed);
+  assert.deepEqual(requestCounts, {
+    channel: concurrentResolverCount,
+    release: concurrentResolverCount,
+    archive: 1,
+  });
   console.log(`Hutch native release store smoke passed for ${platform}`);
 } finally {
   if (server.listening) await new Promise((resolve) => server.close(resolve));

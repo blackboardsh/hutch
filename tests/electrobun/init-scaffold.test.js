@@ -240,22 +240,16 @@ export default {
       readdirSync(workspace).filter((name) => name.startsWith(`.${racedProjectName}.hutch-template-tmp-`)),
       [],
     );
-    assert.equal(requestCounts.channel, 1, "contending cold init must reuse the published catalog");
+    assert.equal(requestCounts.channel, 2, "each contending init must fetch the current catalog");
     assert.equal(requestCounts.nativeArchive, 1, "contending cold init must download one template archive");
-    const templateCache = join(dashHome, "cache", "electrobun", "templates");
-    assert.ok(existsSync(join(templateCache, "channels", "stable.json.lock")));
-    assert.ok(existsSync(join(templateCache, "archives", `${nativeChecksum}.tar.gz.lock`)));
-    assert.deepEqual(
-      readFileSync(join(templateCache, "archives", `${nativeChecksum}.tar.gz`)),
-      nativeArchive,
-      "the winning initializer must publish the complete verified template archive",
-    );
+    assert.equal(existsSync(join(dashHome, "cache")), false, "template metadata and archives must not persist");
 
     const listed = await run(hutch, ["electrobun", "init"], { cwd: workspace, env });
     assert.equal(listed.status, 0, listed.stderr || listed.stdout);
     assert.match(listed.stdout, /Electrobun 2\.0\.0 templates \(stable\):/);
     assert.match(listed.stdout, /hello-world - A remote starter/);
     assert.match(listed.stdout, /native-basic - A package-free starter/);
+    assert.equal(requestCounts.channel, 3, "listing templates must fetch the current catalog");
 
     const result = await run(
       hutch,
@@ -284,6 +278,8 @@ export default {
     assert.match(readFileSync(join(projectRoot, "hutch.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
     assert.ok(existsSync(join(projectRoot, ".hutch", "devkit", "projection.json")));
     assert.equal(readFileSync(join(projectRoot, ".configured-install-ran"), "utf8"), projectRoot);
+    assert.equal(requestCounts.channel, 4);
+    assert.equal(requestCounts.helloArchive, 1);
 
     const nativeProjectName = "native-app";
     const nativeProjectRoot = join(realpathSync(workspace), nativeProjectName);
@@ -300,6 +296,8 @@ export default {
     assert.equal(existsSync(join(nativeProjectRoot, "package.json")), false);
     assert.equal(existsSync(join(nativeProjectRoot, ".configured-install-ran")), false);
     assert.ok(existsSync(join(nativeProjectRoot, ".hutch", "devkit", "projection.json")));
+    assert.equal(requestCounts.channel, 5);
+    assert.equal(requestCounts.nativeArchive, 2, "template archives must be fetched again for a new init");
 
     const skipped = await run(
       hutch,
@@ -311,31 +309,27 @@ export default {
     assert.match(skipped.stdout, /hutch run --if-configured install/);
     assert.equal(existsSync(join(workspace, "skipped-app", ".configured-install-ran")), false);
     assert.ok(existsSync(join(workspace, "skipped-app", ".hutch", "devkit", "projection.json")));
+    assert.equal(requestCounts.channel, 6);
+    assert.equal(requestCounts.helloArchive, 2, "template archives must be discarded after extraction");
 
     const requestsBeforeEnvironmentOffline = { ...requestCounts };
-    const cached = await run(
+    const environmentOffline = await run(
       hutch,
       [
         "electrobun",
         "init",
-        "cached-app",
+        "environment-offline-app",
         "--template=hello-world",
       ],
       { cwd: workspace, env: { ...env, DASH_RELEASE_OFFLINE: "1" } },
     );
-    assert.equal(cached.status, 0, cached.stderr || cached.stdout);
-    assert.ok(existsSync(join(workspace, "cached-app", ".hutch", "devkit", "projection.json")));
-    assert.match(cached.stdout, /Running hutch\.config\.ts install task if configured/);
-    assert.doesNotMatch(cached.stdout, /Skipped configured install task/);
-    assert.doesNotMatch(cached.stdout, /hutch run --if-configured install/);
-    assert.equal(
-      readFileSync(join(workspace, "cached-app", ".configured-install-ran"), "utf8"),
-      join(realpathSync(workspace), "cached-app"),
-    );
+    assert.notEqual(environmentOffline.status, 0);
+    assert.match(environmentOffline.stderr, /template initialization requires network access/);
+    assert.equal(existsSync(join(workspace, "environment-offline-app")), false);
     assert.deepEqual(
       requestCounts,
       requestsBeforeEnvironmentOffline,
-      "DASH_RELEASE_OFFLINE must prevent Dash-managed HTTP without suppressing install",
+      "offline init must fail before performing HTTP",
     );
 
     const requestsBeforeCliOffline = { ...requestCounts };
@@ -350,16 +344,13 @@ export default {
       ],
       { cwd: workspace, env },
     );
-    assert.equal(cliOffline.status, 0, cliOffline.stderr || cliOffline.stdout);
-    assert.match(cliOffline.stdout, /Running hutch\.config\.ts install task if configured/);
-    assert.equal(
-      readFileSync(join(workspace, "cli-offline-app", ".configured-install-ran"), "utf8"),
-      join(realpathSync(workspace), "cli-offline-app"),
-    );
+    assert.notEqual(cliOffline.status, 0);
+    assert.match(cliOffline.stderr, /template initialization requires network access/);
+    assert.equal(existsSync(join(workspace, "cli-offline-app")), false);
     assert.deepEqual(
       requestCounts,
       requestsBeforeCliOffline,
-      "--offline must prevent Dash-managed HTTP without suppressing install",
+      "the removed --offline option must fail before performing HTTP",
     );
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose));

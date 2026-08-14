@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
+const cache_locks = @import("cache_locks.zig");
 const version_selector = @import("version_selector.zig");
 
 const default_hutch_artifacts_base_url = "https://hutch.blackboard.sh";
@@ -8,7 +9,16 @@ const default_cottontail_artifacts_base_url = "https://electrobun-artifacts.blac
 const manifest_schema = 1;
 const max_manifest_bytes = 1024 * 1024;
 const max_archive_bytes = 256 * 1024 * 1024;
-const channel_cache_lifetime_ns = 6 * std.time.ns_per_hour;
+const selections_schema_version = 1;
+const max_selections_bytes = 64 * 1024;
+const store_schema_version = 1;
+const max_store_marker_bytes = 64 * 1024;
+
+pub const releases_directory_name = "releases";
+pub const state_directory_name = "state";
+pub const selections_file_name = "selections.json";
+pub const store_marker_file_name = "store.json";
+pub const store_lock_file_name = "store.lock";
 
 pub const Product = enum {
     hutch,
@@ -53,6 +63,7 @@ pub const Resolution = struct {
     executable: []const u8,
     version: []const u8,
     revision: []const u8,
+    archive_sha256: []const u8,
     installed: bool,
 };
 
@@ -61,6 +72,41 @@ pub const AvailableUpdate = struct {
     current_revision: []const u8,
     version: []const u8,
     revision: []const u8,
+};
+
+pub const Selection = struct {
+    version: []const u8,
+    revision: []const u8,
+    platform: []const u8,
+};
+
+pub const Selections = struct {
+    hutch_production: ?Selection = null,
+    hutch_canary: ?Selection = null,
+    cottontail_production: ?Selection = null,
+    cottontail_canary: ?Selection = null,
+
+    pub fn get(self: Selections, product: Product, channel: []const u8) ?Selection {
+        if (std.mem.eql(u8, channel, "production")) return switch (product) {
+            .hutch => self.hutch_production,
+            .cottontail => self.cottontail_production,
+        };
+        if (std.mem.eql(u8, channel, "canary")) return switch (product) {
+            .hutch => self.hutch_canary,
+            .cottontail => self.cottontail_canary,
+        };
+        return null;
+    }
+
+    fn set(self: *Selections, product: Product, channel: []const u8, value: Selection) !void {
+        if (std.mem.eql(u8, channel, "production")) switch (product) {
+            .hutch => self.hutch_production = value,
+            .cottontail => self.cottontail_production = value,
+        } else if (std.mem.eql(u8, channel, "canary")) switch (product) {
+            .hutch => self.hutch_canary = value,
+            .cottontail => self.cottontail_canary = value,
+        } else return error.InvalidReleaseChannel;
+    }
 };
 
 const Artifact = struct {
@@ -77,7 +123,7 @@ const ChannelManifest = struct {
     release_url: []const u8,
 };
 
-/// A persistent sibling lock coordinates cache writers across Hutch processes.
+/// A persistent sibling lock coordinates state writers across Hutch processes.
 /// The lock file intentionally remains in place so a newly starting process
 /// can never race another process between lock-file creation and acquisition.
 pub const PersistentFileLock = struct {
@@ -93,7 +139,7 @@ pub fn acquirePersistentFileLock(
     io: std.Io,
     lock_path: []const u8,
 ) !PersistentFileLock {
-    const parent = std.fs.path.dirname(lock_path) orelse return error.InvalidCachePath;
+    const parent = std.fs.path.dirname(lock_path) orelse return error.InvalidStatePath;
     try std.Io.Dir.cwd().createDirPath(io, parent);
 
     const initializer: ?std.Io.File = std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -139,7 +185,7 @@ pub fn acquirePersistentFileLock(
     return .{ .file = file, .contended = false };
 }
 
-pub fn acquireCacheFileLock(
+pub fn acquireFileLock(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -157,6 +203,8 @@ pub fn resolve(
     options: Options,
 ) !Resolution {
     const home = try hutchHome(init, allocator);
+    const lifecycle = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer lifecycle.close(init.io);
     if (!options.refresh) {
         if (try activeMatchingResolution(
             init.io,
@@ -167,13 +215,25 @@ pub fn resolve(
         )) |active| {
             return active;
         }
+        if (try installedMatchingResolution(
+            init.io,
+            allocator,
+            home,
+            product,
+            selector,
+        )) |installed| {
+            if (selector.channel()) |channel| {
+                try activateChannel(init, allocator, product, channel, installed);
+            }
+            return installed;
+        }
     }
     const base_url = try artifactsBaseUrl(init, allocator, product);
-    const artifact = try resolveArtifact(init, allocator, home, base_url, product, selector, options);
+    const artifact = try resolveArtifact(init, allocator, base_url, product, selector, options);
     const platform = try platformKey();
     const root = try std.fs.path.join(allocator, &.{
         home,
-        "products",
+        releases_directory_name,
         product.name(),
         artifact.version,
         artifact.revision,
@@ -191,6 +251,7 @@ pub fn resolve(
             .executable = executable,
             .version = artifact.version,
             .revision = artifact.revision,
+            .archive_sha256 = artifact.sha256,
             .installed = false,
         };
         if (selector.channel()) |channel| {
@@ -205,6 +266,7 @@ pub fn resolve(
         .executable = executable,
         .version = artifact.version,
         .revision = artifact.revision,
+        .archive_sha256 = artifact.sha256,
         .installed = true,
     };
     if (selector.channel()) |channel| {
@@ -253,14 +315,73 @@ pub fn activateChannel(
         return error.InvalidReleaseChannel;
     }
     const home = try hutchHome(init, allocator);
-    const pointer = try std.fs.path.join(allocator, &.{
-        home,
-        "channels",
-        product.name(),
-        channel,
+    try writeSelection(init.io, allocator, home, product, channel, .{
+        .version = resolution.version,
+        .revision = resolution.revision,
+        .platform = try platformKey(),
     });
-    const contents = try std.mem.concat(allocator, u8, &.{ resolution.root, "\n" });
-    try writeCacheFile(init.io, allocator, pointer, contents);
+}
+
+/// Claims a freshly installed Hutch home and merges the currently executing
+/// archive into its selections. Installers call this hidden bootstrap entry
+/// point so shell and PowerShell never need to parse or merge JSON.
+pub fn bootstrapInstalledHutch(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    channel_value: []const u8,
+) !void {
+    const channel = try version_selector.normalizeChannel(channel_value);
+    const home = try hutchHome(init, allocator);
+    const lifecycle = try cache_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer lifecycle.close(init.io);
+
+    const executable_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    const root = std.fs.path.dirname(executable_dir) orelse return error.InvalidInstallPath;
+    const metadata_path = try std.fs.path.join(allocator, &.{ root, Product.hutch.metadataFileName() });
+    const metadata_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        metadata_path,
+        allocator,
+        .limited(max_manifest_bytes),
+    );
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, metadata_bytes, .{
+        .duplicate_field_behavior = .@"error",
+    });
+    if ((try jsonPositiveUsize(metadata, "schema")) != manifest_schema or
+        !std.mem.eql(u8, try jsonString(metadata, "kind"), "archive") or
+        !std.mem.eql(u8, try jsonString(metadata, "product"), Product.hutch.name()))
+    {
+        return error.InvalidInstalledHutchArchive;
+    }
+    const version = try jsonString(metadata, "version");
+    const parsed_version = try version_selector.parse(version);
+    if (parsed_version.kind != .version) return error.InvalidInstalledHutchArchive;
+    const revision = try jsonString(metadata, "revision");
+    try validateRevision(revision);
+    const platform = try jsonString(metadata, "platform");
+    if (!std.mem.eql(u8, platform, try platformKey())) return error.ReleasePlatformMismatch;
+    const expected_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        Product.hutch.name(),
+        version,
+        revision,
+        platform,
+    });
+    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, root, allocator);
+    const canonical_expected = try std.Io.Dir.cwd().realPathFileAlloc(init.io, expected_root, allocator);
+    if (!pathEqual(canonical_root, canonical_expected)) return error.InvalidInstalledHutchArchive;
+    const resolution = (try installedResolutionAt(
+        init.io,
+        allocator,
+        root,
+        .hutch,
+        version,
+        revision,
+        platform,
+    )) orelse return error.InvalidInstalledHutchArchive;
+    _ = try ensureManagedHomeAt(init.io, allocator, home);
+    try activateChannel(init, allocator, .hutch, channel, resolution);
 }
 
 pub fn checkForUpdate(
@@ -269,6 +390,7 @@ pub fn checkForUpdate(
     product: Product,
     channel: []const u8,
 ) !?AvailableUpdate {
+    if (environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE")) return null;
     if (!std.mem.eql(u8, channel, "production") and !std.mem.eql(u8, channel, "canary")) {
         return error.InvalidReleaseChannel;
     }
@@ -281,22 +403,12 @@ pub fn checkForUpdate(
         channel,
     )) orelse return null;
     const base_url = try artifactsBaseUrl(init, allocator, product);
-    const selector = try version_selector.parse(channel);
     const channel_url = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}/channels/{s}.json",
         .{ base_url, product.name(), channel },
     );
-    const bytes = try readManifest(
-        init,
-        allocator,
-        home,
-        base_url,
-        product,
-        selector,
-        channel_url,
-        .{},
-    );
+    const bytes = try fetchManifest(init, allocator, channel_url, .{});
     const available = try parseChannelManifest(
         allocator,
         bytes,
@@ -332,7 +444,7 @@ pub fn skipUpdate(
     const home = try hutchHome(init, allocator);
     const path = try updateSkipPath(allocator, home, product, channel);
     const contents = try std.mem.concat(allocator, u8, &.{ revision, "\n" });
-    try writeCacheFile(init.io, allocator, path, contents);
+    try writeAtomicFile(init.io, allocator, path, contents);
 }
 
 /// Which rule produced the resolved Hutch home. Diagnostic commands report
@@ -535,6 +647,247 @@ test "a missing home directory has no fallback" {
     );
 }
 
+pub const StoreIdentity = struct {
+    canonical_root: []const u8,
+};
+
+pub fn ensureManagedHome(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !StoreIdentity {
+    const home = try hutchHome(init, allocator);
+    return ensureManagedHomeAt(init.io, allocator, home);
+}
+
+pub fn loadStoreIdentity(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !StoreIdentity {
+    const home = try hutchHome(init, allocator);
+    return loadStoreIdentityAt(init.io, allocator, home);
+}
+
+fn ensureManagedHomeAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !StoreIdentity {
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+    try std.Io.Dir.cwd().createDirPath(io, state);
+    const locks = try std.fs.path.join(allocator, &.{ state, "locks" });
+    try std.Io.Dir.cwd().createDirPath(io, locks);
+    const lock_path = try std.fs.path.join(allocator, &.{ locks, store_lock_file_name });
+    const lock = try acquirePersistentFileLock(io, lock_path);
+    defer lock.close(io);
+
+    if (loadStoreIdentityAt(io, allocator, home)) |identity| return identity else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    var marker: std.json.ObjectMap = .empty;
+    try marker.put(allocator, "schemaVersion", .{ .integer = store_schema_version });
+    try marker.put(allocator, "kind", .{ .string = "hutch-store" });
+    try marker.put(allocator, "canonicalRoot", .{ .string = canonical_root });
+    const encoded = try jsonBytes(allocator, .{ .object = marker });
+    const path = try storeMarkerPath(allocator, home);
+    try writeAtomicFileLocked(io, path, encoded);
+    return .{ .canonical_root = canonical_root };
+}
+
+fn loadStoreIdentityAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !StoreIdentity {
+    const path = try storeMarkerPath(allocator, home);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_store_marker_bytes),
+    );
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    });
+    if (root != .object or root.object.count() != 3) return error.InvalidHutchStoreMarker;
+    if ((jsonPositiveUsize(root, "schemaVersion") catch return error.InvalidHutchStoreMarker) != store_schema_version) {
+        return error.UnsupportedHutchStoreSchema;
+    }
+    if (!std.mem.eql(u8, jsonString(root, "kind") catch return error.InvalidHutchStoreMarker, "hutch-store")) {
+        return error.InvalidHutchStoreMarker;
+    }
+    const stored_root = jsonString(root, "canonicalRoot") catch return error.InvalidHutchStoreMarker;
+    if (!std.fs.path.isAbsolute(stored_root)) return error.InvalidHutchStoreMarker;
+    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
+    if (!pathEqual(stored_root, canonical_root)) return error.HutchStoreRootMismatch;
+    return .{ .canonical_root = canonical_root };
+}
+
+fn storeMarkerPath(allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{
+        home,
+        state_directory_name,
+        store_marker_file_name,
+    });
+}
+
+pub fn loadSelections(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) !Selections {
+    const home = try hutchHome(init, allocator);
+    return loadSelectionsAt(init.io, allocator, home);
+}
+
+fn loadSelectionsAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !Selections {
+    const path = try selectionsPath(allocator, home);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_selections_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidSelectionsState;
+    if (root != .object or root.object.count() != 3) return error.InvalidSelectionsState;
+    if ((jsonPositiveUsize(root, "schemaVersion") catch return error.InvalidSelectionsState) != selections_schema_version) {
+        return error.UnsupportedSelectionsSchema;
+    }
+    if (!std.mem.eql(u8, jsonString(root, "kind") catch return error.InvalidSelectionsState, "hutch-selections")) {
+        return error.InvalidSelectionsState;
+    }
+    const products = jsonObject(root, "products") catch return error.InvalidSelectionsState;
+    if (!objectKeysAllowed(products, &.{ "hutch", "cottontail" })) return error.InvalidSelectionsState;
+
+    var selections: Selections = .{};
+    try parseProductSelections(&selections, products, .hutch);
+    try parseProductSelections(&selections, products, .cottontail);
+    return selections;
+}
+
+fn parseProductSelections(
+    selections: *Selections,
+    products: std.json.Value,
+    product: Product,
+) !void {
+    const value = products.object.get(product.name()) orelse return;
+    if (!objectKeysAllowed(value, &.{ "production", "canary" })) return error.InvalidSelectionsState;
+    for ([_][]const u8{ "production", "canary" }) |channel| {
+        const entry = value.object.get(channel) orelse continue;
+        if (entry != .object or entry.object.count() != 3) return error.InvalidSelectionsState;
+        const version = jsonString(entry, "version") catch return error.InvalidSelectionsState;
+        const parsed = version_selector.parse(version) catch return error.InvalidSelectionsState;
+        if (parsed.kind != .version) return error.InvalidSelectionsState;
+        const revision = jsonString(entry, "revision") catch return error.InvalidSelectionsState;
+        validateRevision(revision) catch return error.InvalidSelectionsState;
+        const platform = jsonString(entry, "platform") catch return error.InvalidSelectionsState;
+        validatePlatformName(platform) catch return error.InvalidSelectionsState;
+        try selections.set(product, channel, .{
+            .version = version,
+            .revision = revision,
+            .platform = platform,
+        });
+    }
+}
+
+fn writeSelection(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    channel: []const u8,
+    selection: Selection,
+) !void {
+    const parsed = try version_selector.parse(selection.version);
+    if (parsed.kind != .version) return error.InvalidReleaseVersion;
+    try validateRevision(selection.revision);
+    try validatePlatformName(selection.platform);
+    const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+    try std.Io.Dir.cwd().createDirPath(io, state);
+    const locks = try std.fs.path.join(allocator, &.{ state, "locks" });
+    try std.Io.Dir.cwd().createDirPath(io, locks);
+    const lock_path = try std.fs.path.join(allocator, &.{ locks, "selections.lock" });
+    const lock = try acquirePersistentFileLock(io, lock_path);
+    defer lock.close(io);
+
+    var selections = loadSelectionsAt(io, allocator, home) catch |err| switch (err) {
+        error.InvalidSelectionsState, error.UnsupportedSelectionsSchema => Selections{},
+        else => return err,
+    };
+    try selections.set(product, channel, selection);
+    const encoded = try selectionsJson(allocator, selections);
+    try writeAtomicFileLocked(io, try selectionsPath(allocator, home), encoded);
+}
+
+fn selectionsJson(allocator: std.mem.Allocator, selections: Selections) ![]const u8 {
+    var products: std.json.ObjectMap = .empty;
+    try products.put(allocator, "hutch", try productSelectionsJson(allocator, selections, .hutch));
+    try products.put(allocator, "cottontail", try productSelectionsJson(allocator, selections, .cottontail));
+
+    var root: std.json.ObjectMap = .empty;
+    try root.put(allocator, "schemaVersion", .{ .integer = selections_schema_version });
+    try root.put(allocator, "kind", .{ .string = "hutch-selections" });
+    try root.put(allocator, "products", .{ .object = products });
+    return jsonBytes(allocator, .{ .object = root });
+}
+
+fn productSelectionsJson(
+    allocator: std.mem.Allocator,
+    selections: Selections,
+    product: Product,
+) !std.json.Value {
+    var channels: std.json.ObjectMap = .empty;
+    for ([_][]const u8{ "production", "canary" }) |channel| {
+        const selection = selections.get(product, channel) orelse continue;
+        var entry: std.json.ObjectMap = .empty;
+        try entry.put(allocator, "version", .{ .string = selection.version });
+        try entry.put(allocator, "revision", .{ .string = selection.revision });
+        try entry.put(allocator, "platform", .{ .string = selection.platform });
+        try channels.put(allocator, channel, .{ .object = entry });
+    }
+    return .{ .object = channels };
+}
+
+fn selectionsPath(allocator: std.mem.Allocator, home: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{
+        home,
+        state_directory_name,
+        selections_file_name,
+    });
+}
+
+fn jsonBytes(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const compact = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    return std.mem.concat(allocator, u8, &.{ compact, "\n" });
+}
+
+fn objectKeysAllowed(value: std.json.Value, allowed: []const []const u8) bool {
+    if (value != .object) return false;
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        var known = false;
+        for (allowed) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return false;
+    }
+    return true;
+}
+
 pub fn platformKey() ![]const u8 {
     return switch (builtin.os.tag) {
         .macos => switch (builtin.cpu.arch) {
@@ -589,21 +942,38 @@ fn activeResolution(
     product: Product,
     channel: []const u8,
 ) !?Resolution {
-    const pointer = try std.fs.path.join(allocator, &.{
+    const selections = loadSelectionsAt(io, allocator, home) catch return null;
+    const selection = selections.get(product, channel) orelse return null;
+    const platform = platformKey() catch return null;
+    if (!std.mem.eql(u8, selection.platform, platform)) return null;
+    const root = try std.fs.path.join(allocator, &.{
         home,
-        "channels",
+        releases_directory_name,
         product.name(),
-        channel,
+        selection.version,
+        selection.revision,
+        platform,
     });
-    const pointer_bytes = std.Io.Dir.cwd().readFileAlloc(
+    return installedResolutionAt(
         io,
-        pointer,
         allocator,
-        .limited(std.fs.max_path_bytes + 2),
-    ) catch return null;
-    const root_value = std.mem.trim(u8, pointer_bytes, " \t\r\n");
-    if (root_value.len == 0 or !std.fs.path.isAbsolute(root_value)) return null;
-    const root = try allocator.dupe(u8, root_value);
+        root,
+        product,
+        selection.version,
+        selection.revision,
+        platform,
+    );
+}
+
+fn installedResolutionAt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    product: Product,
+    expected_version: []const u8,
+    expected_revision: []const u8,
+    expected_platform: []const u8,
+) !?Resolution {
     const executable = try std.fs.path.join(allocator, &.{
         root,
         "bin",
@@ -618,7 +988,8 @@ fn activeResolution(
         allocator,
         .limited(128),
     ) catch return null;
-    validateSha256(std.mem.trim(u8, marker, " \t\r\n")) catch return null;
+    const archive_sha256 = std.mem.trim(u8, marker, " \t\r\n");
+    validateSha256(archive_sha256) catch return null;
 
     const metadata_path = try std.fs.path.join(allocator, &.{
         root,
@@ -640,27 +1011,151 @@ fn activeResolution(
     if (schema != manifest_schema) return null;
     if (!std.mem.eql(u8, jsonString(metadata, "kind") catch return null, "archive")) return null;
     if (!std.mem.eql(u8, jsonString(metadata, "product") catch return null, product.name())) return null;
-    if (!std.mem.eql(u8, jsonString(metadata, "channel") catch return null, channel)) return null;
     const version = jsonString(metadata, "version") catch return null;
     const revision = jsonString(metadata, "revision") catch return null;
     const platform = jsonString(metadata, "platform") catch return null;
-    _ = version_selector.parse(version) catch return null;
+    const parsed_version = version_selector.parse(version) catch return null;
+    if (parsed_version.kind != .version) return null;
     validateRevision(revision) catch return null;
-    if (!std.mem.eql(u8, platform, platformKey() catch return null)) return null;
+    if (!std.mem.eql(u8, version, expected_version) or
+        !std.mem.eql(u8, revision, expected_revision) or
+        !std.mem.eql(u8, platform, expected_platform)) return null;
 
     return .{
         .root = root,
         .executable = executable,
         .version = version,
         .revision = revision,
+        .archive_sha256 = archive_sha256,
         .installed = false,
     };
+}
+
+fn installedMatchingResolution(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    selector: version_selector.Selector,
+) !?Resolution {
+    const platform = try platformKey();
+    return switch (selector.kind) {
+        .production, .canary => null,
+        .version => try installedVersionResolution(
+            io,
+            allocator,
+            home,
+            product,
+            selector.value,
+            platform,
+        ),
+        .build => try installedBuildResolution(
+            io,
+            allocator,
+            home,
+            product,
+            selector.value,
+            platform,
+        ),
+    };
+}
+
+fn installedVersionResolution(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    version: []const u8,
+    platform: []const u8,
+) !?Resolution {
+    const version_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        product.name(),
+        version,
+    });
+    var directory = std.Io.Dir.cwd().openDir(io, version_root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer directory.close(io);
+
+    var found: ?Resolution = null;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        validateRevision(entry.name) catch continue;
+        const root = try std.fs.path.join(allocator, &.{ version_root, entry.name, platform });
+        const candidate = (try installedResolutionAt(
+            io,
+            allocator,
+            root,
+            product,
+            version,
+            entry.name,
+            platform,
+        )) orelse continue;
+        if (found != null) return null;
+        found = candidate;
+    }
+    return found;
+}
+
+fn installedBuildResolution(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    product: Product,
+    revision: []const u8,
+    platform: []const u8,
+) !?Resolution {
+    const product_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        product.name(),
+    });
+    var directory = std.Io.Dir.cwd().openDir(io, product_root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer directory.close(io);
+
+    var found: ?Resolution = null;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const parsed = version_selector.parse(entry.name) catch continue;
+        if (parsed.kind != .version) continue;
+        const root = try std.fs.path.join(allocator, &.{
+            product_root,
+            entry.name,
+            revision,
+            platform,
+        });
+        const candidate = (try installedResolutionAt(
+            io,
+            allocator,
+            root,
+            product,
+            entry.name,
+            revision,
+            platform,
+        )) orelse continue;
+        if (found != null) return null;
+        found = candidate;
+    }
+    return found;
 }
 
 fn resolveArtifact(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    home: []const u8,
     base_url: []const u8,
     product: Product,
     selector: version_selector.Selector,
@@ -674,16 +1169,7 @@ fn resolveArtifact(
                 "{s}/{s}/channels/{s}.json",
                 .{ base_url, product.name(), channel },
             );
-            const channel_bytes = try readManifest(
-                init,
-                allocator,
-                home,
-                base_url,
-                product,
-                selector,
-                channel_url,
-                options,
-            );
+            const channel_bytes = try fetchManifest(init, allocator, channel_url, options);
             const channel_manifest = try parseChannelManifest(
                 allocator,
                 channel_bytes,
@@ -705,31 +1191,17 @@ fn resolveArtifact(
         ),
     };
 
-    const manifest_selector: version_selector.Selector = switch (selector.kind) {
-        .production, .canary => .{ .kind = .version, .value = artifact_manifest_url },
-        else => selector,
-    };
     const manifest_bytes = if (selector.kind == .production or selector.kind == .canary)
-        try fetchAndCacheReleaseManifest(
+        try fetchReleaseManifest(
             init,
             allocator,
-            home,
             base_url,
             product,
             artifact_manifest_url,
             options,
         )
     else
-        try readManifest(
-            init,
-            allocator,
-            home,
-            base_url,
-            product,
-            manifest_selector,
-            artifact_manifest_url,
-            options,
-        );
+        try fetchManifest(init, allocator, artifact_manifest_url, options);
     const artifact = try parseArtifactManifest(
         allocator,
         manifest_bytes,
@@ -750,112 +1222,19 @@ fn resolveArtifact(
     return artifact;
 }
 
-fn readManifest(
+fn fetchManifest(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    home: []const u8,
-    base_url: []const u8,
-    product: Product,
-    selector: version_selector.Selector,
     url: []const u8,
     options: Options,
 ) ![]const u8 {
-    const cache_path = try manifestCachePath(allocator, home, product, selector);
-    const cache_lock = try acquireCacheFileLock(init.io, allocator, cache_path);
-    defer cache_lock.close(init.io);
-
-    // Re-read only after acquiring the persistent per-path lock. A concurrent
-    // cold resolver may have populated this exact cache while we waited.
-    const cached = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        cache_path,
-        allocator,
-        .limited(max_manifest_bytes),
-    ) catch null;
-    const cached_is_valid = if (cached) |bytes|
-        cachedManifestMatches(allocator, bytes, base_url, product, selector)
-    else
-        false;
-
-    const cache_is_current = if (cached_is_valid and !options.refresh) switch (selector.kind) {
-        .production, .canary => manifestCacheIsCurrent(init.io, cache_path),
-        .version, .build => true,
-    } else false;
-    if (cache_is_current) return cached.?;
-    if (options.offline) {
-        if (cached_is_valid) return cached.?;
-        return if (cached == null)
-            error.ReleaseManifestNotCached
-        else
-            error.ReleaseManifestCacheInvalid;
-    }
-
-    const downloaded = fetchBytes(init, allocator, url, max_manifest_bytes) catch |err| {
-        if (cached_is_valid) return cached.?;
-        return err;
-    };
-    // Do not publish malformed or mismatched responses into the shared cache.
-    // The caller still parses the response and returns its specific contract
-    // error, but a later offline resolver cannot mistake it for a cache hit.
-    if (cachedManifestMatches(allocator, downloaded, base_url, product, selector)) {
-        try writeCacheFileLocked(init.io, cache_path, downloaded);
-    }
-    return downloaded;
+    if (options.offline) return error.ReleaseMetadataUnavailableOffline;
+    return fetchBytes(init, allocator, url, max_manifest_bytes);
 }
 
-fn cachedManifestMatches(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-    base_url: []const u8,
-    product: Product,
-    selector: version_selector.Selector,
-) bool {
-    const parsed = std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        bytes,
-        .{ .duplicate_field_behavior = .@"error" },
-    ) catch return false;
-    defer parsed.deinit();
-    const root = parsed.value;
-    if ((jsonPositiveUsize(root, "schema") catch return false) != manifest_schema) return false;
-    if (!std.mem.eql(u8, jsonString(root, "product") catch return false, product.name())) return false;
-
-    const kind = jsonString(root, "kind") catch return false;
-    return switch (selector.kind) {
-        .production, .canary => blk: {
-            if (!std.mem.eql(u8, kind, "channel")) break :blk false;
-            _ = parseChannelManifest(
-                allocator,
-                bytes,
-                base_url,
-                product,
-                selector.channel().?,
-            ) catch break :blk false;
-            break :blk true;
-        },
-        .version, .build => blk: {
-            const expected_kind = if (selector.kind == .version) "release" else "build";
-            if (!std.mem.eql(u8, kind, expected_kind)) break :blk false;
-            const artifact = parseArtifactManifest(
-                allocator,
-                bytes,
-                base_url,
-                product,
-                platformKey() catch break :blk false,
-            ) catch break :blk false;
-            break :blk if (selector.kind == .version)
-                std.mem.eql(u8, artifact.version, selector.value)
-            else
-                std.mem.eql(u8, artifact.revision, selector.value);
-        },
-    };
-}
-
-fn fetchAndCacheReleaseManifest(
+fn fetchReleaseManifest(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    home: []const u8,
     base_url: []const u8,
     product: Product,
     url: []const u8,
@@ -865,61 +1244,29 @@ fn fetchAndCacheReleaseManifest(
     const version = releaseVersionFromUrl(url) orelse return error.InvalidReleaseManifestUrl;
     const selector = try version_selector.parse(version);
     if (selector.kind != .version) return error.InvalidReleaseManifestUrl;
-    return readManifest(init, allocator, home, base_url, product, selector, url, options);
+    return fetchManifest(init, allocator, url, options);
 }
 
-fn manifestCachePath(
-    allocator: std.mem.Allocator,
-    home: []const u8,
-    product: Product,
-    selector: version_selector.Selector,
-) ![]const u8 {
-    const section = switch (selector.kind) {
-        .production, .canary => "channels",
-        .version => "releases",
-        .build => "builds",
-    };
-    const name = switch (selector.kind) {
-        .production => "production",
-        .canary => "canary",
-        .version, .build => selector.value,
-    };
-    return std.fs.path.join(allocator, &.{
-        home,
-        "cache",
-        product.name(),
-        section,
-        try std.mem.concat(allocator, u8, &.{ name, ".json" }),
-    });
-}
-
-fn manifestCacheIsCurrent(io: std.Io, path: []const u8) bool {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    const now = std.Io.Clock.real.now(io).nanoseconds;
-    if (now < stat.mtime.nanoseconds) return false;
-    return now - stat.mtime.nanoseconds <= channel_cache_lifetime_ns;
-}
-
-pub fn writeCacheFile(
+pub fn writeAtomicFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     bytes: []const u8,
 ) !void {
-    const cache_lock = try acquireCacheFileLock(io, allocator, path);
-    defer cache_lock.close(io);
-    return writeCacheFileLocked(io, path, bytes);
+    const file_lock = try acquireFileLock(io, allocator, path);
+    defer file_lock.close(io);
+    return writeAtomicFileLocked(io, path, bytes);
 }
 
-/// Atomically publishes a cache file while the caller holds its persistent
+/// Atomically publishes a file while the caller holds its persistent
 /// `<path>.lock` lock. The temporary file is unique and lives beside the final
-/// path, so independent cache keys do not collide and replacement is atomic.
-pub fn writeCacheFileLocked(
+/// path, so independent writers do not collide and replacement is atomic.
+pub fn writeAtomicFileLocked(
     io: std.Io,
     path: []const u8,
     bytes: []const u8,
 ) !void {
-    const parent = std.fs.path.dirname(path) orelse return error.InvalidCachePath;
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidStatePath;
     try std.Io.Dir.cwd().createDirPath(io, parent);
 
     var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
@@ -995,6 +1342,7 @@ fn updateSkipPath(
 ) ![]const u8 {
     return std.fs.path.join(allocator, &.{
         home,
+        state_directory_name,
         "update-skip",
         product.name(),
         channel,
@@ -1097,6 +1445,20 @@ fn validateRevision(revision: []const u8) !void {
             return error.InvalidReleaseRevision;
         }
     }
+}
+
+fn validatePlatformName(platform: []const u8) !void {
+    for ([_][]const u8{ "macos-arm64", "linux-x64", "linux-arm64", "windows-x64" }) |supported| {
+        if (std.mem.eql(u8, platform, supported)) return;
+    }
+    return error.UnsupportedReleasePlatform;
+}
+
+fn pathEqual(lhs: []const u8, rhs: []const u8) bool {
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(lhs, rhs)
+    else
+        std.mem.eql(u8, lhs, rhs);
 }
 
 fn validateSha256(value: []const u8) !void {
@@ -1255,6 +1617,13 @@ fn pathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+fn environmentFlagEnabled(environment: *const std.process.Environ.Map, name: []const u8) bool {
+    const value = environment.get(name) orelse return false;
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes");
+}
+
 test "release manifests select and validate the current platform artifact" {
     const platform = try platformKey();
     const json = try std.fmt.allocPrint(
@@ -1326,4 +1695,131 @@ test "tar paths cannot escape the version store" {
     );
     try std.testing.expectError(error.Invalid, archive_util.sanitizeTarPath(&buffer, "root/../escape", 1));
     try std.testing.expectError(error.Invalid, archive_util.sanitizeTarPath(&buffer, "/absolute", 1));
+}
+
+fn testAbsoluteRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+) ![]const u8 {
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    return std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+}
+
+test "selections merge exact identities without creating cache channel or ownership state" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    try std.Io.Dir.cwd().createDirPath(io, home);
+
+    try writeSelection(io, allocator, home, .hutch, "production", .{
+        .version = "0.8.0",
+        .revision = "0123456789abcdef0123456789abcdef01234567",
+        .platform = "macos-arm64",
+    });
+    try writeSelection(io, allocator, home, .cottontail, "canary", .{
+        .version = "0.4.4",
+        .revision = "abcdef0123456789abcdef0123456789abcdef01",
+        .platform = "linux-x64",
+    });
+
+    const selections = try loadSelectionsAt(io, allocator, home);
+    try std.testing.expectEqualStrings("0.8.0", selections.hutch_production.?.version);
+    try std.testing.expectEqualStrings("macos-arm64", selections.hutch_production.?.platform);
+    try std.testing.expectEqualStrings("0.4.4", selections.cottontail_canary.?.version);
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ home, "cache" })));
+    try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ home, "channels" })));
+    try std.testing.expect(!pathExists(io, try storeMarkerPath(allocator, home)));
+}
+
+test "the installer bootstrap marker strictly owns its canonical Hutch root" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+
+    const created = try ensureManagedHomeAt(io, allocator, home);
+    const loaded = try loadStoreIdentityAt(io, allocator, home);
+    try std.testing.expectEqualStrings(created.canonical_root, loaded.canonical_root);
+    try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{
+        home,
+        state_directory_name,
+        "locks",
+        store_lock_file_name,
+    })));
+
+    try writeAtomicFile(io, allocator, try storeMarkerPath(allocator, home), "{\"schemaVersion\":1,\"kind\":\"hutch-store\",\"canonicalRoot\":\"/wrong\"}\n");
+    try std.testing.expectError(
+        error.HutchStoreRootMismatch,
+        loadStoreIdentityAt(io, allocator, home),
+    );
+}
+
+test "selected and exact installed releases resolve without remote metadata" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    const version = "9.8.7";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const platform = try platformKey();
+    const release_root = try std.fs.path.join(allocator, &.{
+        home,
+        releases_directory_name,
+        "cottontail",
+        version,
+        revision,
+        platform,
+    });
+    const bin = try std.fs.path.join(allocator, &.{ release_root, "bin" });
+    try std.Io.Dir.cwd().createDirPath(io, bin);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ bin, Product.cottontail.executableFileName() }),
+        .data = "fixture",
+    });
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"cottontail\",\"channel\":\"canary\",\"version\":\"{s}\",\"revision\":\"{s}\",\"platform\":\"{s}\"}}\n",
+        .{ version, revision, platform },
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ release_root, Product.cottontail.metadataFileName() }),
+        .data = metadata,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ release_root, ".dash-installed" }),
+        .data = checksum,
+    });
+    try writeSelection(io, allocator, home, .cottontail, "production", .{
+        .version = version,
+        .revision = revision,
+        .platform = platform,
+    });
+
+    const selected = (try activeResolution(io, allocator, home, .cottontail, "production")).?;
+    try std.testing.expectEqualStrings(release_root, selected.root);
+    try std.testing.expectEqualStrings(checksum, selected.archive_sha256);
+    const exact = (try installedVersionResolution(
+        io,
+        allocator,
+        home,
+        .cottontail,
+        version,
+        platform,
+    )).?;
+    try std.testing.expectEqualStrings(release_root, exact.root);
 }

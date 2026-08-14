@@ -56,7 +56,7 @@ async function waitForPath(path, timeoutMs = 10_000) {
   }
 }
 
-test("exact Electrobun artifacts are cached and same-project builds serialize", { timeout: 120_000 }, async () => {
+test("exact Electrobun releases are installed and same-project builds serialize", { timeout: 120_000 }, async () => {
   const fixture = mkdtempSync(join(os.tmpdir(), "hutch-published-electrobun-"));
   const project = join(fixture, "project");
   const coreFiles = join(fixture, "core-files");
@@ -222,15 +222,7 @@ export default {
         "HUTCH_BUILD_LEADER_READY",
         "HUTCH_ELECTROBUN_BUILD_LOCK",
       ]) delete env[name];
-      const cacheRoot = join(dashHome, "products", "electrobun", version, names.key);
-      const indexCache = join(
-        dashHome,
-        "cache",
-        "electrobun",
-        "releases",
-        version,
-        "electrobun-artifacts.json",
-      );
+      const releaseRoot = join(dashHome, "releases", "electrobun", version, names.key);
 
       const offlineMiss = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
@@ -238,8 +230,8 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.notEqual(offlineMiss.status, 0);
-      assert.match(offlineMiss.stderr, /ElectrobunArtifactIndexNotCached/);
-      assert.equal(indexRequests, 0, "offline cache misses must not perform HTTP requests");
+      assert.match(offlineMiss.stderr, /ElectrobunReleaseNotInstalled/);
+      assert.equal(indexRequests, 0, "offline installed-release misses must not perform HTTP requests");
       assert.equal(coreRequests, 0);
 
       serveOversizedIndex = true;
@@ -252,7 +244,7 @@ export default {
       assert.match(oversized.stderr, /ReleaseDownloadTooLarge/);
       assert.equal(indexRequests, 1);
       assert.equal(coreRequests, 0, "an oversized index must fail before an artifact request");
-      assert.equal(existsSync(indexCache), false, "an oversized index must not enter the cache");
+      assert.equal(existsSync(join(dashHome, "cache")), false, "metadata must never persist locally");
 
       serveOversizedIndex = false;
       serveCoreUnavailable = true;
@@ -266,7 +258,7 @@ export default {
       assert.equal(indexRequests, 2);
       // An unavailable artifact is retried three times before failing.
       assert.equal(coreRequests, 3);
-      assert.ok(existsSync(indexCache), "a valid immutable index is cached before artifact download");
+      assert.equal(existsSync(join(dashHome, "cache")), false, "a valid index must be discarded after use");
 
       const offlineArtifactMiss = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
@@ -274,13 +266,12 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.notEqual(offlineArtifactMiss.status, 0);
-      assert.match(offlineArtifactMiss.stderr, /ElectrobunArtifactNotCached/);
-      assert.equal(indexRequests, 2, "offline artifact misses must not refresh the index");
+      assert.match(offlineArtifactMiss.stderr, /ElectrobunReleaseNotInstalled/);
+      assert.equal(indexRequests, 2, "offline release misses must not fetch the index");
       assert.equal(coreRequests, 3, "offline artifact misses must not perform HTTP requests");
 
       serveCoreUnavailable = false;
       serveMalformedCore = true;
-      rmSync(indexCache);
       const malformed = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
         env,
@@ -291,14 +282,13 @@ export default {
       assert.equal(indexRequests, 3);
       assert.equal(coreRequests, 4);
       assert.equal(
-        existsSync(join(cacheRoot, ".core-complete")),
+        existsSync(join(releaseRoot, ".core-complete")),
         false,
         "a semantically incomplete archive must never publish a core marker",
       );
-      assert.equal(existsSync(`${cacheRoot}.core-tmp`), false, "failed extraction must be cleaned");
+      assert.equal(existsSync(`${releaseRoot}.core-tmp`), false, "failed extraction must be cleaned");
 
       serveMalformedCore = false;
-      rmSync(indexCache);
       const first = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
         env,
@@ -309,12 +299,12 @@ export default {
       assert.equal(coreRequests, 5, "the first build should download one complete core archive");
       assert.match(first.stderr, /downloading Electrobun 9\.8\.7-test\.1 core/);
 
-      assert.ok(existsSync(join(cacheRoot, executableName("launcher"))));
-      assert.ok(existsSync(join(cacheRoot, ".core-complete")));
-      assert.equal(readFileSync(join(cacheRoot, ".core-complete"), "utf8").trim(), archiveSha256);
-      assert.ok(existsSync(indexCache));
+      assert.ok(existsSync(join(releaseRoot, executableName("launcher"))));
+      assert.ok(existsSync(join(releaseRoot, ".core-complete")));
+      assert.equal(readFileSync(join(releaseRoot, ".core-complete"), "utf8").trim(), archiveSha256);
+      assert.equal(existsSync(join(dashHome, "cache")), false);
 
-      const missingSdkRole = join(cacheRoot, "api", "browser", "index.ts");
+      const missingSdkRole = join(releaseRoot, "api", "browser", "index.ts");
       rmSync(missingSdkRole);
       rmSync(join(project, "build"), { recursive: true, force: true });
       const offlineTampered = await run(hutch, ["electrobun", "build", "--env=dev"], {
@@ -323,8 +313,8 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.notEqual(offlineTampered.status, 0);
-      assert.match(offlineTampered.stderr, /ElectrobunArtifactCacheInvalid/);
-      assert.equal(indexRequests, 4, "offline validation failures must not refresh the index");
+      assert.match(offlineTampered.stderr, /ElectrobunReleaseInvalid/);
+      assert.equal(indexRequests, 4, "offline validation failures must not fetch the index");
       assert.equal(coreRequests, 5, "offline validation failures must not perform HTTP requests");
 
       const repaired = await run(hutch, ["electrobun", "build", "--env=dev"], {
@@ -333,21 +323,20 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(repaired.status, 0, repaired.stderr || repaired.stdout);
-      assert.equal(indexRequests, 4, "repair should reuse the verified artifact index");
+      assert.equal(indexRequests, 5, "repair must fetch fresh artifact metadata");
       assert.equal(coreRequests, 6, "repair should download the verified core archive exactly once");
       assert.ok(existsSync(missingSdkRole), "repair must restore the missing manifest-declared role");
 
-      writeFileSync(indexCache, "{truncated");
       rmSync(join(project, "build"), { recursive: true, force: true });
-      const recovered = await run(hutch, ["electrobun", "build", "--env=dev"], {
+      serveOversizedIndex = true;
+      const reused = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
         env,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
-      assert.equal(indexRequests, 5, "online mode should replace one corrupt cached index");
-      assert.equal(coreRequests, 6, "index recovery must preserve the verified core install");
-      assert.ok(existsSync(`${indexCache}.invalid`));
+      assert.equal(reused.status, 0, reused.stderr || reused.stdout);
+      assert.equal(indexRequests, 5, "a valid installed release must not require metadata");
+      assert.equal(coreRequests, 6, "a valid installed release must not be downloaded again");
 
       rmSync(join(project, "build"), { recursive: true, force: true });
       const second = await run(hutch, ["electrobun", "build", "--env=dev"], {
@@ -356,8 +345,8 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(second.status, 0, second.stderr || second.stdout);
-      assert.equal(indexRequests, 5, "offline cache hits must not refresh the artifact index");
-      assert.equal(coreRequests, 6, "offline cache hits must reuse the verified core cache");
+      assert.equal(indexRequests, 5, "offline installed releases must not fetch metadata");
+      assert.equal(coreRequests, 6, "offline builds must reuse the verified installed release");
 
       rmSync(join(project, "build"), { recursive: true, force: true });
       rmSync(join(project, ".hutch", "locks"), { recursive: true, force: true });
@@ -399,7 +388,7 @@ export default {
       for (const result of concurrent) {
         assert.equal(result.status, 0, result.stderr || result.stdout);
       }
-      assert.equal(indexRequests, 5, "local concurrent builds must not refresh the artifact index");
+      assert.equal(indexRequests, 5, "local concurrent builds must not fetch artifact metadata");
       assert.equal(coreRequests, 6, "local concurrent builds must not download artifacts");
       assert.equal(existsSync(sentinel), false, "the final build must release its serialization sentinel");
       assert.ok(existsSync(join(project, ".hutch", "locks", "electrobun-build.lock")));

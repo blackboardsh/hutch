@@ -165,7 +165,7 @@ if [ "$actual_size" != "$expected_size" ]; then
   exit 1
 fi
 
-install_root="$hutch_home/products/hutch/$release_version/$revision/$platform"
+install_root="$hutch_home/releases/hutch/$release_version/$revision/$platform"
 install_parent="$(dirname "$install_root")"
 extract_root="$tmp_dir/extracted"
 mkdir -p "$extract_root" "$install_parent"
@@ -181,12 +181,9 @@ printf '%s' "$expected_sha256" > "$extract_root/.dash-installed"
 rm -rf "$install_root"
 mv "$extract_root" "$install_root"
 
-channel_dir="$hutch_home/channels/hutch"
 bin_dir="$hutch_home/bin"
-mkdir -p "$channel_dir" "$bin_dir"
-pointer_tmp="$channel_dir/$channel.tmp"
-printf '%s\n' "$install_root" > "$pointer_tmp"
-mv "$pointer_tmp" "$channel_dir/$channel"
+mkdir -p "$bin_dir"
+HUTCH_HOME="$hutch_home" "$install_root/bin/hutch-engine" self bootstrap-install "$channel"
 
 command_name="hutch"
 if [ "$channel" = "canary" ]; then

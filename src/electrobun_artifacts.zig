@@ -103,7 +103,7 @@ fn ensure(
     const platform = try platformKey();
     const root = try std.fs.path.join(allocator, &.{
         home,
-        "products",
+        release_store.releases_directory_name,
         "electrobun",
         version,
         platform,
@@ -114,32 +114,31 @@ fn ensure(
     const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
     defer lock.close(init.io);
 
-    const base_url = try releasesBaseUrl(init, allocator);
     const offline = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE");
-    const selection = try resolveArtifactSelection(
-        init,
-        allocator,
-        home,
-        base_url,
-        version,
-        platform,
-        offline,
-    );
-    const artifact = try selection.artifact(kind);
-    const installation_status = try installationStatus(
+    const local_status = try localInstallationStatus(
         init.io,
         allocator,
         root,
         kind,
-        selection,
+        version,
     );
-    if (installation_status == .valid) return root;
+    if (local_status == .valid) return root;
     if (offline) {
-        return if (installation_status == .invalid)
-            error.ElectrobunArtifactCacheInvalid
+        return if (local_status == .invalid)
+            error.ElectrobunReleaseInvalid
         else
-            error.ElectrobunArtifactNotCached;
+            error.ElectrobunReleaseNotInstalled;
     }
+
+    const base_url = try releasesBaseUrl(init, allocator);
+    const selection = try resolveArtifactSelection(
+        init,
+        allocator,
+        base_url,
+        version,
+        platform,
+    );
+    const artifact = try selection.artifact(kind);
 
     std.debug.print(
         "hutch: downloading Electrobun {s} {s} for {s}\n",
@@ -163,79 +162,9 @@ fn ensure(
 fn resolveArtifactSelection(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    home: []const u8,
     base_url: []const u8,
     version: []const u8,
     platform: []const u8,
-    offline: bool,
-) !ArtifactSelection {
-    const cache_path = try artifactIndexCachePath(allocator, home, version);
-    const cache_parent = std.fs.path.dirname(cache_path) orelse
-        return error.InvalidElectrobunArtifactIndexCachePath;
-    try std.Io.Dir.cwd().createDirPath(init.io, cache_parent);
-    const lock = try release_store.acquireCacheFileLock(init.io, allocator, cache_path);
-    defer lock.close(init.io);
-
-    var cached_too_large = false;
-    const cached = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        cache_path,
-        allocator,
-        .limited(max_artifact_index_bytes),
-    ) catch |err| switch (err) {
-        error.FileNotFound => null,
-        error.StreamTooLong => blk: {
-            cached_too_large = true;
-            break :blk null;
-        },
-        else => |e| return e,
-    };
-    if (cached) |bytes| {
-        const selection = parseArtifactIndex(
-            allocator,
-            bytes,
-            base_url,
-            version,
-            platform,
-        ) catch {
-            if (offline) return error.ElectrobunArtifactIndexCacheInvalid;
-            return refreshArtifactIndex(
-                init,
-                allocator,
-                cache_path,
-                base_url,
-                version,
-                platform,
-                true,
-            );
-        };
-        return selection;
-    }
-    if (offline) {
-        return if (cached_too_large)
-            error.ElectrobunArtifactIndexCacheInvalid
-        else
-            error.ElectrobunArtifactIndexNotCached;
-    }
-    return refreshArtifactIndex(
-        init,
-        allocator,
-        cache_path,
-        base_url,
-        version,
-        platform,
-        cached_too_large,
-    );
-}
-
-fn refreshArtifactIndex(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cache_path: []const u8,
-    base_url: []const u8,
-    version: []const u8,
-    platform: []const u8,
-    quarantine_existing: bool,
 ) !ArtifactSelection {
     const url = try artifactIndexUrl(allocator, base_url, version);
     const downloaded = try fetchBoundedBytes(
@@ -244,32 +173,13 @@ fn refreshArtifactIndex(
         url,
         max_artifact_index_bytes,
     );
-    const selection = try parseArtifactIndex(
+    return parseArtifactIndex(
         allocator,
         downloaded,
         base_url,
         version,
         platform,
     );
-    if (quarantine_existing) {
-        try quarantineCacheFile(init.io, allocator, cache_path);
-    }
-    // resolveArtifactSelection holds the persistent `<cache_path>.lock` lock.
-    try release_store.writeCacheFileLocked(init.io, cache_path, downloaded);
-    return selection;
-}
-
-fn quarantineCacheFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) !void {
-    const quarantine = try std.mem.concat(allocator, u8, &.{ path, ".invalid" });
-    std.Io.Dir.cwd().deleteFile(io, quarantine) catch {};
-    std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), quarantine, io) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
 }
 
 fn parseArtifactIndex(
@@ -544,6 +454,7 @@ fn installCef(
 
     const extracted_cef = try std.fs.path.join(allocator, &.{ temporary, "cef" });
     if (!pathIsDirectory(io, extracted_cef)) return error.ElectrobunCefArchiveInvalid;
+    try validateCefPayload(io, allocator, extracted_cef);
     const installed_cef = try std.fs.path.join(allocator, &.{ root, "cef" });
     std.Io.Dir.cwd().deleteTree(io, installed_cef) catch {};
     try std.Io.Dir.cwd().rename(extracted_cef, std.Io.Dir.cwd(), installed_cef, io);
@@ -578,10 +489,102 @@ fn installationStatus(
         .core => validateCoreInstallation(io, allocator, root, selection) catch return .invalid,
         .cef => {
             const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
-            if (!pathIsDirectory(io, cef)) return .invalid;
+            validateCefPayload(io, allocator, cef) catch return .invalid;
         },
     }
     return .valid;
+}
+
+fn localInstallationStatus(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    kind: Kind,
+    version: []const u8,
+) !InstallationStatus {
+    const marker = try markerPath(allocator, root, kind);
+    const value = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        marker,
+        allocator,
+        .limited(128),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.StreamTooLong => return .invalid,
+        else => |e| return e,
+    };
+    validateSha256(std.mem.trim(u8, value, " \t\r\n")) catch return .invalid;
+
+    switch (kind) {
+        .core => validateLocalCoreInstallation(io, allocator, root, version) catch return .invalid,
+        .cef => {
+            const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
+            validateCefPayload(io, allocator, cef) catch return .invalid;
+        },
+    }
+    return .valid;
+}
+
+fn validateCefPayload(io: std.Io, allocator: std.mem.Allocator, cef: []const u8) !void {
+    if (!pathIsDirectory(io, cef)) return error.ElectrobunCefArchiveInvalid;
+    const required: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &.{
+            "Chromium Embedded Framework.framework/Chromium Embedded Framework",
+            "Chromium Embedded Framework.framework/Resources/icudtl.dat",
+        },
+        .linux => &.{ "libcef.so", "icudtl.dat" },
+        .windows => &.{ "libcef.dll", "icudtl.dat" },
+        else => return error.UnsupportedElectrobunPlatform,
+    };
+    for (required) |relative| {
+        const path = try std.fs.path.join(allocator, &.{ cef, relative });
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size == 0) return error.ElectrobunCefArchiveInvalid;
+    }
+}
+
+fn validateLocalCoreInstallation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    version: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, native_devkit_manifest_file_name });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_artifact_index_bytes),
+    );
+    const manifest = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    });
+    if (try jsonPositiveUsize(manifest, "schemaVersion") != native_devkit_schema_version) {
+        return error.ElectrobunDevkitIdentityMismatch;
+    }
+    const product = try jsonObject(manifest, "product");
+    if (!std.mem.eql(u8, try jsonString(product, "name"), "electrobun") or
+        !std.mem.eql(u8, try jsonString(product, "version"), version))
+    {
+        return error.ElectrobunDevkitIdentityMismatch;
+    }
+    const target = try jsonObject(manifest, "target");
+    if (!std.mem.eql(u8, try jsonString(target, "os"), targetOsName()) or
+        !std.mem.eql(u8, try jsonString(target, "arch"), releaseArchName()))
+    {
+        return error.ElectrobunDevkitIdentityMismatch;
+    }
+    const abi = try jsonObject(manifest, "abi");
+    const core = try jsonObject(abi, "core");
+    const sdk = try jsonObject(abi, "sdk");
+    if (!std.mem.eql(u8, try jsonString(core, "name"), "electrobun-core") or
+        try jsonPositiveUsize(core, "version") != supported_core_abi_version or
+        !std.mem.eql(u8, try jsonString(sdk, "name"), "electrobun-sdk") or
+        try jsonPositiveUsize(sdk, "version") != supported_sdk_abi_version)
+    {
+        return error.ElectrobunDevkitIdentityMismatch;
+    }
+    _ = try electrobun_devkit.load(io, allocator, root, version);
 }
 
 fn validateCoreInstallation(
@@ -646,21 +649,21 @@ fn writeMarker(
 ) !void {
     const marker = try markerPath(allocator, root, kind);
     const value = try std.mem.concat(allocator, u8, &.{ sha256, "\n" });
-    try release_store.writeCacheFile(io, allocator, marker, value);
+    try release_store.writeAtomicFile(io, allocator, marker, value);
 }
 
 fn markerPath(allocator: std.mem.Allocator, root: []const u8, kind: Kind) ![]const u8 {
     return switch (kind) {
         .core => std.fs.path.join(allocator, &.{ root, ".core-complete" }),
         // Keep the CEF identity inside its independently managed root. This
-        // lets cache pruning detach CEF without mutating or invalidating core.
+        // lets pruning detach CEF without mutating or invalidating core.
         .cef => std.fs.path.join(allocator, &.{ root, "cef", ".cef-complete" }),
     };
 }
 
 test "CEF completion identity is stored inside its independently managed root" {
     const allocator = std.testing.allocator;
-    const root = try std.fs.path.join(allocator, &.{ "cache", "electrobun", "2.0.0", "platform" });
+    const root = try std.fs.path.join(allocator, &.{ "releases", "electrobun", "2.0.0", "platform" });
     defer allocator.free(root);
     const core = try markerPath(allocator, root, .core);
     defer allocator.free(core);
@@ -674,19 +677,44 @@ test "CEF completion identity is stored inside its independently managed root" {
     try std.testing.expectEqualStrings(expected_cef, cef);
 }
 
-fn artifactIndexCachePath(
-    allocator: std.mem.Allocator,
-    home: []const u8,
-    version: []const u8,
-) ![]const u8 {
-    return std.fs.path.join(allocator, &.{
-        home,
-        "cache",
-        "electrobun",
-        "releases",
-        version,
-        artifact_index_file_name,
+test "CEF completion markers require a concrete platform payload" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+    const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
+    try std.Io.Dir.cwd().createDirPath(io, cef);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ cef, ".cef-complete" }),
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     });
+    try std.testing.expectEqual(
+        InstallationStatus.invalid,
+        try localInstallationStatus(io, allocator, root, .cef, "2.0.0"),
+    );
+
+    const payload_names: []const []const u8 = switch (builtin.os.tag) {
+        .macos => &.{
+            "Chromium Embedded Framework.framework/Chromium Embedded Framework",
+            "Chromium Embedded Framework.framework/Resources/icudtl.dat",
+        },
+        .linux => &.{ "libcef.so", "icudtl.dat" },
+        .windows => &.{ "libcef.dll", "icudtl.dat" },
+        else => return error.SkipZigTest,
+    };
+    for (payload_names) |payload_name| {
+        const payload = try std.fs.path.join(allocator, &.{ cef, payload_name });
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(payload).?);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = payload, .data = "cef" });
+    }
+    try std.testing.expectEqual(
+        InstallationStatus.valid,
+        try localInstallationStatus(io, allocator, root, .cef, "2.0.0"),
+    );
 }
 
 fn artifactIndexUrl(
@@ -956,7 +984,7 @@ test "Electrobun artifact archives must match both declared size and SHA-256" {
     );
 }
 
-test "Electrobun index URLs and versions cannot escape the shared cache" {
+test "Electrobun index URLs and versions cannot escape the release URL" {
     const url = try artifactIndexUrl(
         std.testing.allocator,
         "https://releases.example.test",

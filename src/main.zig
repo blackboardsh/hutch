@@ -1064,6 +1064,15 @@ fn runReleaseCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
+    if (product == .hutch and args.len == 2 and
+        std.mem.eql(u8, args[0], "bootstrap-install"))
+    {
+        release_store.bootstrapInstalledHutch(init, allocator, args[1]) catch |err| {
+            try stderr.print("hutch: could not bootstrap installed Hutch: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        return 0;
+    }
     if (args.len == 0 or isHelpFlag(args[0])) {
         const namespace = if (product == .hutch) "self" else "cottontail";
         try stderr.print(

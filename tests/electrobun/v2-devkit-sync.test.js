@@ -72,7 +72,7 @@ function waitFor(promise, timeoutMilliseconds, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
-test("v2 sync and build use only the cached devkit, without an npm package", { timeout: 120_000 }, async () => {
+test("v2 sync and build use only the installed devkit, without an npm package", { timeout: 120_000 }, async () => {
   const fixture = mkdtempSync(join(os.tmpdir(), "hutch-v2-devkit-"));
   const project = join(fixture, "project");
   const coreFiles = join(fixture, "core-files");
@@ -184,57 +184,34 @@ export default {
         "concurrent cold syncs must share one artifact index and one core archive download",
       );
 
-      const cacheRoot = join(dashHome, "products", "electrobun", version, host.key);
-      const indexCache = join(
-        dashHome,
-        "cache",
-        "electrobun",
-        "releases",
-        version,
-        "electrobun-artifacts.json",
-      );
-      assert.ok(existsSync(`${indexCache}.lock`));
-      assert.ok(existsSync(`${cacheRoot}.lock`));
+      const releaseRoot = join(dashHome, "releases", "electrobun", version, host.key);
+      assert.equal(existsSync(join(dashHome, "cache")), false, "artifact metadata must not persist");
+      assert.ok(existsSync(`${releaseRoot}.lock`));
       assert.ok(existsSync(join(project, ".hutch", "devkit.lock")));
       assert.deepEqual(
         readdirSync(join(project, ".hutch")).filter((name) =>
           name.startsWith(".devkit-tmp-") || name.startsWith(".devkit-old-")),
         [],
       );
-      assert.ok(existsSync(join(cacheRoot, "native-devkit.json")));
+      assert.ok(existsSync(join(releaseRoot, "native-devkit.json")));
       assert.ok(existsSync(join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts")));
       assert.ok(existsSync(join(project, ".hutch", "devkit", "go-sdk", "go.mod")));
       assert.match(readFileSync(join(project, ".hutch", "devkit", "tsconfig.json"), "utf8"), /electrobun\/main/);
       const dependencyLock = readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8");
       assert.match(dependencyLock, /hutch-project-dependencies/);
-      assert.match(dependencyLock, new RegExp(`products/electrobun/${version}/${host.key}`));
+      assert.match(dependencyLock, new RegExp(`releases/electrobun/${version}/${host.key}`));
       assert.match(dependencyLock, new RegExp(archiveSha256));
-      const registrations = readdirSync(join(dashHome, "state", "cache-v2", "projects"))
+      const registrations = readdirSync(join(dashHome, "state", "projects"))
         .filter((name) => name.endsWith(".json"));
       assert.equal(registrations.length, 1);
       const registration = readFileSync(
-        join(dashHome, "state", "cache-v2", "projects", registrations[0]),
+        join(dashHome, "state", "projects", registrations[0]),
         "utf8",
       );
       assert.match(registration, /hutch-project-registration/);
-      assert.match(registration, new RegExp(`products/electrobun/${version}/${host.key}`));
+      assert.match(registration, new RegExp(`releases/electrobun/${version}/${host.key}`));
 
-      const cachePreview = await run(hutch, ["cache", "clean", "--dry-run"], {
-        cwd: project,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      assert.equal(cachePreview.status, 0, cachePreview.stderr || cachePreview.stdout);
-      assert.match(cachePreview.stdout, /eligible 0/);
-      assert.ok(existsSync(cacheRoot), "a registered exact devkit must remain reachable");
-      const destructiveClean = await run(hutch, ["cache", "clean"], {
-        cwd: project,
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      assert.equal(destructiveClean.status, 1);
-      assert.match(destructiveClean.stderr, /preview-only/);
-      assert.ok(existsSync(cacheRoot), "cache clean without --dry-run must not mutate state");
+      assert.ok(existsSync(releaseRoot), "a registered exact devkit must remain installed");
 
       const projectedMainSdk = join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts");
       writeFixtureFile(
@@ -242,9 +219,9 @@ export default {
         "export const devkitMarker = 'PROJECT_SDK_EDIT';\nexport type { ElectrobunConfig } from '../../config/ElectrobunConfig';\n",
       );
       assert.match(
-        readFileSync(join(cacheRoot, "api", "sdks", "main", "index.ts"), "utf8"),
+        readFileSync(join(releaseRoot, "api", "sdks", "main", "index.ts"), "utf8"),
         /V2_DEVKIT_ALIAS/,
-        "editing the project SDK must not mutate the cached core",
+        "editing the project SDK must not mutate the installed core",
       );
 
       const build = await run(hutch, ["electrobun", "build", "--env=dev"], {
@@ -253,7 +230,7 @@ export default {
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(build.status, 0, build.stderr || build.stdout);
-      assert.equal(requests, 2, "build should reuse the exact index, core, and projected devkit");
+      assert.equal(requests, 2, "build should reuse the installed core and projected devkit");
       const bundledMain = process.platform === "darwin"
         ? join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev.app", "Contents", "Resources", "app", "bun", "index.js")
         : join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev", "Resources", "app", "bun", "index.js");
@@ -262,7 +239,7 @@ export default {
       assert.match(readFileSync(projectedMainSdk, "utf8"), /PROJECT_SDK_EDIT/);
       assert.equal(existsSync(join(project, "node_modules")), false);
 
-      rmSync(cacheRoot, { recursive: true, force: true });
+      rmSync(releaseRoot, { recursive: true, force: true });
       rmSync(join(project, ".hutch", "devkit"), { recursive: true, force: true });
       const configPath = join(project, "electrobun.config.ts");
       writeFileSync(
@@ -420,7 +397,7 @@ export default {
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /electrobun sync complete/);
       }
-      assert.equal(proxyRequests, 1, "waiters must recheck the completed cache instead of downloading");
+      assert.equal(proxyRequests, 1, "waiters must recheck the installed toolchain instead of downloading");
       assert.ok(existsSync(`${toolchainRoot}.lock`));
       assert.equal(
         readFileSync(join(toolchainRoot, ".hutch-toolchain"), "utf8").trim(),
