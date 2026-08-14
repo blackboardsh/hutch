@@ -116,6 +116,7 @@ jobs:
           ./vendors/zig/zig build test
           node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
           node scripts/local-stack.test.js
+          node --test --test-concurrency=1 tests/storage-contract.test.js
           node --test --test-concurrency=1 \
             tests/electrobun/decorator-bundle.test.js \
             tests/electrobun/init-scaffold.test.js \
@@ -134,6 +135,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
           node scripts/local-stack.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }
+          node --test --test-concurrency=1 tests/storage-contract.test.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch storage contract tests failed" }
 
       - name: Smoke test Hutch release executables
         if: matrix.os != 'windows'
