@@ -138,6 +138,7 @@ const PlatformPaths = struct {
     process_helper: []const u8,
     cef_dir: []const u8,
     wgpu_lib: []const u8,
+    wgpu_auxiliary_libraries: []const []const u8,
     extractor: []const u8,
     bsdiff: []const u8,
     bspatch: []const u8,
@@ -4250,6 +4251,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
 
     if (bundleUsesWgpu(config.root) and pathExists(ctx.io, platform_paths.wgpu_lib)) {
         try copyPath(ctx, platform_paths.wgpu_lib, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.wgpu_lib) }));
+        for (platform_paths.wgpu_auxiliary_libraries) |library| {
+            try copyPath(ctx, library, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(library) }));
+        }
     }
 
     if (bundleUsesCef(config.root)) {
@@ -5884,6 +5888,7 @@ fn platformPathsFromDevkit(
         .process_helper = devkit.runtime.process_helper,
         .cef_dir = try std.fs.path.join(ctx.allocator, &.{ devkit.root, "cef" }),
         .wgpu_lib = devkit.runtime.wgpu_library,
+        .wgpu_auxiliary_libraries = devkit.runtime.wgpu_auxiliary_libraries,
         .extractor = devkit.runtime.extractor,
         .bsdiff = devkit.runtime.bsdiff,
         .bspatch = devkit.runtime.bspatch,
@@ -6555,6 +6560,7 @@ test "preload scripts are resources rather than code-directory files" {
         .process_helper = "",
         .cef_dir = "",
         .wgpu_lib = "",
+        .wgpu_auxiliary_libraries = &.{},
         .extractor = "",
         .bsdiff = "",
         .bspatch = "",
@@ -6622,6 +6628,7 @@ test "bundled extractor is an uninstall manager resource" {
         .process_helper = "",
         .cef_dir = "",
         .wgpu_lib = "",
+        .wgpu_auxiliary_libraries = &.{},
         .extractor = try std.fs.path.join(allocator, &.{ absolute_root, "platform", "extractor" }),
         .bsdiff = "",
         .bspatch = "",
@@ -6707,6 +6714,7 @@ test "bundled CEF layouts match the native wrapper contract" {
         .process_helper = process_helper,
         .cef_dir = cef_dir,
         .wgpu_lib = "",
+        .wgpu_auxiliary_libraries = &.{},
         .extractor = "",
         .bsdiff = "",
         .bspatch = "",

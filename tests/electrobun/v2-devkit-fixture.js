@@ -35,6 +35,7 @@ export function hostContract() {
       nativeCef: "libNativeWrapper.dll",
       asar: "libasar.dll",
       wgpu: "webgpu_dawn.dll",
+      wgpuAuxiliaryLibraries: ["d3dcompiler_47.dll"],
     };
   }
   return {
@@ -63,6 +64,7 @@ export function createCoreFixture(root, version, host = hostContract()) {
     nativeWrapperCef: host.nativeCef,
     asarLibrary: host.asar,
     wgpuLibrary: host.wgpu,
+    wgpuAuxiliaryLibraries: host.wgpuAuxiliaryLibraries || [],
     processHelper: executableName("process_helper"),
     bsdiff: executableName("bsdiff"),
     bspatch: executableName("bspatch"),
@@ -114,7 +116,11 @@ export function createCoreFixture(root, version, host = hostContract()) {
     },
   };
 
-  for (const file of new Set(Object.values(runtime))) {
+  const { wgpuAuxiliaryLibraries, ...runtimeFiles } = runtime;
+  for (const file of new Set([
+    ...Object.values(runtimeFiles),
+    ...wgpuAuxiliaryLibraries,
+  ])) {
     writeFixtureFile(join(root, file), file);
     if (process.platform !== "win32") chmodSync(join(root, file), 0o755);
   }

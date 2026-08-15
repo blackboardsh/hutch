@@ -37,6 +37,7 @@ pub const RuntimePaths = struct {
     native_wrapper_cef: []const u8,
     asar_library: []const u8,
     wgpu_library: []const u8,
+    wgpu_auxiliary_libraries: []const []const u8,
     process_helper: []const u8,
     bsdiff: []const u8,
     bspatch: []const u8,
@@ -247,6 +248,7 @@ pub fn load(
         .native_wrapper_cef = try requiredExistingPath(io, allocator, core_root, runtime, "nativeWrapperCef", .file),
         .asar_library = try requiredExistingPath(io, allocator, core_root, runtime, "asarLibrary", .file),
         .wgpu_library = try requiredExistingPath(io, allocator, core_root, runtime, "wgpuLibrary", .file),
+        .wgpu_auxiliary_libraries = try optionalExistingPaths(io, allocator, core_root, runtime, "wgpuAuxiliaryLibraries", .file),
         .process_helper = try requiredExistingPath(io, allocator, core_root, runtime, "processHelper", .file),
         .bsdiff = try requiredExistingPath(io, allocator, core_root, runtime, "bsdiff", .file),
         .bspatch = try requiredExistingPath(io, allocator, core_root, runtime, "bspatch", .file),
@@ -868,6 +870,26 @@ fn requiredExistingPath(
     kind: ExpectedPathKind,
 ) ![]const u8 {
     return existingPath(io, allocator, core_root, try requiredString(object, field), kind);
+}
+
+fn optionalExistingPaths(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    core_root: []const u8,
+    object: std.json.ObjectMap,
+    field: []const u8,
+    kind: ExpectedPathKind,
+) ![]const []const u8 {
+    const value = object.get(field) orelse return &.{};
+    if (value != .array) return error.InvalidElectrobunDevkitManifest;
+    const paths = try allocator.alloc([]const u8, value.array.items.len);
+    for (value.array.items, 0..) |item, index| {
+        if (item != .string or item.string.len == 0) {
+            return error.InvalidElectrobunDevkitManifest;
+        }
+        paths[index] = try existingPath(io, allocator, core_root, item.string, kind);
+    }
+    return paths;
 }
 
 fn existingPath(
