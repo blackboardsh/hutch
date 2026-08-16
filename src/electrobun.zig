@@ -4148,6 +4148,9 @@ fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform
         try std.fmt.allocPrint(ctx.allocator, "-out:{s}", .{odin_out_bin}),
         try std.fmt.allocPrint(ctx.allocator, "-collection:{s}={s}", .{ odin_collection_name, odin_sdk_collection }),
     });
+    if (odinMainStackLinkerArg(builtin.os.tag)) |arg| {
+        try argv.append(ctx.allocator, arg);
+    }
     if (config.build_env != .dev) {
         try argv.append(ctx.allocator, "-o:size");
     }
@@ -4171,6 +4174,22 @@ fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform
 
     if (!pathExists(ctx.io, odin_out_bin)) return error.OdinMainBinaryNotFound;
     return odin_out_bin;
+}
+
+fn odinMainStackLinkerArg(os_tag: std.Target.Os.Tag) ?[]const u8 {
+    // link.exe's 1 MiB default is easy for a native Odin host with a large
+    // dispatcher to exhaust. Reserving virtual address space is cheap on x64
+    // and brings Windows in line with typical Unix main-thread stacks.
+    return if (os_tag == .windows) "-extra-linker-flags:/STACK:8388608" else null;
+}
+
+test "Windows Odin main processes reserve an eight MiB stack" {
+    try std.testing.expectEqualStrings(
+        "-extra-linker-flags:/STACK:8388608",
+        odinMainStackLinkerArg(.windows).?,
+    );
+    try std.testing.expect(odinMainStackLinkerArg(.linux) == null);
+    try std.testing.expect(odinMainStackLinkerArg(.macos) == null);
 }
 
 fn copyBundledPreloadScripts(
