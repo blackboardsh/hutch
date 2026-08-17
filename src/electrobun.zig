@@ -784,6 +784,12 @@ fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
         .follow_symlinks = false,
     }) catch |err| switch (err) {
         error.WouldBlock => {
+            // Never wait for the project lock while retaining a managed object
+            // lease. A cold peer can hold this lock while taking the same
+            // object's exclusive publication lock, so the reverse order would
+            // deadlock. Preparation after the wait revalidates and re-leases
+            // the invalidated devkit before using it again.
+            suspendManagedRootLeasesBeforeProjectBuildLockWait(ctx);
             ctx.writeStdout("[electrobun] Waiting for the project build lock...\n", .{});
             return locks.openFile(ctx.io, "electrobun-build.lock", .{
                 .mode = .read_write,
@@ -793,6 +799,21 @@ fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
         },
         else => return err,
     };
+}
+
+fn suspendManagedRootLeasesBeforeProjectBuildLockWait(ctx: *const Context) void {
+    const managed_leases = ctx.managed_root_leases orelse return;
+    var suspended = false;
+    for (managed_leases.items) |*managed| {
+        if (managed.lease) |lease| {
+            lease.close(ctx.io);
+            managed.lease = null;
+            suspended = true;
+        }
+    }
+    if (suspended) {
+        if (ctx.cached_managed_devkit) |cached| cached.* = null;
+    }
 }
 
 fn projectBuildLockContext(ctx: *const Context) Context {

@@ -209,7 +209,11 @@ export default {
         "utf8",
       );
       assert.match(registration, /hutch-project-registration/);
-      assert.match(registration, new RegExp(`releases/electrobun/${version}/${host.key}`));
+      assert.equal(
+        JSON.parse(registration).projectLockSha256,
+        createHash("sha256").update(dependencyLock).digest("hex"),
+        "the global registration must authenticate the project dependency lock",
+      );
 
       assert.ok(existsSync(releaseRoot), "a registered exact devkit must remain installed");
 
