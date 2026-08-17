@@ -980,6 +980,7 @@ const max_release_download_bytes = 2 * 1024 * 1024 * 1024;
 
 const BundleHashEntry = struct {
     relative_path: []const u8,
+    kind: std.Io.File.Kind,
 
     fn lessThan(_: void, lhs: BundleHashEntry, rhs: BundleHashEntry) bool {
         return std.mem.order(u8, lhs.relative_path, rhs.relative_path) == .lt;
@@ -989,7 +990,18 @@ const BundleHashEntry = struct {
 fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
-    const hash = try hashBundle(ctx, bundle.bundle_root);
+    const app_file_name = try artifactAppFileName(ctx, config);
+    const semantic_fields = [_][]const u8{
+        try getAppIdentifier(ctx, config.root),
+        try getAppName(ctx, config.root),
+        try getAppVersion(ctx, config.root),
+        buildEnvironmentName(config.build_env),
+        releaseBaseUrl(config.root),
+        osName(),
+        archName(),
+        app_file_name,
+    };
+    const hash = try hashBundle(ctx, bundle.bundle_root, &semantic_fields);
     try writeVersionMetadata(ctx, config, bundle, hash);
     const flatpak_payload_path = if (builtin.os.tag == .linux and flatpakEnabled(config.root))
         try stageFlatpakPayload(ctx, bundle)
@@ -1004,7 +1016,6 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
         }
     }
 
-    const app_file_name = try artifactAppFileName(ctx, config);
     const tar_name = if (builtin.os.tag == .macos)
         try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, ".app.tar" })
     else
@@ -1090,7 +1101,11 @@ fn shouldCreateDmg(config: CommandContext) bool {
     return builtin.os.tag == .macos and platformConfigBool(config.root, "createDmg", true);
 }
 
-fn hashBundle(ctx: *const Context, bundle_root: []const u8) ![]const u8 {
+fn hashBundle(
+    ctx: *const Context,
+    bundle_root: []const u8,
+    semantic_fields: []const []const u8,
+) ![]const u8 {
     var entries: std.ArrayList(BundleHashEntry) = .empty;
     var dir = try std.Io.Dir.openDirAbsolute(ctx.io, bundle_root, .{ .iterate = true });
     defer dir.close(ctx.io);
@@ -1098,32 +1113,87 @@ fn hashBundle(ctx: *const Context, bundle_root: []const u8) ![]const u8 {
     defer walker.deinit();
 
     while (try walker.next(ctx.io)) |entry| {
-        if (entry.kind != .file) continue;
+        const kind = if (entry.kind == .unknown)
+            (try dir.statFile(ctx.io, entry.path, .{ .follow_symlinks = false })).kind
+        else
+            entry.kind;
+        switch (kind) {
+            .file, .directory, .sym_link => {},
+            else => return error.UnsupportedBundleEntry,
+        }
         try entries.append(ctx.allocator, .{
             .relative_path = try ctx.allocator.dupe(u8, entry.path),
+            .kind = kind,
         });
     }
     std.mem.sort(BundleHashEntry, entries.items, {}, BundleHashEntry.lessThan);
 
-    var hasher = std.hash.Wyhash.init(43770);
+    // Update hashes are durable release identities. A non-cryptographic
+    // streaming hash can converge after a long common suffix, causing two
+    // different bundles to look identical to installed clients. Hash an
+    // unambiguous path/size/content stream with SHA-256, then retain the
+    // established <=13-character base36 contract by taking 64 digest bits.
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var reader_buffer: [64 * 1024]u8 = undefined;
     var content_buffer: [64 * 1024]u8 = undefined;
+    var length_buffer: [8]u8 = undefined;
+    hasher.update("electrobun.bundle.sha256.v1");
+    for (semantic_fields) |field| {
+        std.mem.writeInt(u64, &length_buffer, @intCast(field.len), .big);
+        hasher.update(&length_buffer);
+        hasher.update(field);
+    }
     for (entries.items) |entry| {
+        std.mem.writeInt(u64, &length_buffer, @intCast(entry.relative_path.len), .big);
+        hasher.update(&length_buffer);
         hasher.update(entry.relative_path);
-        hasher.update(&.{0});
-        const absolute_path = try std.fs.path.join(ctx.allocator, &.{ bundle_root, entry.relative_path });
-        const file = try std.Io.Dir.openFileAbsolute(ctx.io, absolute_path, .{});
-        defer file.close(ctx.io);
-        var reader = file.reader(ctx.io, &reader_buffer);
-        while (true) {
-            const count = try reader.interface.readSliceShort(&content_buffer);
-            if (count == 0) break;
-            hasher.update(content_buffer[0..count]);
+        const kind_tag: u8 = switch (entry.kind) {
+            .file => 1,
+            .directory => 2,
+            .sym_link => 3,
+            else => unreachable,
+        };
+        hasher.update(&.{kind_tag});
+        const stat = try dir.statFile(ctx.io, entry.relative_path, .{ .follow_symlinks = false });
+        const executable_mode: u16 = if (comptime std.Io.File.Permissions.has_executable_bit)
+            @intCast(stat.permissions.toMode() & 0o111)
+        else
+            0;
+        var mode_buffer: [2]u8 = undefined;
+        std.mem.writeInt(u16, &mode_buffer, executable_mode, .big);
+        hasher.update(&mode_buffer);
+
+        switch (entry.kind) {
+            .file => {
+                std.mem.writeInt(u64, &length_buffer, stat.size, .big);
+                hasher.update(&length_buffer);
+                const file = try dir.openFile(ctx.io, entry.relative_path, .{});
+                defer file.close(ctx.io);
+                var reader = file.reader(ctx.io, &reader_buffer);
+                while (true) {
+                    const count = try reader.interface.readSliceShort(&content_buffer);
+                    if (count == 0) break;
+                    hasher.update(content_buffer[0..count]);
+                }
+            },
+            .sym_link => {
+                var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const target_length = try dir.readLink(ctx.io, entry.relative_path, &target_buffer);
+                std.mem.writeInt(u64, &length_buffer, @intCast(target_length), .big);
+                hasher.update(&length_buffer);
+                hasher.update(target_buffer[0..target_length]);
+            },
+            .directory => {
+                std.mem.writeInt(u64, &length_buffer, 0, .big);
+                hasher.update(&length_buffer);
+            },
+            else => unreachable,
         }
-        hasher.update(&.{0xff});
     }
 
-    return formatBase36(ctx.allocator, hasher.final());
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return formatBase36(ctx.allocator, std.mem.readInt(u64, digest[0..8], .big));
 }
 
 fn formatBase36(allocator: std.mem.Allocator, input: u64) ![]const u8 {
@@ -1159,6 +1229,11 @@ fn writeVersionMetadata(
     try object.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
     try object.put(ctx.allocator, "baseUrl", .{ .string = releaseBaseUrl(config.root) });
     try object.put(ctx.allocator, "name", .{ .string = try artifactAppFileName(ctx, config) });
+    // `name` is the channel-qualified filesystem artifact name retained for
+    // updater compatibility. Native update integration needs the developer's
+    // original display name so shortcuts and uninstall UI do not inherit that
+    // sanitized filename during a v1-layout migration.
+    try object.put(ctx.allocator, "displayName", .{ .string = try getAppName(ctx, config.root) });
     try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config.root) });
     const json = try std.json.Stringify.valueAlloc(
         ctx.allocator,
@@ -2486,16 +2561,21 @@ fn writeReleaseArtifacts(
     const artifact_root = try artifactOutputRoot(ctx, config.root);
     try recreateDirWithin(ctx, ctx.project_root, artifact_root);
     const prefix = try releasePlatformPrefix(ctx, config);
-
-    var update: std.json.ObjectMap = .empty;
-    try update.put(ctx.allocator, "version", .{ .string = try getAppVersion(ctx, config.root) });
-    try update.put(ctx.allocator, "hash", .{ .string = state.hash });
-    try update.put(ctx.allocator, "platform", .{ .string = osName() });
-    try update.put(ctx.allocator, "arch", .{ .string = archName() });
-    const update_json = try std.json.Stringify.valueAlloc(
-        ctx.allocator,
-        std.json.Value{ .object = update },
-        .{},
+    const compressed_artifact_name = try std.mem.concat(ctx.allocator, u8, &.{
+        prefix,
+        "-",
+        std.fs.path.basename(state.compressed_tar_path),
+    });
+    const update_json = try releaseUpdateJson(
+        ctx,
+        try getAppIdentifier(ctx, config.root),
+        buildEnvironmentName(config.build_env),
+        try getAppVersion(ctx, config.root),
+        state.hash,
+        osName(),
+        archName(),
+        compressed_artifact_name,
+        state.compressed_tar_path,
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(
@@ -2504,6 +2584,36 @@ fn writeReleaseArtifacts(
         ),
         .data = update_json,
     });
+
+    const legacy_stable_prefix = if (config.build_env == .production)
+        try std.fmt.allocPrint(ctx.allocator, "stable-{s}-{s}", .{ osName(), archName() })
+    else
+        null;
+    if (legacy_stable_prefix) |legacy_prefix| {
+        const legacy_artifact_name = try std.mem.concat(ctx.allocator, u8, &.{
+            legacy_prefix,
+            "-",
+            std.fs.path.basename(state.compressed_tar_path),
+        });
+        const legacy_update_json = try releaseUpdateJson(
+            ctx,
+            try getAppIdentifier(ctx, config.root),
+            buildEnvironmentName(config.build_env),
+            try getAppVersion(ctx, config.root),
+            state.hash,
+            osName(),
+            archName(),
+            legacy_artifact_name,
+            state.compressed_tar_path,
+        );
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{
+            .sub_path = try std.fs.path.join(
+                ctx.allocator,
+                &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ legacy_prefix, "-update.json" }) },
+            ),
+            .data = legacy_update_json,
+        });
+    }
 
     const candidates = [_]?[]const u8{
         state.compressed_tar_path,
@@ -2518,8 +2628,74 @@ fn writeReleaseArtifacts(
             &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-", std.fs.path.basename(source) }) },
         );
         try copyPathWithin(ctx, artifact_root, source, destination);
+        if (legacy_stable_prefix) |legacy_prefix| {
+            const is_update_payload = std.mem.eql(u8, source, state.compressed_tar_path) or
+                (state.patch_path != null and std.mem.eql(u8, source, state.patch_path.?));
+            if (is_update_payload) {
+                const legacy_destination = try std.fs.path.join(
+                    ctx.allocator,
+                    &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ legacy_prefix, "-", std.fs.path.basename(source) }) },
+                );
+                try copyPathWithin(ctx, artifact_root, source, legacy_destination);
+            }
+        }
         std.Io.Dir.cwd().deleteFile(ctx.io, source) catch {};
     }
+}
+
+fn releaseUpdateJson(
+    ctx: *const Context,
+    identifier: []const u8,
+    channel: []const u8,
+    version: []const u8,
+    hash: []const u8,
+    platform: []const u8,
+    arch: []const u8,
+    artifact_name: []const u8,
+    artifact_path: []const u8,
+) ![]const u8 {
+    const artifact_stat = try std.Io.Dir.cwd().statFile(ctx.io, artifact_path, .{});
+    if (artifact_stat.kind != .file) return error.InvalidReleaseArtifact;
+    const artifact_sha256 = try fileSha256(ctx, artifact_path);
+
+    var artifact: std.json.ObjectMap = .empty;
+    try artifact.put(ctx.allocator, "file", .{ .string = artifact_name });
+    try artifact.put(ctx.allocator, "size", .{ .integer = @intCast(artifact_stat.size) });
+    try artifact.put(ctx.allocator, "sha256", .{ .string = artifact_sha256 });
+
+    var update: std.json.ObjectMap = .empty;
+    try update.put(ctx.allocator, "schemaVersion", .{ .integer = 1 });
+    try update.put(ctx.allocator, "identifier", .{ .string = identifier });
+    try update.put(ctx.allocator, "channel", .{ .string = channel });
+    try update.put(ctx.allocator, "version", .{ .string = version });
+    try update.put(ctx.allocator, "hash", .{ .string = hash });
+    try update.put(ctx.allocator, "platform", .{ .string = platform });
+    try update.put(ctx.allocator, "arch", .{ .string = arch });
+    try update.put(ctx.allocator, "artifact", .{ .object = artifact });
+    return std.json.Stringify.valueAlloc(
+        ctx.allocator,
+        std.json.Value{ .object = update },
+        .{},
+    );
+}
+
+fn fileSha256(ctx: *const Context, path: []const u8) ![]const u8 {
+    const file = try std.Io.Dir.openFileAbsolute(ctx.io, path, .{});
+    defer file.close(ctx.io);
+
+    var reader_buffer: [64 * 1024]u8 = undefined;
+    var content_buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(ctx.io, &reader_buffer);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    while (true) {
+        const count = try reader.interface.readSliceShort(&content_buffer);
+        if (count == 0) break;
+        hasher.update(content_buffer[0..count]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return ctx.allocator.dupe(u8, &encoded);
 }
 
 fn runBuiltApp(
@@ -5078,7 +5254,9 @@ fn validateSafeOutputSegment(value: []const u8) !void {
         return error.UnsafeOutputPath;
     }
     for (value) |byte| {
-        if (byte == 0 or byte == '/' or byte == '\\' or byte == ':') return error.UnsafeOutputPath;
+        if (byte <= 31 or byte == 127 or byte == '/' or byte == '\\' or byte == ':') {
+            return error.UnsafeOutputPath;
+        }
     }
     if (isWindowsDeviceOutputSegment(value)) return error.UnsafeOutputPath;
 }
@@ -5299,6 +5477,9 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
 
     for ([_][]const u8{ "", ".", "..", ". ", ".. ", "a/../b", "a\\..\\b", "/tmp/out", "C:\\out", "C:out", "safe/file:stream" }) |path| {
         try std.testing.expectError(error.UnsafeOutputPath, validateSafeRelativeOutputPath(path));
+    }
+    for ([_][]const u8{ "line\nbreak", "tab\tname", "delete\x7fbyte" }) |name| {
+        try std.testing.expectError(error.UnsafeOutputPath, validateSafeOutputSegment(name));
     }
 
     for ([_][]const u8{
@@ -7380,13 +7561,320 @@ test "release bundle hashes are deterministic and content sensitive" {
         .project_root = absolute_root,
     };
 
-    const first = try hashBundle(&ctx, bundle_root);
-    const second = try hashBundle(&ctx, bundle_root);
-    try std.testing.expectEqualStrings(first, second);
+    const semantic_fields = [_][]const u8{
+        "com.example.application",
+        "Example App",
+        "1.0.0",
+        "production",
+        "https://updates.example.test",
+        osName(),
+        archName(),
+        "ExampleApp",
+    };
+    const changed_semantic_fields = [_][]const u8{
+        "com.example.application",
+        "Example App",
+        "2.0.0",
+        "production",
+        "https://updates.example.test",
+        osName(),
+        archName(),
+        "ExampleApp",
+    };
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "bundle/nested/a.txt", .data = "changed" });
-    const changed = try hashBundle(&ctx, bundle_root);
+    const first = try hashBundle(&ctx, bundle_root, &semantic_fields);
+    const second = try hashBundle(&ctx, bundle_root, &semantic_fields);
+    try std.testing.expectEqualStrings(first, second);
+    const metadata_changed = try hashBundle(&ctx, bundle_root, &changed_semantic_fields);
+    try std.testing.expect(!std.mem.eql(u8, first, metadata_changed));
+
+    // A content hash must change even when the replacement has the same byte
+    // length; update identity cannot rely on file sizes or timestamps.
+    try tmp.dir.writeFile(io, .{ .sub_path = "bundle/nested/a.txt", .data = "other" });
+    const changed = try hashBundle(&ctx, bundle_root, &semantic_fields);
     try std.testing.expect(!std.mem.eql(u8, first, changed));
+
+    // Separate build roots with the same relative paths must have the same
+    // content sensitivity as an in-place rebuild.
+    try tmp.dir.createDirPath(io, "other-bundle/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = "other-bundle/z.txt", .data = "last" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other-bundle/nested/a.txt", .data = "first" });
+    const other_bundle_root = try std.fs.path.join(allocator, &.{ absolute_root, "other-bundle" });
+    const other_first = try hashBundle(&ctx, other_bundle_root, &semantic_fields);
+    try std.testing.expectEqualStrings(first, other_first);
+    try tmp.dir.writeFile(io, .{ .sub_path = "other-bundle/nested/a.txt", .data = "other" });
+    const other_changed = try hashBundle(&ctx, other_bundle_root, &semantic_fields);
+    try std.testing.expectEqualStrings(changed, other_changed);
+
+    // Exercise incremental hashing around large neighboring files, matching a
+    // packaged app where a small resource is surrounded by runtime binaries.
+    var large_contents: [128 * 1024]u8 = undefined;
+    @memset(&large_contents, 0x5a);
+    try tmp.dir.createDirPath(io, "large-bundle/Resources/app");
+    try tmp.dir.createDirPath(io, "large-bundle/bin");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "large-bundle/Resources/app/marker.txt",
+        .data = "fixture 1.0.0",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "large-bundle/bin/runtime.exe",
+        .data = &large_contents,
+    });
+    const large_bundle_root = try std.fs.path.join(allocator, &.{ absolute_root, "large-bundle" });
+    const large_first = try hashBundle(&ctx, large_bundle_root, &semantic_fields);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "large-bundle/Resources/app/marker.txt",
+        .data = "fixture 2.0.0",
+    });
+    const large_changed = try hashBundle(&ctx, large_bundle_root, &semantic_fields);
+    try std.testing.expect(!std.mem.eql(u8, large_first, large_changed));
+
+    // This compact pair collided under the previous path/NUL/content/FF
+    // streaming Wyhash implementation. Keep it as a direct regression for
+    // update identity rather than relying only on ordinary text changes.
+    var collision_suffix: [29]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &collision_suffix,
+        "4d0f45c24c89e848c1c02048b9db28b4a0d17e03e74831c848ba2c8d78",
+    );
+    var collision_a: [30]u8 = undefined;
+    var collision_b: [30]u8 = undefined;
+    collision_a[0] = '1';
+    collision_b[0] = '2';
+    @memcpy(collision_a[1..], &collision_suffix);
+    @memcpy(collision_b[1..], &collision_suffix);
+    try tmp.dir.createDirPath(io, "collision-a");
+    try tmp.dir.createDirPath(io, "collision-b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "collision-a/a", .data = &collision_a });
+    try tmp.dir.writeFile(io, .{ .sub_path = "collision-b/a", .data = &collision_b });
+    const collision_a_root = try std.fs.path.join(allocator, &.{ absolute_root, "collision-a" });
+    const collision_b_root = try std.fs.path.join(allocator, &.{ absolute_root, "collision-b" });
+    const collision_a_hash = try hashBundle(&ctx, collision_a_root, &semantic_fields);
+    const collision_b_hash = try hashBundle(&ctx, collision_b_root, &semantic_fields);
+    try std.testing.expect(!std.mem.eql(u8, collision_a_hash, collision_b_hash));
+
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.createDirPath(io, "link-a");
+        try tmp.dir.createDirPath(io, "link-b");
+        try tmp.dir.symLink(io, "target-one", "link-a/current", .{});
+        try tmp.dir.symLink(io, "target-two", "link-b/current", .{});
+        const link_a_root = try std.fs.path.join(allocator, &.{ absolute_root, "link-a" });
+        const link_b_root = try std.fs.path.join(allocator, &.{ absolute_root, "link-b" });
+        const link_a_hash = try hashBundle(&ctx, link_a_root, &semantic_fields);
+        const link_b_hash = try hashBundle(&ctx, link_b_root, &semantic_fields);
+        try std.testing.expect(!std.mem.eql(u8, link_a_hash, link_b_hash));
+
+        try tmp.dir.createDirPath(io, "mode-bundle");
+        try tmp.dir.writeFile(io, .{ .sub_path = "mode-bundle/tool", .data = "same bytes" });
+        const mode_root = try std.fs.path.join(allocator, &.{ absolute_root, "mode-bundle" });
+        const non_executable_hash = try hashBundle(&ctx, mode_root, &semantic_fields);
+        const mode_file = try tmp.dir.openFile(io, "mode-bundle/tool", .{ .mode = .read_write });
+        try mode_file.setPermissions(io, @enumFromInt(0o755));
+        mode_file.close(io);
+        const executable_hash = try hashBundle(&ctx, mode_root, &semantic_fields);
+        try std.testing.expect(!std.mem.eql(u8, non_executable_hash, executable_hash));
+    }
+}
+
+test "release update metadata pins identity and compressed artifact integrity" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "bundle.tar.zst", .data = "compressed update payload" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const artifact_path = try std.fs.path.join(allocator, &.{ absolute_root, "bundle.tar.zst" });
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = absolute_root,
+    };
+
+    const json = try releaseUpdateJson(
+        &ctx,
+        "com.example.update",
+        "canary",
+        "2.0.0",
+        "abc123",
+        "win",
+        "x64",
+        "canary-win-x64-Example-canary.tar.zst",
+        artifact_path,
+    );
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+    const update = parsed.object;
+    try std.testing.expectEqual(@as(i64, 1), update.get("schemaVersion").?.integer);
+    try std.testing.expectEqualStrings("com.example.update", update.get("identifier").?.string);
+    try std.testing.expectEqualStrings("canary", update.get("channel").?.string);
+    try std.testing.expectEqualStrings("2.0.0", update.get("version").?.string);
+    try std.testing.expectEqualStrings("abc123", update.get("hash").?.string);
+    try std.testing.expectEqualStrings("win", update.get("platform").?.string);
+    try std.testing.expectEqualStrings("x64", update.get("arch").?.string);
+
+    const artifact = update.get("artifact").?.object;
+    try std.testing.expectEqualStrings(
+        "canary-win-x64-Example-canary.tar.zst",
+        artifact.get("file").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(i64, "compressed update payload".len),
+        artifact.get("size").?.integer,
+    );
+    var expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("compressed update payload", &expected_digest, .{});
+    const expected_sha256 = std.fmt.bytesToHex(expected_digest, .lower);
+    try std.testing.expectEqualStrings(&expected_sha256, artifact.get("sha256").?.string);
+}
+
+test "release version metadata keeps display and artifact names distinct" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const project_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const resources_dir = try std.fs.path.join(allocator, &.{ project_root, "Resources" });
+    try std.Io.Dir.cwd().createDirPath(io, resources_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "app":{"name":"Migration App","identifier":"com.example.migration","version":"2.0.0"},
+        \\  "release":{"baseUrl":"https://updates.example.test"}
+        \\}
+    ,
+        .{},
+    );
+    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .canary };
+    const bundle = AppBundlePaths{
+        .build_root = project_root,
+        .bundle_root = project_root,
+        .exec_dir = project_root,
+        .resources_dir = resources_dir,
+        .frameworks_dir = null,
+        .app_code_dir = project_root,
+    };
+
+    try writeVersionMetadata(&ctx, config, bundle, "abc123");
+    const version_path = try std.fs.path.join(allocator, &.{ resources_dir, "version.json" });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, version_path, allocator, .limited(64 * 1024));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
+    try std.testing.expectEqualStrings(
+        "MigrationApp-canary",
+        parsed.object.get("name").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "Migration App",
+        parsed.object.get("displayName").?.string,
+    );
+}
+
+test "production releases publish stable update aliases for Electrobun 1.x clients" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const compressed_path = try std.fs.path.join(allocator, &.{ absolute_root, "MigrationApp.tar.zst" });
+    const patch_path = try std.fs.path.join(allocator, &.{ absolute_root, "oldhash.patch" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = compressed_path, .data = "compressed" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patch_path, .data = "patch" });
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &env_map,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = absolute_root,
+    };
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "app":{"name":"Migration App","identifier":"com.example.migration","version":"2.0.0"},
+        \\  "build":{"artifactFolder":"artifacts"}
+        \\}
+    ,
+        .{},
+    );
+    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .production };
+    const unused_bundle = AppBundlePaths{
+        .build_root = absolute_root,
+        .bundle_root = absolute_root,
+        .exec_dir = absolute_root,
+        .resources_dir = absolute_root,
+        .frameworks_dir = null,
+        .app_code_dir = absolute_root,
+    };
+    try writeReleaseArtifacts(&ctx, config, .{
+        .bundle = unused_bundle,
+        .hash = "newhash",
+        .compressed_tar_path = compressed_path,
+        .patch_path = patch_path,
+        .flatpak_payload_path = null,
+    }, null);
+
+    const artifact_root = try std.fs.path.join(allocator, &.{ absolute_root, "artifacts" });
+    const production_prefix = try std.fmt.allocPrint(allocator, "production-{s}-{s}", .{ osName(), archName() });
+    const stable_prefix = try std.fmt.allocPrint(allocator, "stable-{s}-{s}", .{ osName(), archName() });
+    for ([_][]const u8{
+        try std.mem.concat(allocator, u8, &.{ production_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ production_prefix, "-MigrationApp.tar.zst" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
+        try std.mem.concat(allocator, u8, &.{ production_prefix, "-oldhash.patch" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
+    }) |name| {
+        try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ artifact_root, name })));
+    }
+
+    const stable_update_path = try std.fs.path.join(
+        allocator,
+        &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }) },
+    );
+    const stable_bytes = try std.Io.Dir.cwd().readFileAlloc(io, stable_update_path, allocator, .limited(64 * 1024));
+    const stable_update = try std.json.parseFromSliceLeaky(std.json.Value, allocator, stable_bytes, .{});
+    try std.testing.expectEqualStrings("production", stable_update.object.get("channel").?.string);
+    try std.testing.expectEqualStrings(
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
+        stable_update.object.get("artifact").?.object.get("file").?.string,
+    );
 }
 
 test "release metadata and macOS plist preserve public app configuration" {
