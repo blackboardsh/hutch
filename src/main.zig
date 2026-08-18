@@ -1674,6 +1674,11 @@ pub fn main(init: std.process.Init) !void {
             error.LegacyBunVersionConfig,
             error.ElectrobunProductConfigMovedToHutch,
             => 1,
+            error.InvalidBuildEnvironment => blk: {
+                try stderr.writeAll("hutch electrobun: --env must be dev, canary, or stable\n");
+                try stderr.flush();
+                break :blk 1;
+            },
             else => return err,
         };
         if (exit_code != 0) std.process.exit(exit_code);

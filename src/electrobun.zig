@@ -27,7 +27,7 @@ const MainProcess = enum {
 const BuildEnvironment = enum {
     dev,
     canary,
-    production,
+    stable,
 };
 
 const MainProcessInspectorMode = enum {
@@ -240,7 +240,7 @@ pub fn run(
     const command = args[0];
 
     if (std.mem.eql(u8, command, "config")) {
-        const config = try loadConfigAfterProductDevkit(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigAfterProductDevkit(&ctx, try parseBuildEnvironment(args[1..]));
         pruneAutomaticOnce(&ctx);
         ctx.writeStdout("{s}\n", .{config.raw_json});
         return 0;
@@ -256,20 +256,20 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, command, "sync")) {
-        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
         try prepareProjectWithBuildLock(&ctx, config);
         ctx.writeStdout("electrobun sync complete: {s}/.hutch/devkit\n", .{ctx.project_root});
         return 0;
     }
 
     if (std.mem.eql(u8, command, "build")) {
-        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
         try runBuild(&ctx, config);
         return 0;
     }
 
     if (std.mem.eql(u8, command, "run")) {
-        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try runBuiltApp(&ctx, config, inspector);
         return 0;
@@ -277,13 +277,13 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "dev")) {
         if (hasFlag(args[1..], "--watch")) {
-            const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
+            const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
             const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
             try runDevWatch(&ctx, config, inspector);
             return 0;
         }
 
-        const config = try loadConfigForPreparedOperation(&ctx, parseBuildEnvironment(args[1..]));
+        const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
         const inspector = resolveMainProcessInspectorForRun(&ctx, config.root, args[1..]) catch return 1;
         try buildAndRunBuiltApp(&ctx, config, inspector);
         return 0;
@@ -311,11 +311,11 @@ fn printHelp(writer: anytype) !void {
         \\
         \\Usage:
         \\  hutch electrobun init [project-name] [--template=name] [--beta] [--skip-install]
-        \\  hutch electrobun config [--env=dev|canary|production|stable]
-        \\  hutch electrobun sync [--env=dev|canary|production|stable]
-        \\  hutch electrobun build [--env=dev|canary|production|stable]
-        \\  hutch electrobun run [--env=dev|canary|production|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
-        \\  hutch electrobun dev [--env=dev|canary|production|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
+        \\  hutch electrobun config [--env=dev|canary|stable]
+        \\  hutch electrobun sync [--env=dev|canary|stable]
+        \\  hutch electrobun build [--env=dev|canary|stable]
+        \\  hutch electrobun run [--env=dev|canary|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
+        \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
         \\  - esbuild is vendored automatically on first use as a native binary.
@@ -343,22 +343,31 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
     return false;
 }
 
-fn parseBuildEnvironment(args: []const [:0]const u8) BuildEnvironment {
+fn parseBuildEnvironment(args: []const [:0]const u8) !BuildEnvironment {
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--env=")) {
             const value = arg["--env=".len..];
+            if (std.mem.eql(u8, value, "dev")) return .dev;
             if (std.mem.eql(u8, value, "canary")) return .canary;
-            if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) return .production;
-            return .dev;
+            if (std.mem.eql(u8, value, "stable")) return .stable;
+            return error.InvalidBuildEnvironment;
         }
     }
 
     return .dev;
 }
 
-test "stable build environment resolves to production" {
+test "stable is the canonical release build environment" {
     const args = [_][:0]const u8{"--env=stable"};
-    try std.testing.expectEqual(BuildEnvironment.production, parseBuildEnvironment(&args));
+    try std.testing.expectEqual(BuildEnvironment.stable, try parseBuildEnvironment(&args));
+
+    const dev_args = [_][:0]const u8{"--env=dev"};
+    try std.testing.expectEqual(BuildEnvironment.dev, try parseBuildEnvironment(&dev_args));
+
+    try std.testing.expectEqual(BuildEnvironment.dev, try parseBuildEnvironment(&.{}));
+
+    const removed_alias = [_][:0]const u8{"--env=production"};
+    try std.testing.expectError(error.InvalidBuildEnvironment, parseBuildEnvironment(&removed_alias));
 }
 
 fn inspectorModeFromName(name: []const u8) ?MainProcessInspectorMode {
@@ -1064,7 +1073,7 @@ fn artifactAppFileName(ctx: *const Context, config: CommandContext) ![]const u8 
     const app_name = try getAppName(ctx, config.root);
     const sanitized = try removeAsciiSpaces(ctx.allocator, app_name);
     const result = try switch (config.build_env) {
-        .production => sanitized,
+        .stable => sanitized,
         .canary => std.mem.concat(ctx.allocator, u8, &.{ sanitized, "-canary" }),
         .dev => std.mem.concat(ctx.allocator, u8, &.{ sanitized, "-dev" }),
     };
@@ -1087,6 +1096,13 @@ fn releasePlatformPrefix(ctx: *const Context, config: CommandContext) ![]const u
         osName(),
         archName(),
     });
+}
+
+fn installerPlatformPrefix(ctx: *const Context, config: CommandContext) ![]const u8 {
+    if (config.build_env == .stable) {
+        return std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() });
+    }
+    return releasePlatformPrefix(ctx, config);
 }
 
 fn releaseBaseUrl(root: std.json.Value) []const u8 {
@@ -1317,6 +1333,97 @@ fn compressTar(
     );
 }
 
+const PreviousReleasePatchSource = struct {
+    hash: []const u8,
+    artifact_file: []const u8,
+};
+
+fn isElectrobunReleaseHash(value: []const u8) bool {
+    if (value.len == 0 or value.len > 13) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'z')) return false;
+    }
+    return true;
+}
+
+fn encodeUrlPathSegment(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const hex = "0123456789ABCDEF";
+    var encoded: std.ArrayList(u8) = .empty;
+    try encoded.ensureTotalCapacity(allocator, value.len);
+    for (value) |byte| {
+        const unreserved = std.ascii.isAlphanumeric(byte) or
+            byte == '-' or byte == '.' or byte == '_' or byte == '~';
+        if (unreserved) {
+            try encoded.append(allocator, byte);
+        } else {
+            try encoded.appendSlice(allocator, &.{ '%', hex[byte >> 4], hex[byte & 0x0f] });
+        }
+    }
+    return encoded.toOwnedSlice(allocator);
+}
+
+fn previousReleasePatchSource(
+    previous: std.json.Value,
+    expected_identifier: []const u8,
+    expected_channel: []const u8,
+    expected_platform: []const u8,
+    expected_arch: []const u8,
+    expected_artifact_file: []const u8,
+) ?PreviousReleasePatchSource {
+    if (previous != .object) return null;
+    const object = previous.object;
+    const platform = getStringFieldFromObject(object, "platform") orelse return null;
+    const arch = getStringFieldFromObject(object, "arch") orelse return null;
+    const hash = getStringFieldFromObject(object, "hash") orelse return null;
+    if (!std.mem.eql(u8, platform, expected_platform) or
+        !std.mem.eql(u8, arch, expected_arch) or
+        !isElectrobunReleaseHash(hash))
+    {
+        return null;
+    }
+
+    if (object.get("schemaVersion")) |schema_version| {
+        if (schema_version != .integer or schema_version.integer != 1) return null;
+        const identifier = getStringFieldFromObject(object, "identifier") orelse return null;
+        const channel = getStringFieldFromObject(object, "channel") orelse return null;
+        if (!std.mem.eql(u8, identifier, expected_identifier) or
+            !std.mem.eql(u8, channel, expected_channel))
+        {
+            return null;
+        }
+
+        const artifact = getObjectFieldFromObject(object, "artifact") orelse return null;
+        const artifact_file = getStringFieldFromObject(artifact, "file") orelse return null;
+        validateSafeOutputSegment(artifact_file) catch return null;
+        if (!std.mem.eql(u8, artifact_file, expected_artifact_file)) return null;
+        return .{ .hash = hash, .artifact_file = artifact_file };
+    }
+
+    // Electrobun 1.x manifests predate schema, identity, channel, and artifact
+    // fields. Their archive name followed the same platform-prefix convention,
+    // so use the locally derived safe name while retaining platform/arch checks.
+    if (object.get("identifier") != null or
+        object.get("channel") != null or
+        object.get("artifact") != null)
+    {
+        return null;
+    }
+    return .{ .hash = hash, .artifact_file = expected_artifact_file };
+}
+
+fn cacheBustedReleaseUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    encoded_file: []const u8,
+    cache_buster: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}?cache={s}", .{
+        base_url,
+        encoded_file,
+        cache_buster,
+    });
+}
+
 fn generateDeltaPatch(
     ctx: *const Context,
     config: CommandContext,
@@ -1338,7 +1445,13 @@ fn generateDeltaPatch(
     }
 
     const prefix = try releasePlatformPrefix(ctx, config);
-    const update_url = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-update.json", .{ base_url, prefix });
+    const compressed_name = std.fs.path.basename(try std.mem.concat(ctx.allocator, u8, &.{ current_tar_path, ".zst" }));
+    const expected_archive_file = try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-", compressed_name });
+    var cache_random: [16]u8 = undefined;
+    ctx.io.random(&cache_random);
+    const cache_buster = std.fmt.bytesToHex(cache_random, .lower);
+    const update_file = try std.fmt.allocPrint(ctx.allocator, "{s}-update.json", .{prefix});
+    const update_url = try cacheBustedReleaseUrl(ctx.allocator, base_url, update_file, &cache_buster);
     const update_bytes = fetchOptionalBytes(ctx, update_url, 1024 * 1024) catch |err| {
         ctx.writeStderr("hutch electrobun: could not fetch previous update metadata ({s}); skipping delta patch\n", .{@errorName(err)});
         return null;
@@ -1350,17 +1463,25 @@ fn generateDeltaPatch(
         ctx.writeStderr("hutch electrobun: previous update metadata is invalid; skipping delta patch\n", .{});
         return null;
     };
-    const previous_hash = getStringField(previous, "hash") orelse {
-        ctx.writeStderr("hutch electrobun: previous update metadata has no hash; skipping delta patch\n", .{});
+    const previous_source = previousReleasePatchSource(
+        previous,
+        try getAppIdentifier(ctx, config.root),
+        buildEnvironmentName(config.build_env),
+        osName(),
+        archName(),
+        expected_archive_file,
+    ) orelse {
+        ctx.writeStderr("hutch electrobun: previous update metadata does not match this release; skipping delta patch\n", .{});
         return null;
     };
 
-    const compressed_name = std.fs.path.basename(try std.mem.concat(ctx.allocator, u8, &.{ current_tar_path, ".zst" }));
-    const archive_url = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}-{s}", .{
+    const encoded_artifact_file = try encodeUrlPathSegment(ctx.allocator, previous_source.artifact_file);
+    const archive_url = try cacheBustedReleaseUrl(
+        ctx.allocator,
         base_url,
-        prefix,
-        compressed_name,
-    });
+        encoded_artifact_file,
+        &cache_buster,
+    );
     const previous_archive = fetchOptionalBytes(ctx, archive_url, max_release_download_bytes) catch |err| {
         ctx.writeStderr("hutch electrobun: could not fetch previous update bundle ({s}); skipping delta patch\n", .{@errorName(err)});
         return null;
@@ -1389,7 +1510,7 @@ fn generateDeltaPatch(
 
     const patch_path = try std.fs.path.join(
         ctx.allocator,
-        &.{ std.fs.path.dirname(current_tar_path).?, try std.mem.concat(ctx.allocator, u8, &.{ previous_hash, ".patch" }) },
+        &.{ std.fs.path.dirname(current_tar_path).?, try std.mem.concat(ctx.allocator, u8, &.{ previous_source.hash, ".patch" }) },
     );
     if (!try runReleaseCommandSuccess(
         ctx,
@@ -1598,7 +1719,7 @@ fn installLinuxBundleAssets(ctx: *const Context, config: CommandContext, bundle:
     const description = getStringFieldFromObject(app, "description") orelse app_name;
     const artifact_name = try artifactAppFileName(ctx, config);
     const display_name = switch (config.build_env) {
-        .production => app_name,
+        .stable => app_name,
         .canary => try std.fmt.allocPrint(ctx.allocator, "{s} (Canary)", .{app_name}),
         .dev => try std.fmt.allocPrint(ctx.allocator, "{s} (Development)", .{app_name}),
     };
@@ -2064,10 +2185,10 @@ fn createDmg(ctx: *const Context, config: CommandContext, bundle: AppBundlePaths
         ctx.allocator,
         &.{ bundle.build_root, try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, ".dmg" }) },
     );
-    const creation_path = if (config.build_env == .production)
+    const creation_path = if (config.build_env == .stable)
         try std.fs.path.join(
             ctx.allocator,
-            &.{ bundle.build_root, try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, "-production.dmg" }) },
+            &.{ bundle.build_root, try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, "-stable.dmg" }) },
         )
     else
         output_path;
@@ -2112,7 +2233,7 @@ fn dmgVolumeName(ctx: *const Context, config: CommandContext) ![]const u8 {
     }
     const base = try sanitized.toOwnedSlice(ctx.allocator);
     return switch (config.build_env) {
-        .production => base,
+        .stable => base,
         .canary => std.mem.concat(ctx.allocator, u8, &.{ base, "-canary" }),
         .dev => std.mem.concat(ctx.allocator, u8, &.{ base, "-dev" }),
     };
@@ -2164,7 +2285,7 @@ fn createWindowsInstaller(ctx: *const Context, config: CommandContext, state: Re
 fn windowsSetupFileName(ctx: *const Context, config: CommandContext) ![]const u8 {
     const app_name = try getAppName(ctx, config.root);
     return switch (config.build_env) {
-        .production => std.mem.concat(ctx.allocator, u8, &.{ app_name, "-Setup.exe" }),
+        .stable => std.mem.concat(ctx.allocator, u8, &.{ app_name, "-Setup.exe" }),
         .canary => std.mem.concat(ctx.allocator, u8, &.{ app_name, "-Setup-canary.exe" }),
         .dev => std.mem.concat(ctx.allocator, u8, &.{ app_name, "-Setup-dev.exe" }),
     };
@@ -2484,7 +2605,7 @@ fn writeFlatpakOutput(
     const app = getObjectField(config.root, "app") orelse return error.InvalidConfig;
     const base_app_name = try getAppName(ctx, config.root);
     const display_name = switch (config.build_env) {
-        .production => base_app_name,
+        .stable => base_app_name,
         .canary => try std.fmt.allocPrint(ctx.allocator, "{s} (Canary)", .{base_app_name}),
         .dev => try std.fmt.allocPrint(ctx.allocator, "{s} (Development)", .{base_app_name}),
     };
@@ -2582,6 +2703,7 @@ fn writeReleaseArtifacts(
     const artifact_root = try artifactOutputRoot(ctx, config.root);
     try recreateDirWithin(ctx, ctx.project_root, artifact_root);
     const prefix = try releasePlatformPrefix(ctx, config);
+    const installer_prefix = try installerPlatformPrefix(ctx, config);
     const compressed_artifact_name = try std.mem.concat(ctx.allocator, u8, &.{
         prefix,
         "-",
@@ -2596,7 +2718,6 @@ fn writeReleaseArtifacts(
         osName(),
         archName(),
         compressed_artifact_name,
-        state.compressed_tar_path,
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(
@@ -2606,36 +2727,6 @@ fn writeReleaseArtifacts(
         .data = update_json,
     });
 
-    const legacy_stable_prefix = if (config.build_env == .production)
-        try std.fmt.allocPrint(ctx.allocator, "stable-{s}-{s}", .{ osName(), archName() })
-    else
-        null;
-    if (legacy_stable_prefix) |legacy_prefix| {
-        const legacy_artifact_name = try std.mem.concat(ctx.allocator, u8, &.{
-            legacy_prefix,
-            "-",
-            std.fs.path.basename(state.compressed_tar_path),
-        });
-        const legacy_update_json = try releaseUpdateJson(
-            ctx,
-            try getAppIdentifier(ctx, config.root),
-            buildEnvironmentName(config.build_env),
-            try getAppVersion(ctx, config.root),
-            state.hash,
-            osName(),
-            archName(),
-            legacy_artifact_name,
-            state.compressed_tar_path,
-        );
-        try std.Io.Dir.cwd().writeFile(ctx.io, .{
-            .sub_path = try std.fs.path.join(
-                ctx.allocator,
-                &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ legacy_prefix, "-update.json" }) },
-            ),
-            .data = legacy_update_json,
-        });
-    }
-
     const candidates = [_]?[]const u8{
         state.compressed_tar_path,
         state.patch_path,
@@ -2644,22 +2735,15 @@ fn writeReleaseArtifacts(
     for (candidates) |candidate| {
         const source = candidate orelse continue;
         if (!pathExists(ctx.io, source)) continue;
+        const destination_prefix = if (installer_path != null and std.mem.eql(u8, source, installer_path.?))
+            installer_prefix
+        else
+            prefix;
         const destination = try std.fs.path.join(
             ctx.allocator,
-            &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-", std.fs.path.basename(source) }) },
+            &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ destination_prefix, "-", std.fs.path.basename(source) }) },
         );
         try copyPathWithin(ctx, artifact_root, source, destination);
-        if (legacy_stable_prefix) |legacy_prefix| {
-            const is_update_payload = std.mem.eql(u8, source, state.compressed_tar_path) or
-                (state.patch_path != null and std.mem.eql(u8, source, state.patch_path.?));
-            if (is_update_payload) {
-                const legacy_destination = try std.fs.path.join(
-                    ctx.allocator,
-                    &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ legacy_prefix, "-", std.fs.path.basename(source) }) },
-                );
-                try copyPathWithin(ctx, artifact_root, source, legacy_destination);
-            }
-        }
         std.Io.Dir.cwd().deleteFile(ctx.io, source) catch {};
     }
 }
@@ -2673,16 +2757,9 @@ fn releaseUpdateJson(
     platform: []const u8,
     arch: []const u8,
     artifact_name: []const u8,
-    artifact_path: []const u8,
 ) ![]const u8 {
-    const artifact_stat = try std.Io.Dir.cwd().statFile(ctx.io, artifact_path, .{});
-    if (artifact_stat.kind != .file) return error.InvalidReleaseArtifact;
-    const artifact_sha256 = try fileSha256(ctx, artifact_path);
-
     var artifact: std.json.ObjectMap = .empty;
     try artifact.put(ctx.allocator, "file", .{ .string = artifact_name });
-    try artifact.put(ctx.allocator, "size", .{ .integer = @intCast(artifact_stat.size) });
-    try artifact.put(ctx.allocator, "sha256", .{ .string = artifact_sha256 });
 
     var update: std.json.ObjectMap = .empty;
     try update.put(ctx.allocator, "schemaVersion", .{ .integer = 1 });
@@ -2698,25 +2775,6 @@ fn releaseUpdateJson(
         std.json.Value{ .object = update },
         .{},
     );
-}
-
-fn fileSha256(ctx: *const Context, path: []const u8) ![]const u8 {
-    const file = try std.Io.Dir.openFileAbsolute(ctx.io, path, .{});
-    defer file.close(ctx.io);
-
-    var reader_buffer: [64 * 1024]u8 = undefined;
-    var content_buffer: [64 * 1024]u8 = undefined;
-    var reader = file.reader(ctx.io, &reader_buffer);
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    while (true) {
-        const count = try reader.interface.readSliceShort(&content_buffer);
-        if (count == 0) break;
-        hasher.update(content_buffer[0..count]);
-    }
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    const encoded = std.fmt.bytesToHex(digest, .lower);
-    return ctx.allocator.dupe(u8, &encoded);
 }
 
 fn runBuiltApp(
@@ -3672,7 +3730,7 @@ test "Rust Cargo profiles map to deterministic artifact directories" {
     try std.testing.expectEqualStrings("dev", rustCargoProfile(.dev));
     try std.testing.expectEqualStrings("debug", rustCargoOutputProfile(.dev));
     try std.testing.expectEqualStrings("release", rustCargoProfile(.canary));
-    try std.testing.expectEqualStrings("release", rustCargoOutputProfile(.production));
+    try std.testing.expectEqualStrings("release", rustCargoOutputProfile(.stable));
     try std.testing.expect(validCargoBinaryName("desktop-main"));
     try std.testing.expect(validCargoBinaryName("desktop_main2"));
     try std.testing.expect(!validCargoBinaryName("."));
@@ -4129,7 +4187,7 @@ test "Go v2 build arguments use the project module package" {
         "/toolchains/go/bin/go",
         "/project/build/main",
         "./src/go",
-        .production,
+        .stable,
     );
     const expected = [_][]const u8{
         "/toolchains/go/bin/go",
@@ -5464,7 +5522,7 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
     try validateOutputConfiguration(&ctx, .{
         .raw_json = valid_json,
         .root = valid_root,
-        .build_env = .production,
+        .build_env = .stable,
     });
 
     const cases = [_][]const u8{
@@ -5492,7 +5550,7 @@ test "output configuration accepts nested paths and rejects traversal-capable fi
         try std.testing.expectError(error.UnsafeOutputPath, validateOutputConfiguration(&ctx, .{
             .raw_json = config_json,
             .root = root,
-            .build_env = .production,
+            .build_env = .stable,
         }));
     }
 
@@ -5561,7 +5619,7 @@ test "output mutation refuses project roots parents and symlink escapes" {
 
     const build_link = try std.fs.path.join(allocator, &.{ project_root, "build" });
     try std.Io.Dir.cwd().symLink(io, outside_root, build_link, .{ .is_directory = true });
-    const escaped_build = try std.fs.path.join(allocator, &.{ build_link, "production" });
+    const escaped_build = try std.fs.path.join(allocator, &.{ build_link, "stable" });
     try std.testing.expectError(error.UnsafeOutputPath, recreateDirWithin(&ctx, project_root, escaped_build));
 
     const output_root = try std.fs.path.join(allocator, &.{ project_root, "output" });
@@ -5670,7 +5728,7 @@ fn buildEnvironmentName(build_env: BuildEnvironment) []const u8 {
     return switch (build_env) {
         .dev => "dev",
         .canary => "canary",
-        .production => "production",
+        .stable => "stable",
     };
 }
 
@@ -6165,7 +6223,7 @@ fn bundleDisplayName(ctx: *const Context, config: CommandContext) ![]const u8 {
 fn appDisplayName(ctx: *const Context, config: CommandContext) ![]const u8 {
     const app_name = try getAppName(ctx, config.root);
     return switch (config.build_env) {
-        .production => app_name,
+        .stable => app_name,
         else => std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ app_name, buildEnvironmentName(config.build_env) }),
     };
 }
@@ -7128,10 +7186,10 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     const packaged_json = try bundledRuntimeMetadataJson(&ctx, .{
         .raw_json = "",
         .root = packaged_root,
-        .build_env = .production,
+        .build_env = .stable,
     }, provenance);
     const packaged = try std.json.parseFromSliceLeaky(std.json.Value, allocator, packaged_json, .{});
-    try std.testing.expectEqualStrings("production", getStringField(packaged, "buildEnvironment").?);
+    try std.testing.expectEqualStrings("stable", getStringField(packaged, "buildEnvironment").?);
     try std.testing.expect(packaged.object.get("chromiumFlags") == null);
 
     const bun_root = try std.json.parseFromSliceLeaky(
@@ -7144,7 +7202,7 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     const bun_json = try bundledRuntimeMetadataJson(&ctx, .{
         .raw_json = "",
         .root = bun_root,
-        .build_env = .production,
+        .build_env = .stable,
     }, provenance);
     const bun_metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bun_json, .{});
     const runtime_versions = bun_metadata.object.get("runtimeVersions").?;
@@ -7454,7 +7512,7 @@ test "Zig builds invoke the project build file with the projected SDK contract" 
         "/install",
         "/cache",
         "/sdk/electrobun.zig",
-        .production,
+        .stable,
     );
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", argv.items[optimize_index]);
 }
@@ -7513,6 +7571,163 @@ test "release base36 formatting is stable" {
     try std.testing.expectEqualStrings("z", thirty_five);
     try std.testing.expectEqualStrings("10", thirty_six);
     try std.testing.expectEqualStrings("1z141z3", large);
+}
+
+test "previous release fetch URLs bypass mutable caches without changing filenames" {
+    const allocator = std.testing.allocator;
+    const cache_buster = "0123456789abcdef0123456789abcdef";
+    const metadata_url = try cacheBustedReleaseUrl(
+        allocator,
+        "https://updates.example.test/releases",
+        "stable-win-x64-update.json",
+        cache_buster,
+    );
+    defer allocator.free(metadata_url);
+    const archive_url = try cacheBustedReleaseUrl(
+        allocator,
+        "https://updates.example.test/releases",
+        "stable-win-x64-Example%20App.tar.zst",
+        cache_buster,
+    );
+    defer allocator.free(archive_url);
+
+    try std.testing.expectEqualStrings(
+        "https://updates.example.test/releases/stable-win-x64-update.json?cache=0123456789abcdef0123456789abcdef",
+        metadata_url,
+    );
+    try std.testing.expectEqualStrings(
+        "https://updates.example.test/releases/stable-win-x64-Example%20App.tar.zst?cache=0123456789abcdef0123456789abcdef",
+        archive_url,
+    );
+}
+
+test "previous release patch source accepts legacy metadata and validates modern identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const expected_artifact = "stable-win-x64-Example.tar.zst";
+    const valid = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "identifier": "com.example.update",
+        \\  "channel": "stable",
+        \\  "hash": "1z141z3",
+        \\  "platform": "win",
+        \\  "arch": "x64",
+        \\  "artifact": {"file": "stable-win-x64-Example.tar.zst"}
+        \\}
+    ,
+        .{},
+    );
+    const source = previousReleasePatchSource(
+        valid,
+        "com.example.update",
+        "stable",
+        "win",
+        "x64",
+        expected_artifact,
+    ).?;
+    try std.testing.expectEqualStrings("1z141z3", source.hash);
+    try std.testing.expectEqualStrings(expected_artifact, source.artifact_file);
+
+    const malicious_hash = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "identifier": "com.example.update",
+        \\  "channel": "stable",
+        \\  "hash": "../../outside",
+        \\  "platform": "win",
+        \\  "arch": "x64",
+        \\  "artifact": {"file": "stable-win-x64-Example.tar.zst"}
+        \\}
+    ,
+        .{},
+    );
+    try std.testing.expect(previousReleasePatchSource(
+        malicious_hash,
+        "com.example.update",
+        "stable",
+        "win",
+        "x64",
+        expected_artifact,
+    ) == null);
+
+    try std.testing.expect(previousReleasePatchSource(
+        valid,
+        "com.example.other",
+        "stable",
+        "win",
+        "x64",
+        expected_artifact,
+    ) == null);
+    try std.testing.expect(previousReleasePatchSource(
+        valid,
+        "com.example.update",
+        "stable",
+        "macos",
+        "x64",
+        expected_artifact,
+    ) == null);
+    try std.testing.expect(previousReleasePatchSource(
+        valid,
+        "com.example.update",
+        "stable",
+        "win",
+        "x64",
+        "stable-win-x64-Other.tar.zst",
+    ) == null);
+
+    const legacy = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"version":"1.18.4","hash":"abc123","platform":"win","arch":"x64"}
+    ,
+        .{},
+    );
+    const legacy_source = previousReleasePatchSource(
+        legacy,
+        "com.example.update",
+        "stable",
+        "win",
+        "x64",
+        expected_artifact,
+    ).?;
+    try std.testing.expectEqualStrings("abc123", legacy_source.hash);
+    try std.testing.expectEqualStrings(expected_artifact, legacy_source.artifact_file);
+
+    try std.testing.expect(previousReleasePatchSource(
+        legacy,
+        "com.example.update",
+        "stable",
+        "linux",
+        "x64",
+        expected_artifact,
+    ) == null);
+}
+
+test "Electrobun release hashes are lowercase base36 with bounded length" {
+    inline for (.{ "0", "z", "10", "1z141z3", "zzzzzzzzzzzzz" }) |valid| {
+        try std.testing.expect(isElectrobunReleaseHash(valid));
+    }
+    inline for (.{ "", "A", "abc-def", "abc_def", "../../outside", "zzzzzzzzzzzzzz" }) |invalid| {
+        try std.testing.expect(!isElectrobunReleaseHash(invalid));
+    }
+}
+
+test "release artifact filenames are encoded as one URL path segment" {
+    const encoded = try encodeUrlPathSegment(
+        std.testing.allocator,
+        "Example #?%/café+你好.tar.zst",
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "Example%20%23%3F%25%2Fcaf%C3%A9%2B%E4%BD%A0%E5%A5%BD.tar.zst",
+        encoded,
+    );
 }
 
 test "release entitlements plist preserves types and escapes XML" {
@@ -7586,7 +7801,7 @@ test "release bundle hashes are deterministic and content sensitive" {
         "com.example.application",
         "Example App",
         "1.0.0",
-        "production",
+        "stable",
         "https://updates.example.test",
         osName(),
         archName(),
@@ -7596,7 +7811,7 @@ test "release bundle hashes are deterministic and content sensitive" {
         "com.example.application",
         "Example App",
         "2.0.0",
-        "production",
+        "stable",
         "https://updates.example.test",
         osName(),
         archName(),
@@ -7697,29 +7912,21 @@ test "release bundle hashes are deterministic and content sensitive" {
     }
 }
 
-test "release update metadata pins identity and compressed artifact integrity" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "bundle.tar.zst", .data = "compressed update payload" });
-
+test "release update metadata carries identity and the conventional artifact name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
-    const artifact_path = try std.fs.path.join(allocator, &.{ absolute_root, "bundle.tar.zst" });
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const ctx = Context{
         .init = undefined,
-        .io = io,
+        .io = std.testing.io,
         .allocator = allocator,
         .environ_map = &env_map,
         .self_exe_path = "",
         .cottontail_home = "",
         .cottontail_binary = "",
-        .project_root = absolute_root,
+        .project_root = "",
     };
 
     const json = try releaseUpdateJson(
@@ -7731,7 +7938,6 @@ test "release update metadata pins identity and compressed artifact integrity" {
         "win",
         "x64",
         "canary-win-x64-Example-canary.tar.zst",
-        artifact_path,
     );
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
     const update = parsed.object;
@@ -7748,14 +7954,10 @@ test "release update metadata pins identity and compressed artifact integrity" {
         "canary-win-x64-Example-canary.tar.zst",
         artifact.get("file").?.string,
     );
-    try std.testing.expectEqual(
-        @as(i64, "compressed update payload".len),
-        artifact.get("size").?.integer,
-    );
-    var expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash("compressed update payload", &expected_digest, .{});
-    const expected_sha256 = std.fmt.bytesToHex(expected_digest, .lower);
-    try std.testing.expectEqualStrings(&expected_sha256, artifact.get("sha256").?.string);
+    try std.testing.expectEqual(@as(usize, 1), artifact.count());
+    try std.testing.expect(artifact.get("size") == null);
+    try std.testing.expect(artifact.get("sha256") == null);
+    try std.testing.expect(update.get("patch") == null);
 }
 
 test "release version metadata keeps display and artifact names distinct" {
@@ -7817,7 +8019,7 @@ test "release version metadata keeps display and artifact names distinct" {
     );
 }
 
-test "production releases publish stable update aliases for Electrobun 1.x clients" {
+test "stable releases use one updater prefix and unprefixed-channel installers" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7829,8 +8031,10 @@ test "production releases publish stable update aliases for Electrobun 1.x clien
     const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     const compressed_path = try std.fs.path.join(allocator, &.{ absolute_root, "MigrationApp.tar.zst" });
     const patch_path = try std.fs.path.join(allocator, &.{ absolute_root, "oldhash.patch" });
+    const installer_path = try std.fs.path.join(allocator, &.{ absolute_root, "MigrationApp-Setup.zip" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = compressed_path, .data = "compressed" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patch_path, .data = "patch" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = installer_path, .data = "installer" });
 
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
@@ -7854,7 +8058,7 @@ test "production releases publish stable update aliases for Electrobun 1.x clien
     ,
         .{},
     );
-    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .production };
+    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .stable };
     const unused_bundle = AppBundlePaths{
         .build_root = absolute_root,
         .bundle_root = absolute_root,
@@ -7869,18 +8073,16 @@ test "production releases publish stable update aliases for Electrobun 1.x clien
         .compressed_tar_path = compressed_path,
         .patch_path = patch_path,
         .flatpak_payload_path = null,
-    }, null);
+    }, installer_path);
 
     const artifact_root = try std.fs.path.join(allocator, &.{ absolute_root, "artifacts" });
-    const production_prefix = try std.fmt.allocPrint(allocator, "production-{s}-{s}", .{ osName(), archName() });
     const stable_prefix = try std.fmt.allocPrint(allocator, "stable-{s}-{s}", .{ osName(), archName() });
+    const installer_prefix = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ osName(), archName() });
     for ([_][]const u8{
-        try std.mem.concat(allocator, u8, &.{ production_prefix, "-update.json" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
-        try std.mem.concat(allocator, u8, &.{ production_prefix, "-MigrationApp.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
-        try std.mem.concat(allocator, u8, &.{ production_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
+        try std.mem.concat(allocator, u8, &.{ installer_prefix, "-MigrationApp-Setup.zip" }),
     }) |name| {
         try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ artifact_root, name })));
     }
@@ -7891,10 +8093,27 @@ test "production releases publish stable update aliases for Electrobun 1.x clien
     );
     const stable_bytes = try std.Io.Dir.cwd().readFileAlloc(io, stable_update_path, allocator, .limited(64 * 1024));
     const stable_update = try std.json.parseFromSliceLeaky(std.json.Value, allocator, stable_bytes, .{});
-    try std.testing.expectEqualStrings("production", stable_update.object.get("channel").?.string);
+    try std.testing.expectEqualStrings("stable", stable_update.object.get("channel").?.string);
     try std.testing.expectEqualStrings(
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         stable_update.object.get("artifact").?.object.get("file").?.string,
+    );
+    try std.testing.expect(stable_update.object.get("patch") == null);
+
+    const removed_prefix = try std.fmt.allocPrint(allocator, "production-{s}-{s}", .{ osName(), archName() });
+    for ([_][]const u8{
+        try std.mem.concat(allocator, u8, &.{ removed_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ removed_prefix, "-MigrationApp.tar.zst" }),
+        try std.mem.concat(allocator, u8, &.{ removed_prefix, "-oldhash.patch" }),
+    }) |name| {
+        try std.testing.expect(!pathExists(io, try std.fs.path.join(allocator, &.{ artifact_root, name })));
+    }
+
+    const canary_config = CommandContext{ .raw_json = "", .root = root, .build_env = .canary };
+    const canary_installer_prefix = try installerPlatformPrefix(&ctx, canary_config);
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(allocator, "canary-{s}-{s}", .{ osName(), archName() }),
+        canary_installer_prefix,
     );
 }
 
@@ -8172,7 +8391,7 @@ test "Linux bundle archives desktop entries independently of icon configuration"
         .{
             .directory = "valid-icon",
             .icon_state = .valid,
-            .build_env = .production,
+            .build_env = .stable,
             .desktop_stem = "ArchiveApp",
             .display_name = "Archive App",
             .config_json =
@@ -8462,7 +8681,7 @@ test "opt-in Flatpak output stages expanded payload and disables release metadat
     };
     try std.testing.expect(flatpakEnabled(root));
     // Zig's build test protocol owns stdout, so this unit test must not emit
-    // the production status line while exercising the real output writer.
+    // the build status line while exercising the real output writer.
     try writeFlatpakOutput(&ctx, config, staged_payload, .{ .announce = false });
 
     const architecture = try flatpakArchitectureName();

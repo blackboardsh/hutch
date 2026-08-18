@@ -258,32 +258,31 @@ edits are visible immediately.
 ## Electrobun Packaging
 
 `hutch electrobun build --env=dev` creates a runnable inner application bundle.
-Canary and production builds also create the self-extracting outer wrapper,
+Canary and stable builds also create the self-extracting outer wrapper,
 compressed full-update archive, optional delta patch, platform installer, and
 `<channel>-<os>-<arch>-update.json` in the configured artifact folder:
 
 ```sh
 hutch electrobun build --env=canary
-hutch electrobun build --env=production
+hutch electrobun build --env=stable
 ```
 
 The update document keeps the Electrobun 1.x `version`, `hash`, `platform`,
 and `arch` fields and adds schema, app identity, and the exact compressed
-artifact filename, byte size, and SHA-256 required by the 2.0 updater. Those
-additive fields let compatible v1.18.1+ apps transition to a 2.0 release while
-new clients verify the archive before handoff. Keep the app name, identifier,
-and the existing update base URL unchanged for that bridge release.
+artifact filename. Those additive fields let compatible v1.18.1+ apps
+transition to a 2.0 release. Keep the app name, identifier, and existing update
+base URL unchanged for that bridge release.
 
-Production builds also emit `stable-<os>-<arch>-` aliases for the update JSON,
-compressed archive, and any patch. Compatible Electrobun v1.18.1+ production
-clients used that channel name, so the aliases provide their one-time update
-path into 2.0 without duplicating installer artifacts. Older prereleases used
-updater or payload layouts that are not universally bridgeable.
+Updater protocol files use `stable-<os>-<arch>-` or
+`canary-<os>-<arch>-`: the update JSON, compressed archive, and conventional
+`<fromHash>.patch`. Hutch generates one patch from the previously published
+bundle; retain older hash-named patch files so clients can follow the chain.
 
-Production app and installer names are unsuffixed; canary names include
-`-canary`. `--env=stable` remains an alias for `--env=production`. macOS
-produces a DMG unless `build.mac.createDmg` is false. Windows
-produces a Setup ZIP, and Linux produces a self-extracting installer tarball.
+Stable app names are unsuffixed. Stable installers use `<os>-<arch>-...`
+filenames, while canary updater files and installers keep the
+`canary-<os>-<arch>-...` prefix. macOS produces a DMG unless
+`build.mac.createDmg` is false. Windows produces a Setup ZIP, and Linux
+produces a self-extracting installer tarball.
 Set `release.baseUrl` to the published artifact root to generate a delta from
 the previous release, or set `release.generatePatch` to false to skip it.
 
