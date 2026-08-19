@@ -601,14 +601,25 @@ fn bootstrapInstalledHutchAt(
     const staged = try validateStagedHutchArchive(io, allocator, home, staged_root);
     const canonical_home = try std.Io.Dir.cwd().realPathFileAlloc(io, home, allocator);
     if (loadStoreIdentityAt(io, allocator, canonical_home)) |_| {} else |err| switch (err) {
-        error.FileNotFound => try validateUnmarkedInstallerHome(
+        error.FileNotFound => validateUnmarkedInstallerHome(
             io,
             allocator,
             home,
             canonical_home,
             staged,
             forbidden_unmarked_roots,
-        ),
+        ) catch |validation_err| switch (validation_err) {
+            // A concurrent installer can publish the store marker between the
+            // probe above and this validation, making its store entries look
+            // like unrelated files. A home that is marked by the time the
+            // validation fails is this store, not a foreign directory; the
+            // locked publisher below owns all remaining contention.
+            error.UnsafeUnmarkedHutchHome => {
+                _ = loadStoreIdentityAt(io, allocator, canonical_home) catch
+                    return validation_err;
+            },
+            else => return validation_err,
+        },
         else => return err,
     }
     // Existing selection state must parse before the explicit installer claims
