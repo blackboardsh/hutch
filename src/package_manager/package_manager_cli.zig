@@ -1074,7 +1074,7 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --trust                  Trust added packages and run lifecycle scripts
         \\  --lockfile-only          Resolve without writing node_modules
         \\  --linker <strategy>      Use the isolated or hoisted install layout
-        \\  --no-save                Do not update package.json or bun.lock
+        \\  --no-save                Do not update package.json or hutch.lock
         \\  --no-verify              Skip package integrity verification
         \\  -f, --force              Re-resolve and reinstall dependencies
         \\  --dry-run                Perform a dry run without making changes
@@ -11741,22 +11741,16 @@ const Manager = struct {
         return false;
     }
 
+    // Foreign lockfiles are invisible to Hutch: never read, counted, or
+    // deleted. hutch.lock is the only lockfile that exists to the resolver.
     fn deleteLockfiles(manager: *Manager) void {
         const hutch_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, Lockfile.file_name }) catch return;
-        const text_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" }) catch return;
-        const binary_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" }) catch return;
         std.Io.Dir.cwd().deleteFile(manager.init_data.io, hutch_path) catch {};
-        std.Io.Dir.cwd().deleteFile(manager.init_data.io, text_path) catch {};
-        std.Io.Dir.cwd().deleteFile(manager.init_data.io, binary_path) catch {};
     }
 
     fn hasExistingLockfile(manager: *Manager) bool {
         const hutch_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, Lockfile.file_name }) catch return false;
-        if (std.Io.Dir.cwd().access(manager.init_data.io, hutch_path, .{})) |_| return true else |_| {}
-        const text_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" }) catch return false;
-        if (std.Io.Dir.cwd().access(manager.init_data.io, text_path, .{})) |_| return true else |_| {}
-        const binary_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" }) catch return false;
-        if (std.Io.Dir.cwd().access(manager.init_data.io, binary_path, .{})) |_| return true else |_| return false;
+        if (std.Io.Dir.cwd().access(manager.init_data.io, hutch_path, .{})) |_| return true else |_| return false;
     }
 };
 
@@ -12311,10 +12305,8 @@ fn findInstallProject(io: std.Io, allocator: std.mem.Allocator, start: []const u
 fn findPatchProjectRoot(io: std.Io, allocator: std.mem.Allocator, start: []const u8) ![]const u8 {
     var current = try allocator.dupe(u8, start);
     while (true) {
-        const text_lock = try std.fs.path.join(allocator, &.{ current, "bun.lock" });
+        const text_lock = try std.fs.path.join(allocator, &.{ current, Lockfile.file_name });
         if (std.Io.Dir.cwd().access(io, text_lock, .{})) |_| return current else |_| {}
-        const binary_lock = try std.fs.path.join(allocator, &.{ current, "bun.lockb" });
-        if (std.Io.Dir.cwd().access(io, binary_lock, .{})) |_| return current else |_| {}
         const parent = std.fs.path.dirname(current) orelse return allocator.dupe(u8, start);
         if (std.mem.eql(u8, parent, current)) return allocator.dupe(u8, start);
         current = try allocator.dupe(u8, parent);

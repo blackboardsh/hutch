@@ -45,10 +45,9 @@ const help_text_template =
     \\  String scripts run through the selected Cottontail Bun.$ shell.
     \\  Array scripts run as exact non-empty argv string arrays.
     \\  packageManager selects npm, bun, pnpm, yarn, or an explicit executable;
-    \\  the default is Hutch's built-in npm-compatible resolver (hutch.lock).
-    \\  Unconfigured projects keep their manager: a package.json packageManager
-    \\  field wins, then a foreign lockfile routes to its own tool. The built-in
-    \\  resolver never runs lifecycle scripts and installs registry/file deps.
+    \\  without a selection, Hutch's built-in npm-compatible resolver installs
+    \\  package.json registry and file dependencies into hutch.lock, ignoring
+    \\  any foreign lockfile, and never runs lifecycle scripts.
     \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\
@@ -1490,7 +1489,7 @@ fn resolvePackageManager(
     allocator: std.mem.Allocator,
     stderr: *std.Io.Writer,
 ) !?PackageManagerResolution {
-    if (findHutchConfig(init, allocator)) |config_path| {
+    if (findHutchConfig(init, allocator)) |_| {
         const no_args: [0][:0]const u8 = .{};
         const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
             try stderr.print(
@@ -1514,81 +1513,20 @@ fn resolvePackageManager(
             }
             return null;
         };
-        var resolved = selection;
-        if (!resolved.configured) {
-            const project_root = std.fs.path.dirname(config_path) orelse ".";
-            resolved = try inferProjectPackageManager(init, allocator, project_root);
+        if (package_manager_adapter.eligibleForVendoredBun(selection)) {
+            return resolveVendoredBun(init, allocator, config.root, selection, stderr);
         }
-        if (package_manager_adapter.eligibleForVendoredBun(resolved)) {
-            return resolveVendoredBun(init, allocator, config.root, resolved, stderr);
-        }
-        return .{ .selection = resolved };
+        return .{ .selection = selection };
     } else |err| switch (err) {
         error.HutchConfigNotFound => {
             managed_store.pruneAutomatic(init, allocator);
-            const resolved = try inferProjectPackageManager(init, allocator, ".");
-            if (package_manager_adapter.eligibleForVendoredBun(resolved)) {
-                return resolveVendoredBun(init, allocator, std.json.Value.null, resolved, stderr);
-            }
-            return .{ .selection = resolved };
+            return .{ .selection = package_manager_adapter.defaultSelection() };
         },
         else => return err,
     }
 }
 
-const foreign_lockfiles = [_]struct {
-    file_name: []const u8,
-    manager: package_manager_adapter.Name,
-}{
-    .{ .file_name = "bun.lockb", .manager = .bun },
-    .{ .file_name = "bun.lock", .manager = .bun },
-    .{ .file_name = "package-lock.json", .manager = .npm },
-    .{ .file_name = "pnpm-lock.yaml", .manager = .pnpm },
-    .{ .file_name = "yarn.lock", .manager = .yarn },
-};
 
-// An unconfigured project keeps whatever package manager it already uses: a
-// package.json packageManager declaration wins, then a foreign lockfile.
-// Fresh projects and hutch.lock projects use the built-in resolver.
-fn inferProjectPackageManager(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    project_root: []const u8,
-) !package_manager_adapter.Selection {
-    if (try packageJsonPackageManagerName(init, allocator, project_root)) |name| {
-        return .{ .name = name, .executable = name.command() };
-    }
-    const hutch_lock = try std.fs.path.join(allocator, &.{ project_root, "hutch.lock" });
-    if (pathExists(init.io, hutch_lock)) return package_manager_adapter.defaultSelection();
-    for (foreign_lockfiles) |entry| {
-        const lockfile_path = try std.fs.path.join(allocator, &.{ project_root, entry.file_name });
-        if (pathExists(init.io, lockfile_path)) {
-            return .{ .name = entry.manager, .executable = entry.manager.command() };
-        }
-    }
-    return package_manager_adapter.defaultSelection();
-}
-
-fn packageJsonPackageManagerName(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    project_root: []const u8,
-) !?package_manager_adapter.Name {
-    const package_json_path = try std.fs.path.join(allocator, &.{ project_root, "package.json" });
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        package_json_path,
-        allocator,
-        .limited(4 * 1024 * 1024),
-    ) catch return null;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{}) catch return null;
-    if (parsed != .object) return null;
-    const declared = parsed.object.get("packageManager") orelse return null;
-    if (declared != .string) return null;
-    // Corepack format: "<name>@<version>[+<hash>]"; a bare name also counts.
-    const name = declared.string[0 .. std.mem.indexOfScalar(u8, declared.string, '@') orelse declared.string.len];
-    return std.meta.stringToEnum(package_manager_adapter.Name, name);
-}
 
 // Bun is vendored like any other toolchain: the devkit of the pinned
 // electrobun.version supplies the version, and Hutch's own default covers

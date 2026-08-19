@@ -427,59 +427,38 @@ pub fn main(init: std.process.Init) !void {
     try expectExit(install_bare.term, 0);
     try expectPathExists(init.io, try std.fs.path.join(allocator, &.{ builtin_root, "hutch.lock" }));
 
-    // Unconfigured projects keep their existing manager: a foreign lockfile
-    // routes to it, and a package.json packageManager field wins outright.
-    const inferred_npm_root = try std.fs.path.join(allocator, &.{ fixture_root, "inferred-npm" });
-    try std.Io.Dir.cwd().createDirPath(init.io, inferred_npm_root);
+    // Foreign lockfiles are ignored entirely: the built-in resolver runs,
+    // creates hutch.lock, and leaves the foreign file untouched.
+    const ignored_lock_root = try std.fs.path.join(allocator, &.{ fixture_root, "ignored-bun-lock" });
+    try std.Io.Dir.cwd().createDirPath(init.io, ignored_lock_root);
     try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "hutch.config.ts" }),
+        .sub_path = try std.fs.path.join(allocator, &.{ ignored_lock_root, "hutch.config.ts" }),
         .data = "export default {};\n",
     });
+    try writeLocalDependencyProject(init, allocator, ignored_lock_root, "ignored-bun-lock-fixture");
+    const stale_bun_lock = try std.fs.path.join(allocator, &.{ ignored_lock_root, "bun.lock" });
     try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "package.json" }),
-        .data = "{ this stays invalid because npm owns this project\n",
+        .sub_path = stale_bun_lock,
+        .data = "{ stale bun lockfile that hutch must never read }\n",
     });
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "package-lock.json" }),
-        .data = "{}\n",
-    });
-    const inferred_npm = try runConfigCommand(
+    const ignored_lock = try runConfigCommand(
         init,
         allocator,
         launcher,
         engine,
         runtime,
-        inferred_npm_root,
+        ignored_lock_root,
         fake_bin,
-        "config-pm-inferred-npm",
+        "config-pm-ignored-lock",
         "{\"scripts\":{}}",
-        &.{ "install", "--offline-probe" },
+        &.{"install"},
     );
-    try expectExit(inferred_npm.term, 0);
-
-    const field_pnpm_root = try std.fs.path.join(allocator, &.{ fixture_root, "field-pnpm" });
-    try std.Io.Dir.cwd().createDirPath(init.io, field_pnpm_root);
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ field_pnpm_root, "hutch.config.ts" }),
-        .data = "export default {};\n",
-    });
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ field_pnpm_root, "package.json" }),
-        .data = "{\"name\":\"field-fixture\",\"version\":\"1.0.0\",\"packageManager\":\"pnpm@9.1.0\"}\n",
-    });
-    const field_pnpm = try runConfigCommand(
-        init,
-        allocator,
-        launcher,
-        engine,
-        runtime,
-        field_pnpm_root,
-        fake_bin,
-        "config-pm-field-pnpm",
-        "{\"scripts\":{}}",
-        &.{ "install", "--offline-probe" },
-    );
-    try expectExit(field_pnpm.term, 0);
+    try expectExit(ignored_lock.term, 0);
+    try expectPathExists(init.io, try std.fs.path.join(allocator, &.{ ignored_lock_root, "hutch.lock" }));
+    const stale_contents = try std.Io.Dir.cwd().readFileAlloc(init.io, stale_bun_lock, allocator, .limited(4096));
+    if (!std.mem.eql(u8, stale_contents, "{ stale bun lockfile that hutch must never read }\n")) {
+        return error.ForeignLockfileWasModified;
+    }
 
     const bun_raw = try runConfigCommand(
         init,

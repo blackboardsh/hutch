@@ -67,8 +67,8 @@ replaces the global production or canary selection.
 Hutch ships a minimal built-in npm-compatible resolver and uses it by
 default: it downloads registry tarballs, verifies sha512 integrity, caches
 under `~/.hutch/cache/npm`, materializes `node_modules`, and writes Hutch's
-own deterministic lockfile, `hutch.lock` (the only lockfile Hutch reads — no
-foreign-lockfile migration). It installs registry and `file:` dependencies,
+own deterministic lockfile, `hutch.lock` — the only lockfile Hutch reads;
+foreign lockfiles are ignored, never migrated. It installs registry and `file:` dependencies,
 never runs lifecycle scripts, and leaves workspaces and git dependencies to
 external managers. Standalone Cottontail scripts get launch-time
 auto-installation of their package imports.
@@ -92,13 +92,14 @@ export default {
 manager unchanged; package operations beyond install stay native to that
 manager (`hutch pm add three` rather than a Hutch-specific add command).
 
-Unconfigured projects keep whatever manager they already use: a
-`package.json` `packageManager` declaration wins, then the presence of a
-foreign lockfile (`bun.lock`/`bun.lockb`, `package-lock.json`,
-`pnpm-lock.yaml`, `yarn.lock`) routes to that tool; a `hutch.lock` or a fresh
-project uses the built-in resolver. Selecting `bun` still resolves the
-toolchain-vendored Bun (the same managed binary `mainProcess: "bun"` apps
-bundle), so no PATH tooling is required in either mode.
+`hutch.config.ts` is the only selection channel. Without a `packageManager`
+there, the built-in resolver runs — foreign lockfiles (`bun.lock`,
+`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) are ignored entirely:
+never read, migrated, or modified. Hutch resolves from `package.json` and
+creates `hutch.lock`; projects that want their previous tool declare it
+explicitly. Selecting `bun` resolves the toolchain-vendored Bun (the same
+managed binary `mainProcess: "bun"` apps bundle), so no PATH tooling is
+required in either mode.
 
 On Windows, Hutch invokes npm/pnpm/yarn `.cmd` and `.bat` shims only through its
 native argv adapter. The underlying Windows batch format cannot preserve NUL,

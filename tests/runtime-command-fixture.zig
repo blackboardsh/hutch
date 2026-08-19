@@ -426,20 +426,6 @@ pub fn main(init: std.process.Init) !void {
                 &.{ "install", "two words", "$literal" },
             );
         }
-        if (std.mem.eql(u8, mode, "config-pm-inferred-npm")) {
-            return expectPackageManagerInvocation(
-                args,
-                "npm",
-                &.{ "install", "--offline-probe" },
-            );
-        }
-        if (std.mem.eql(u8, mode, "config-pm-field-pnpm")) {
-            return expectPackageManagerInvocation(
-                args,
-                "pnpm",
-                &.{ "install", "--offline-probe" },
-            );
-        }
         if (std.mem.eql(u8, mode, "config-pm-vendored-bun")) {
             const expected_path = init.environ_map.get("HUTCH_TEST_VENDORED_BUN_PATH") orelse
                 return error.MissingVendoredBunPath;
