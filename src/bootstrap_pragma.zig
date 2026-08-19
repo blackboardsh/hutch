@@ -1,7 +1,7 @@
 const std = @import("std");
 const version_selector = @import("version_selector.zig");
 
-const prefix = "// @hutch";
+pub const prefix = "// @hutch";
 const max_first_line_bytes = 4096;
 
 pub const Pragma = struct {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
+const pragma_pin = @import("pragma_pin.zig");
 const managed_store = @import("managed_store.zig");
 const package_manager = @import("package_manager/root.zig");
 const prune_cli = @import("prune_cli.zig");
@@ -35,8 +36,8 @@ const help_text_template =
     \\  hutch prune [--dry-run]
     \\  hutch reset
     \\  hutch status [--json]
-    \\  hutch self <path|version|update> [selector]
-    \\  hutch cottontail <path|version|update> [selector]
+    \\  hutch self <path|version|update|pin> [selector] [--recursive]
+    \\  hutch cottontail <path|version|update|pin> [selector] [--recursive]
     \\  hutch --help
     \\  hutch --version
     \\
@@ -1143,17 +1144,21 @@ fn runReleaseCommand(
     if (args.len == 0 or isHelpFlag(args[0])) {
         const namespace = if (product == .hutch) "self" else "cottontail";
         try stderr.print(
-            "Usage: hutch {s} <path|version|update> [production|stable|canary|<semver>|build:<revision>]\n",
+            "Usage: hutch {s} <path|version|update|pin> " ++
+                "[production|stable|canary|latest|<semver>|build:<revision>] [--recursive]\n",
             .{namespace},
         );
         return if (args.len == 0) 1 else 0;
+    }
+
+    const operation = args[0];
+    if (std.mem.eql(u8, operation, "pin")) {
+        return runPinCommand(init, allocator, product, args[1..], stdout, stderr);
     }
     if (args.len > 2) {
         try stderr.print("hutch {s}: too many arguments\n", .{product.name()});
         return 1;
     }
-
-    const operation = args[0];
     const channel = activeReleaseChannel(init.environ_map) catch |err| {
         try stderr.print("hutch: invalid active channel: {s}\n", .{@errorName(err)});
         return 1;
@@ -1200,7 +1205,151 @@ fn runReleaseCommand(
             "{s} {s}@{s} is active for {s}\n",
             .{ product.name(), resolution.version, resolution.revision, selector.channel() orelse "this project" },
         );
+        if (selector.channel()) |channel_name| {
+            notePragmaPin(init, allocator, product, channel_name, resolution.version, stderr) catch {};
+        }
     }
+    return 0;
+}
+
+// An updated channel selection changes nothing for a project whose pragma
+// pins a version: say so, or the update looks silently ignored.
+fn notePragmaPin(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: release_store.Product,
+    channel_name: []const u8,
+    updated_version: []const u8,
+    stderr: anytype,
+) !void {
+    const config_path = (try bootstrap_pragma.findNearestConfig(init.io, allocator)) orelse return;
+    const pragma = ((bootstrap_pragma.parseFile(init.io, allocator, config_path) catch return) orelse return);
+    const field = (if (product == .hutch) pragma.cli else pragma.cottontail) orelse return;
+    const namespace = if (product == .hutch) "self" else "cottontail";
+    const key = if (product == .hutch) "cli" else "cottontail";
+    switch (field.kind) {
+        .version => if (!std.mem.eql(u8, field.value, updated_version)) {
+            try stderr.print(
+                "note: this project pins {s}={s} via {s}; run 'hutch {s} pin' to move it to {s}\n",
+                .{ key, field.value, config_path, namespace, updated_version },
+            );
+        },
+        .build => try stderr.print(
+            "note: this project pins {s}=build:{s} via {s}; run 'hutch {s} pin' to move it to {s}\n",
+            .{ key, field.value, config_path, namespace, updated_version },
+        ),
+        .production, .canary => if (!std.mem.eql(u8, field.value, channel_name)) {
+            try stderr.print(
+                "note: this project tracks the {s} channel via {s}, not {s}\n",
+                .{ field.value, config_path, channel_name },
+            );
+        },
+    }
+}
+
+fn runPinCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: release_store.Product,
+    args: []const [:0]const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const namespace = if (product == .hutch) "self" else "cottontail";
+    const key = if (product == .hutch) "cli" else "cottontail";
+
+    var recursive = false;
+    var requested: ?[]const u8 = null;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--recursive") or std.mem.eql(u8, arg, "-r")) {
+            recursive = true;
+        } else if (requested == null and arg.len > 0 and arg[0] != '-') {
+            requested = arg;
+        } else {
+            try stderr.print("hutch {s} pin: unexpected argument: {s}\n", .{ namespace, arg });
+            return 1;
+        }
+    }
+    if (requested) |text| {
+        _ = version_selector.parse(text) catch |err| {
+            try stderr.print("hutch: invalid release selector: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    }
+
+    // Without a selector, pin the exact version currently selected for the
+    // active channel; `latest`/`stable`/`canary` write the floating alias.
+    const value = requested orelse concrete: {
+        const channel = activeReleaseChannel(init.environ_map) catch |err| {
+            try stderr.print("hutch: invalid active channel: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        const selector = version_selector.parse(channel) catch unreachable;
+        const resolution = release_store.resolve(init, allocator, product, selector, .{
+            .offline = environmentFlag(init.environ_map, "DASH_RELEASE_OFFLINE"),
+        }) catch |err| {
+            try stderr.print(
+                "hutch: could not resolve {s}: {s}\n",
+                .{ product.name(), @errorName(err) },
+            );
+            return 1;
+        };
+        break :concrete resolution.version;
+    };
+
+    if (recursive) {
+        const root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+        const configs = try pragma_pin.findConfigsRecursive(init.io, allocator, root);
+        var pinned: usize = 0;
+        for (configs) |config_path| {
+            // Recursive pinning only moves existing pins; projects that
+            // track a channel or the global default keep doing so.
+            const pragma = (bootstrap_pragma.parseFile(init.io, allocator, config_path) catch |err| {
+                try stderr.print(
+                    "hutch {s} pin: skipped {s}: {s}\n",
+                    .{ namespace, config_path, @errorName(err) },
+                );
+                continue;
+            }) orelse continue;
+            const field = (if (product == .hutch) pragma.cli else pragma.cottontail) orelse continue;
+            if (field.kind != .version and field.kind != .build) continue;
+            const rewrite = pragma_pin.pinConfigFile(init.io, allocator, config_path, key, value) catch |err| {
+                try stderr.print(
+                    "hutch {s} pin: could not rewrite {s}: {s}\n",
+                    .{ namespace, config_path, @errorName(err) },
+                );
+                return 1;
+            };
+            const before = rewrite.previous.?;
+            if (std.mem.eql(u8, before, value)) continue;
+            try stdout.print("{s}: {s}={s} (was {s})\n", .{ config_path, key, value, before });
+            pinned += 1;
+        }
+        try stdout.print(
+            "pinned {s}={s} in {d} of {d} configs under {s}\n",
+            .{ key, value, pinned, configs.len, root },
+        );
+        return 0;
+    }
+
+    const config_path = (try bootstrap_pragma.findNearestConfig(init.io, allocator)) orelse {
+        try stderr.print(
+            "hutch {s} pin: no hutch.config.ts found from the current directory\n",
+            .{namespace},
+        );
+        return 1;
+    };
+    const rewrite = pragma_pin.pinConfigFile(init.io, allocator, config_path, key, value) catch |err| {
+        try stderr.print(
+            "hutch {s} pin: could not rewrite {s}: {s}\n",
+            .{ namespace, config_path, @errorName(err) },
+        );
+        return 1;
+    };
+    try stdout.print(
+        "{s}: {s}={s} (was {s})\n",
+        .{ config_path, key, value, rewrite.previous orelse "unset" },
+    );
     return 0;
 }
 

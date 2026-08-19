@@ -53,14 +53,25 @@ either layer:
 // @hutch cli=0.4.1 cottontail=0.2.3
 ```
 
-Accepted selectors are `production`, `stable`, `canary`, an exact semantic
-version, or `build:<full-git-revision>`. `stable` resolves to `production`. The
-same pragma works in a directly invoked
+Accepted selectors are `production`, `stable`, `canary`, `latest`, an exact
+semantic version, or `build:<full-git-revision>`. `stable` and `latest` resolve
+to `production`. The same pragma works in a directly invoked
 JavaScript or TypeScript entrypoint. An entrypoint field overrides the matching
 config field; omitted fields continue to use the invocation channel.
 
 Malformed pragmas and unavailable releases are hard errors. A project pin never
 replaces the global production or canary selection.
+
+`hutch self pin` and `hutch cottontail pin` rewrite the nearest config's pragma
+in place. Without a selector they pin the exact version currently selected for
+the active channel; an explicit selector — including the floating `latest` — is
+written as given. `--recursive` instead walks the tree below the current
+directory and moves every config whose pragma already pins an exact version or
+build, leaving channel-tracking and pragma-free configs alone — one command
+bumps a whole monorepo of templates after a release. `hutch status` reports the
+current directory's pragma, what it resolves to, and the active channel's
+version side by side, and `hutch self update` points out when the directory's
+pin keeps it behind the selection it just advanced.
 
 ## Package Managers
 
@@ -394,8 +405,8 @@ for the release workflow.
 - `hutch run [--if-configured] [script-name] [args...]`
 - `hutch build [args...]`
 - `hutch electrobun <init|sync|build|run|dev> [args...]`
-- `hutch self <path|version|update> [selector]`
-- `hutch cottontail <path|version|update> [selector]`
+- `hutch self <path|version|update|pin> [selector] [--recursive]`
+- `hutch cottontail <path|version|update|pin> [selector] [--recursive]`
 - `hutch status [--json]`
 - `hutch prune [--dry-run]`
 - `hutch reset`

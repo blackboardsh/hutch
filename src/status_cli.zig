@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const managed_store = @import("managed_store.zig");
 const release_store = @import("release_store.zig");
+const version_selector = @import("version_selector.zig");
 
 const help_text =
     "Usage:\n" ++
@@ -16,7 +18,7 @@ const help_text =
     "the report itself is a read-only snapshot of the store.\n";
 
 /// The `--json` document version. Any incompatible field change bumps this.
-pub const json_schema_version = 3;
+pub const json_schema_version = 4;
 
 const max_walk_depth = 64;
 
@@ -256,6 +258,27 @@ pub const ReleaseSelection = struct {
     installed: bool,
 };
 
+pub const PinEntry = struct {
+    product: []const u8,
+    field: []const u8,
+    /// The pragma's selector text, or null when the directory uses the
+    /// active-channel default.
+    selector: ?[]const u8,
+    /// The version this directory actually runs. Null when unknowable
+    /// (a build-revision pin, or no selection recorded yet).
+    resolved: ?[]const u8,
+    /// The active channel's current selection.
+    channel_version: ?[]const u8,
+    behind: bool,
+};
+
+pub const PinReport = struct {
+    config_path: ?[]const u8 = null,
+    channel: []const u8 = "production",
+    parse_error: ?[]const u8 = null,
+    entries: std.ArrayList(PinEntry) = .empty,
+};
+
 pub const ManagedStoreObject = struct {
     kind: managed_store.ManagedObject.Kind,
     relative_root: []const u8,
@@ -276,6 +299,7 @@ pub const ManagedStoreObject = struct {
 pub const Report = struct {
     home: []const u8,
     home_source: release_store.HomeSource,
+    pins: PinReport = .{},
     releases: std.ArrayList(ReleaseProduct) = .empty,
     selections: std.ArrayList(ReleaseSelection) = .empty,
     toolchains: std.ArrayList(Toolchain) = .empty,
@@ -297,9 +321,67 @@ pub fn collect(init: std.process.Init, allocator: std.mem.Allocator) !Report {
 
     try collectReleases(init.io, allocator, home.path, &report);
     try collectSelections(init, allocator, &report);
+    try collectPins(init, allocator, &report);
     try collectToolchains(init.io, allocator, home.path, &report);
     try collectManagedStore(init, allocator, &report);
     return report;
+}
+
+fn collectPins(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    report: *Report,
+) !void {
+    const channel_name = init.environ_map.get("HUTCH_ACTIVE_CHANNEL") orelse "production";
+    report.pins.channel = version_selector.normalizeChannel(channel_name) catch "production";
+
+    var pragma: bootstrap_pragma.Pragma = .{};
+    if (bootstrap_pragma.findNearestConfig(init.io, allocator) catch null) |config_path| {
+        report.pins.config_path = config_path;
+        if (bootstrap_pragma.parseFile(init.io, allocator, config_path)) |parsed| {
+            if (parsed) |value| pragma = value;
+        } else |err| {
+            report.pins.parse_error = @errorName(err);
+        }
+    }
+
+    for ([_]release_store.Product{ .hutch, .cottontail }) |product| {
+        const field = if (product == .hutch) pragma.cli else pragma.cottontail;
+        const channel_version = selectionVersion(report, product, report.pins.channel);
+        const selector: ?[]const u8 = if (field) |value| switch (value.kind) {
+            .version, .production, .canary => value.value,
+            .build => try std.fmt.allocPrint(allocator, "build:{s}", .{value.value}),
+        } else null;
+        const resolved: ?[]const u8 = if (field) |value| switch (value.kind) {
+            .version => value.value,
+            .build => null,
+            .production, .canary => selectionVersion(report, product, value.value),
+        } else channel_version;
+        try report.pins.entries.append(allocator, .{
+            .product = product.name(),
+            .field = if (product == .hutch) "cli" else "cottontail",
+            .selector = selector,
+            .resolved = resolved,
+            .channel_version = channel_version,
+            .behind = resolved != null and channel_version != null and
+                !std.mem.eql(u8, resolved.?, channel_version.?),
+        });
+    }
+}
+
+fn selectionVersion(
+    report: *const Report,
+    product: release_store.Product,
+    channel: []const u8,
+) ?[]const u8 {
+    for (report.selections.items) |selection| {
+        if (std.mem.eql(u8, selection.product, product.name()) and
+            std.mem.eql(u8, selection.name, channel))
+        {
+            return selection.version;
+        }
+    }
+    return null;
 }
 
 fn collectReleases(
@@ -707,6 +789,42 @@ pub fn writeText(
         try writer.print("  source  {s}\n", .{report.home_source.label()});
     }
 
+    try writer.writeAll("\nPins (current directory)\n");
+    if (report.pins.config_path) |config_path| {
+        try writer.print("  config  {s}\n", .{config_path});
+    } else {
+        try writer.writeAll("  config  (no hutch.config.ts found; the channel default applies)\n");
+    }
+    if (report.pins.parse_error) |parse_error| {
+        try writer.print("  (pragma unreadable: {s})\n", .{parse_error});
+    } else {
+        var table: Table = .{
+            .headers = &.{ "product", "pragma", "runs", "channel", "action" },
+            .aligns = &.{ .left, .left, .left, .left, .left },
+        };
+        for (report.pins.entries.items) |entry| {
+            try table.addRow(allocator, &.{
+                entry.product,
+                if (entry.selector) |selector|
+                    try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry.field, selector })
+                else
+                    "(default)",
+                entry.resolved orelse "?",
+                try std.fmt.allocPrint(allocator, "{s} {s}", .{
+                    report.pins.channel,
+                    entry.channel_version orelse "-",
+                }),
+                if (entry.behind)
+                    try std.fmt.allocPrint(allocator, "hutch {s} pin", .{
+                        if (std.mem.eql(u8, entry.product, "hutch")) "self" else entry.product,
+                    })
+                else
+                    "-",
+            });
+        }
+        try table.write(allocator, writer, 2);
+    }
+
     try writer.writeAll("\nReleases\n");
     if (report.releases.items.len == 0) {
         try writer.writeAll("  (none)\n");
@@ -888,6 +1006,38 @@ fn jsonDocument(allocator: std.mem.Allocator, report: Report) !std.json.Value {
         .null);
     try home.put(allocator, "deprecated", .{ .bool = report.home_source.deprecated() });
 
+    var pin_entries = std.json.Array.init(allocator);
+    for (report.pins.entries.items) |entry| {
+        var value: std.json.ObjectMap = .empty;
+        try value.put(allocator, "product", .{ .string = entry.product });
+        try value.put(allocator, "field", .{ .string = entry.field });
+        try value.put(allocator, "selector", if (entry.selector) |selector|
+            .{ .string = selector }
+        else
+            .null);
+        try value.put(allocator, "resolved", if (entry.resolved) |resolved|
+            .{ .string = resolved }
+        else
+            .null);
+        try value.put(allocator, "channelVersion", if (entry.channel_version) |channel_version|
+            .{ .string = channel_version }
+        else
+            .null);
+        try value.put(allocator, "behind", .{ .bool = entry.behind });
+        try pin_entries.append(.{ .object = value });
+    }
+    var pins: std.json.ObjectMap = .empty;
+    try pins.put(allocator, "configPath", if (report.pins.config_path) |config_path|
+        .{ .string = config_path }
+    else
+        .null);
+    try pins.put(allocator, "channel", .{ .string = report.pins.channel });
+    try pins.put(allocator, "parseError", if (report.pins.parse_error) |parse_error|
+        .{ .string = parse_error }
+    else
+        .null);
+    try pins.put(allocator, "entries", .{ .array = pin_entries });
+
     var releases = std.json.Array.init(allocator);
     for (report.releases.items) |product| {
         var installs = std.json.Array.init(allocator);
@@ -1007,6 +1157,7 @@ fn jsonDocument(allocator: std.mem.Allocator, report: Report) !std.json.Value {
     try root.put(allocator, "schemaVersion", .{ .integer = json_schema_version });
     try root.put(allocator, "kind", .{ .string = "hutch-status" });
     try root.put(allocator, "home", .{ .object = home });
+    try root.put(allocator, "pins", .{ .object = pins });
     try root.put(allocator, "releases", .{ .array = releases });
     try root.put(allocator, "selections", .{ .array = selections });
     try root.put(allocator, "toolchains", .{ .array = toolchains });
@@ -1188,6 +1339,12 @@ test "the json document exposes every section with stable keys" {
     try std.testing.expectEqualStrings("production", selections.items[0].object.get("name").?.string);
     try std.testing.expect(selections.items[0].object.get("installed").?.bool);
     try std.testing.expect(root.get("channels") == null);
+
+    const pins = root.get("pins").?.object;
+    try std.testing.expect(pins.get("configPath").? == .null);
+    try std.testing.expectEqualStrings("production", pins.get("channel").?.string);
+    try std.testing.expect(pins.get("parseError").? == .null);
+    try std.testing.expectEqual(@as(usize, 0), pins.get("entries").?.array.items.len);
 
     const toolchains = root.get("toolchains").?.array;
     try std.testing.expectEqualStrings("zig", toolchains.items[0].object.get("language").?.string);

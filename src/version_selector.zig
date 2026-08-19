@@ -20,17 +20,21 @@ pub const Selector = struct {
     }
 };
 
+fn isProductionAlias(value: []const u8) bool {
+    return std.mem.eql(u8, value, "production") or
+        std.mem.eql(u8, value, "stable") or
+        std.mem.eql(u8, value, "latest");
+}
+
 pub fn normalizeChannel(value: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) {
-        return "production";
-    }
+    if (isProductionAlias(value)) return "production";
     if (std.mem.eql(u8, value, "canary")) return "canary";
     return error.InvalidReleaseChannel;
 }
 
 pub fn parse(value: []const u8) !Selector {
     if (value.len == 0 or value.len > 128) return error.InvalidVersionSelector;
-    if (std.mem.eql(u8, value, "production") or std.mem.eql(u8, value, "stable")) {
+    if (isProductionAlias(value)) {
         return .{ .kind = .production, .value = "production" };
     }
     if (std.mem.eql(u8, value, "canary")) return .{ .kind = .canary, .value = value };
@@ -56,6 +60,9 @@ test "version selectors accept channels, semver, and full revisions" {
     try std.testing.expectEqual(Kind.production, stable.kind);
     try std.testing.expectEqualStrings("production", stable.value);
     try std.testing.expectEqualStrings("production", stable.channel().?);
+    const latest = try parse("latest");
+    try std.testing.expectEqual(Kind.production, latest.kind);
+    try std.testing.expectEqualStrings("production", latest.value);
     try std.testing.expectEqual(Kind.canary, (try parse("canary")).kind);
     try std.testing.expectEqual(Kind.version, (try parse("1.2.3-canary.4")).kind);
 
@@ -65,7 +72,7 @@ test "version selectors accept channels, semver, and full revisions" {
 }
 
 test "version selectors reject unknown aliases and abbreviated revisions" {
-    try std.testing.expectError(error.InvalidSemanticVersion, parse("latest"));
+    try std.testing.expectError(error.InvalidSemanticVersion, parse("newest"));
     try std.testing.expectError(error.InvalidSemanticVersion, parse("v1.2.3"));
     try std.testing.expectError(error.InvalidBuildRevision, parse("build:0123456"));
     try std.testing.expectError(
@@ -74,9 +81,10 @@ test "version selectors reject unknown aliases and abbreviated revisions" {
     );
 }
 
-test "release channels normalize the stable compatibility alias" {
+test "release channels normalize the stable and latest compatibility aliases" {
     try std.testing.expectEqualStrings("production", try normalizeChannel("production"));
     try std.testing.expectEqualStrings("production", try normalizeChannel("stable"));
+    try std.testing.expectEqualStrings("production", try normalizeChannel("latest"));
     try std.testing.expectEqualStrings("canary", try normalizeChannel("canary"));
-    try std.testing.expectError(error.InvalidReleaseChannel, normalizeChannel("latest"));
+    try std.testing.expectError(error.InvalidReleaseChannel, normalizeChannel("newest"));
 }
