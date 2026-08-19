@@ -1309,12 +1309,101 @@ fn createBundleTar(ctx: *const Context, bundle_root: []const u8, tar_path: []con
     defer env_map.deinit();
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     try env_map.put("COPYFILE_DISABLE", "1");
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(ctx.allocator);
+    try appendBundleTarArgs(ctx.allocator, &argv, builtin.os.tag, tar_path, parent, name);
     try runReleaseCommand(
         ctx,
-        &.{ "tar", "-cf", tar_path, "-C", parent, name },
+        argv.items,
         ctx.project_root,
         &env_map,
     );
+}
+
+fn appendBundleTarArgs(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    os_tag: std.Target.Os.Tag,
+    tar_path: []const u8,
+    parent: []const u8,
+    name: []const u8,
+) !void {
+    try argv.append(allocator, "tar");
+    // COPYFILE_DISABLE prevents AppleDouble sidecars, while --no-xattrs also
+    // prevents binary macOS extended attributes from entering PAX records.
+    if (os_tag == .macos) try argv.append(allocator, "--no-xattrs");
+    try argv.appendSlice(allocator, &.{ "-cf", tar_path, "-C", parent, name });
+}
+
+test "bundle tar requests extended attribute exclusion only on macOS" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+
+    try appendBundleTarArgs(
+        std.testing.allocator,
+        &argv,
+        .macos,
+        "/tmp/bundle.tar",
+        "/tmp",
+        "Example.app",
+    );
+    const macos_expected = [_][]const u8{
+        "tar",
+        "--no-xattrs",
+        "-cf",
+        "/tmp/bundle.tar",
+        "-C",
+        "/tmp",
+        "Example.app",
+    };
+    try std.testing.expectEqual(macos_expected.len, argv.items.len);
+    for (macos_expected, argv.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+
+    argv.clearRetainingCapacity();
+    try appendBundleTarArgs(
+        std.testing.allocator,
+        &argv,
+        .linux,
+        "/tmp/bundle.tar",
+        "/tmp",
+        "example",
+    );
+    const linux_expected = [_][]const u8{
+        "tar",
+        "-cf",
+        "/tmp/bundle.tar",
+        "-C",
+        "/tmp",
+        "example",
+    };
+    try std.testing.expectEqual(linux_expected.len, argv.items.len);
+    for (linux_expected, argv.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+
+    argv.clearRetainingCapacity();
+    try appendBundleTarArgs(
+        std.testing.allocator,
+        &argv,
+        .windows,
+        "C:\\bundle.tar",
+        "C:\\",
+        "example",
+    );
+    const windows_expected = [_][]const u8{
+        "tar",
+        "-cf",
+        "C:\\bundle.tar",
+        "-C",
+        "C:\\",
+        "example",
+    };
+    try std.testing.expectEqual(windows_expected.len, argv.items.len);
+    for (windows_expected, argv.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 fn compressTar(
