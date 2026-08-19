@@ -364,22 +364,22 @@ fn extractArchive(
     archive_path: []const u8,
     destination: []const u8,
 ) !void {
+    // Zip extraction is native: Expand-Archive refuses non-.zip filenames and
+    // minimal Linux hosts lack unzip, so neither is an acceptable dependency.
     if (std.mem.endsWith(u8, archive_path, ".zip.tmp")) {
-        if (builtin.os.tag != .windows) {
-            try runCommand(init, allocator, &.{ "unzip", "-q", archive_path, "-d", destination });
-            return;
-        }
-        const archive_literal = try powerShellLiteral(allocator, archive_path);
-        const destination_literal = try powerShellLiteral(allocator, destination);
-        const script = try std.fmt.allocPrint(
-            allocator,
-            "Expand-Archive -LiteralPath {s} -DestinationPath {s} -Force",
-            .{ archive_literal, destination_literal },
-        );
-        try runCommand(init, allocator, &.{ "powershell", "-NoProfile", "-Command", script });
-        return;
+        return extractZipArchive(init.io, archive_path, destination);
     }
     try runCommand(init, allocator, &.{ "tar", "-xf", archive_path, "-C", destination });
+}
+
+fn extractZipArchive(io: std.Io, archive_path: []const u8, destination: []const u8) !void {
+    var destination_dir = try std.Io.Dir.cwd().openDir(io, destination, .{});
+    defer destination_dir.close(io);
+    var archive = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
+    defer archive.close(io);
+    var buffer: [16 * 1024]u8 = undefined;
+    var reader = archive.reader(io, &buffer);
+    try std.zip.extract(destination_dir, &reader, .{});
 }
 
 fn installRustDistribution(
@@ -808,6 +808,89 @@ test "bun archives resolve from upstream oven-sh releases" {
     } else {
         try std.testing.expect(std.mem.indexOf(u8, archive.filename, "baseline") == null);
     }
+}
+
+test "zip archives extract natively without external tools" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const name = "bun-fixture/bun";
+    const content = "#!/bin/sh\necho fixture\n";
+    const crc = std.hash.Crc32.hash(content);
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const local: std.zip.LocalFileHeader = .{
+        .signature = std.zip.local_file_header_sig,
+        .version_needed_to_extract = 20,
+        .flags = .{ .encrypted = false, ._ = 0 },
+        .compression_method = .store,
+        .last_modification_time = 0,
+        .last_modification_date = 0,
+        .crc32 = crc,
+        .compressed_size = content.len,
+        .uncompressed_size = content.len,
+        .filename_len = name.len,
+        .extra_len = 0,
+    };
+    try bytes.appendSlice(allocator, std.mem.asBytes(&local));
+    try bytes.appendSlice(allocator, name);
+    try bytes.appendSlice(allocator, content);
+    const central_offset: u32 = @intCast(bytes.items.len);
+    const central: std.zip.CentralDirectoryFileHeader = .{
+        .signature = std.zip.central_file_header_sig,
+        .version_made_by = 20,
+        .version_needed_to_extract = 20,
+        .flags = .{ .encrypted = false, ._ = 0 },
+        .compression_method = .store,
+        .last_modification_time = 0,
+        .last_modification_date = 0,
+        .crc32 = crc,
+        .compressed_size = content.len,
+        .uncompressed_size = content.len,
+        .filename_len = name.len,
+        .extra_len = 0,
+        .comment_len = 0,
+        .disk_number = 0,
+        .internal_file_attributes = 0,
+        .external_file_attributes = 0,
+        .local_file_header_offset = 0,
+    };
+    try bytes.appendSlice(allocator, std.mem.asBytes(&central));
+    try bytes.appendSlice(allocator, name);
+    const end: std.zip.EndRecord = .{
+        .signature = std.zip.end_record_sig,
+        .disk_number = 0,
+        .central_directory_disk_number = 0,
+        .record_count_disk = 1,
+        .record_count_total = 1,
+        .central_directory_size = @intCast(bytes.items.len - central_offset),
+        .central_directory_offset = central_offset,
+        .comment_len = 0,
+    };
+    try bytes.appendSlice(allocator, std.mem.asBytes(&end));
+
+    try tmp.dir.createDirPath(io, "out");
+    try tmp.dir.writeFile(io, .{ .sub_path = "toolchain-fixture.zip.tmp", .data = bytes.items });
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+
+    try extractZipArchive(
+        io,
+        try std.fs.path.join(allocator, &.{ fixture_root, "toolchain-fixture.zip.tmp" }),
+        try std.fs.path.join(allocator, &.{ fixture_root, "out" }),
+    );
+    const extracted = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ fixture_root, "out", "bun-fixture", "bun" }),
+        allocator,
+        .limited(1024),
+    );
+    try std.testing.expectEqualStrings(content, extracted);
 }
 
 test "temporary toolchain archives keep the archive extension last" {
