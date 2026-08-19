@@ -8471,11 +8471,9 @@ const Manager = struct {
         locked_selection: ?LockedSelection,
         protocol_patch_paths: []const []const u8,
     ) !GitPackage {
-        // v1 scope: registry and file dependencies only.
-        try manager.stderr.writeAll(
-            "error: Hutch's built-in resolver does not support git dependencies yet; select an external packageManager (npm, bun, pnpm, or yarn) in hutch.config.ts\n",
-        );
-        if (true) return error.PackageManagerErrorReported;
+        // Git dependencies install as checked out: lifecycle scripts,
+        // including prepare, never run. Packages that must build on install
+        // belong to an explicitly selected external package manager.
         const spec = (try Git.parse(manager.allocator, requested)) orelse return error.InvalidGitDependency;
         const destination = if (locked_selection) |selection|
             selection.destination

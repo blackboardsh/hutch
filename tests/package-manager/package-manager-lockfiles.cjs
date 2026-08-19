@@ -213,6 +213,47 @@ try {
     "not a lockfile hutch would read",
   );
 
+  // Git dependencies install as checked out from a pinned commit; lifecycle
+  // scripts (including prepare) never run.
+  const gitFixture = path.join(scratch, "git-fixture-repo");
+  fs.mkdirSync(gitFixture, { recursive: true });
+  writeJson(gitFixture, "package.json", {
+    name: "git-dep",
+    version: "1.0.0",
+    scripts: { prepare: "node -e \"require('fs').writeFileSync('prepare-ran','')\"" },
+  });
+  fs.writeFileSync(path.join(gitFixture, "lib.js"), "module.exports = 42;\n");
+  const git = (args, cwd = gitFixture) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  };
+  git(["init", "--quiet", "--initial-branch=main"]);
+  git(["-c", "user.email=t@t", "-c", "user.name=t", "add", "."]);
+  git(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-m", "v1"]);
+  git(["tag", "v1.0.0"]);
+
+  const gitRoot = path.join(scratch, "git-consumer");
+  writeJson(gitRoot, "package.json", {
+    name: "git-consumer",
+    dependencies: { "git-dep": `git+file://${gitFixture}#v1.0.0` },
+  });
+  expectSuccess(install(gitRoot));
+  const gitLock = fs.readFileSync(path.join(gitRoot, "hutch.lock"), "utf8");
+  assert.match(gitLock, /git-dep@git\+file/);
+  const installedGitDep = path.join(gitRoot, "node_modules", "git-dep");
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(installedGitDep, "package.json"), "utf8")).version,
+    "1.0.0",
+  );
+  assert.equal(
+    fs.existsSync(path.join(installedGitDep, "prepare-ran")),
+    false,
+    "git dependencies must install without running prepare",
+  );
+  fs.rmSync(path.join(gitRoot, "node_modules"), { recursive: true, force: true });
+  expectSuccess(install(gitRoot, ["--frozen-lockfile"]));
+  assert.equal(fs.readFileSync(path.join(gitRoot, "hutch.lock"), "utf8"), gitLock);
+
   // Workspaces are out of scope for the built-in resolver.
   const monorepo = path.join(scratch, "workspaces-rejected");
   writeJson(monorepo, "package.json", { name: "monorepo", workspaces: ["packages/*"] });

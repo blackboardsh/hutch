@@ -46,8 +46,8 @@ const help_text_template =
     \\  Array scripts run as exact non-empty argv string arrays.
     \\  packageManager selects npm, bun, pnpm, yarn, or an explicit executable;
     \\  without a selection, Hutch's built-in npm-compatible resolver installs
-    \\  package.json registry and file dependencies into hutch.lock, ignoring
-    \\  any foreign lockfile, and never runs lifecycle scripts.
+    \\  package.json registry, file, and git dependencies into hutch.lock,
+    \\  ignoring any foreign lockfile, and never runs lifecycle scripts.
     \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\

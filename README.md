@@ -68,10 +68,12 @@ Hutch ships a minimal built-in npm-compatible resolver and uses it by
 default: it downloads registry tarballs, verifies sha512 integrity, caches
 under `~/.hutch/cache/npm`, materializes `node_modules`, and writes Hutch's
 own deterministic lockfile, `hutch.lock` — the only lockfile Hutch reads;
-foreign lockfiles are ignored, never migrated. It installs registry and `file:` dependencies,
-never runs lifecycle scripts, and leaves workspaces and git dependencies to
-external managers. Standalone Cottontail scripts get launch-time
-auto-installation of their package imports.
+foreign lockfiles are ignored, never migrated. It installs registry, `file:`,
+and git dependencies (`github:owner/repo#ref` and `git+<url>#ref`, pinned to
+exact commits in the lockfile and installed as checked out — lifecycle
+scripts, including `prepare`, never run). Workspaces remain external-manager
+territory. Standalone Cottontail scripts get launch-time auto-installation of
+their package imports.
 
 Explicit choices always win. Projects can select `npm`, `bun`, `pnpm`, or
 `yarn` in `hutch.config.ts`, or provide an explicit executable:
