@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Name = enum {
+    hutch,
     npm,
     bun,
     pnpm,
@@ -15,10 +16,14 @@ pub const Selection = struct {
     name: Name,
     executable: []const u8,
     explicit_executable: bool = false,
+    // True when hutch.config.ts names a packageManager; false selections may
+    // be refined by project inference (package.json field, foreign lockfiles).
+    configured: bool = false,
 };
 
+// Hutch's built-in npm-compatible resolver is the default package manager.
 pub fn defaultSelection() Selection {
-    return .{ .name = .bun, .executable = "bun" };
+    return .{ .name = .hutch, .executable = "hutch" };
 }
 
 // A bun selection without an explicit executable may be upgraded by the
@@ -44,6 +49,7 @@ pub fn fromConfig(root: std.json.Value) !Selection {
         .string => .{
             .name = try parseName(value),
             .executable = value.string,
+            .configured = true,
         },
         .object => |object| objectSelection: {
             const name = try parseName(object.get("name") orelse
@@ -60,6 +66,7 @@ pub fn fromConfig(root: std.json.Value) !Selection {
                 .name = name,
                 .executable = executable,
                 .explicit_executable = object.get("executable") != null,
+                .configured = true,
             };
         },
         else => error.InvalidPackageManagerConfig,
@@ -116,13 +123,26 @@ fn expectConfigErrorForTest(expected: anyerror, source: []const u8) !void {
     try std.testing.expectError(expected, fromConfig(parsed));
 }
 
-test "package manager defaults to bun" {
-    try expectSelectionForTest("{}", .bun, "bun");
-    try expectSelectionForTest("null", .bun, "bun");
+test "package manager defaults to the built-in resolver" {
+    try expectSelectionForTest("{}", .hutch, "hutch");
+    try expectSelectionForTest("null", .hutch, "hutch");
+    try std.testing.expect(!defaultSelection().configured);
+}
+
+test "explicit package manager selections are marked configured" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"packageManager\":\"npm\"}",
+        .{},
+    );
+    try std.testing.expect((try fromConfig(parsed)).configured);
 }
 
 test "vendored bun applies only to bun selections without an explicit executable" {
-    try std.testing.expect(eligibleForVendoredBun(defaultSelection()));
+    try std.testing.expect(!eligibleForVendoredBun(defaultSelection()));
     try std.testing.expect(eligibleForVendoredBun(.{ .name = .bun, .executable = "bun" }));
     try std.testing.expect(!eligibleForVendoredBun(.{
         .name = .bun,

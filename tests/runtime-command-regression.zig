@@ -171,6 +171,33 @@ fn expectNoPrivateTempArtifacts(init: std.process.Init, directory: []const u8) !
     }
 }
 
+fn writeLocalDependencyProject(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    name: []const u8,
+) !void {
+    const dep_dir = try std.fs.path.join(allocator, &.{ root, "local-dep" });
+    try std.Io.Dir.cwd().createDirPath(init.io, dep_dir);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ dep_dir, "package.json" }),
+        .data = "{\"name\":\"local-dep\",\"version\":\"1.0.0\"}\n",
+    });
+    const manifest = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"{s}\",\"version\":\"1.0.0\",\"dependencies\":{{\"local-dep\":\"file:./local-dep\"}}}}\n",
+        .{name},
+    );
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ root, "package.json" }),
+        .data = manifest,
+    });
+}
+
+fn expectPathExists(io: std.Io, path: []const u8) !void {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.ExpectedPathMissing;
+}
+
 fn toolchainPlatformKey() []const u8 {
     return switch (builtin.os.tag) {
         .macos => if (builtin.cpu.arch == .aarch64) "macos-arm64" else "macos-x64",
@@ -314,10 +341,9 @@ pub fn main(init: std.process.Init) !void {
     std.Io.Dir.cwd().deleteTree(init.io, no_config_root) catch {};
     defer std.Io.Dir.cwd().deleteTree(init.io, no_config_root) catch {};
     try std.Io.Dir.cwd().createDirPath(init.io, no_config_root);
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ no_config_root, "package.json" }),
-        .data = "{ this stays invalid because Hutch must not read it\n",
-    });
+    // Without configuration or lockfiles the built-in resolver installs; a
+    // file: dependency completes offline and writes hutch.lock.
+    try writeLocalDependencyProject(init, allocator, no_config_root, "no-config-fixture");
     const default_without_config = try runConfigCommand(
         init,
         allocator,
@@ -326,11 +352,12 @@ pub fn main(init: std.process.Init) !void {
         runtime,
         no_config_root,
         fake_bin,
-        "pm-no-config-bun",
+        "pm-no-config-builtin",
         "{}",
         &.{ "install", "--ignore-scripts" },
     );
     try expectExit(default_without_config.term, 0);
+    try expectPathExists(init.io, try std.fs.path.join(allocator, &.{ no_config_root, "hutch.lock" }));
 
     const config_json =
         \\{"scripts":{"install":["npm","install","--offline"],"npm-install":["npm","install","--offline"],"pnpm-dev":["pnpm","run","dev"],"hutch-version":["hutch","--version"],"hutch-version-shell":"hutch --version","shell-args":"shell-probe","ts-command":"entry.ts","bun-shell":"HUTCH_VALUE=alpha; echo \"$HUTCH_VALUE\" | tr a-z A-Z","shell-fail":"exit 37"}}
@@ -378,19 +405,81 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(npm_run.term, 0);
 
+    const builtin_root = try std.fs.path.join(allocator, &.{ fixture_root, "builtin-default" });
+    try std.Io.Dir.cwd().createDirPath(init.io, builtin_root);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ builtin_root, "hutch.config.ts" }),
+        .data = "export default {};\n",
+    });
+    try writeLocalDependencyProject(init, allocator, builtin_root, "builtin-default-fixture");
     const install_bare = try runConfigCommand(
         init,
         allocator,
         launcher,
         engine,
         runtime,
-        fixture_root,
+        builtin_root,
         fake_bin,
-        "config-pm-default-install",
-        config_json,
-        &.{ "install", "two words", "$literal" },
+        "config-pm-default-builtin",
+        "{\"scripts\":{}}",
+        &.{"install"},
     );
     try expectExit(install_bare.term, 0);
+    try expectPathExists(init.io, try std.fs.path.join(allocator, &.{ builtin_root, "hutch.lock" }));
+
+    // Unconfigured projects keep their existing manager: a foreign lockfile
+    // routes to it, and a package.json packageManager field wins outright.
+    const inferred_npm_root = try std.fs.path.join(allocator, &.{ fixture_root, "inferred-npm" });
+    try std.Io.Dir.cwd().createDirPath(init.io, inferred_npm_root);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "hutch.config.ts" }),
+        .data = "export default {};\n",
+    });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "package.json" }),
+        .data = "{ this stays invalid because npm owns this project\n",
+    });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ inferred_npm_root, "package-lock.json" }),
+        .data = "{}\n",
+    });
+    const inferred_npm = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        inferred_npm_root,
+        fake_bin,
+        "config-pm-inferred-npm",
+        "{\"scripts\":{}}",
+        &.{ "install", "--offline-probe" },
+    );
+    try expectExit(inferred_npm.term, 0);
+
+    const field_pnpm_root = try std.fs.path.join(allocator, &.{ fixture_root, "field-pnpm" });
+    try std.Io.Dir.cwd().createDirPath(init.io, field_pnpm_root);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ field_pnpm_root, "hutch.config.ts" }),
+        .data = "export default {};\n",
+    });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ field_pnpm_root, "package.json" }),
+        .data = "{\"name\":\"field-fixture\",\"version\":\"1.0.0\",\"packageManager\":\"pnpm@9.1.0\"}\n",
+    });
+    const field_pnpm = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        field_pnpm_root,
+        fake_bin,
+        "config-pm-field-pnpm",
+        "{\"scripts\":{}}",
+        &.{ "install", "--offline-probe" },
+    );
+    try expectExit(field_pnpm.term, 0);
 
     const bun_raw = try runConfigCommand(
         init,
@@ -456,7 +545,7 @@ pub fn main(init: std.process.Init) !void {
         fixture_root,
         fake_bin,
         "config-pm-vendored-bun",
-        "{\"scripts\":{}}",
+        "{\"packageManager\":\"bun\",\"scripts\":{}}",
         &.{ "install", "--linker=isolated" },
         &.{
             .{ .key = "HUTCH_HOME", .value = vendored_home },
@@ -958,8 +1047,8 @@ pub fn main(init: std.process.Init) !void {
         runtime,
         fixture_root,
         fake_bin,
-        "config-pm-default-install",
-        "{\"scripts\":{}}",
+        "config-pm-explicit-npm-install",
+        "{\"packageManager\":\"npm\",\"scripts\":{}}",
         &.{ "install", "two words", "$literal" },
     );
     try expectExit(absent_install.term, 0);

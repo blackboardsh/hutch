@@ -419,11 +419,25 @@ pub fn main(init: std.process.Init) !void {
                 &.{ "run", "dev", "--filter", "app one" },
             );
         }
-        if (std.mem.eql(u8, mode, "config-pm-default-install")) {
+        if (std.mem.eql(u8, mode, "config-pm-explicit-npm-install")) {
             return expectPackageManagerInvocation(
                 args,
-                "bun",
+                "npm",
                 &.{ "install", "two words", "$literal" },
+            );
+        }
+        if (std.mem.eql(u8, mode, "config-pm-inferred-npm")) {
+            return expectPackageManagerInvocation(
+                args,
+                "npm",
+                &.{ "install", "--offline-probe" },
+            );
+        }
+        if (std.mem.eql(u8, mode, "config-pm-field-pnpm")) {
+            return expectPackageManagerInvocation(
+                args,
+                "pnpm",
+                &.{ "install", "--offline-probe" },
             );
         }
         if (std.mem.eql(u8, mode, "config-pm-vendored-bun")) {
@@ -457,10 +471,6 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, mode, "config-list")) return error.UnexpectedConfigCommand;
         return error.UnknownFixtureMode;
-    }
-
-    if (std.mem.eql(u8, mode, "pm-no-config-bun")) {
-        return expectPackageManagerInvocation(args, "bun", &.{ "install", "--ignore-scripts" });
     }
 
     if (std.mem.eql(u8, mode, "runtime-options")) {

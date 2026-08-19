@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const managed_store = @import("managed_store.zig");
+const package_manager = @import("package_manager/root.zig");
 const prune_cli = @import("prune_cli.zig");
 const electrobun = @import("electrobun.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
@@ -10,6 +11,7 @@ const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
 const reset_cli = @import("reset_cli.zig");
+const runtime_autoinstall = @import("runtime_autoinstall.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const status_cli = @import("status_cli.zig");
 const toolchain_store = @import("toolchain_store.zig");
@@ -42,10 +44,11 @@ const help_text_template =
     \\  Scripts are resolved only from hutch.config.ts.
     \\  String scripts run through the selected Cottontail Bun.$ shell.
     \\  Array scripts run as exact non-empty argv string arrays.
-    \\  packageManager selects bun (default), npm, pnpm, yarn, or an explicit executable.
-    \\  Default bun is vendored as a toolchain at the devkit default of the pinned
-    \\  electrobun.version, or at Hutch's own default without a pin.
-    \\  Hutch delegates package-manager argv and never resolves package.json dependencies.
+    \\  packageManager selects npm, bun, pnpm, yarn, or an explicit executable;
+    \\  the default is Hutch's built-in npm-compatible resolver (hutch.lock).
+    \\  Unconfigured projects keep their manager: a package.json packageManager
+    \\  field wins, then a foreign lockfile routes to its own tool. The built-in
+    \\  resolver never runs lifecycle scripts and installs registry/file deps.
     \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\
@@ -1287,12 +1290,157 @@ fn maybePromptForUpdates(
     }
 }
 
+
+
+fn cottontailRuntimeOptionTakesValue(arg: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    const value_options = [_][]const u8{
+        "-r",
+        "--allow-fs-read",
+        "--allow-fs-write",
+        "--conditions",
+        "--console-depth",
+        "--cpu-prof-dir",
+        "--cpu-prof-interval",
+        "--cpu-prof-name",
+        "--cwd",
+        "--define",
+        "--diagnostic-dir",
+        "--elide-lines",
+        "--env-file",
+        "--env-file-if-exists",
+        "--experimental-default-type",
+        "--experimental-loader",
+        "--feature",
+        "--fetch-preconnect",
+        "--filter",
+        "--heap-prof-dir",
+        "--heap-prof-name",
+        "--icu-data-dir",
+        "--import",
+        "--input-type",
+        "--inspect-publish-uid",
+        "--loader",
+        "--port",
+        "--preload",
+        "--redirect-warnings",
+        "--require",
+        "--shell",
+        "--snapshot-blob",
+        "--test-name-pattern",
+        "--test-reporter",
+        "--test-reporter-destination",
+        "--test-shard",
+        "--tsconfig-override",
+        "--user-agent",
+    };
+    for (value_options) |option| {
+        if (std.mem.eql(u8, arg, option)) return true;
+    }
+    return false;
+}
+
+
+const RuntimeAutoInstallInput = union(enum) {
+    entrypoint: []const u8,
+    source: []const u8,
+};
+
+fn isDirectRuntimeFacade(environment: *const std.process.Environ.Map) bool {
+    return isBunCliFacade(environment) and
+        environment.get("HUTCH_LAUNCHER_PATH") == null;
+}
+
+// Runtime arguments here exclude the leading "hutch"; scanning starts at 0.
+fn runtimeAutoInstallInput(args: []const [:0]const u8) ?RuntimeAutoInstallInput {
+    var index: usize = 0;
+    var saw_run = false;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            index += 1;
+            return if (index < args.len) .{ .entrypoint = args[index] } else null;
+        }
+        if (!saw_run and std.mem.eql(u8, arg, "run")) {
+            saw_run = true;
+            index += 1;
+            continue;
+        }
+        if (!saw_run and
+            (std.mem.eql(u8, arg, "-e") or
+                std.mem.eql(u8, arg, "--eval") or
+                std.mem.eql(u8, arg, "-p") or
+                std.mem.eql(u8, arg, "--print")))
+        {
+            return if (index + 1 < args.len) .{ .source = args[index + 1] } else null;
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--eval=")) {
+            return .{ .source = arg["--eval=".len..] };
+        }
+        if (!saw_run and std.mem.startsWith(u8, arg, "--print=")) {
+            return .{ .source = arg["--print=".len..] };
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            index += if (cottontailRuntimeOptionTakesValue(arg) and index + 1 < args.len) 2 else 1;
+            continue;
+        }
+        return .{ .entrypoint = arg };
+    }
+    return null;
+}
+
+fn prepareRuntimeAutoInstall(
+    init: std.process.Init,
+    entrypoint: []const u8,
+    mode: runtime_autoinstall.Mode,
+    stderr: *std.Io.Writer,
+) !bool {
+    // Direct facade mode (engine spawned as the runtime's CLI, no launcher):
+    // the runtime owns dependency installation; scanning here would reject
+    // entrypoints the runtime itself handles (non-package imports, syntax the
+    // scanner cannot parse) and mask its real errors.
+    if (isDirectRuntimeFacade(init.environ_map)) return true;
+    runtime_autoinstall.prepare(init, entrypoint, mode, stderr) catch |err| {
+        if (err != error.AutoInstallFailed) {
+            try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+        }
+        try stderr.flush();
+        return false;
+    };
+    return true;
+}
+
+fn prepareForwardedRuntimeAutoInstall(
+    init: std.process.Init,
+    command_args: []const [:0]const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    if (isDirectRuntimeFacade(init.environ_map)) return true;
+    const input = runtimeAutoInstallInput(command_args) orelse return true;
+    switch (input) {
+        .entrypoint => |entrypoint| {
+            return try prepareRuntimeAutoInstall(init, entrypoint, .auto, stderr);
+        },
+        .source => |source| {
+            runtime_autoinstall.prepareSource(init, source, .auto, stderr) catch |err| {
+                if (err != error.AutoInstallFailed) {
+                    try stderr.print("hutch: dependency preflight failed: {s}\n", .{@errorName(err)});
+                }
+                try stderr.flush();
+                return false;
+            };
+            return true;
+        },
+    }
+}
+
 fn forwardToCottontail(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     command_args: []const [:0]const u8,
     stderr: *std.Io.Writer,
 ) !u8 {
+    if (!try prepareForwardedRuntimeAutoInstall(init, command_args, stderr)) return 1;
     const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
         try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
         try stderr.flush();
@@ -1342,7 +1490,7 @@ fn resolvePackageManager(
     allocator: std.mem.Allocator,
     stderr: *std.Io.Writer,
 ) !?PackageManagerResolution {
-    if (findHutchConfig(init, allocator)) |_| {
+    if (findHutchConfig(init, allocator)) |config_path| {
         const no_args: [0][:0]const u8 = .{};
         const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
             try stderr.print(
@@ -1366,23 +1514,80 @@ fn resolvePackageManager(
             }
             return null;
         };
-        if (package_manager_adapter.eligibleForVendoredBun(selection)) {
-            return resolveVendoredBun(init, allocator, config.root, selection, stderr);
+        var resolved = selection;
+        if (!resolved.configured) {
+            const project_root = std.fs.path.dirname(config_path) orelse ".";
+            resolved = try inferProjectPackageManager(init, allocator, project_root);
         }
-        return .{ .selection = selection };
+        if (package_manager_adapter.eligibleForVendoredBun(resolved)) {
+            return resolveVendoredBun(init, allocator, config.root, resolved, stderr);
+        }
+        return .{ .selection = resolved };
     } else |err| switch (err) {
         error.HutchConfigNotFound => {
             managed_store.pruneAutomatic(init, allocator);
-            return resolveVendoredBun(
-                init,
-                allocator,
-                std.json.Value.null,
-                package_manager_adapter.defaultSelection(),
-                stderr,
-            );
+            const resolved = try inferProjectPackageManager(init, allocator, ".");
+            if (package_manager_adapter.eligibleForVendoredBun(resolved)) {
+                return resolveVendoredBun(init, allocator, std.json.Value.null, resolved, stderr);
+            }
+            return .{ .selection = resolved };
         },
         else => return err,
     }
+}
+
+const foreign_lockfiles = [_]struct {
+    file_name: []const u8,
+    manager: package_manager_adapter.Name,
+}{
+    .{ .file_name = "bun.lockb", .manager = .bun },
+    .{ .file_name = "bun.lock", .manager = .bun },
+    .{ .file_name = "package-lock.json", .manager = .npm },
+    .{ .file_name = "pnpm-lock.yaml", .manager = .pnpm },
+    .{ .file_name = "yarn.lock", .manager = .yarn },
+};
+
+// An unconfigured project keeps whatever package manager it already uses: a
+// package.json packageManager declaration wins, then a foreign lockfile.
+// Fresh projects and hutch.lock projects use the built-in resolver.
+fn inferProjectPackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) !package_manager_adapter.Selection {
+    if (try packageJsonPackageManagerName(init, allocator, project_root)) |name| {
+        return .{ .name = name, .executable = name.command() };
+    }
+    const hutch_lock = try std.fs.path.join(allocator, &.{ project_root, "hutch.lock" });
+    if (pathExists(init.io, hutch_lock)) return package_manager_adapter.defaultSelection();
+    for (foreign_lockfiles) |entry| {
+        const lockfile_path = try std.fs.path.join(allocator, &.{ project_root, entry.file_name });
+        if (pathExists(init.io, lockfile_path)) {
+            return .{ .name = entry.manager, .executable = entry.manager.command() };
+        }
+    }
+    return package_manager_adapter.defaultSelection();
+}
+
+fn packageJsonPackageManagerName(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) !?package_manager_adapter.Name {
+    const package_json_path = try std.fs.path.join(allocator, &.{ project_root, "package.json" });
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        package_json_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{}) catch return null;
+    if (parsed != .object) return null;
+    const declared = parsed.object.get("packageManager") orelse return null;
+    if (declared != .string) return null;
+    // Corepack format: "<name>@<version>[+<hash>]"; a bare name also counts.
+    const name = declared.string[0 .. std.mem.indexOfScalar(u8, declared.string, '@') orelse declared.string.len];
+    return std.meta.stringToEnum(package_manager_adapter.Name, name);
 }
 
 // Bun is vendored like any other toolchain: the devkit of the pinned
@@ -1448,11 +1653,26 @@ fn runPackageManager(
     allocator: std.mem.Allocator,
     subcommand: ?[]const u8,
     forwarded_args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
     const resolution = (try resolvePackageManager(init, allocator, stderr)) orelse return 1;
     defer resolution.close(init.io);
     const selection = resolution.selection;
+    if (selection.name == .hutch) {
+        if (subcommand == null) {
+            try stderr.writeAll(
+                "hutch: `hutch pm` forwards to an external package manager; select npm, bun, pnpm, or yarn in hutch.config.ts\n",
+            );
+            return 1;
+        }
+        var builtin_args: std.ArrayList([:0]const u8) = .empty;
+        defer builtin_args.deinit(allocator);
+        try builtin_args.append(allocator, "hutch");
+        try builtin_args.append(allocator, "install");
+        try builtin_args.appendSlice(allocator, forwarded_args);
+        return package_manager.cli.run(init, builtin_args.items, stdout, stderr);
+    }
     const term = package_manager_adapter.run(
         init,
         allocator,
@@ -1623,8 +1843,10 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             if (std.mem.eql(u8, selected_command, "install")) "install" else null,
             args[2..],
+            stdout,
             stderr,
         );
+        try stdout.flush();
         try stderr.flush();
         if (exit_code != 0) std.process.exit(exit_code);
         return;

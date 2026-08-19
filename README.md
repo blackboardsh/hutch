@@ -9,9 +9,9 @@ installation has two parts:
 
 Cottontail is an independently released runtime. Hutch resolves it from the same
 global content store when JavaScript execution is needed; it is not embedded in
-or version-locked to a Hutch release. JavaScript dependency installation is
-delegated to a package manager — a vendored bun toolchain by default. Hutch does
-not implement npm registry resolution or mutate package-manager lockfiles.
+or version-locked to a Hutch release. JavaScript dependencies install through
+Hutch's minimal built-in npm-compatible resolver by default, or through an
+explicitly selected external package manager.
 
 ## Install
 
@@ -64,17 +64,17 @@ replaces the global production or canary selection.
 
 ## Package Managers
 
-Hutch delegates JavaScript dependency operations to a package manager. `bun` is
-the default, vendored as a toolchain exactly like zig, rust, go, and odin:
-Hutch downloads the exact bun release from bun's own servers into
-`~/.hutch/toolchains/bun/<version>`, and a version-matching system bun
-short-circuits the download. In a project, the devkit of the pinned
-`electrobun.version` supplies the bun version; outside a project Hutch falls
-back to its own default bun version. (`build.bun.version` in the app config
-overrides the version an app bundles, like the other toolchain overrides; it
-does not affect package-manager resolution.) Projects can instead select
-`npm`, `pnpm`, or `yarn` in `hutch.config.ts`, or provide an explicit
-executable:
+Hutch ships a minimal built-in npm-compatible resolver and uses it by
+default: it downloads registry tarballs, verifies sha512 integrity, caches
+under `~/.hutch/cache/npm`, materializes `node_modules`, and writes Hutch's
+own deterministic lockfile, `hutch.lock` (the only lockfile Hutch reads — no
+foreign-lockfile migration). It installs registry and `file:` dependencies,
+never runs lifecycle scripts, and leaves workspaces and git dependencies to
+external managers. Standalone Cottontail scripts get launch-time
+auto-installation of their package imports.
+
+Explicit choices always win. Projects can select `npm`, `bun`, `pnpm`, or
+`yarn` in `hutch.config.ts`, or provide an explicit executable:
 
 ```ts
 export default {
@@ -86,20 +86,19 @@ export default {
 };
 ```
 
-`hutch install [args...]` runs `<package-manager> install [args...]`. `hutch pm
-[args...]` passes the remaining arguments through unchanged. Other package
-operations stay native to the selected manager; for example, use `hutch pm add
-three` rather than a Hutch-specific add command. Hutch does not read
-`package.json`, resolve dependencies, emulate lifecycle scripts, or mutate
-lockfiles.
+`hutch install [args...]` resolves with the built-in resolver, or runs
+`<package-manager> install [args...]` when one is selected. `hutch pm
+[args...]` passes arguments through to an explicitly selected external
+manager unchanged; package operations beyond install stay native to that
+manager (`hutch pm add three` rather than a Hutch-specific add command).
 
-The same vendored bun toolchain provides the runtime that `mainProcess: "bun"`
-apps bundle, so a machine with no JavaScript tooling installed can install
-dependencies and build an app with nothing but Hutch. Bundling always ships
-the managed install — a PATH bun (often a version-manager shim) is accepted
-only as a package-manager convenience, never as a bundled artifact. Explicitly
-selected managers (`npm`, `pnpm`, `yarn`, or an explicit `executable`) resolve
-from `PATH` or the configured path.
+Unconfigured projects keep whatever manager they already use: a
+`package.json` `packageManager` declaration wins, then the presence of a
+foreign lockfile (`bun.lock`/`bun.lockb`, `package-lock.json`,
+`pnpm-lock.yaml`, `yarn.lock`) routes to that tool; a `hutch.lock` or a fresh
+project uses the built-in resolver. Selecting `bun` still resolves the
+toolchain-vendored Bun (the same managed binary `mainProcess: "bun"` apps
+bundle), so no PATH tooling is required in either mode.
 
 On Windows, Hutch invokes npm/pnpm/yarn `.cmd` and `.bat` shims only through its
 native argv adapter. The underlying Windows batch format cannot preserve NUL,
