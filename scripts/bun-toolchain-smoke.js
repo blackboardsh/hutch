@@ -4,7 +4,8 @@
 // shadows any system bun with a version-mismatched stub, runs `hutch pm
 // --version` in a config-free directory, and requires Hutch to download the
 // default bun into a scratch HUTCH_HOME and execute it. Run it on each release
-// platform before shipping a bun default bump: `npm run smoke:bun-toolchain`.
+// platform before shipping a bun default bump: `hutch run smoke:bun-toolchain`
+// (needs a built zig-out; no tooling beyond Hutch itself).
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
