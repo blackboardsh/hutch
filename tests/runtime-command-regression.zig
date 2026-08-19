@@ -615,7 +615,7 @@ pub fn main(init: std.process.Init) !void {
                 fixture_root,
                 fake_bin,
                 "config-pm-adversarial-npm",
-                "{}",
+                "{\"packageManager\":\"npm\"}",
                 &.{ "install", invalid_arg },
             );
             try expectExit(invalid_batch_arg.term, 1);
