@@ -475,16 +475,17 @@ fn archiveFor(allocator: std.mem.Allocator, kind: Kind, version: []const u8) !Ar
 }
 
 fn bunArchiveName(allocator: std.mem.Allocator) ![]const u8 {
+    // Windows uses the baseline build: the binary ships inside end-user app
+    // bundles, and the non-baseline build requires AVX2.
+    if (builtin.os.tag == .windows) {
+        return allocator.dupe(u8, "bun-windows-x64-baseline.zip");
+    }
     const os = switch (builtin.os.tag) {
         .macos => "darwin",
         .linux => "linux",
-        .windows => "windows",
         else => return error.UnsupportedToolchainPlatform,
     };
-    const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
-        "aarch64"
-    else
-        "x64";
+    const arch = if (builtin.cpu.arch == .aarch64) "aarch64" else "x64";
     return std.fmt.allocPrint(allocator, "bun-{s}-{s}.zip", .{ os, arch });
 }
 
@@ -802,6 +803,11 @@ test "bun archives resolve from upstream oven-sh releases" {
         "https://github.com/oven-sh/bun/releases/download/bun-v1.3.13/bun-",
     ));
     try std.testing.expect(std.mem.endsWith(u8, archive.filename, ".zip"));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("bun-windows-x64-baseline.zip", archive.filename);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, archive.filename, "baseline") == null);
+    }
 }
 
 test "temporary toolchain archives keep the archive extension last" {
