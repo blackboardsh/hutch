@@ -4,6 +4,7 @@ const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const managed_store = @import("managed_store.zig");
 const prune_cli = @import("prune_cli.zig");
 const electrobun = @import("electrobun.zig");
+const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
@@ -11,6 +12,7 @@ const release_store = @import("release_store.zig");
 const reset_cli = @import("reset_cli.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const status_cli = @import("status_cli.zig");
+const toolchain_store = @import("toolchain_store.zig");
 const version_selector = @import("version_selector.zig");
 
 const version = @import("version.zig").version;
@@ -40,7 +42,9 @@ const help_text_template =
     \\  Scripts are resolved only from hutch.config.ts.
     \\  String scripts run through the selected Cottontail Bun.$ shell.
     \\  Array scripts run as exact non-empty argv string arrays.
-    \\  packageManager selects npm (default), bun, pnpm, yarn, or an explicit executable.
+    \\  packageManager selects bun (default), npm, pnpm, yarn, or an explicit executable.
+    \\  Default bun is vendored as a toolchain at the devkit default of the pinned
+    \\  electrobun.version, or at Hutch's own default without a pin.
     \\  Hutch delegates package-manager argv and never resolves package.json dependencies.
     \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
@@ -1324,11 +1328,20 @@ fn runNamedConfigScript(
     );
 }
 
+const PackageManagerResolution = struct {
+    selection: package_manager_adapter.Selection,
+    toolchain: ?toolchain_store.LeasedResolution = null,
+
+    fn close(self: PackageManagerResolution, io: std.Io) void {
+        if (self.toolchain) |leased| leased.close(io);
+    }
+};
+
 fn resolvePackageManager(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     stderr: *std.Io.Writer,
-) !?package_manager_adapter.Selection {
+) !?PackageManagerResolution {
     if (findHutchConfig(init, allocator)) |_| {
         const no_args: [0][:0]const u8 = .{};
         const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
@@ -1342,24 +1355,92 @@ fn resolvePackageManager(
             try stderr.print("hutch: failed to load hutch.config.ts: {s}\n", .{@errorName(err)});
             return null;
         };
-        return package_manager_adapter.fromConfig(config.root) catch |err| {
+        const selection = package_manager_adapter.fromConfig(config.root) catch |err| {
             switch (err) {
                 error.UnsupportedPackageManager => try stderr.writeAll(
-                    "hutch: unsupported packageManager in hutch.config.ts; expected npm, bun, pnpm, or yarn\n",
+                    "hutch: unsupported packageManager in hutch.config.ts; expected bun, npm, pnpm, or yarn\n",
                 ),
                 error.InvalidPackageManagerConfig => try stderr.writeAll(
-                    "hutch: packageManager must be npm, bun, pnpm, yarn, or { name, executable? }\n",
+                    "hutch: packageManager must be bun, npm, pnpm, yarn, or { name, executable? }\n",
                 ),
             }
             return null;
         };
+        if (package_manager_adapter.eligibleForVendoredBun(selection)) {
+            return resolveVendoredBun(init, allocator, config.root, selection, stderr);
+        }
+        return .{ .selection = selection };
     } else |err| switch (err) {
         error.HutchConfigNotFound => {
             managed_store.pruneAutomatic(init, allocator);
-            return package_manager_adapter.defaultSelection();
+            return resolveVendoredBun(
+                init,
+                allocator,
+                std.json.Value.null,
+                package_manager_adapter.defaultSelection(),
+                stderr,
+            );
         },
         else => return err,
     }
+}
+
+// Bun is vendored like any other toolchain: the devkit of the pinned
+// electrobun.version supplies the version, and Hutch's own default covers
+// invocations without a pin. A version-matching system bun short-circuits the
+// download.
+fn resolveVendoredBun(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    config_root: std.json.Value,
+    selection: package_manager_adapter.Selection,
+    stderr: *std.Io.Writer,
+) !?PackageManagerResolution {
+    const bun_version = vendoredBunVersion(init, allocator, config_root) catch |err| {
+        try stderr.print(
+            "hutch: could not determine the bun package-manager version: {s}\n",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    const leased = toolchain_store.resolveVersion(init, allocator, .bun, bun_version) catch |err| {
+        switch (err) {
+            error.ToolchainNotInstalledOffline => try stderr.print(
+                "hutch: bun {s} is not installed; offline mode cannot download it\n",
+                .{bun_version},
+            ),
+            error.ToolchainDamagedOffline => try stderr.print(
+                "hutch: the installed bun {s} toolchain is damaged; disable offline mode to replace it\n",
+                .{bun_version},
+            ),
+            else => try stderr.print(
+                "hutch: could not resolve the bun {s} toolchain: {s}\n",
+                .{ bun_version, @errorName(err) },
+            ),
+        }
+        return null;
+    };
+    var resolved = selection;
+    resolved.executable = leased.resolution.binary;
+    return .{ .selection = resolved, .toolchain = leased };
+}
+
+fn vendoredBunVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    config_root: std.json.Value,
+) ![]const u8 {
+    if (config_root != .object) return toolchain_store.default_bun_version;
+    const electrobun_version = electrobun_devkit.configuredVersion(config_root) catch |err| switch (err) {
+        error.ElectrobunVersionMissing => return toolchain_store.default_bun_version,
+        else => return err,
+    };
+    const core_root = if (init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| blk: {
+        if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
+        break :blk try std.Io.Dir.cwd().realPathFileAlloc(init.io, configured, allocator);
+    } else try electrobun_artifacts.ensureCore(init, allocator, electrobun_version);
+    const devkit = try electrobun_devkit.load(init.io, allocator, core_root, electrobun_version);
+    return devkit.toolchains.bun;
 }
 
 fn runPackageManager(
@@ -1369,7 +1450,9 @@ fn runPackageManager(
     forwarded_args: []const [:0]const u8,
     stderr: *std.Io.Writer,
 ) !u8 {
-    const selection = (try resolvePackageManager(init, allocator, stderr)) orelse return 1;
+    const resolution = (try resolvePackageManager(init, allocator, stderr)) orelse return 1;
+    defer resolution.close(init.io);
+    const selection = resolution.selection;
     const term = package_manager_adapter.run(
         init,
         allocator,

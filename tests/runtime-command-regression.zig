@@ -171,6 +171,14 @@ fn expectNoPrivateTempArtifacts(init: std.process.Init, directory: []const u8) !
     }
 }
 
+fn toolchainPlatformKey() []const u8 {
+    return switch (builtin.os.tag) {
+        .macos => if (builtin.cpu.arch == .aarch64) "macos-arm64" else "macos-x64",
+        .linux => if (builtin.cpu.arch == .aarch64) "linux-arm64" else "linux-x64",
+        else => "windows-x64",
+    };
+}
+
 fn writeFakePackageManager(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -318,7 +326,7 @@ pub fn main(init: std.process.Init) !void {
         runtime,
         no_config_root,
         fake_bin,
-        "pm-no-config-npm",
+        "pm-no-config-bun",
         "{}",
         &.{ "install", "--ignore-scripts" },
     );
@@ -412,6 +420,53 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(custom_install.term, 0);
 
+    // The default bun is vendored as a toolchain. With the PATH bun reporting
+    // a version Hutch's default cannot accept, resolution must fall through to
+    // the pre-installed managed toolchain and run that binary by exact path.
+    const vendored_home = try std.fs.path.join(allocator, &.{ fixture_root, "hutch-home" });
+    const vendored_root = try std.fs.path.join(allocator, &.{
+        vendored_home,
+        "toolchains",
+        "bun",
+        "1.3.13",
+        toolchainPlatformKey(),
+    });
+    const vendored_bun = try std.fs.path.join(allocator, &.{
+        vendored_root,
+        if (builtin.os.tag == .windows) "bun.exe" else "bun",
+    });
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        runtime,
+        std.Io.Dir.cwd(),
+        vendored_bun,
+        init.io,
+        .{ .permissions = .executable_file, .make_path = true },
+    );
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ vendored_root, ".hutch-toolchain" }),
+        .data = "1.3.13",
+    });
+    const vendored_install = try runConfigCommandWithOverrides(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pm-vendored-bun",
+        "{\"scripts\":{}}",
+        &.{ "install", "--linker=isolated" },
+        &.{
+            .{ .key = "HUTCH_HOME", .value = vendored_home },
+            .{ .key = "HUTCH_TEST_VENDORED_BUN_PATH", .value = vendored_bun },
+            .{ .key = "HUTCH_TEST_VENDORED_BUN_VERSION", .value = "1.3.13" },
+            .{ .key = "HUTCH_TEST_PATH_BUN_VERSION", .value = "0.0.1" },
+        },
+    );
+    try expectExit(vendored_install.term, 0);
+
     const missing_manager = try runConfigCommand(
         init,
         allocator,
@@ -459,7 +514,7 @@ pub fn main(init: std.process.Init) !void {
         mode: []const u8,
         config: []const u8,
     }{
-        .{ .mode = "config-pm-adversarial-npm", .config = "{}" },
+        .{ .mode = "config-pm-adversarial-npm", .config = "{\"packageManager\":\"npm\"}" },
         .{ .mode = "config-pm-adversarial-pnpm", .config = "{\"packageManager\":\"pnpm\"}" },
         .{ .mode = "config-pm-adversarial-yarn", .config = "{\"packageManager\":\"yarn\"}" },
     };

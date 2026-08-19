@@ -19,9 +19,6 @@ pub const ToolchainVersions = struct {
     rust: []const u8,
     go: []const u8,
     odin: []const u8,
-};
-
-pub const RuntimeVersions = struct {
     bun: []const u8,
 };
 
@@ -29,7 +26,6 @@ pub const RuntimePaths = struct {
     main: []const u8,
     preload_full: []const u8,
     preload_sandboxed: []const u8,
-    bun: []const u8,
     launcher: []const u8,
     extractor: []const u8,
     core_library: []const u8,
@@ -106,7 +102,6 @@ pub const Resolution = struct {
     version: []const u8,
     source_manifest_sha256: []const u8,
     toolchains: ToolchainVersions,
-    runtimes: RuntimeVersions,
     runtime: RuntimePaths,
     sdks: SdkPaths,
 };
@@ -227,11 +222,7 @@ pub fn load(
         .rust = try toolchainVersion(toolchains, "rust"),
         .go = try toolchainVersion(toolchains, "go"),
         .odin = try toolchainVersion(toolchains, "odin"),
-    };
-
-    const runtimes = try requiredObjectField(root, "runtimes");
-    const runtime_versions: RuntimeVersions = .{
-        .bun = try runtimeVersion(runtimes, "bun"),
+        .bun = try toolchainVersion(toolchains, "bun"),
     };
 
     const layout = try requiredObjectField(root, "layout");
@@ -240,7 +231,6 @@ pub fn load(
         .main = try requiredExistingPath(io, allocator, core_root, runtime, "main", .file),
         .preload_full = try requiredExistingPath(io, allocator, core_root, runtime, "preloadFull", .file),
         .preload_sandboxed = try requiredExistingPath(io, allocator, core_root, runtime, "preloadSandboxed", .file),
-        .bun = try requiredExistingPath(io, allocator, core_root, runtime, "bun", .file),
         .launcher = try requiredExistingPath(io, allocator, core_root, runtime, "launcher", .file),
         .extractor = try requiredExistingPath(io, allocator, core_root, runtime, "extractor", .file),
         .core_library = try requiredExistingPath(io, allocator, core_root, runtime, "coreLibrary", .file),
@@ -282,7 +272,6 @@ pub fn load(
         .version = manifest_version,
         .source_manifest_sha256 = try allocator.dupe(u8, &manifest_digest_hex),
         .toolchains = toolchain_versions,
-        .runtimes = runtime_versions,
         .runtime = runtime_paths,
         .sdks = sdk_paths,
     };
@@ -702,14 +691,6 @@ fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u
     return version;
 }
 
-fn runtimeVersion(runtimes: std.json.ObjectMap, name: []const u8) ![]const u8 {
-    const runtime = try requiredObjectField(runtimes, name);
-    const version = try requiredString(runtime, "version");
-    if (version.len > 128) return error.InvalidElectrobunRuntimeVersion;
-    _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunRuntimeVersion;
-    return version;
-}
-
 fn validateExactOdinVersion(version: []const u8) !void {
     if (std.SemanticVersion.parse(version)) |_| return else |_| {}
     if (version.len != 11 and version.len != 12) return error.InvalidElectrobunToolchainVersion;
@@ -1064,17 +1045,14 @@ const test_manifest_template =
     \\    "zig": { "defaultVersion": "0.16.0" },
     \\    "rust": { "defaultVersion": "1.88.0" },
     \\    "go": { "defaultVersion": "1.26.4" },
-    \\    "odin": { "defaultVersion": "dev-2026-07a" }
-    \\  },
-    \\  "runtimes": {
-    \\    "bun": { "version": "1.3.13" }
+    \\    "odin": { "defaultVersion": "dev-2026-07a" },
+    \\    "bun": { "defaultVersion": "1.3.13" }
     \\  },
     \\  "layout": {
     \\    "runtime": {
     \\      "main": "main.js",
     \\      "preloadFull": "preload-full.js",
     \\      "preloadSandboxed": "preload-sandboxed.js",
-    \\      "bun": "bin/bun",
     \\      "launcher": "bin/launcher",
     \\      "extractor": "bin/extractor",
     \\      "coreLibrary": "lib/core",
@@ -1128,7 +1106,6 @@ const test_fixture_files = [_][]const u8{
     "main.js",
     "preload-full.js",
     "preload-sandboxed.js",
-    "bin/bun",
     "bin/launcher",
     "bin/extractor",
     "lib/core",
@@ -1190,14 +1167,14 @@ test "package-free v2 devkit resolves runtime SDKs and toolchain defaults" {
 
     try std.testing.expectEqualStrings("2.0.0-beta.1", resolution.version);
     try std.testing.expectEqualStrings("0.16.0", resolution.toolchains.zig);
-    try std.testing.expectEqualStrings("1.3.13", resolution.runtimes.bun);
+    try std.testing.expectEqualStrings("1.3.13", resolution.toolchains.bun);
     try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.preload_full, "preload-full.js"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.javascript.main, "api/sdks/main/index.ts"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.go.root, "go-sdk"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.odin.collection, "odin-sdk"));
 }
 
-test "v2 devkit requires exact bundled Bun runtime provenance" {
+test "v2 devkit requires an exact bun toolchain default" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1216,33 +1193,29 @@ test "v2 devkit requires exact bundled Bun runtime provenance" {
     for ([_][]const u8{ "latest", "^1.3.13" }) |invalid_version| {
         const replacement = try std.fmt.allocPrint(
             arena.allocator(),
-            "\"version\": \"{s}\"",
+            "\"bun\": {{ \"defaultVersion\": \"{s}\" }}",
             .{invalid_version},
         );
         const malformed = try std.mem.replaceOwned(
             u8,
             arena.allocator(),
             valid_source,
-            "\"version\": \"1.3.13\"",
+            "\"bun\": { \"defaultVersion\": \"1.3.13\" }",
             replacement,
         );
+        try std.testing.expect(std.mem.indexOf(u8, malformed, invalid_version) != null);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = malformed });
         try std.testing.expectError(
-            error.InvalidElectrobunRuntimeVersion,
+            error.InvalidElectrobunToolchainVersion,
             load(io, arena.allocator(), root, "2.0.0"),
         );
     }
 
-    const runtimes_block =
-        \\  "runtimes": {
-        \\    "bun": { "version": "1.3.13" }
-        \\  },
-    ;
     const missing = try std.mem.replaceOwned(
         u8,
         arena.allocator(),
         valid_source,
-        runtimes_block,
+        ",\n    \"bun\": { \"defaultVersion\": \"1.3.13\" }",
         "",
     );
     try std.testing.expect(missing.len < valid_source.len);

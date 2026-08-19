@@ -56,7 +56,6 @@ export function createCoreFixture(root, version, host = hostContract()) {
     main: "main.js",
     preloadFull: "preload-full.js",
     preloadSandboxed: "preload-sandboxed.js",
-    bun: executableName("bun"),
     launcher: executableName("launcher"),
     extractor: executableName("extractor"),
     coreLibrary: host.core,
@@ -84,9 +83,7 @@ export function createCoreFixture(root, version, host = hostContract()) {
       rust: { defaultVersion: "1.88.0" },
       go: { defaultVersion: "1.26.4" },
       odin: { defaultVersion: "dev-2026-07a" },
-    },
-    runtimes: {
-      bun: { version: "1.3.13" },
+      bun: { defaultVersion: "1.3.13" },
     },
     layout: {
       runtime,

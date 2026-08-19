@@ -10,8 +10,8 @@ installation has two parts:
 Cottontail is an independently released runtime. Hutch resolves it from the same
 global content store when JavaScript execution is needed; it is not embedded in
 or version-locked to a Hutch release. JavaScript dependency installation is
-delegated to the project's external package manager. Hutch does not implement
-npm registry resolution or mutate package-manager lockfiles.
+delegated to a package manager — a vendored bun toolchain by default. Hutch does
+not implement npm registry resolution or mutate package-manager lockfiles.
 
 ## Install
 
@@ -64,9 +64,17 @@ replaces the global production or canary selection.
 
 ## Package Managers
 
-Hutch delegates JavaScript dependency operations to an external package
-manager. `npm` is the default; projects can select `bun`, `pnpm`, or `yarn` in
-`hutch.config.ts`, or provide an explicit executable:
+Hutch delegates JavaScript dependency operations to a package manager. `bun` is
+the default, vendored as a toolchain exactly like zig, rust, go, and odin:
+Hutch downloads the exact bun release from bun's own servers into
+`~/.hutch/toolchains/bun/<version>`, and a version-matching system bun
+short-circuits the download. In a project, the devkit of the pinned
+`electrobun.version` supplies the bun version; outside a project Hutch falls
+back to its own default bun version. (`build.bun.version` in the app config
+overrides the version an app bundles, like the other toolchain overrides; it
+does not affect package-manager resolution.) Projects can instead select
+`npm`, `pnpm`, or `yarn` in `hutch.config.ts`, or provide an explicit
+executable:
 
 ```ts
 export default {
@@ -85,10 +93,13 @@ three` rather than a Hutch-specific add command. Hutch does not read
 `package.json`, resolve dependencies, emulate lifecycle scripts, or mutate
 lockfiles.
 
-The external `bun` package-manager executable comes from `PATH` (or the explicit
-`executable` above). It is intentionally separate from the Bun runtime bundled
-inside an Electrobun devkit for `mainProcess: "bun"`; Hutch does not expose or
-repurpose that application runtime as a package manager.
+The same vendored bun toolchain provides the runtime that `mainProcess: "bun"`
+apps bundle, so a machine with no JavaScript tooling installed can install
+dependencies and build an app with nothing but Hutch. Bundling always ships
+the managed install — a PATH bun (often a version-manager shim) is accepted
+only as a package-manager convenience, never as a bundled artifact. Explicitly
+selected managers (`npm`, `pnpm`, `yarn`, or an explicit `executable`) resolve
+from `PATH` or the configured path.
 
 On Windows, Hutch invokes npm/pnpm/yarn `.cmd` and `.bat` shims only through its
 native argv adapter. The underlying Windows batch format cannot preserve NUL,

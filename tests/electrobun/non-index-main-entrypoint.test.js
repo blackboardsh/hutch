@@ -83,18 +83,46 @@ function bunCompatibilityVersion(cottontail) {
   return version;
 }
 
-function prepareBunDevkit(root, version, cottontail) {
+// The exact string the fixture bun answers to `--version`, which is what the
+// toolchain store validates a pinned install against.
+function bunToolchainVersion(cottontail) {
+  const result = spawnSync(cottontail, ["--version"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const version = result.stdout.trim();
+  assert.match(version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);
+  return version;
+}
+
+function toolchainPlatformKey() {
+  if (process.platform === "darwin") {
+    return process.arch === "arm64" ? "macos-arm64" : "macos-x64";
+  }
+  if (process.platform === "linux") {
+    return process.arch === "arm64" ? "linux-arm64" : "linux-x64";
+  }
+  return "windows-x64";
+}
+
+// Pre-installs the fixture bun into a Hutch home's toolchain store the way a
+// completed upstream download would land there.
+function installManagedBun(home, version, cottontail) {
+  const root = join(home, "toolchains", "bun", version, toolchainPlatformKey());
+  const executable = join(root, executableName("bun"));
+  mkdirSync(root, { recursive: true });
+  copyFileSync(cottontail, executable);
+  chmodSync(executable, 0o755);
+  writeFixtureFile(join(root, ".hutch-toolchain"), version);
+  return executable;
+}
+
+function prepareBunDevkit(root, version, pinnedBunVersion, cottontail) {
   const host = hostContract();
   const manifest = createCoreFixture(root, version, host);
-  const runtime = join(root, manifest.layout.runtime.bun);
   const launcher = join(root, manifest.layout.runtime.launcher);
 
-  // The fixture runtime is Cottontail's Bun-compatible executable. Keeping it
-  // inside the devkit (rather than resolving `bun` from PATH) exercises the
-  // same immutable runtime path used by a published Electrobun artifact.
-  copyFileSync(cottontail, runtime);
-  chmodSync(runtime, 0o755);
-  manifest.runtimes.bun.version = bunCompatibilityVersion(cottontail);
+  // The devkit no longer distributes a bun binary; it only pins the default
+  // bun toolchain version the way it pins zig/rust/go/odin defaults.
+  manifest.toolchains.bun.defaultVersion = pinnedBunVersion;
   writeFixtureFile(
     join(root, "native-devkit.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
@@ -110,7 +138,7 @@ function prepareBunDevkit(root, version, cottontail) {
     );
   }
   chmodSync(launcher, 0o755);
-  return { host, manifest, runtime };
+  return { host, manifest };
 }
 
 function bundlePaths(project) {
@@ -307,11 +335,12 @@ test("v2 Electrobun rejects removed Bun version fields but permits unknown build
   }
 });
 
-test("v2 Electrobun keeps external package-manager Bun separate from its bundled Bun runtime", { timeout: 120_000 }, () => {
+test("v2 mainProcess bun and the default package manager share the vendored bun toolchain", { timeout: 120_000 }, () => {
   mkdirSync(scratchRoot, { recursive: true });
   const fixture = mkdtempSync(join(scratchRoot, "non-index-main-entrypoint-"));
   const project = join(fixture, "project");
   const coreRoot = join(fixture, "electrobun-core");
+  const home = join(fixture, "hutch-home");
   const version = "2.0.0-test.bun.1";
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
@@ -320,16 +349,17 @@ test("v2 Electrobun keeps external package-manager Bun separate from its bundled
   try {
     assert.ok(existsSync(hutch), `Hutch must be built before this test: ${hutch}`);
     assert.ok(existsSync(engine), `Hutch engine must be built before this test: ${engine}`);
-    const { manifest, runtime: devkitBun } = prepareBunDevkit(coreRoot, version, cottontail);
+    const pinnedBunVersion = bunToolchainVersion(cottontail);
+    const { manifest } = prepareBunDevkit(coreRoot, version, pinnedBunVersion, cottontail);
+    const managedBun = installManagedBun(home, pinnedBunVersion, cottontail);
     const externalBun = prepareExternalBun(fixture);
-    assert.match(manifest.runtimes.bun.version, /^\d+\.\d+\.\d+/);
-    const devkitBunSha256 = sha256(devkitBun);
+    const managedBunSha256 = sha256(managedBun);
     const externalBunSha256 = sha256(externalBun.executable);
     const devkitManifestSha256 = sha256(join(coreRoot, "native-devkit.json"));
     assert.notEqual(
       externalBunSha256,
-      devkitBunSha256,
-      "the external package manager must be distinguishable from the devkit runtime",
+      managedBunSha256,
+      "the PATH bun must be distinguishable from the managed toolchain bun",
     );
 
     writeFixtureFile(
@@ -363,6 +393,7 @@ export default {
       DASH_COTTONTAIL: cottontail,
       HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
       HUTCH_ENGINE_BINARY: engine,
+      HUTCH_HOME: home,
       HUTCH_NO_UPDATE_CHECK: "1",
       HUTCH_PM_CAPTURE: externalBun.capture,
     };
@@ -381,14 +412,14 @@ export default {
     assert.deepEqual(
       packageManagerInvocation.args,
       ["add", "left-pad", "--exact"],
-      "packageManager: bun must preserve the external manager's argv",
+      "packageManager: bun must preserve the manager's argv",
     );
     assert.equal(
       packageManagerInvocation.executableSha256,
-      externalBunSha256,
-      "packageManager: bun must execute the PATH Bun, not the devkit runtime",
+      managedBunSha256,
+      "packageManager: bun must execute the vendored toolchain bun, not the PATH bun",
     );
-    assert.notEqual(packageManagerInvocation.executableSha256, devkitBunSha256);
+    assert.notEqual(packageManagerInvocation.executableSha256, externalBunSha256);
 
     const build = spawnSync(hutch, ["electrobun", "build", "--env=dev"], {
       cwd: project,
@@ -404,8 +435,8 @@ export default {
     const stagedBun = join(execDir, executableName("bun"));
 
     assert.ok(existsSync(canonicalMain), `Expected canonical main artifact: ${canonicalMain}`);
-    assert.ok(existsSync(stagedBun), `Expected the devkit Bun runtime: ${stagedBun}`);
-    assert.equal(sha256(stagedBun), devkitBunSha256, "the bundle must contain the exact devkit runtime");
+    assert.ok(existsSync(stagedBun), `Expected the vendored bun runtime: ${stagedBun}`);
+    assert.equal(sha256(stagedBun), managedBunSha256, "the bundle must contain the exact managed toolchain bun");
     assert.equal(existsSync(sourceNamedOutput), false, "The source basename must not leak into the launcher contract");
     assert.match(readFileSync(canonicalMain, "utf8"), new RegExp(marker));
     assert.match(readFileSync(canonicalMain, "utf8"), /V2_DEVKIT_ALIAS/);
@@ -413,7 +444,7 @@ export default {
     const buildMetadata = JSON.parse(readFileSync(join(resourcesDir, "build.json"), "utf8"));
     assert.equal(buildMetadata.mainProcess, "bun");
     assert.equal(buildMetadata.electrobunVersion, version);
-    assert.equal(buildMetadata.runtimeVersions.bun, manifest.runtimes.bun.version);
+    assert.equal(buildMetadata.runtimeVersions.bun, manifest.toolchains.bun.defaultVersion);
     assert.equal(existsSync(join(project, "node_modules")), false);
     const projectionMarker = readFileSync(join(project, ".hutch", "devkit", ".complete"), "utf8");
     assert.match(projectionMarker, new RegExp(`electrobun=${version.replaceAll(".", "\\.")}`));
@@ -425,7 +456,7 @@ export default {
     assert.equal(launch.status, 0, launch.stderr || launch.stdout);
     assert.match(launch.stdout, new RegExp(marker));
     assert.match(launch.stdout, /V2_DEVKIT_ALIAS/);
-    assert.match(launch.stdout, new RegExp(manifest.runtimes.bun.version.replaceAll(".", "\\.")));
+    assert.match(launch.stdout, new RegExp(bunCompatibilityVersion(cottontail).replaceAll(".", "\\.")));
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

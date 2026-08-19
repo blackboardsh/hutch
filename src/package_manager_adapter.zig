@@ -14,10 +14,18 @@ pub const Name = enum {
 pub const Selection = struct {
     name: Name,
     executable: []const u8,
+    explicit_executable: bool = false,
 };
 
 pub fn defaultSelection() Selection {
-    return .{ .name = .npm, .executable = "npm" };
+    return .{ .name = .bun, .executable = "bun" };
+}
+
+// A bun selection without an explicit executable may be upgraded by the
+// caller to the Bun binary vendored inside the project's Electrobun devkit,
+// so fresh machines need no package manager on PATH.
+pub fn eligibleForVendoredBun(selection: Selection) bool {
+    return selection.name == .bun and !selection.explicit_executable;
 }
 
 fn parseName(value: std.json.Value) !Name {
@@ -51,6 +59,7 @@ pub fn fromConfig(root: std.json.Value) !Selection {
             break :objectSelection .{
                 .name = name,
                 .executable = executable,
+                .explicit_executable = object.get("executable") != null,
             };
         },
         else => error.InvalidPackageManagerConfig,
@@ -107,9 +116,20 @@ fn expectConfigErrorForTest(expected: anyerror, source: []const u8) !void {
     try std.testing.expectError(expected, fromConfig(parsed));
 }
 
-test "package manager defaults to external npm" {
-    try expectSelectionForTest("{}", .npm, "npm");
-    try expectSelectionForTest("null", .npm, "npm");
+test "package manager defaults to bun" {
+    try expectSelectionForTest("{}", .bun, "bun");
+    try expectSelectionForTest("null", .bun, "bun");
+}
+
+test "vendored bun applies only to bun selections without an explicit executable" {
+    try std.testing.expect(eligibleForVendoredBun(defaultSelection()));
+    try std.testing.expect(eligibleForVendoredBun(.{ .name = .bun, .executable = "bun" }));
+    try std.testing.expect(!eligibleForVendoredBun(.{
+        .name = .bun,
+        .executable = "/opt/tools/bun",
+        .explicit_executable = true,
+    }));
+    try std.testing.expect(!eligibleForVendoredBun(.{ .name = .npm, .executable = "npm" }));
 }
 
 test "package manager accepts the supported external managers" {

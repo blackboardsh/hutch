@@ -1023,15 +1023,14 @@ test "matching core markers do not hide incomplete manifest layouts" {
         \\    "zig": { "defaultVersion": "0.16.0" },
         \\    "rust": { "defaultVersion": "1.88.0" },
         \\    "go": { "defaultVersion": "1.26.4" },
-        \\    "odin": { "defaultVersion": "1.0.0" }
+        \\    "odin": { "defaultVersion": "1.0.0" },
+        \\    "bun": { "defaultVersion": "1.3.13" }
         \\  },
-        \\  "runtimes": { "bun": { "version": "1.3.13" } },
         \\  "layout": {
         \\    "runtime": {
         \\      "main": "missing/main.js",
         \\      "preloadFull": "missing/preload-full.js",
         \\      "preloadSandboxed": "missing/preload-sandboxed.js",
-        \\      "bun": "missing/bun",
         \\      "launcher": "missing/launcher",
         \\      "extractor": "missing/extractor",
         \\      "coreLibrary": "missing/core",

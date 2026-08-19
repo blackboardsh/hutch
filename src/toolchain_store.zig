@@ -5,11 +5,16 @@ const release_store = @import("release_store.zig");
 
 const max_archive_bytes = 1536 * 1024 * 1024;
 
+// Hutch's own bun default for invocations with no hutch.config.ts, where no
+// devkit manifest exists to supply toolchains.bun.defaultVersion.
+pub const default_bun_version = "1.3.13";
+
 pub const Kind = enum {
     zig,
     rust,
     go,
     odin,
+    bun,
 
     pub fn name(self: Kind) []const u8 {
         return @tagName(self);
@@ -21,6 +26,7 @@ pub const Kind = enum {
             .rust => if (builtin.os.tag == .windows) "rustc.exe" else "rustc",
             .go => if (builtin.os.tag == .windows) "go.exe" else "go",
             .odin => if (builtin.os.tag == .windows) "odin.exe" else "odin",
+            .bun => if (builtin.os.tag == .windows) "bun.exe" else "bun",
         };
     }
 
@@ -30,13 +36,14 @@ pub const Kind = enum {
             .rust => "rustc",
             .go => "go",
             .odin => "odin",
+            .bun => "bun",
         };
     }
 
     fn versionArgs(self: Kind) []const []const u8 {
         return switch (self) {
             .zig, .odin => &.{"version"},
-            .rust => &.{"--version"},
+            .rust, .bun => &.{"--version"},
             .go => &.{"version"},
         };
     }
@@ -106,6 +113,33 @@ pub fn resolveVersionUnderGraph(
         .resolution = system,
         .lease = null,
     };
+    const home = try release_store.hutchHome(init, allocator);
+    return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
+}
+
+/// Resolves only the managed install, never a PATH executable. Bundled
+/// runtimes ship the resolved binary itself, so a system executable (often a
+/// version-manager shim) is never an acceptable artifact source.
+pub fn resolveManagedOnlyVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    version: []const u8,
+) !LeasedResolution {
+    try validateVersion(kind, version);
+    const home = try release_store.hutchHome(init, allocator);
+    const graph = try store_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer graph.close(init.io);
+    return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
+}
+
+pub fn resolveManagedOnlyVersionUnderGraph(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    kind: Kind,
+    version: []const u8,
+) !LeasedResolution {
+    try validateVersion(kind, version);
     const home = try release_store.hutchHome(init, allocator);
     return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
 }
@@ -282,9 +316,11 @@ fn temporaryArchivePath(
     const suffix = std.fmt.bytesToHex(random, .lower);
     const temporary_root = try std.fs.path.join(allocator, &.{ home, "state", "tmp" });
     try std.Io.Dir.cwd().createDirPath(io, temporary_root);
+    // The archive filename stays last so extension-based extraction
+    // detection (".zip.tmp") sees the real archive format.
     return std.fs.path.join(allocator, &.{
         temporary_root,
-        try std.fmt.allocPrint(allocator, "toolchain-{s}-{s}.tmp", .{ archive_filename, &suffix }),
+        try std.fmt.allocPrint(allocator, "toolchain-{s}-{s}.tmp", .{ &suffix, archive_filename }),
     });
 }
 
@@ -418,6 +454,7 @@ fn archiveFor(allocator: std.mem.Allocator, kind: Kind, version: []const u8) !Ar
             },
         ),
         .odin => try odinArchiveName(allocator, version),
+        .bun => try bunArchiveName(allocator),
     };
     const url = switch (kind) {
         .zig => try std.fmt.allocPrint(allocator, "https://ziglang.org/download/{s}/{s}", .{ version, filename }),
@@ -428,8 +465,27 @@ fn archiveFor(allocator: std.mem.Allocator, kind: Kind, version: []const u8) !Ar
             "https://github.com/odin-lang/Odin/releases/download/{s}/{s}",
             .{ version, filename },
         ),
+        .bun => try std.fmt.allocPrint(
+            allocator,
+            "https://github.com/oven-sh/bun/releases/download/bun-v{s}/{s}",
+            .{ version, filename },
+        ),
     };
     return .{ .url = url, .filename = filename };
+}
+
+fn bunArchiveName(allocator: std.mem.Allocator) ![]const u8 {
+    const os = switch (builtin.os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "windows",
+        else => return error.UnsupportedToolchainPlatform,
+    };
+    const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
+        "aarch64"
+    else
+        "x64";
+    return std.fmt.allocPrint(allocator, "bun-{s}-{s}.zip", .{ os, arch });
 }
 
 fn zigArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -490,7 +546,7 @@ fn rustHostTriple() []const u8 {
 fn installedBinaryPath(allocator: std.mem.Allocator, root: []const u8, kind: Kind) ![]const u8 {
     return switch (kind) {
         .rust, .go => std.fs.path.join(allocator, &.{ root, "bin", kind.executableName() }),
-        .zig, .odin => std.fs.path.join(allocator, &.{ root, kind.executableName() }),
+        .zig, .odin, .bun => std.fs.path.join(allocator, &.{ root, kind.executableName() }),
     };
 }
 
@@ -581,7 +637,7 @@ fn executableMatchesVersion(
     if (termExitCode(result.term) != 0) return false;
     const output = std.mem.trim(u8, result.stdout, " \t\r\n");
     return switch (kind) {
-        .zig => std.mem.eql(u8, output, version),
+        .zig, .bun => std.mem.eql(u8, output, version),
         .rust => std.mem.startsWith(u8, output, try std.fmt.allocPrint(allocator, "rustc {s} ", .{version})),
         .go => std.mem.startsWith(u8, output, try std.fmt.allocPrint(allocator, "go version go{s} ", .{version})),
         .odin => blk: {
@@ -727,10 +783,37 @@ test "toolchain versions cannot escape their toolchain path" {
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "latest"));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "stable"));
     try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.odin, "dev-2026-13"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.bun, "latest"));
+    try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.bun, "1.3"));
     try validateVersion(.zig, "0.16.0");
     try validateVersion(.rust, "1.88.0");
     try validateVersion(.go, "1.26.4");
     try validateVersion(.odin, "dev-2026-07a");
+    try validateVersion(.bun, "1.3.13");
+}
+
+test "bun archives resolve from upstream oven-sh releases" {
+    const archive = try archiveFor(std.testing.allocator, .bun, "1.3.13");
+    defer std.testing.allocator.free(archive.url);
+    defer std.testing.allocator.free(archive.filename);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        archive.url,
+        "https://github.com/oven-sh/bun/releases/download/bun-v1.3.13/bun-",
+    ));
+    try std.testing.expect(std.mem.endsWith(u8, archive.filename, ".zip"));
+}
+
+test "temporary toolchain archives keep the archive extension last" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const relative = try std.fs.path.join(arena.allocator(), &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena.allocator());
+    const path = try temporaryArchivePath(io, arena.allocator(), home, "bun-darwin-aarch64.zip");
+    try std.testing.expect(std.mem.endsWith(u8, path, ".zip.tmp"));
 }
 
 test "Rust Cargo is selected from the resolved Rust toolchain" {

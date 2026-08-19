@@ -72,6 +72,32 @@ fn packageManagerInvocation(args: []const [:0]const u8) !PackageManagerInvocatio
     };
 }
 
+fn isPackageManagerMode(mode: []const u8) bool {
+    return std.mem.startsWith(u8, mode, "pm-") or
+        std.mem.startsWith(u8, mode, "config-pm-");
+}
+
+fn isBunVersionProbe(args: []const [:0]const u8) bool {
+    var forwarded = args[1..];
+    if (builtin.os.tag == .windows and forwarded.len > 0 and
+        std.mem.startsWith(u8, forwarded[0], package_manager_marker))
+    {
+        forwarded = forwarded[1..];
+    }
+    return forwarded.len == 1 and std.mem.eql(u8, forwarded[0], "--version");
+}
+
+fn executableMatchesPath(
+    init: std.process.Init,
+    executable: []const u8,
+    expected_path: []const u8,
+) bool {
+    const allocator = init.arena.allocator();
+    const actual = std.Io.Dir.cwd().realPathFileAlloc(init.io, executable, allocator) catch return false;
+    const expected = std.Io.Dir.cwd().realPathFileAlloc(init.io, expected_path, allocator) catch return false;
+    return std.mem.eql(u8, actual, expected);
+}
+
 fn expectPackageManagerInvocation(
     args: []const [:0]const u8,
     expected_name: []const u8,
@@ -255,6 +281,27 @@ pub fn main(init: std.process.Init) !void {
     const mode = init.environ_map.get("HUTCH_TEST_FIXTURE_MODE") orelse
         return error.MissingFixtureMode;
 
+    // Toolchain resolution probes candidate bun executables with `--version`
+    // before any package-manager invocation. The managed toolchain copy
+    // answers with the vendored fixture version; every other copy answers with
+    // Hutch's default so the PATH bun can satisfy a system match.
+    if (isPackageManagerMode(mode) and isBunVersionProbe(args)) {
+        const stdout = std.Io.File.stdout();
+        if (init.environ_map.get("HUTCH_TEST_VENDORED_BUN_PATH")) |expected_path| {
+            if (executableMatchesPath(init, args[0], expected_path)) {
+                const vendored = init.environ_map.get("HUTCH_TEST_VENDORED_BUN_VERSION") orelse
+                    return error.MissingVendoredBunVersion;
+                try stdout.writeStreamingAll(init.io, vendored);
+                try stdout.writeStreamingAll(init.io, "\n");
+                return;
+            }
+        }
+        const path_version = init.environ_map.get("HUTCH_TEST_PATH_BUN_VERSION") orelse "1.3.13";
+        try stdout.writeStreamingAll(init.io, path_version);
+        try stdout.writeStreamingAll(init.io, "\n");
+        return;
+    }
+
     if (std.mem.startsWith(u8, mode, "config-")) {
         if (args.len == 5 and
             std.mem.eql(u8, args[1], "--hutch-config-file") and
@@ -375,9 +422,17 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, mode, "config-pm-default-install")) {
             return expectPackageManagerInvocation(
                 args,
-                "npm",
+                "bun",
                 &.{ "install", "two words", "$literal" },
             );
+        }
+        if (std.mem.eql(u8, mode, "config-pm-vendored-bun")) {
+            const expected_path = init.environ_map.get("HUTCH_TEST_VENDORED_BUN_PATH") orelse
+                return error.MissingVendoredBunPath;
+            if (!executableMatchesPath(init, args[0], expected_path)) {
+                return error.UnexpectedPackageManagerExecutable;
+            }
+            return expectArgs(args[1..], &.{ "install", "--linker=isolated" });
         }
         if (std.mem.eql(u8, mode, "config-pm-bun-raw")) {
             return expectPackageManagerInvocation(
@@ -404,8 +459,8 @@ pub fn main(init: std.process.Init) !void {
         return error.UnknownFixtureMode;
     }
 
-    if (std.mem.eql(u8, mode, "pm-no-config-npm")) {
-        return expectPackageManagerInvocation(args, "npm", &.{ "install", "--ignore-scripts" });
+    if (std.mem.eql(u8, mode, "pm-no-config-bun")) {
+        return expectPackageManagerInvocation(args, "bun", &.{ "install", "--ignore-scripts" });
     }
 
     if (std.mem.eql(u8, mode, "runtime-options")) {

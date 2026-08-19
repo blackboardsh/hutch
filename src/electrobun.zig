@@ -127,7 +127,6 @@ const PlatformPaths = struct {
     devkit: ?electrobun_devkit.Resolution,
     projection: ?electrobun_devkit.Projection,
     launcher: []const u8,
-    bun_binary: []const u8,
     main_js: []const u8,
     preload_full_js: []const u8,
     preload_sandboxed_js: []const u8,
@@ -723,7 +722,8 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             }
         },
         .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .odin)),
-        .bun, .cottontail => {},
+        .bun => try appendManagedToolchain(ctx, &objects, .bun, try resolveBundledBunToolchainUnderGraph(ctx, config.root, platform_paths)),
+        .cottontail => {},
     }
     try managed_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
 }
@@ -3292,7 +3292,7 @@ fn resolveBuildToolchain(
     platform_paths: PlatformPaths,
     kind: toolchain_store.Kind,
 ) !toolchain_store.LeasedResolution {
-    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, false);
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, false, false);
 }
 
 fn resolveBuildToolchainUnderGraph(
@@ -3301,7 +3301,25 @@ fn resolveBuildToolchainUnderGraph(
     platform_paths: PlatformPaths,
     kind: toolchain_store.Kind,
 ) !toolchain_store.LeasedResolution {
-    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, true);
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, kind, true, false);
+}
+
+// The resolved bun binary ships inside the app bundle, so a PATH executable
+// is never an acceptable source; only the managed install is.
+fn resolveBundledBunToolchain(
+    ctx: *const Context,
+    config_root: std.json.Value,
+    platform_paths: PlatformPaths,
+) !toolchain_store.LeasedResolution {
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, .bun, false, true);
+}
+
+fn resolveBundledBunToolchainUnderGraph(
+    ctx: *const Context,
+    config_root: std.json.Value,
+    platform_paths: PlatformPaths,
+) !toolchain_store.LeasedResolution {
+    return resolveBuildToolchainWithMode(ctx, config_root, platform_paths, .bun, true, true);
 }
 
 fn resolveBuildToolchainWithMode(
@@ -3310,6 +3328,7 @@ fn resolveBuildToolchainWithMode(
     platform_paths: PlatformPaths,
     kind: toolchain_store.Kind,
     graph_held: bool,
+    managed_only: bool,
 ) !toolchain_store.LeasedResolution {
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const default_version = switch (kind) {
@@ -3317,9 +3336,15 @@ fn resolveBuildToolchainWithMode(
         .rust => devkit.toolchains.rust,
         .go => devkit.toolchains.go,
         .odin => devkit.toolchains.odin,
+        .bun => devkit.toolchains.bun,
     };
     const version = try configuredToolchainVersion(config_root, kind, default_version);
-    return (if (graph_held)
+    return (if (managed_only)
+        (if (graph_held)
+            toolchain_store.resolveManagedOnlyVersionUnderGraph(ctx.init, ctx.allocator, kind, version)
+        else
+            toolchain_store.resolveManagedOnlyVersion(ctx.init, ctx.allocator, kind, version))
+    else if (graph_held)
         toolchain_store.resolveVersionUnderGraph(ctx.init, ctx.allocator, kind, version)
     else
         toolchain_store.resolveVersion(ctx.init, ctx.allocator, kind, version)) catch |err| {
@@ -4584,7 +4609,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     try copyBundledUninstallManager(ctx, bundle, platform_paths);
     try copyPath(ctx, platform_paths.launcher, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() }));
     if (main_process == .bun) {
-        try copyPath(ctx, platform_paths.bun_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+        const bun_toolchain = try resolveBundledBunToolchain(ctx, config.root, platform_paths);
+        defer bun_toolchain.close(ctx.io);
+        try copyPath(ctx, bun_toolchain.resolution.binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
     }
     if (main_process == .cottontail) {
         try copyPath(ctx, try resolveCottontailBinary(ctx), try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, cottontailBinaryFileName() }));
@@ -6245,7 +6272,6 @@ fn platformPathsFromDevkit(
         .devkit = devkit,
         .projection = projection,
         .launcher = devkit.runtime.launcher,
-        .bun_binary = devkit.runtime.bun,
         .main_js = devkit.runtime.main,
         .preload_full_js = devkit.runtime.preload_full,
         .preload_sandboxed_js = devkit.runtime.preload_sandboxed,
@@ -6917,7 +6943,6 @@ test "preload scripts are resources rather than code-directory files" {
         .devkit = null,
         .projection = null,
         .launcher = "",
-        .bun_binary = "",
         .main_js = "",
         .preload_full_js = try std.fs.path.join(allocator, &.{ absolute_root, "platform", "preload-full.js" }),
         .preload_sandboxed_js = try std.fs.path.join(allocator, &.{ absolute_root, "platform", "preload-sandboxed.js" }),
@@ -6985,7 +7010,6 @@ test "bundled extractor is an uninstall manager resource" {
         .devkit = null,
         .projection = null,
         .launcher = "",
-        .bun_binary = "",
         .main_js = "",
         .preload_full_js = "",
         .preload_sandboxed_js = "",
@@ -7071,7 +7095,6 @@ test "bundled CEF layouts match the native wrapper contract" {
         .devkit = null,
         .projection = null,
         .launcher = "",
-        .bun_binary = "",
         .main_js = "",
         .preload_full_js = "",
         .preload_sandboxed_js = "",
@@ -7172,7 +7195,7 @@ fn writeBundledRuntimeMetadata(
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotPrepared;
     const build_json = try bundledRuntimeMetadataJson(ctx, config, .{
         .electrobun_version = devkit.version,
-        .bun_runtime_version = devkit.runtimes.bun,
+        .bun_runtime_version = try configuredToolchainVersion(config.root, .bun, devkit.toolchains.bun),
     });
     const version_json = try std.fmt.allocPrint(
         ctx.allocator,
