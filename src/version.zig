@@ -1,4 +1,4 @@
-pub const version = "0.21.0";
+pub const version = "0.22.0";
 
 /// The Cottontail release this Hutch release was built and tested with.
 /// With no pragma and no shim-supplied default, this pair is what runs:
