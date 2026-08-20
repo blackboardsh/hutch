@@ -156,6 +156,12 @@ function testRegistryAndMinimumAge() {
     "edge-package": ["1.0.0"],
     "external-child": ["1.0.0"],
     "cross-package": ["1.0.0"],
+    "redirect-manifest-package": ["1.0.0"],
+    "redirect-tarball-package": ["1.0.0"],
+    "empty-integrity-package": ["1.0.0"],
+    "malformed-integrity-package": ["1.0.0"],
+    "nonstring-integrity-package": ["1.0.0"],
+    "wrong-integrity-package": ["1.0.0"],
     "retry-package": ["1.0.0"],
     "age-package": ["1.0.0", "2.0.0"],
     "excluded-package": ["1.0.0", "2.0.0"],
@@ -210,6 +216,20 @@ const server = http.createServer((request, response) => {
       return;
     }
   }
+  if (url.pathname === "/redirect-manifest-package" && request.headers.host.startsWith("127.0.0.1:")) {
+    save();
+    response.writeHead(302, {
+      location: "http://localhost:" + server.address().port + "/redirected-manifest-package",
+    }).end();
+    return;
+  }
+  if (url.pathname.startsWith("/redirect-tarballs/")) {
+    save();
+    response.writeHead(302, {
+      location: "http://localhost:" + server.address().port + "/tarballs/" + path.basename(url.pathname),
+    }).end();
+    return;
+  }
   if (url.pathname.startsWith("/tarballs/")) {
     const filename = path.join(root, path.basename(url.pathname));
     save();
@@ -217,7 +237,9 @@ const server = http.createServer((request, response) => {
     response.writeHead(200, { "content-type": "application/octet-stream" });
     return fs.createReadStream(filename).pipe(response);
   }
-  const name = url.pathname.slice(1);
+  const name = url.pathname === "/redirected-manifest-package"
+    ? "redirect-manifest-package"
+    : url.pathname.slice(1);
   const packageVersions = ${JSON.stringify(versions)}[name];
   if (!packageVersions) {
     save();
@@ -230,8 +252,17 @@ const server = http.createServer((request, response) => {
     let tarball = "/tarballs/" + name + "-" + version + ".tgz";
     if (name === "cross-package") {
       tarball = "http://localhost:" + server.address().port + tarball;
+    } else if (name === "redirect-tarball-package") {
+      tarball = "/redirect-tarballs/" + name + "-" + version + ".tgz";
     }
-    manifestVersions[version] = { name, version, dist: { tarball } };
+    const dist = { tarball };
+    if (name === "empty-integrity-package") dist.integrity = "";
+    if (name === "malformed-integrity-package") dist.integrity = "sha512-not-base64";
+    if (name === "nonstring-integrity-package") dist.integrity = 42;
+    if (name === "wrong-integrity-package") {
+      dist.integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    }
+    manifestVersions[version] = { name, version, dist };
     if (version === "1.0.0") time[version] = new Date(now - 20 * 86400000).toISOString();
     else time[version] = new Date(now - 86400000).toISOString();
   }
@@ -273,6 +304,8 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
         "edge-package": "*",
         "external-registry-package": "file:../external-registry-package",
         "cross-package": "*",
+        "redirect-manifest-package": "*",
+        "redirect-tarball-package": "*",
         "retry-package": "*",
         "age-package": "*",
         "excluded-package": "*",
@@ -335,14 +368,47 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
       assert.ok(!fs.existsSync(path.join(root, "node_modules", "direct-musl-package")));
     }
 
+    // Repeat a redirected archive without any cache so the synchronous fetch
+    // path receives the same cross-origin credential-stripping coverage as
+    // the concurrent archive prefetch path above.
+    const redirectNoCacheRoot = path.join(scratch, "redirect-no-cache-project");
+    const redirectNoCacheHome = path.join(scratch, "redirect-no-cache-home");
+    writeJson(path.join(redirectNoCacheRoot, "package.json"), {
+      name: "redirect-no-cache-project",
+      dependencies: { "redirect-tarball-package": "1.0.0" },
+    });
+    fs.writeFileSync(
+      path.join(redirectNoCacheRoot, "bunfig.toml"),
+      `[install]\nregistry = "http://127.0.0.1:${port}/"\n`,
+    );
+    expectSuccess(
+      "cross-origin redirect without archive cache",
+      runInstall(redirectNoCacheRoot, redirectNoCacheHome, ["--no-cache", "--no-verify"], {
+        BUN_CONFIG_TOKEN: "edge-token",
+      }),
+    );
+
     const stats = JSON.parse(fs.readFileSync(statsFile, "utf8"));
     assert.ok(stats.retryManifestRequests >= 3, "429 manifest response was not retried");
-    const manifests = stats.requests.filter((request) => !request.pathname.startsWith("/tarballs/"));
-    assert.ok(manifests.length >= Object.keys(versions).length);
-    assert.ok(manifests.every((request) => !request.pathname.startsWith("//")));
-    assert.ok(manifests.every((request) => request.authorization === "Bearer edge-token"));
-    assert.ok(manifests.every((request) => request.npmAuthType === "legacy"));
-    assert.ok(manifests.every((request) => request.accept.includes("application/json")));
+    const manifests = stats.requests.filter(
+      (request) => !request.pathname.startsWith("/tarballs/") &&
+        !request.pathname.startsWith("/redirect-tarballs/"),
+    );
+    const firstOriginManifests = manifests.filter((request) => request.host.startsWith("127.0.0.1:"));
+    assert.ok(firstOriginManifests.length >= 10);
+    assert.ok(firstOriginManifests.every((request) => !request.pathname.startsWith("//")));
+    assert.ok(firstOriginManifests.every((request) => request.authorization === "Bearer edge-token"));
+    assert.ok(firstOriginManifests.every((request) => request.npmAuthType === "legacy"));
+    assert.ok(firstOriginManifests.every((request) => request.accept.includes("application/json")));
+
+    const redirectedManifest = manifests.find(
+      (request) => request.pathname === "/redirected-manifest-package" &&
+        request.host.startsWith("localhost:"),
+    );
+    assert.ok(redirectedManifest, "cross-origin manifest redirect target was not requested");
+    assert.equal(redirectedManifest.authorization, null);
+    assert.equal(redirectedManifest.npmAuthType, null);
+    assert.ok(redirectedManifest.accept.includes("application/json"));
 
     const sameOriginTarballs = stats.requests.filter(
       (request) => request.pathname.startsWith("/tarballs/") && request.host.startsWith("127.0.0.1:"),
@@ -354,6 +420,58 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
     );
     assert.ok(crossOriginTarball, "cross-origin tarball was not requested");
     assert.equal(crossOriginTarball.authorization, null);
+    const redirectedTarballs = stats.requests.filter(
+      (request) => request.pathname === "/tarballs/redirect-tarball-package-1.0.0.tgz" &&
+        request.host.startsWith("localhost:"),
+    );
+    assert.ok(redirectedTarballs.length >= 2, "both archive fetch paths must follow the redirect");
+    assert.ok(redirectedTarballs.every((request) => request.authorization === null));
+    const redirectFirstHops = stats.requests.filter(
+      (request) => request.pathname === "/redirect-tarballs/redirect-tarball-package-1.0.0.tgz" &&
+        request.host.startsWith("127.0.0.1:"),
+    );
+    assert.ok(redirectFirstHops.length >= 2);
+    assert.ok(redirectFirstHops.every((request) => request.authorization === "Bearer edge-token"));
+
+    function registryIntegrityInstall(packageName, args) {
+      const fixtureRoot = path.join(scratch, `integrity-${packageName}`);
+      const fixtureHome = path.join(scratch, `integrity-${packageName}-home`);
+      writeJson(path.join(fixtureRoot, "package.json"), {
+        name: `fixture-${packageName}`,
+        dependencies: { [packageName]: "1.0.0" },
+      });
+      fs.writeFileSync(
+        path.join(fixtureRoot, "bunfig.toml"),
+        `[install]\nregistry = "http://127.0.0.1:${port}/"\n`,
+      );
+      return { fixtureRoot, result: runInstall(fixtureRoot, fixtureHome, args) };
+    }
+
+    const emptyIntegrity = registryIntegrityInstall("empty-integrity-package", ["--no-cache"]);
+    expectSuccess("empty registry integrity remains an absent claim", emptyIntegrity.result);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(
+        emptyIntegrity.fixtureRoot,
+        "node_modules",
+        "empty-integrity-package",
+        "package.json",
+      ))).name,
+      "empty-integrity-package",
+    );
+
+    for (const packageName of ["malformed-integrity-package", "nonstring-integrity-package"]) {
+      const malformed = registryIntegrityInstall(packageName, ["--no-cache", "--no-verify"]);
+      assert.equal(malformed.result.status, 1, `${packageName} unexpectedly installed`);
+      assert.match(malformed.result.stderr, /InvalidRegistryIntegrity/);
+      assert.equal(
+        fs.existsSync(path.join(malformed.fixtureRoot, "node_modules", packageName)),
+        false,
+      );
+    }
+
+    const wrongIntegrity = registryIntegrityInstall("wrong-integrity-package", ["--no-cache"]);
+    assert.equal(wrongIntegrity.result.status, 1);
+    assert.match(wrongIntegrity.result.stderr, /Integrity check failed/);
 
     if (process.platform === "linux") {
       const offlineRoot = path.join(scratch, "registry-offline-project");

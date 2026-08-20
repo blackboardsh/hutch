@@ -217,6 +217,37 @@ export default {
 
       assert.ok(existsSync(releaseRoot), "a registered exact devkit must remain installed");
 
+      const projectionPath = join(project, ".hutch", "devkit", "projection.json");
+      const initialProjection = JSON.parse(readFileSync(projectionPath, "utf8"));
+      assert.deepEqual(
+        {
+          schemaVersion: initialProjection.schemaVersion,
+          kind: initialProjection.kind,
+          product: initialProjection.product,
+        },
+        {
+          schemaVersion: 1,
+          kind: "electrobun-devkit-projection",
+          product: { name: "electrobun", version },
+        },
+      );
+      const hutchConfigPath = join(project, "hutch.config.ts");
+      writeFileSync(hutchConfigPath, "export default {};\n");
+      const offlineFloatingEnv = { ...env, DASH_RELEASE_OFFLINE: "1" };
+      const prepare = await run(hutch, ["electrobun", "prepare", "--env=dev"], {
+        cwd: project,
+        env: offlineFloatingEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(prepare.status, 0, prepare.stderr || prepare.stdout);
+      assert.match(prepare.stdout, /electrobun prepare complete/);
+      assert.equal(requests, 2, "offline prepare must select the existing projection without querying a channel");
+      assert.equal(
+        JSON.parse(readFileSync(projectionPath, "utf8")).product.version,
+        version,
+        "prepare and normal commands must agree on the projected Electrobun release",
+      );
+
       const projectedMainSdk = join(project, ".hutch", "devkit", "api", "sdks", "main", "index.ts");
       writeFixtureFile(
         projectedMainSdk,
@@ -230,11 +261,11 @@ export default {
 
       const build = await run(hutch, ["electrobun", "build", "--env=dev"], {
         cwd: project,
-        env,
+        env: offlineFloatingEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
       assert.equal(build.status, 0, build.stderr || build.stdout);
-      assert.equal(requests, 2, "build should reuse the installed core and projected devkit");
+      assert.equal(requests, 2, "build and prepare should both reuse the installed core and projected devkit");
       const bundledMain = process.platform === "darwin"
         ? join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev.app", "Contents", "Resources", "app", "bun", "index.js")
         : join(project, "build", `dev-${host.os}-${host.arch}`, "V2Devkit-dev", "Resources", "app", "bun", "index.js");
@@ -242,6 +273,11 @@ export default {
       assert.doesNotMatch(readFileSync(bundledMain, "utf8"), /V2_DEVKIT_ALIAS/);
       assert.match(readFileSync(projectedMainSdk, "utf8"), /PROJECT_SDK_EDIT/);
       assert.equal(existsSync(join(project, "node_modules")), false);
+
+      writeFileSync(
+        hutchConfigPath,
+        `export default { electrobun: { version: "${version}" } };\n`,
+      );
 
       rmSync(releaseRoot, { recursive: true, force: true });
       rmSync(join(project, ".hutch", "devkit"), { recursive: true, force: true });

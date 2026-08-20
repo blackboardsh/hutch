@@ -10,6 +10,20 @@ const test_invocation = [_][]const u8{
     "--bail=3",
 };
 
+const local_exec_arguments = [_][]const u8{
+    "two words",
+    "$literal",
+    "%PATH%",
+    "!HUTCH_BATCH_DELAYED!",
+    "quote\"value",
+    "amp&value",
+    "pipe|value",
+    "caret^value",
+    "",
+    "--flag=value",
+    "工作-🚀",
+};
+
 fn run(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -142,6 +156,46 @@ fn runConfigCommand(
     );
 }
 
+fn runBuiltinCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    launcher: []const u8,
+    engine: []const u8,
+    project_dir: []const u8,
+    fake_bin_dir: []const u8,
+    mode: []const u8,
+    invocation: []const []const u8,
+) !CapturedRun {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, launcher);
+    try argv.appendSlice(allocator, invocation);
+
+    var environment = try init.environ_map.clone(allocator);
+    defer environment.deinit();
+    try environment.put("HUTCH_ENGINE_BINARY", engine);
+    try environment.put("HUTCH_TEST_FIXTURE_MODE", mode);
+    try environment.put("HUTCH_TEST_EXPECTED_CWD", project_dir);
+    try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
+    try environment.put("CI", "1");
+
+    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+    try environment.put(path_key, fake_bin_dir);
+
+    const result = try std.process.run(allocator, init.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = project_dir },
+        .environ_map = &environment,
+        .stderr_limit = .limited(1024 * 1024),
+        .stdout_limit = .limited(1024 * 1024),
+    });
+    return .{
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
 fn expectExit(term: std.process.Child.Term, expected: u8) !void {
     switch (term) {
         .exited => |actual| if (actual != expected) return error.UnexpectedExitCode,
@@ -244,6 +298,70 @@ fn writeFakePackageManager(
             .{ .permissions = .executable_file, .make_path = true },
         );
     }
+}
+
+fn writeLocalBin(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    bin_directory: []const u8,
+    runtime: []const u8,
+    name: []const u8,
+    windows_extension: []const u8,
+) !void {
+    try std.Io.Dir.cwd().createDirPath(init.io, bin_directory);
+    const executable = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}{s}",
+        .{
+            bin_directory,
+            std.fs.path.sep,
+            name,
+            if (builtin.os.tag == .windows) windows_extension else "",
+        },
+    );
+    if (builtin.os.tag == .windows) {
+        const wrapper = try std.fmt.allocPrint(
+            allocator,
+            "@\"{s}\" \"--hutch-test-local-bin={s}\" %*\r\n",
+            .{ runtime, name },
+        );
+        try std.Io.Dir.cwd().writeFile(init.io, .{
+            .sub_path = executable,
+            .data = wrapper,
+        });
+    } else {
+        try std.Io.Dir.copyFile(
+            std.Io.Dir.cwd(),
+            runtime,
+            std.Io.Dir.cwd(),
+            executable,
+            init.io,
+            .{ .permissions = .executable_file, .make_path = true },
+        );
+    }
+}
+
+fn writeSuccessfulPathCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    name: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}{s}{s}",
+        .{
+            directory,
+            std.fs.path.sep,
+            name,
+            if (builtin.os.tag == .windows) ".cmd" else "",
+        },
+    );
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = path,
+        .data = if (builtin.os.tag == .windows) "@exit /b 0\r\n" else "#!/bin/sh\nexit 0\n",
+        .flags = .{ .permissions = .executable_file },
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -427,6 +545,212 @@ pub fn main(init: std.process.Init) !void {
     try expectExit(install_bare.term, 0);
     try expectPathExists(init.io, try std.fs.path.join(allocator, &.{ builtin_root, "hutch.lock" }));
 
+    // The default package-manager selection has its own small CLI. Its
+    // version is Hutch's version (not Bun's), and both explicit and bare help
+    // stay local without resolving a runtime or an external manager.
+    const hutch_version = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "pm-builtin-metadata",
+        &.{"--version"},
+    );
+    try expectExit(hutch_version.term, 0);
+    const pm_version = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "pm-builtin-metadata",
+        &.{ "pm", "--version" },
+    );
+    try expectExit(pm_version.term, 0);
+    try std.testing.expectEqualStrings(hutch_version.stdout, pm_version.stdout);
+
+    const pm_help = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "pm-builtin-metadata",
+        &.{ "pm", "--help" },
+    );
+    try expectExit(pm_help.term, 0);
+    try expectContains(pm_help.stdout, "hutch pm exec [--] <command> [args...]");
+    const pm_bare = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "pm-builtin-metadata",
+        &.{"pm"},
+    );
+    try expectExit(pm_bare.term, 0);
+    try expectContains(pm_bare.stdout, "hutch pm exec [--] <command> [args...]");
+
+    const upgrade_help = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "upgrade-help",
+        &.{ "upgrade", "--help" },
+    );
+    const self_update_help = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "upgrade-help",
+        &.{ "self", "update", "--help" },
+    );
+    try expectExit(upgrade_help.term, 0);
+    try expectExit(self_update_help.term, 0);
+    try expectContains(upgrade_help.stdout, "hutch upgrade [production|stable|canary|latest|<semver>|build:<revision>]");
+    try std.testing.expectEqualStrings(self_update_help.stdout, upgrade_help.stdout);
+    try std.testing.expectEqualStrings("", upgrade_help.stderr);
+    try std.testing.expectEqualStrings("", self_update_help.stderr);
+
+    // A deliberately invalid selector is rejected before release resolution,
+    // proving the top-level alias maps the selector exactly like `self update`
+    // without making this hermetic suite contact a release service.
+    const upgrade_selector = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "upgrade-selector",
+        &.{ "upgrade", "not-a-selector" },
+    );
+    const self_update_selector = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        no_config_root,
+        fake_bin,
+        "upgrade-selector",
+        &.{ "self", "update", "not-a-selector" },
+    );
+    try expectExit(upgrade_selector.term, 1);
+    try expectExit(self_update_selector.term, 1);
+    try expectContains(upgrade_selector.stderr, "invalid release selector");
+    try std.testing.expectEqualStrings(self_update_selector.stderr, upgrade_selector.stderr);
+
+    const builtin_exec_root = try std.fs.path.join(allocator, &.{ no_config_root, "builtin-exec" });
+    const builtin_exec_cwd = try std.fs.path.join(allocator, &.{ builtin_exec_root, "nested", "cwd" });
+    const builtin_exec_bin = try std.fs.path.join(
+        allocator,
+        &.{ builtin_exec_root, "node_modules", ".bin" },
+    );
+    try std.Io.Dir.cwd().createDirPath(init.io, builtin_exec_cwd);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ builtin_exec_root, "package.json" }),
+        .data = "{\"name\":\"builtin-exec-fixture\",\"version\":\"1.0.0\"}\n",
+    });
+    try writeLocalBin(init, allocator, builtin_exec_bin, runtime, "local-probe", ".cmd");
+    try writeLocalBin(init, allocator, builtin_exec_bin, runtime, "local-fail", ".cmd");
+
+    const local_exec_invocation = [_][]const u8{
+        "pm",
+        "exec",
+        "--",
+        "local-probe",
+    } ++ local_exec_arguments;
+    const local_exec = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        builtin_exec_cwd,
+        fake_bin,
+        "pm-exec-success",
+        &local_exec_invocation,
+    );
+    try expectExit(local_exec.term, 0);
+
+    const local_fail = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        builtin_exec_cwd,
+        fake_bin,
+        "pm-exec-exit",
+        &.{ "pm", "exec", "local-fail", "exit" },
+    );
+    try expectExit(local_fail.term, 37);
+
+    // A same-named executable on PATH is deliberately runnable, but built-in
+    // exec must still fail when the project-local bin entry is absent.
+    try writeSuccessfulPathCommand(init, allocator, fake_bin, "path-only-probe");
+    const no_path_fallback = try runBuiltinCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        builtin_exec_cwd,
+        fake_bin,
+        "pm-exec-path-fallback",
+        &.{ "pm", "exec", "path-only-probe" },
+    );
+    try expectExit(no_path_fallback.term, 1);
+    try expectContains(no_path_fallback.stderr, "was not found in");
+    try expectContains(no_path_fallback.stderr, "node_modules");
+
+    if (comptime builtin.os.tag == .windows) {
+        try writeLocalBin(init, allocator, builtin_exec_bin, runtime, "local-bat-probe", ".bat");
+        const local_bat_invocation = [_][]const u8{
+            "pm",
+            "exec",
+            "local-bat-probe",
+        } ++ local_exec_arguments;
+        const local_bat = try runBuiltinCommand(
+            init,
+            allocator,
+            launcher,
+            engine,
+            builtin_exec_cwd,
+            fake_bin,
+            "pm-exec-bat",
+            &local_bat_invocation,
+        );
+        try expectExit(local_bat.term, 0);
+
+        for ([_][]const u8{ "line\nfeed", "carriage\rreturn" }) |invalid_arg| {
+            const invalid_local_batch_arg = try runBuiltinCommand(
+                init,
+                allocator,
+                launcher,
+                engine,
+                builtin_exec_cwd,
+                fake_bin,
+                "pm-exec-batch-invalid",
+                &.{ "pm", "exec", "local-probe", invalid_arg },
+            );
+            try expectExit(invalid_local_batch_arg.term, 1);
+            try expectContains(
+                invalid_local_batch_arg.stderr,
+                "Windows .cmd/.bat shims reject arguments containing NUL, CR, or LF",
+            );
+        }
+    }
+
     // Foreign lockfiles are ignored entirely: the built-in resolver runs,
     // creates hutch.lock, and leaves the foreign file untouched.
     const ignored_lock_root = try std.fs.path.join(allocator, &.{ fixture_root, "ignored-bun-lock" });
@@ -473,6 +797,22 @@ pub fn main(init: std.process.Init) !void {
         &.{ "pm", "add", "left-pad", "--exact" },
     );
     try expectExit(bun_raw.term, 0);
+
+    // Explicit managers own the entire pm argv, including words understood
+    // by Hutch's built-in CLI and the optional `--` separator.
+    const external_exec = try runConfigCommand(
+        init,
+        allocator,
+        launcher,
+        engine,
+        runtime,
+        fixture_root,
+        fake_bin,
+        "config-pm-external-exec",
+        "{\"packageManager\":\"npm\",\"scripts\":{}}",
+        &.{ "pm", "exec", "--", "local-probe", "two words" },
+    );
+    try expectExit(external_exec.term, 0);
 
     const custom_install = try runConfigCommand(
         init,

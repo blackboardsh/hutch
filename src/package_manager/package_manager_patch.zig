@@ -64,6 +64,10 @@ pub fn apply(
 ) !void {
     diagnostic.* = null;
     if (patch_paths.len == 0) {
+        switch (patchPathLinkStatus(io, package_dir)) {
+            .not_link => {},
+            .missing, .symbolic_link, .unknown => return,
+        }
         try clearPatchTags(allocator, io, package_dir);
         return;
     }
@@ -86,6 +90,10 @@ pub fn apply(
 
     try clearPatchTags(allocator, io, package_dir);
     const tag = try patchTagPath(allocator, package_dir, hasher.final());
+    switch (patchPathLinkStatus(io, tag)) {
+        .symbolic_link, .unknown => return error.PatchApplyFailed,
+        .missing, .not_link => {},
+    }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tag, .data = "" });
 }
 
@@ -245,12 +253,12 @@ fn applyParsedPatch(
 ) !void {
     for (patch_file.parts.items) |part| switch (part) {
         .file_deletion => |deletion| {
-            const path = try safePatchPath(allocator, package_dir, deletion.path);
+            const path = try safePatchPath(allocator, io, package_dir, deletion.path);
             std.Io.Dir.cwd().deleteFile(io, path) catch |err| return applyFailure(diagnostic, "unlink", err);
         },
         .file_rename => |rename| {
-            const from = try safePatchPath(allocator, package_dir, rename.from_path);
-            const to = try safePatchPath(allocator, package_dir, rename.to_path);
+            const from = try safePatchPath(allocator, io, package_dir, rename.from_path);
+            const to = try safePatchPath(allocator, io, package_dir, rename.to_path);
             if (std.fs.path.dirname(to)) |parent| {
                 std.Io.Dir.cwd().createDirPath(io, parent) catch |err| return applyFailure(diagnostic, "mkdir", err);
             }
@@ -259,7 +267,7 @@ fn applyParsedPatch(
         .file_creation => |creation| try applyFileCreation(allocator, io, package_dir, creation, diagnostic),
         .file_patch => |file_patch| try applyFilePatch(allocator, io, package_dir, file_patch, diagnostic),
         .file_mode_change => |mode_change| {
-            const path = try safePatchPath(allocator, package_dir, mode_change.path);
+            const path = try safePatchPath(allocator, io, package_dir, mode_change.path);
             const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(mode_change.new_mode));
             std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch |err| return applyFailure(diagnostic, "chmod", err);
         },
@@ -273,7 +281,7 @@ fn applyFileCreation(
     creation: *const Patch.FileCreation,
     diagnostic: *?ApplyDiagnostic,
 ) !void {
-    const path = try safePatchPath(allocator, package_dir, creation.path);
+    const path = try safePatchPath(allocator, io, package_dir, creation.path);
     if (std.fs.path.dirname(path)) |parent| {
         std.Io.Dir.cwd().createDirPath(io, parent) catch |err| return applyFailure(diagnostic, "mkdir", err);
     }
@@ -303,7 +311,7 @@ fn applyFilePatch(
     file_patch: *const Patch.FilePatch,
     diagnostic: *?ApplyDiagnostic,
 ) !void {
-    const path = try safePatchPath(allocator, package_dir, file_patch.path);
+    const path = try safePatchPath(allocator, io, package_dir, file_patch.path);
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| return applyFailure(diagnostic, "stat", err);
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024 * 1024)) catch |err|
         return applyFailure(diagnostic, "read", err);
@@ -367,12 +375,45 @@ fn systemErrorDetail(cause: anyerror) struct { code: []const u8, message: []cons
     };
 }
 
-fn safePatchPath(allocator: std.mem.Allocator, package_dir: []const u8, relative: []const u8) ![]const u8 {
+fn safePatchPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_dir: []const u8,
+    relative: []const u8,
+) ![]const u8 {
     if (relative.len == 0 or std.fs.path.isAbsolute(relative)) return error.PatchApplyFailed;
     const root = try std.fs.path.resolve(allocator, &.{package_dir});
     const resolved = try std.fs.path.resolve(allocator, &.{ package_dir, relative });
-    if (!pathHasPrefix(resolved, root)) return error.PatchApplyFailed;
+    if (resolved.len == root.len or !pathHasPrefix(resolved, root)) return error.PatchApplyFailed;
+    if (patchPathLinkStatus(io, root) != .not_link) return error.PatchApplyFailed;
+
+    const relative_resolved = resolved[root.len + 1 ..];
+    var components = std.mem.tokenizeAny(u8, relative_resolved, "/\\");
+    var current = try allocator.dupe(u8, root);
+    while (components.next()) |component| {
+        current = try std.fs.path.join(allocator, &.{ current, component });
+        switch (patchPathLinkStatus(io, current)) {
+            .symbolic_link, .unknown => return error.PatchApplyFailed,
+            .missing, .not_link => {},
+        }
+    }
     return resolved;
+}
+
+const PatchPathLinkStatus = enum { missing, not_link, symbolic_link, unknown };
+
+fn patchPathLinkStatus(io: std.Io, path: []const u8) PatchPathLinkStatus {
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.readLinkAbsolute(io, path, &target_buffer)
+    else
+        std.Io.Dir.cwd().readLink(io, path, &target_buffer);
+    _ = target_len catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.NotLink => return .not_link,
+        else => return .unknown,
+    };
+    return .symbolic_link;
 }
 
 fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
@@ -460,4 +501,47 @@ test "patch application uses Hutch-owned parser and hash" {
     const output_path = try std.fs.path.join(allocator, &.{ package_dir, "index.txt" });
     const output = try std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .limited(1024));
     try std.testing.expectEqualStrings("one\nthree\n", output);
+}
+
+test "patch application rejects symlink targets outside the package" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "package");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "preserve\n" });
+    try tmp.dir.symLink(io, "../outside.txt", "package/index.txt", .{});
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "change.patch",
+        .data =
+        \\diff --git a/index.txt b/index.txt
+        \\index 1111111..2222222 100644
+        \\--- a/index.txt
+        \\+++ b/index.txt
+        \\@@ -1 +1 @@
+        \\-preserve
+        \\+overwritten
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const package_dir = try std.fs.path.join(allocator, &.{ root, "package" });
+
+    var diagnostic: ?ApplyDiagnostic = null;
+    try std.testing.expectError(
+        error.PatchApplyFailed,
+        apply(allocator, io, root, package_dir, &.{"change.patch"}, &diagnostic),
+    );
+    const outside = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "outside.txt" }),
+        allocator,
+        .limited(1024),
+    );
+    try std.testing.expectEqualStrings("preserve\n", outside);
 }

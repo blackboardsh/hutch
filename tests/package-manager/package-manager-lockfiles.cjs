@@ -184,6 +184,158 @@ try {
   assert.match(frozen.stderr, /lockfile had changes, but lockfile is frozen/);
   assert.equal(fs.readFileSync(path.join(second, "hutch.lock"), "utf8"), beforeFrozen);
 
+  // A frozen install without a lockfile is valid only when the declared
+  // dependency/workspace graph is provably empty. It remains a read-only
+  // no-op and must not manufacture an empty lockfile or node_modules tree.
+  const frozenEmpty = path.join(scratch, "frozen-empty");
+  writeJson(frozenEmpty, "package.json", { name: "frozen-empty", version: "1.0.0" });
+  expectSuccess(install(frozenEmpty, ["--frozen-lockfile"]));
+  assert.equal(fs.existsSync(path.join(frozenEmpty, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(frozenEmpty, "node_modules")), false);
+
+  const frozenEmptyWorkspaceList = path.join(scratch, "frozen-empty-workspaces");
+  writeJson(frozenEmptyWorkspaceList, "package.json", {
+    name: "frozen-empty-workspaces",
+    workspaces: { packages: [] },
+  });
+  expectSuccess(install(frozenEmptyWorkspaceList, ["--frozen-lockfile"]));
+  assert.equal(fs.existsSync(path.join(frozenEmptyWorkspaceList, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(frozenEmptyWorkspaceList, "node_modules")), false);
+
+  const frozenEmptyWorkspaceArray = path.join(scratch, "frozen-empty-workspace-array");
+  writeJson(frozenEmptyWorkspaceArray, "package.json", {
+    name: "frozen-empty-workspace-array",
+    workspaces: [],
+  });
+  expectSuccess(install(frozenEmptyWorkspaceArray, ["--frozen-lockfile"]));
+  assert.equal(fs.existsSync(path.join(frozenEmptyWorkspaceArray, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(frozenEmptyWorkspaceArray, "node_modules")), false);
+
+  const frozenMissingDependency = path.join(scratch, "frozen-missing-dependency");
+  writeJson(frozenMissingDependency, "package.json", {
+    name: "frozen-missing-dependency",
+    dependencies: { missing: "file:./missing" },
+  });
+  const missingDependencyResult = install(frozenMissingDependency, ["--frozen-lockfile"]);
+  assert.equal(missingDependencyResult.status, 1);
+  assert.match(missingDependencyResult.stderr, /lockfile not found, but lockfile is frozen/);
+  assert.equal(fs.existsSync(path.join(frozenMissingDependency, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(frozenMissingDependency, "node_modules")), false);
+
+  const frozenMissingWorkspace = path.join(scratch, "frozen-missing-workspace");
+  writeJson(frozenMissingWorkspace, "package.json", {
+    name: "frozen-missing-workspace",
+    workspaces: ["packages/*"],
+  });
+  const missingWorkspaceResult = install(frozenMissingWorkspace, ["--frozen-lockfile"]);
+  assert.equal(missingWorkspaceResult.status, 1);
+  assert.match(missingWorkspaceResult.stderr, /lockfile not found, but lockfile is frozen/);
+  assert.equal(fs.existsSync(path.join(frozenMissingWorkspace, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(frozenMissingWorkspace, "node_modules")), false);
+
+  // Dependency aliases are filesystem destinations. Reject a malicious root
+  // edge before node_modules preparation or any outside-tree mutation.
+  const traversalBase = path.join(scratch, "root-traversal");
+  const traversalRoot = path.join(traversalBase, "project");
+  const traversalSentinel = path.join(traversalBase, "sentinel");
+  writeJson(traversalRoot, "package.json", {
+    name: "root-traversal",
+    dependencies: { "../../sentinel": "file:../sentinel" },
+  });
+  fs.mkdirSync(traversalSentinel, { recursive: true });
+  fs.writeFileSync(path.join(traversalSentinel, "marker"), "preserve\n");
+  const traversalResult = install(traversalRoot);
+  assert.equal(traversalResult.status, 1);
+  assert.match(traversalResult.stderr, /InvalidDependencyAlias/);
+  assert.equal(fs.readFileSync(path.join(traversalSentinel, "marker"), "utf8"), "preserve\n");
+  assert.equal(fs.existsSync(path.join(traversalRoot, "hutch.lock")), false);
+  assert.equal(fs.existsSync(path.join(traversalRoot, "node_modules")), false);
+
+  if (process.platform !== "win32") {
+    // A lexical in-tree path is still unsafe when its scoped ancestor is a
+    // symlink. Refuse to traverse it and preserve the external sentinel.
+    const scopeRoot = path.join(scratch, "scope-symlink");
+    const scopeOutside = path.join(scratch, "scope-outside");
+    writeJson(scopeRoot, "package.json", {
+      name: "scope-symlink",
+      dependencies: { "@scope/pkg": "file:./vendor/pkg" },
+    });
+    writeJson(scopeRoot, "vendor/pkg/package.json", { name: "@scope/pkg", version: "1.0.0" });
+    fs.mkdirSync(path.join(scopeRoot, "node_modules"), { recursive: true });
+    fs.mkdirSync(path.join(scopeOutside, "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(scopeOutside, "pkg", "marker"), "preserve\n");
+    fs.symlinkSync(scopeOutside, path.join(scopeRoot, "node_modules", "@scope"), "dir");
+    const scopeResult = install(scopeRoot);
+    assert.equal(scopeResult.status, 1);
+    assert.match(scopeResult.stderr, /InvalidPackageDestination/);
+    assert.equal(fs.readFileSync(path.join(scopeOutside, "pkg", "marker"), "utf8"), "preserve\n");
+    assert.equal(fs.existsSync(path.join(scopeRoot, "hutch.lock")), false);
+
+    // Isolated finalization enumerates managed .bin directories. A preexisting
+    // symlink must be rejected before pruning so it cannot delete external files.
+    const isolatedBinRoot = path.join(scratch, "isolated-bin-symlink");
+    const isolatedBinOutside = path.join(scratch, "isolated-bin-outside");
+    writeJson(isolatedBinRoot, "package.json", {
+      name: "isolated-bin-symlink",
+      dependencies: { safe: "file:./vendor/safe" },
+    });
+    writeJson(isolatedBinRoot, "vendor/safe/package.json", { name: "safe", version: "1.0.0" });
+    fs.writeFileSync(path.join(isolatedBinRoot, "bunfig.toml"), '[install]\nlinker = "isolated"\n');
+    fs.mkdirSync(path.join(isolatedBinRoot, "node_modules", ".bun", "node_modules"), { recursive: true });
+    fs.mkdirSync(isolatedBinOutside, { recursive: true });
+    fs.writeFileSync(path.join(isolatedBinOutside, "marker"), "preserve\n");
+    fs.symlinkSync(isolatedBinOutside, path.join(isolatedBinRoot, "node_modules", ".bin"), "dir");
+    const isolatedBinResult = install(isolatedBinRoot);
+    assert.equal(isolatedBinResult.status, 1);
+    assert.match(isolatedBinResult.stderr, /InvalidPackageDestination/);
+    assert.equal(fs.readFileSync(path.join(isolatedBinOutside, "marker"), "utf8"), "preserve\n");
+
+    // Folder packages are linked into node_modules. Bin preparation must not
+    // chmod or normalize the physical source through that symlinked base.
+    const linkedBinRoot = path.join(scratch, "linked-bin-source");
+    const linkedBinTarget = path.join(linkedBinRoot, "vendor", "linked", "cli.js");
+    writeJson(linkedBinRoot, "package.json", {
+      name: "linked-bin-source",
+      dependencies: { linked: "file:./vendor/linked" },
+    });
+    writeJson(linkedBinRoot, "vendor/linked/package.json", {
+      name: "linked",
+      version: "1.0.0",
+      bin: { linked: "cli.js" },
+    });
+    fs.writeFileSync(linkedBinTarget, "#!/usr/bin/env node\r\nconsole.log('linked');\n");
+    fs.chmodSync(linkedBinTarget, 0o644);
+    expectSuccess(install(linkedBinRoot));
+    assert.equal(fs.statSync(linkedBinTarget).mode & 0o111, 0, "install chmodded a linked package source");
+    assert.match(fs.readFileSync(linkedBinTarget, "utf8"), /node\r\n/);
+  }
+
+  // A crafted transitive lock alias is rejected during lock parsing, before
+  // it can become a nested node_modules destination.
+  const craftedLockRoot = path.join(scratch, "crafted-lock-traversal");
+  writeJson(craftedLockRoot, "package.json", {
+    name: "crafted-lock-traversal",
+    dependencies: { safe: "1.0.0" },
+  });
+  const craftedLock = {
+    lockfileVersion: 1,
+    workspaces: { "": { name: "crafted-lock-traversal", dependencies: { safe: "1.0.0" } } },
+    packages: {
+      safe: ["safe@1.0.0", "", { dependencies: { "../../sentinel": "1.0.0" } }, ""],
+    },
+  };
+  writeJson(craftedLockRoot, "hutch.lock", craftedLock);
+  const craftedSentinel = path.join(scratch, "sentinel");
+  fs.mkdirSync(craftedSentinel, { recursive: true });
+  fs.writeFileSync(path.join(craftedSentinel, "marker"), "preserve\n");
+  const craftedBefore = fs.readFileSync(path.join(craftedLockRoot, "hutch.lock"), "utf8");
+  const craftedResult = install(craftedLockRoot, ["--frozen-lockfile"]);
+  assert.equal(craftedResult.status, 1);
+  assert.match(craftedResult.stderr, /InvalidDependencyAlias/);
+  assert.equal(fs.readFileSync(path.join(craftedSentinel, "marker"), "utf8"), "preserve\n");
+  assert.equal(fs.readFileSync(path.join(craftedLockRoot, "hutch.lock"), "utf8"), craftedBefore);
+  assert.equal(fs.existsSync(path.join(craftedLockRoot, "node_modules")), false);
+
   const noSave = path.join(scratch, "no-save");
   makeLocalProject(noSave, ["alpha"]);
   expectSuccess(install(noSave, ["--no-save"]));

@@ -48,6 +48,34 @@ pub const Catalog = struct {
     }
 };
 
+/// Validate the tool contract published with a template catalog against the
+/// Hutch release doing the initialization. `tools.hutch` is a minimum: a
+/// newer Hutch can consume a catalog produced by an older release. Cottontail
+/// is deliberately exact because the catalog is generated from Electrobun's
+/// tested `// @hutch ... cottontail=<version>` pin and the contract does not
+/// promise compatibility between different Cottontail releases.
+pub fn validateToolCompatibility(
+    catalog: Catalog,
+    current_hutch_version: []const u8,
+    paired_cottontail_version: []const u8,
+) !void {
+    const required_hutch = try parseExactToolVersion(
+        catalog.hutch_version,
+        error.InvalidTemplateHutchVersion,
+    );
+    const current_hutch = std.SemanticVersion.parse(current_hutch_version) catch
+        return error.InvalidCurrentHutchVersion;
+    if (current_hutch.order(required_hutch) == .lt) {
+        return error.TemplateRequiresNewerHutch;
+    }
+
+    // Build metadata is part of an exact artifact selector even though SemVer
+    // intentionally ignores it for ordering, so use byte equality here.
+    if (!std.mem.eql(u8, paired_cottontail_version, catalog.cottontail_version)) {
+        return error.IncompatibleTemplateCottontail;
+    }
+}
+
 pub fn parseChannel(value: []const u8) !Channel {
     // Accept the new stable/beta names plus the legacy production/canary aliases
     // so older callers and env values keep working.
@@ -199,9 +227,8 @@ fn parseCatalog(
     const tools = try jsonObject(root, "tools");
     const hutch_version = try jsonString(tools, "hutch");
     const cottontail_version = try jsonString(tools, "cottontail");
-    if (hutch_version.len == 0 or cottontail_version.len == 0) {
-        return error.InvalidTemplateCatalog;
-    }
+    _ = try parseExactToolVersion(hutch_version, error.InvalidTemplateHutchVersion);
+    _ = try parseExactToolVersion(cottontail_version, error.InvalidTemplateCottontailVersion);
 
     const template_values = try jsonArray(root, "templates");
     if (template_values.len == 0 or template_values.len > 256) {
@@ -244,6 +271,13 @@ fn parseCatalog(
         .cottontail_version = cottontail_version,
         .templates = try templates.toOwnedSlice(allocator),
     };
+}
+
+fn parseExactToolVersion(
+    value: []const u8,
+    comptime invalid_error: anyerror,
+) !std.SemanticVersion {
+    return std.SemanticVersion.parse(value) catch return invalid_error;
 }
 
 fn baseUrl(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -330,7 +364,7 @@ test "template catalogs expose the selected channel and immutable archive" {
         \\  "channel": "beta",
         \\  "version": "2.0.0-beta.1",
         \\  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "tools": { "hutch": "0.5.0-canary.1", "cottontail": "0.2.3" },
+        \\  "tools": { "hutch": "0.5.0-canary.1+release.1", "cottontail": "0.2.3-beta.2+build.4" },
         \\  "templates": [{
         \\    "id": "hello-world",
         \\    "name": "Hello World",
@@ -353,7 +387,83 @@ test "template catalogs expose the selected channel and immutable archive" {
     try std.testing.expectEqual(Channel.beta, catalog.channel);
     try std.testing.expectEqualStrings("2.0.0-beta.1", catalog.version);
     try std.testing.expectEqualStrings("hello-world", catalog.templates[0].id);
+    try std.testing.expectEqualStrings("0.5.0-canary.1+release.1", catalog.hutch_version);
+    try std.testing.expectEqualStrings("0.2.3-beta.2+build.4", catalog.cottontail_version);
     try std.testing.expect(catalog.find("missing") == null);
+}
+
+test "template catalogs require exact semantic tool versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const catalog_format =
+        \\{{
+        \\  "schema": 1,
+        \\  "kind": "electrobun-template-channel",
+        \\  "channel": "stable",
+        \\  "version": "2.0.0",
+        \\  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "tools": {{ "hutch": "{s}", "cottontail": "{s}" }},
+        \\  "templates": [{{
+        \\    "id": "hello-world",
+        \\    "name": "Hello World",
+        \\    "description": "A starter",
+        \\    "mainProcess": "cottontail",
+        \\    "archive": {{
+        \\      "url": "https://example.test/electrobun/templates/artifacts/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.tar.gz",
+        \\      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 123
+        \\    }}
+        \\  }}]
+        \\}}
+    ;
+
+    for ([_][]const u8{ "^0.5.0", "latest", "v0.5.0", "00.5.0", "0.5" }) |version| {
+        const bytes = try std.fmt.allocPrint(arena.allocator(), catalog_format, .{ version, "0.2.3" });
+        try std.testing.expectError(
+            error.InvalidTemplateHutchVersion,
+            parseCatalog(
+                arena.allocator(),
+                bytes,
+                "https://example.test/electrobun/templates",
+                .stable,
+            ),
+        );
+    }
+    for ([_][]const u8{ "~0.2.3", "stable", "0.2", "0.2.3-", "0.2.3+" }) |version| {
+        const bytes = try std.fmt.allocPrint(arena.allocator(), catalog_format, .{ "0.5.0", version });
+        try std.testing.expectError(
+            error.InvalidTemplateCottontailVersion,
+            parseCatalog(
+                arena.allocator(),
+                bytes,
+                "https://example.test/electrobun/templates",
+                .stable,
+            ),
+        );
+    }
+}
+
+test "template catalog tool compatibility uses a Hutch minimum and exact Cottontail" {
+    const catalog = Catalog{
+        .channel = .stable,
+        .version = "2.0.0",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .hutch_version = "0.23.0-beta.2+catalog-build",
+        .cottontail_version = "0.5.0-beta.2+paired-build",
+        .templates = &.{},
+    };
+
+    try validateToolCompatibility(catalog, "0.23.0-beta.2+other-build", "0.5.0-beta.2+paired-build");
+    try validateToolCompatibility(catalog, "0.23.0", "0.5.0-beta.2+paired-build");
+    try std.testing.expectError(
+        error.TemplateRequiresNewerHutch,
+        validateToolCompatibility(catalog, "0.23.0-beta.1", "0.5.0-beta.2+paired-build"),
+    );
+    try std.testing.expectError(
+        error.IncompatibleTemplateCottontail,
+        validateToolCompatibility(catalog, "0.24.0", "0.5.0-beta.2+other-build"),
+    );
 }
 
 test "template catalogs reject archive URLs outside their artifact origin" {

@@ -12,6 +12,7 @@ import {
   validateReleaseTag,
 } from "./release-contract.js";
 import "./x64-baseline-release.test.js";
+import "./upload-release-r2.test.js";
 
 const revision = "0123456789abcdef0123456789abcdef01234567";
 const artifacts = [

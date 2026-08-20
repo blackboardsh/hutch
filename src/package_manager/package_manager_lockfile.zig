@@ -13,6 +13,8 @@ pub const lifecycle_script_names = [_][]const u8{
 
 
 const std = @import("std");
+const PackageName = @import("support/util/package_name.zig");
+const Semver = @import("support/semver/root.zig");
 
 const Value = std.json.Value;
 
@@ -129,6 +131,62 @@ const dependency_sections = [_][]const u8{
     "peerDependencies",
 };
 
+/// Dependency aliases become path components below node_modules. Keep this
+/// deliberately narrower than npm's presentation-level name parser: neither
+/// platform separator nor either dot component is ever a valid install edge.
+pub fn packageNameIsSafe(name: []const u8) bool {
+    if (!PackageName.isNPMPackageName(name) or std.fs.path.isAbsolute(name)) return false;
+    if (name[0] == '@') {
+        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return false;
+        if (slash <= 1 or slash + 1 >= name.len) return false;
+        if (std.mem.indexOfAnyPos(u8, name, slash + 1, "/\\") != null) return false;
+        return packageNameComponentIsSafe(name[1..slash]) and
+            packageNameComponentIsSafe(name[slash + 1 ..]);
+    }
+    return std.mem.indexOfAny(u8, name, "/\\") == null and packageNameComponentIsSafe(name);
+}
+
+fn packageNameComponentIsSafe(component: []const u8) bool {
+    if (component.len == 0 or
+        std.mem.eql(u8, component, ".") or
+        std.mem.eql(u8, component, "..")) return false;
+    for (component) |byte| {
+        if (byte == 0 or byte < ' ' or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Lock keys are logical node_modules chains (for example
+/// `parent/@scope/child`). Validate every package component before any caller
+/// turns the key back into a filesystem destination.
+pub fn packageKeyIsSafe(key: []const u8) bool {
+    if (key.len == 0 or std.fs.path.isAbsolute(key) or std.mem.indexOfScalar(u8, key, '\\') != null) return false;
+    var components = std.mem.splitScalar(u8, key, '/');
+    while (components.next()) |component| {
+        if (component.len == 0) return false;
+        if (component[0] == '@') {
+            const package = components.next() orelse return false;
+            var scoped_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const scoped = std.fmt.bufPrint(&scoped_buffer, "{s}/{s}", .{ component, package }) catch return false;
+            if (!packageNameIsSafe(scoped)) return false;
+        } else if (!packageNameIsSafe(component)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn validateDependencyAliases(value: *const Value) !void {
+    if (value.* != .object) return;
+    for (dependency_sections) |section_name| {
+        const section = value.object.get(section_name) orelse continue;
+        if (section != .object) continue;
+        for (section.object.keys()) |alias| {
+            if (!packageNameIsSafe(alias)) return error.InvalidDependencyAlias;
+        }
+    }
+}
+
 pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
     const json = try normalizeJsonc(allocator, source);
     var document = std.json.parseFromSliceLeaky(Value, allocator, json, .{}) catch return error.InvalidTextLockfile;
@@ -148,6 +206,7 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
     if (workspaces_value.* != .object) return error.InvalidWorkspacesObject;
     const root_workspace = workspaces_value.object.getPtr("") orelse return error.MissingRootWorkspace;
     if (root_workspace.* != .object) return error.InvalidRootWorkspace;
+    try validateDependencyAliases(root_workspace);
 
     var graph = Graph{
         .document = document,
@@ -162,13 +221,21 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
 
     for (workspaces_value.object.keys(), workspaces_value.object.values()) |path, *workspace| {
         if (workspace.* != .object) return error.InvalidWorkspace;
+        try validateDependencyAliases(workspace);
         try graph.workspaces.put(path, workspace);
     }
 
     if (document.object.getPtr("packages")) |packages_value| {
         if (packages_value.* != .object) return error.InvalidPackagesObject;
         for (packages_value.object.keys(), packages_value.object.values()) |key, *entry| {
+            if (!packageKeyIsSafe(key)) return error.InvalidPackageKey;
             const package = try parsePackageEntry(key, entry);
+            if ((package.kind == .root and package.name.len != 0) or
+                (package.kind != .root and !packageNameIsSafe(package.name))) return error.InvalidPackageName;
+            if (package.kind == .npm and !Semver.Version.parseUTF8(package.version).valid) {
+                return error.InvalidPackageVersion;
+            }
+            if (package.info) |info| try validateDependencyAliases(info);
             // Bun validates lockfile integrity digests strictly; a package
             // whose integrity cannot be parsed is re-resolved from scratch.
             if (integrityIsMalformed(package.integrity)) {
@@ -184,20 +251,37 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
 
 fn integrityIsMalformed(integrity: []const u8) bool {
     if (integrity.len == 0) return false;
-    const dash = std.mem.indexOfScalar(u8, integrity, '-') orelse return true;
-    const digest_len: usize = if (std.mem.eql(u8, integrity[0..dash], "sha1"))
-        20
-    else if (std.mem.eql(u8, integrity[0..dash], "sha256"))
-        32
-    else if (std.mem.eql(u8, integrity[0..dash], "sha384"))
-        48
-    else if (std.mem.eql(u8, integrity[0..dash], "sha512"))
-        64
-    else
-        return true;
-    const encoded = integrity[dash + 1 ..];
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return true;
-    return decoded_len != digest_len;
+    var supported_token_count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, integrity, " \t\r\n");
+    while (tokens.next()) |token| {
+        const dash = std.mem.indexOfScalar(u8, token, '-') orelse return true;
+        const digest_len: ?usize = if (std.mem.eql(u8, token[0..dash], "sha1"))
+            20
+        else if (std.mem.eql(u8, token[0..dash], "sha256"))
+            32
+        else if (std.mem.eql(u8, token[0..dash], "sha384"))
+            48
+        else if (std.mem.eql(u8, token[0..dash], "sha512"))
+            64
+        else
+            null;
+        const supported_digest_len = digest_len orelse continue;
+        supported_token_count += 1;
+        const encoded = token[dash + 1 ..];
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return true;
+        if (decoded_len != supported_digest_len) return true;
+        var decoded: [64]u8 = undefined;
+        std.base64.standard.Decoder.decode(decoded[0..supported_digest_len], encoded) catch return true;
+    }
+    return supported_token_count == 0;
+}
+
+test "integrity metadata ignores unsupported algorithms but validates supported digests" {
+    const valid = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    try std.testing.expect(!integrityIsMalformed(valid));
+    try std.testing.expect(!integrityIsMalformed("md5-ignored sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="));
+    try std.testing.expect(integrityIsMalformed("md5-ignored"));
+    try std.testing.expect(integrityIsMalformed("md5-ignored sha512-not-base64"));
 }
 
 fn parsePackageEntry(key: []const u8, entry: *const Value) !Package {
@@ -433,8 +517,8 @@ test "parse Bun text lockfile graph and package metadata" {
         \\    "": { "name": "app", "dependencies": { "foo": "^1.0.0" }, },
         \\  },
         \\  "packages": {
-        \\    "foo": ["foo@1.2.3", "", { "dependencies": { "bar": "2.0.0" } }, "sha512-a"],
-        \\    "foo/bar": ["bar@2.0.0", "https://registry.example/bar.tgz", {}, "sha512-b"],
+        \\    "foo": ["foo@1.2.3", "", { "dependencies": { "bar": "2.0.0" } }, "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="],
+        \\    "foo/bar": ["bar@2.0.0", "https://registry.example/bar.tgz", {}, "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="],
         \\  },
         \\}
     );
@@ -484,7 +568,7 @@ test "parse scoped and non-registry resolutions" {
         \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
         \\  "@scope/pkg":["@scope/pkg@workspace:packages/pkg"],
         \\  "linked":["linked@link:../linked",{}],
-        \\  "archive":["archive@./archive.tgz",{},"sha512-c"],
+        \\  "archive":["archive@./archive.tgz",{},"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="],
         \\  "ssh-git":["ssh-git@ssh://git@example.com/owner/repo.git#abcdef012345",{},"abcdef012345"],
         \\  "scp-git":["scp-git@git@example.com:owner/repo.git#abcdef012345",{},"abcdef012345"]
         \\}}
@@ -519,4 +603,52 @@ test "frozen workspace comparison covers workspace dependency graphs" {
     , .{});
     try std.testing.expect(graph.workspaceMatchesPackageJSON("packages/api", &matching));
     try std.testing.expect(!graph.workspaceMatchesPackageJSON("packages/api", &changed));
+}
+
+test "package aliases and logical lock keys cannot escape node_modules" {
+    try std.testing.expect(packageNameIsSafe("plain"));
+    try std.testing.expect(packageNameIsSafe("@scope/pkg"));
+    try std.testing.expect(packageKeyIsSafe("parent/@scope/pkg/child"));
+    try std.testing.expect(!packageNameIsSafe("../outside"));
+    try std.testing.expect(!packageNameIsSafe("@scope/.."));
+    try std.testing.expect(!packageNameIsSafe("scope\\outside"));
+    try std.testing.expect(!packageNameIsSafe("has space"));
+    try std.testing.expect(!packageNameIsSafe("has:colon"));
+    try std.testing.expect(!packageNameIsSafe("a" ** 215));
+    try std.testing.expect(!packageKeyIsSafe("parent/../../outside"));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.InvalidDependencyAlias,
+        parseText(arena.allocator(),
+            \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
+            \\  "safe":["safe@1.0.0","",{"dependencies":{"@scope/..":"1"}},""],
+            \\}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPackageKey,
+        parseText(arena.allocator(),
+            \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
+            \\  "../../outside":["outside@1.0.0","",{},""],
+            \\}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPackageVersion,
+        parseText(arena.allocator(),
+            \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
+            \\  "safe":["safe@../../outside","",{},""],
+            \\}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidPackageName,
+        parseText(arena.allocator(),
+            \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
+            \\  "safe":["@scope/..@root:",{}],
+            \\}}
+        ),
+    );
 }

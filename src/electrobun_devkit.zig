@@ -32,6 +32,10 @@ pub const RuntimePaths = struct {
     main: []const u8,
     preload_full: []const u8,
     preload_sandboxed: []const u8,
+    /// Schema-1 devkits through Electrobun 2.0.1-beta.18 shipped Bun in the
+    /// core archive and described it at `layout.runtime.bun`. Newer schema-1
+    /// devkits omit the path and pin a separately managed Bun toolchain.
+    bun: ?[]const u8,
     launcher: []const u8,
     extractor: []const u8,
     core_library: []const u8,
@@ -223,12 +227,16 @@ pub fn load(
     );
 
     const toolchains = try requiredObjectField(root, "toolchains");
+    const has_managed_bun_toolchain = toolchains.get("bun") != null;
     const toolchain_versions: ToolchainVersions = .{
         .zig = try toolchainVersion(toolchains, "zig"),
         .rust = try toolchainVersion(toolchains, "rust"),
         .go = try toolchainVersion(toolchains, "go"),
         .odin = try toolchainVersion(toolchains, "odin"),
-        .bun = try toolchainVersion(toolchains, "bun"),
+        .bun = if (has_managed_bun_toolchain)
+            try toolchainVersion(toolchains, "bun")
+        else
+            try runtimeVersion(try requiredObjectField(root, "runtimes"), "bun"),
         .cottontail = try optionalToolchainVersion(toolchains, "cottontail"),
     };
 
@@ -238,6 +246,10 @@ pub fn load(
         .main = try requiredExistingPath(io, allocator, core_root, runtime, "main", .file),
         .preload_full = try requiredExistingPath(io, allocator, core_root, runtime, "preloadFull", .file),
         .preload_sandboxed = try requiredExistingPath(io, allocator, core_root, runtime, "preloadSandboxed", .file),
+        .bun = if (has_managed_bun_toolchain)
+            null
+        else
+            try requiredExistingPath(io, allocator, core_root, runtime, "bun", .file),
         .launcher = try requiredExistingPath(io, allocator, core_root, runtime, "launcher", .file),
         .extractor = try requiredExistingPath(io, allocator, core_root, runtime, "extractor", .file),
         .core_library = try requiredExistingPath(io, allocator, core_root, runtime, "coreLibrary", .file),
@@ -706,6 +718,14 @@ fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u
     return version;
 }
 
+fn runtimeVersion(runtimes: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const runtime = try requiredObjectField(runtimes, name);
+    const version = try requiredString(runtime, "version");
+    if (version.len > 128) return error.InvalidElectrobunRuntimeVersion;
+    _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunRuntimeVersion;
+    return version;
+}
+
 fn validateExactOdinVersion(version: []const u8) !void {
     if (std.SemanticVersion.parse(version)) |_| return else |_| {}
     if (version.len != 11 and version.len != 12) return error.InvalidElectrobunToolchainVersion;
@@ -1061,7 +1081,8 @@ const test_manifest_template =
     \\    "rust": { "defaultVersion": "1.88.0" },
     \\    "go": { "defaultVersion": "1.26.4" },
     \\    "odin": { "defaultVersion": "dev-2026-07a" },
-    \\    "bun": { "defaultVersion": "1.3.13" }
+    \\    "bun": { "defaultVersion": "1.3.13" },
+    \\    "cottontail": { "defaultVersion": "0.5.0" }
     \\  },
     \\  "layout": {
     \\    "runtime": {
@@ -1121,6 +1142,7 @@ const test_fixture_files = [_][]const u8{
     "main.js",
     "preload-full.js",
     "preload-sandboxed.js",
+    "bin/bun",
     "bin/launcher",
     "bin/extractor",
     "lib/core",
@@ -1149,6 +1171,43 @@ fn testManifestSource(allocator: std.mem.Allocator, version: []const u8) ![]cons
     const with_version = try std.mem.replaceOwned(u8, allocator, test_manifest_template, "__VERSION__", version);
     const with_os = try std.mem.replaceOwned(u8, allocator, with_version, "__OS__", targetOs());
     return std.mem.replaceOwned(u8, allocator, with_os, "__ARCH__", targetArch());
+}
+
+fn legacyTestManifestSource(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
+    const current = try testManifestSource(allocator, version);
+    const legacy_toolchains = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        current,
+        \\    "odin": { "defaultVersion": "dev-2026-07a" },
+        \\    "bun": { "defaultVersion": "1.3.13" },
+        \\    "cottontail": { "defaultVersion": "0.5.0" }
+    ,
+        \\    "odin": { "defaultVersion": "dev-2026-07a" }
+        ,
+    );
+    const with_runtime_version = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        legacy_toolchains,
+        \\  "layout": {
+    ,
+        \\  "runtimes": {
+        \\    "bun": { "version": "1.3.13" }
+        \\  },
+        \\  "layout": {
+        ,
+    );
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        with_runtime_version,
+        \\      "preloadSandboxed": "preload-sandboxed.js",
+    ,
+        \\      "preloadSandboxed": "preload-sandboxed.js",
+        \\      "bun": "bin/bun",
+        ,
+    );
 }
 
 fn createTestDevkit(io: std.Io, allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, version: []const u8) ![]const u8 {
@@ -1183,10 +1242,50 @@ test "package-free v2 devkit resolves runtime SDKs and toolchain defaults" {
     try std.testing.expectEqualStrings("2.0.0-beta.1", resolution.version);
     try std.testing.expectEqualStrings("0.16.0", resolution.toolchains.zig);
     try std.testing.expectEqualStrings("1.3.13", resolution.toolchains.bun);
+    try std.testing.expectEqualStrings("0.5.0", resolution.toolchains.cottontail.?);
+    try std.testing.expect(resolution.runtime.bun == null);
     try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.preload_full, "preload-full.js"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.javascript.main, "api/sdks/main/index.ts"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.go.root, "go-sdk"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.odin.collection, "odin-sdk"));
+}
+
+test "Electrobun 2.0.1-beta.18 schema-1 devkit preserves its embedded Bun runtime" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const version = "2.0.1-beta.18";
+    const root = try createTestDevkit(io, allocator, &tmp, version);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ root, manifest_file_name }),
+        .data = try legacyTestManifestSource(allocator, version),
+    });
+
+    const resolution = try load(io, allocator, root, version);
+    try std.testing.expectEqualStrings(version, resolution.version);
+    try std.testing.expectEqualStrings("1.3.13", resolution.toolchains.bun);
+    try std.testing.expect(resolution.toolchains.cottontail == null);
+    try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.bun.?, "bin/bun"));
+
+    const invalid_runtime_version = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        try legacyTestManifestSource(allocator, version),
+        "\"version\": \"1.3.13\"",
+        "\"version\": \"latest\"",
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ root, manifest_file_name }),
+        .data = invalid_runtime_version,
+    });
+    try std.testing.expectError(
+        error.InvalidElectrobunRuntimeVersion,
+        load(io, allocator, root, version),
+    );
 }
 
 test "v2 devkit requires an exact bun toolchain default" {
@@ -1230,7 +1329,7 @@ test "v2 devkit requires an exact bun toolchain default" {
         u8,
         arena.allocator(),
         valid_source,
-        ",\n    \"bun\": { \"defaultVersion\": \"1.3.13\" }",
+        "    \"bun\": { \"defaultVersion\": \"1.3.13\" },\n",
         "",
     );
     try std.testing.expect(missing.len < valid_source.len);

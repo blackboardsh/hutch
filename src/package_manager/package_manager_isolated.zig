@@ -207,12 +207,20 @@ pub fn placementWithPeerContext(
     source: []const u8,
     peer_context: PeerContext,
 ) !Placement {
+    if (!Lockfile.packageNameIsSafe(name)) return error.InvalidPackageName;
     const store_key = try storeKeyWithPeerContext(allocator, name, version, kind, source, peer_context);
-    const modules_dir = try std.fs.path.join(allocator, &.{ root_dir, "node_modules", ".bun", store_key, "node_modules" });
+    const store_root = try std.fs.path.resolve(allocator, &.{ root_dir, "node_modules", ".bun" });
+    const modules_dir = try std.fs.path.resolve(allocator, &.{ store_root, store_key, "node_modules" });
+    const package_dir = try std.fs.path.resolve(allocator, &.{ modules_dir, name });
+    if (!pathHasPrefix(modules_dir, store_root) or modules_dir.len == store_root.len or
+        !pathHasPrefix(package_dir, modules_dir) or package_dir.len == modules_dir.len)
+    {
+        return error.InvalidPackageDestination;
+    }
     return .{
         .store_key = store_key,
         .modules_dir = modules_dir,
-        .package_dir = try std.fs.path.join(allocator, &.{ modules_dir, name }),
+        .package_dir = package_dir,
     };
 }
 
@@ -236,7 +244,10 @@ pub fn storeKeyWithPeerContext(
 ) ![]const u8 {
     const escaped_name = try escapeStoreComponent(allocator, name);
     const base = try switch (kind) {
-        .npm => std.fmt.allocPrint(allocator, "{s}@{s}", .{ escaped_name, version }),
+        .npm => std.fmt.allocPrint(allocator, "{s}@{s}", .{
+            escaped_name,
+            try escapeStoreComponent(allocator, version),
+        }),
         .folder => std.fmt.allocPrint(allocator, "{s}@file+{s}", .{
             escaped_name,
             try escapeStoreComponent(allocator, normalizedLocalSource(source)),
@@ -313,6 +324,12 @@ fn escapeStoreComponent(allocator: std.mem.Allocator, value: []const u8) ![]cons
     return escaped;
 }
 
+fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (path.len == prefix.len) return true;
+    return path[prefix.len] == std.fs.path.sep or path[prefix.len] == '/' or path[prefix.len] == '\\';
+}
+
 test "isolated store paths match Bun package layout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -337,6 +354,13 @@ test "isolated store paths match Bun package layout" {
 
     const root = try placement(allocator, "/project", "root-file-dep", "0.0.0", .root, "");
     try std.testing.expectEqualStrings("root-file-dep@root", root.store_key);
+
+    try std.testing.expectError(
+        error.InvalidPackageName,
+        placement(allocator, "/project", "../../outside", "1.0.0", .npm, ""),
+    );
+    const escaped_version = try storeKey(allocator, "safe", "../../outside", .npm, "");
+    try std.testing.expectEqualStrings("safe@..+..+outside", escaped_version);
 }
 
 test "peer contexts use Bun's resolved peer hash" {

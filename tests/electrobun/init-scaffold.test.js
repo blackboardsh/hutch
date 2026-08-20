@@ -22,6 +22,18 @@ import {
 } from "./v2-devkit-fixture.js";
 
 const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const hutchPragma = readFileSync(join(hutchRoot, "hutch.config.ts"), "utf8").match(
+  /^\/\/\s*@hutch\s+cli=([^\s]+)\s+cottontail=([^\s]+)$/m,
+);
+assert.ok(hutchPragma, "Hutch's release pragma must carry exact CLI and Cottontail versions");
+const currentHutchVersion = hutchPragma[1];
+const pairedCottontailVersion = hutchPragma[2];
+
+function nextPatchVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  assert.ok(match, `expected a stable version, got ${version}`);
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
+}
 
 function run(command, args, options) {
   return new Promise((resolveResult, reject) => {
@@ -129,6 +141,8 @@ export default {
     helloArchive: 0,
     nativeArchive: 0,
   };
+  let requiredHutchVersion = currentHutchVersion;
+  let requiredCottontailVersion = pairedCottontailVersion;
 
   let baseUrl;
   const server = createServer((request, response) => {
@@ -140,7 +154,10 @@ export default {
         channel: "stable",
         version: "2.0.0",
         revision: "a".repeat(40),
-        tools: { hutch: "0.5.0", cottontail: "0.2.3" },
+        tools: {
+          hutch: requiredHutchVersion,
+          cottontail: requiredCottontailVersion,
+        },
         templates: [
           {
             id: "hello-world",
@@ -311,6 +328,62 @@ export default {
     assert.ok(existsSync(join(workspace, "skipped-app", ".hutch", "devkit", "projection.json")));
     assert.equal(requestCounts.channel, 6);
     assert.equal(requestCounts.helloArchive, 2, "template archives must be discarded after extraction");
+
+    requiredHutchVersion = nextPatchVersion(currentHutchVersion);
+    const archivesBeforeHutchMismatch = {
+      hello: requestCounts.helloArchive,
+      native: requestCounts.nativeArchive,
+    };
+    const newerHutchRequired = await run(
+      hutch,
+      ["electrobun", "init", "needs-newer-hutch", "--template=hello-world", "--skip-install"],
+      { cwd: workspace, env },
+    );
+    assert.equal(newerHutchRequired.status, 1);
+    assert.match(
+      newerHutchRequired.stderr,
+      new RegExp(`requires Hutch ${requiredHutchVersion.replaceAll(".", "\\.")}`),
+    );
+    assert.match(newerHutchRequired.stderr, /run `hutch upgrade` and retry/);
+    assert.doesNotMatch(newerHutchRequired.stderr, /TemplateRequiresNewerHutch/);
+    assert.equal(existsSync(join(workspace, "needs-newer-hutch")), false);
+    assert.deepEqual(
+      {
+        hello: requestCounts.helloArchive,
+        native: requestCounts.nativeArchive,
+      },
+      archivesBeforeHutchMismatch,
+      "an incompatible catalog must fail before downloading a template archive",
+    );
+    requiredHutchVersion = currentHutchVersion;
+
+    requiredCottontailVersion = nextPatchVersion(pairedCottontailVersion);
+    const archivesBeforeCottontailMismatch = {
+      hello: requestCounts.helloArchive,
+      native: requestCounts.nativeArchive,
+    };
+    const incompatibleCottontail = await run(
+      hutch,
+      ["electrobun", "init", "needs-cottontail", "--template=hello-world", "--skip-install"],
+      { cwd: workspace, env },
+    );
+    assert.equal(incompatibleCottontail.status, 1);
+    assert.match(
+      incompatibleCottontail.stderr,
+      new RegExp(`requires exactly Cottontail ${requiredCottontailVersion.replaceAll(".", "\\.")}`),
+    );
+    assert.match(incompatibleCottontail.stderr, /try `hutch upgrade`/);
+    assert.doesNotMatch(incompatibleCottontail.stderr, /IncompatibleTemplateCottontail/);
+    assert.equal(existsSync(join(workspace, "needs-cottontail")), false);
+    assert.deepEqual(
+      {
+        hello: requestCounts.helloArchive,
+        native: requestCounts.nativeArchive,
+      },
+      archivesBeforeCottontailMismatch,
+      "a Cottontail mismatch must fail before downloading a template archive",
+    );
+    requiredCottontailVersion = pairedCottontailVersion;
 
     const requestsBeforeEnvironmentOffline = { ...requestCounts };
     const environmentOffline = await run(

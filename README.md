@@ -7,11 +7,11 @@ installation has two parts:
 - `hutch-engine`, the versioned engine that owns scripts, builds, toolchains, and
   Electrobun orchestration.
 
-Cottontail is an independently released runtime. Hutch resolves it from the same
-global content store when JavaScript execution is needed; it is not embedded in
-or version-locked to a Hutch release. JavaScript dependencies install through
-Hutch's minimal built-in npm-compatible resolver by default, or through an
-explicitly selected external package manager.
+Cottontail is released and stored independently, but every Hutch release names
+the Cottontail version it was built and tested with. An unpinned project uses
+that pair for build-time JavaScript execution; an explicit Cottontail pin wins.
+JavaScript dependencies install through Hutch's minimal built-in npm-compatible
+resolver by default, or through an explicitly selected external package manager.
 
 ## Install
 
@@ -38,8 +38,9 @@ Pass `-Channel canary` to install `hutch-canary.exe`. Both installers also accep
 an exact semantic version or full build revision. Releases are stored side by
 side under `~/.hutch/releases`. The installer atomically refreshes the native
 launcher and records the selected exact release in
-`~/.hutch/state/selections.json`; `hutch self update` advances that selection
-for the next invocation. The Unix installer adds `~/.hutch/bin` to the detected
+`~/.hutch/state/selections.json`; `hutch upgrade` advances that selection for
+the next invocation (`hutch self update` is its explicit long form). The Unix
+installer adds `~/.hutch/bin` to the detected
 zsh, bash, fish, or POSIX shell profile and prints the command that activates it
 in the current terminal. Pass `--no-modify-path` to only print that command.
 `stable` is accepted as an installer channel alias for `production`.
@@ -70,9 +71,10 @@ package) may supply its paired CLI and Electrobun versions through
 `HUTCH_DEFAULT_CLI` and `HUTCH_DEFAULT_ELECTROBUN`; those are defaults,
 not overrides — an explicit pragma or config pin always wins.
 Electrobun projects may also omit `electrobun.version` entirely: the project
-then floats on the Electrobun release channel, `hutch electrobun sync`
-advances it to the current channel head, and every other command reuses the
-release recorded in `.hutch/devkit` so builds stay stable between syncs.
+then uses an npm-supplied paired version when present. Otherwise it floats on
+the Electrobun release channel: `hutch electrobun sync` advances it to the
+current channel head, and every other command reuses the release recorded in
+`.hutch/devkit` so builds stay stable between syncs.
 
 `hutch self pin` and `hutch cottontail pin` rewrite the nearest config's pragma
 in place. Without a selector they pin the exact version currently selected for
@@ -82,7 +84,7 @@ directory and moves every config whose pragma already pins an exact version or
 build, leaving channel-tracking and pragma-free configs alone — one command
 bumps a whole monorepo of templates after a release. `hutch status` reports the
 current directory's pragma, what it resolves to, and the active channel's
-version side by side, and `hutch self update` points out when the directory's
+version side by side, and `hutch upgrade` points out when the directory's
 pin keeps it behind the selection it just advanced.
 
 ## Package Managers
@@ -112,13 +114,16 @@ export default {
 ```
 
 `hutch install [args...]` resolves with the built-in resolver, or runs
-`<package-manager> install [args...]` when one is selected. `hutch pm
-[args...]` passes arguments through to an explicitly selected external
-manager unchanged; package operations beyond install stay native to that
-manager (`hutch pm add three` rather than a Hutch-specific add command).
+`<package-manager> install [args...]` when one is selected. With the built-in
+resolver, `hutch pm` shows help and `hutch pm exec [--] <command> [args...]`
+runs only a matching executable from the nearest package project's
+`node_modules/.bin`; it never downloads a package or falls back to `PATH`.
+`hutch pm --version` reports the Hutch version. With an external manager
+selected, `hutch pm [args...]` instead passes every argument through unchanged,
+so its native operations remain available (`hutch pm add three`, for example).
 
-`hutch.config.ts` is the only selection channel. Without a `packageManager`
-there, the built-in resolver runs — foreign lockfiles (`bun.lock`,
+`hutch.config.ts` is the only external-manager selection channel. Without a
+`packageManager` there, the built-in resolver runs — foreign lockfiles (`bun.lock`,
 `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) are ignored entirely:
 never read, migrated, or modified. Hutch resolves from `package.json` and
 creates `hutch.lock`; projects that want their previous tool declare it
@@ -204,20 +209,22 @@ be reused without the network. Resolving anything missing requires a fresh
 network lookup and download. `hutch electrobun init` always requires the network
 because template catalogs and archives are not persisted. A build can run
 offline when every exact Hutch, Cottontail, and Electrobun release and every
-managed toolchain it needs are already installed; dependencies owned by an
-external package manager are a separate concern.
+managed toolchain it needs are already installed. JavaScript dependencies must
+also already be materialized by the built-in resolver or the explicitly
+selected external package manager.
 
 ## Updates
 
 ```sh
-hutch self update
+hutch upgrade
 ```
 
 Cottontail is paired with the Hutch release: an unpinned project runs the
 Cottontail version this launcher was built and tested with, and
-`hutch self update` advances both together. There is no separate
-`hutch cottontail update`; a project that needs a different Cottontail pins
-one with the pragma or `hutch cottontail pin`.
+`hutch upgrade` advances both together (`hutch self update` is the explicit
+long form). There is no separate `hutch cottontail update`; a project that
+needs a different Cottontail pins one with the pragma or
+`hutch cottontail pin`.
 
 Interactive use checks for newer remote-channel releases at most every six
 hours. Each check fetches current metadata rather than reading a persistent
@@ -261,13 +268,17 @@ Pass `--skip-install` to leave that step to another orchestrator. Init requires
 network access to fetch the current catalog and chosen template. Only
 `--skip-install` prints `hutch run --if-configured install` as the explicit next
 step.
-The thin Electrobun npm package
-delegates `npx electrobun init` and `bunx electrobun init` to
-`hutch electrobun init`, installing the matching Hutch channel when needed.
-Starter templates come from the selected production or canary Electrobun
-catalog rather than from an npm package bundle.
+The single, dependency-free Electrobun npm package delegates
+`npx electrobun init` and `bunx electrobun init` to `hutch electrobun init`.
+When its exact paired Hutch is not cached, the bootstrap downloads and verifies
+the host archive published on that Electrobun version's GitHub Release. Init
+also ensures a compatible global launcher is present for the generated
+project's direct `hutch` tasks while running the initializer through the exact
+private cache. Starter templates come from the selected production or canary
+Electrobun catalog rather than from an npm package bundle.
 
-Every v2 project pins its exact Electrobun release in `hutch.config.ts`:
+An exact Electrobun pin in `hutch.config.ts` is optional and always wins over
+the npm-supplied or channel default:
 
 ```ts
 export default {
@@ -276,20 +287,27 @@ export default {
 };
 ```
 
+Without that pin, an npm-launched command uses the version paired with the
+installed `electrobun` package. A direct Hutch invocation instead reuses the
+version already projected into `.hutch/devkit`; an explicit
+`hutch electrobun sync` advances a floating project to the active channel head.
 `electrobun.config.ts` owns application, build, packaging, and release settings;
 it cannot select the Electrobun framework or SDK version.
 
 `hutch electrobun init` prepares the extracted project before reporting
-success. `hutch electrobun sync` repeats that preparation without building the
-app. Both resolve the exact core and SDK release, optional CEF payload, and the
-native compiler required by `build.mainProcess`. They atomically generate the
-package-shaped editor/build facade at `.hutch/devkit`; projects should ignore
+success. `hutch electrobun prepare` repeats that work without advancing an
+existing floating projection, while `hutch electrobun sync` deliberately
+selects the current default or channel release. All three resolve the exact core
+and SDK release, optional CEF payload, and the native compiler required by
+`build.mainProcess`. They atomically generate the package-shaped editor/build
+facade at `.hutch/devkit`; projects should ignore
 `.hutch/` by default and may extend `./.hutch/devkit/tsconfig.json`. The project
 facade is generated state owned by Hutch; direct edits and committing it are
-not supported workflows, and a later sync may replace it. Electrobun itself is
-not an npm dependency.
-Third-party JavaScript dependencies remain owned by the external package
-manager invoked by a project script.
+not supported workflows, and a later sync may replace it. The optional
+`electrobun` devDependency is only a command bootstrap; runtime and SDK imports
+come from the projected devkit rather than `node_modules/electrobun`.
+Third-party JavaScript dependencies use Hutch's built-in resolver by default,
+or an external package manager selected explicitly in `hutch.config.ts`.
 
 For development against an unpublished local core, set
 `HUTCH_ELECTROBUN_DEVKIT_ROOT` to its absolute directory containing the exact
@@ -420,8 +438,11 @@ for the release workflow.
 - `hutch <entrypoint.js|entrypoint.ts> [args...]`
 - `hutch <script-name> [args...]`
 - `hutch run [--if-configured] [script-name] [args...]`
+- `hutch install [args...]`
+- `hutch pm exec [--] <command> [args...]`
 - `hutch build [args...]`
-- `hutch electrobun <init|sync|build|run|dev> [args...]`
+- `hutch electrobun <init|prepare|sync|build|run|dev> [args...]`
+- `hutch upgrade [selector]`
 - `hutch self <path|version|update|pin> [selector] [--recursive]`
 - `hutch cottontail <path|version|pin> [selector] [--recursive]`
 - `hutch status [--json]`
@@ -450,10 +471,10 @@ execution mode from a filename extension and does not send string tasks to the
 host's `/bin/sh` or `cmd.exe`.
 
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
-emulate npm lifecycle variables when running these tasks. The configured
-package manager owns those semantics. Hutch invokes the selected Cottontail
-release for JavaScript execution, runtime compatibility APIs, and
-compiler-backed build paths.
+emulate npm lifecycle variables when running these tasks. Invoke a local binary
+explicitly with `hutch pm exec`, or select and call an external package manager.
+Hutch invokes the selected Cottontail release for JavaScript execution, runtime
+compatibility APIs, and compiler-backed build paths.
 
 `hutch run --if-configured <script-name>` uses the same config-only lookup but
 exits successfully when the task is absent. It is intended for generic setup

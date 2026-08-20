@@ -11,6 +11,7 @@ const release_store = @import("release_store.zig");
 const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const windows_icon = @import("windows_icon.zig");
+const hutch_release = @import("version.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
 const run_hook_template = @embedFile("electrobun_cli/run_hook_helper.js");
@@ -148,6 +149,9 @@ const PlatformPaths = struct {
 const BundledRuntimeProvenance = struct {
     electrobun_version: []const u8,
     bun_runtime_version: []const u8,
+    /// The app-runtime Cottontail pinned by Electrobun. This is deliberately
+    /// separate from the Cottontail paired with Hutch for build-time work.
+    cottontail_runtime_version: ?[]const u8 = null,
 };
 
 const ReleaseState = struct {
@@ -248,17 +252,24 @@ pub fn run(
 
     if (std.mem.eql(u8, command, "init")) {
         runInit(&ctx, args[1..]) catch |err| {
-            ctx.writeStderr("hutch electrobun init: {s}\n", .{@errorName(err)});
+            switch (err) {
+                // `runInit` already emits actionable version guidance for
+                // these catalog compatibility failures.
+                error.TemplateRequiresNewerHutch,
+                error.IncompatibleTemplateCottontail,
+                => {},
+                else => ctx.writeStderr("hutch electrobun init: {s}\n", .{@errorName(err)}),
+            }
             return 1;
         };
         pruneAutomaticOnce(&ctx);
         return 0;
     }
 
-    if (std.mem.eql(u8, command, "sync")) {
+    if (std.mem.eql(u8, command, "sync") or std.mem.eql(u8, command, "prepare")) {
         const config = try loadConfigForPreparedOperation(&ctx, try parseBuildEnvironment(args[1..]));
         try prepareProjectWithBuildLock(&ctx, config);
-        ctx.writeStdout("electrobun sync complete: {s}/.hutch/devkit\n", .{ctx.project_root});
+        ctx.writeStdout("electrobun {s} complete: {s}/.hutch/devkit\n", .{ command, ctx.project_root });
         return 0;
     }
 
@@ -313,11 +324,13 @@ fn printHelp(writer: anytype) !void {
         \\  hutch electrobun init [project-name] [--template=name] [--beta] [--skip-install]
         \\  hutch electrobun config [--env=dev|canary|stable]
         \\  hutch electrobun sync [--env=dev|canary|stable]
+        \\  hutch electrobun prepare [--env=dev|canary|stable]
         \\  hutch electrobun build [--env=dev|canary|stable]
         \\  hutch electrobun run [--env=dev|canary|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
+        \\  - prepare reuses an existing valid projection for a floating direct-Hutch project; sync advances it to the active channel.
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
@@ -683,9 +696,34 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         _ = try requireProjectZigBuildFile(ctx);
     }
 
+    // Release resolution acquires the managed-store graph internally. Resolve
+    // a devkit-pinned app-runtime Cottontail before taking the graph lock used
+    // to publish the complete project dependency snapshot, and retain its
+    // object lease across that gap. The paired build-time Cottontail remains a
+    // separate dependency below.
+    var bundled_cottontail: ?BundledCottontail = null;
+    if (main_process == .cottontail) {
+        const pinned_cottontail_version = blk: {
+            const product_graph = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
+            defer product_graph.close(ctx.io);
+            const paths = try getPlatformPathsUnderGraph(ctx, config.root);
+            const devkit = paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+            break :blk devkit.toolchains.cottontail;
+        };
+        if (pinned_cottontail_version) |pinned| {
+            bundled_cottontail = try resolvePinnedBundledCottontailBinary(ctx, pinned);
+        }
+    }
+    defer if (bundled_cottontail) |bundled| {
+        if (bundled.lease) |lease| lease.close(ctx.io);
+    };
+
     const graph_lock = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
     defer graph_lock.close(ctx.io);
 
+    // Do not reuse paths observed before the graph-lock gap above. Revalidate
+    // the devkit and platform artifacts under the lock that commits their
+    // reachability snapshot.
     const platform_paths = try getPlatformPathsUnderGraph(ctx, config.root);
     var objects: std.ArrayList(managed_store.ManagedObject) = .empty;
     if (platform_paths.devkit) |devkit| {
@@ -712,7 +750,7 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         ctx.allocator,
         .cottontail,
         ctx.cottontail_home,
-    )) |object| try objects.append(ctx.allocator, object);
+    )) |object| try appendManagedObjectIfDistinct(ctx.allocator, &objects, object);
     switch (main_process) {
         .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .zig)),
         .rust => try appendManagedToolchain(ctx, &objects, .rust, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .rust)),
@@ -723,10 +761,36 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             }
         },
         .odin => try appendManagedToolchain(ctx, &objects, .odin, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .odin)),
-        .bun => try appendManagedToolchain(ctx, &objects, .bun, try resolveBundledBunToolchainUnderGraph(ctx, config.root, platform_paths)),
-        .cottontail => {},
+        .bun => {
+            const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+            // Historical schema-1 devkits carry their exact Bun executable
+            // inside the already-registered Electrobun core object.
+            if (devkit.runtime.bun == null) {
+                try appendManagedToolchain(ctx, &objects, .bun, try resolveBundledBunToolchainUnderGraph(ctx, config.root, platform_paths));
+            }
+        },
+        .cottontail => if (bundled_cottontail) |bundled| {
+            const object = (try managed_store.managedReleaseObject(
+                ctx.init,
+                ctx.allocator,
+                .cottontail,
+                bundled.executable,
+            )) orelse return error.BundledCottontailManagedObjectMissing;
+            try appendManagedObjectIfDistinct(ctx.allocator, &objects, object);
+        },
     }
     try managed_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
+}
+
+fn appendManagedObjectIfDistinct(
+    allocator: std.mem.Allocator,
+    objects: *std.ArrayList(managed_store.ManagedObject),
+    object: managed_store.ManagedObject,
+) !void {
+    for (objects.items) |existing| {
+        if (std.mem.eql(u8, existing.relative_root, object.relative_root)) return;
+    }
+    try objects.append(allocator, object);
 }
 
 fn prepareProjectWithBuildLock(ctx: *const Context, config: CommandContext) !void {
@@ -2987,6 +3051,36 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
     }
 
     const catalog = try electrobun_templates.load(ctx.init, ctx.allocator, channel);
+    electrobun_templates.validateToolCompatibility(
+        catalog,
+        hutch_release.version,
+        hutch_release.paired_cottontail_version,
+    ) catch |err| switch (err) {
+        error.TemplateRequiresNewerHutch => {
+            ctx.writeStderr(
+                "hutch electrobun init: the {s} template catalog requires Hutch {s}, " ++
+                    "but this executable is Hutch {s}; run `hutch upgrade` and retry\n",
+                .{ channel.name(), catalog.hutch_version, hutch_release.version },
+            );
+            return err;
+        },
+        error.IncompatibleTemplateCottontail => {
+            ctx.writeStderr(
+                "hutch electrobun init: the {s} template catalog requires exactly Cottontail {s}, " ++
+                    "but Hutch {s} is paired with Cottontail {s}; install a Hutch release paired " ++
+                    "with Cottontail {s} (try `hutch upgrade`) and retry\n",
+                .{
+                    channel.name(),
+                    catalog.cottontail_version,
+                    hutch_release.version,
+                    hutch_release.paired_cottontail_version,
+                    catalog.cottontail_version,
+                },
+            );
+            return err;
+        },
+        else => return err,
+    };
 
     if (template_name == null) {
         if (project_name) |name| {
@@ -4621,9 +4715,14 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     try copyBundledUninstallManager(ctx, bundle, platform_paths);
     try copyPath(ctx, platform_paths.launcher, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() }));
     if (main_process == .bun) {
-        const bun_toolchain = try resolveBundledBunToolchain(ctx, config.root, platform_paths);
-        defer bun_toolchain.close(ctx.io);
-        try copyPath(ctx, bun_toolchain.resolution.binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+        const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+        if (devkit.runtime.bun) |embedded_bun| {
+            try copyPath(ctx, embedded_bun, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+        } else {
+            const bun_toolchain = try resolveBundledBunToolchain(ctx, config.root, platform_paths);
+            defer bun_toolchain.close(ctx.io);
+            try copyPath(ctx, bun_toolchain.resolution.binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+        }
     }
     if (main_process == .cottontail) {
         const bundled = try resolveBundledCottontailBinary(ctx, platform_paths);
@@ -6150,6 +6249,13 @@ fn resolveBundledCottontailBinary(
     const pinned = devkit.toolchains.cottontail orelse {
         return .{ .executable = try resolveCottontailBinary(ctx) };
     };
+    return resolvePinnedBundledCottontailBinary(ctx, pinned);
+}
+
+fn resolvePinnedBundledCottontailBinary(
+    ctx: *const Context,
+    pinned: []const u8,
+) !BundledCottontail {
     const selector = version_selector.parse(pinned) catch
         return error.InvalidElectrobunToolchainVersion;
     const release = release_store.resolveLeased(
@@ -7209,9 +7315,15 @@ fn bundledRuntimeMetadataJson(
     var metadata: std.json.ObjectMap = .empty;
     try metadata.put(ctx.allocator, "mainProcess", .{ .string = mainProcessName(main_process) });
     try metadata.put(ctx.allocator, "electrobunVersion", .{ .string = provenance.electrobun_version });
-    if (main_process == .bun) {
+    if (main_process == .bun or
+        (main_process == .cottontail and provenance.cottontail_runtime_version != null))
+    {
         var runtime_versions: std.json.ObjectMap = .empty;
-        try runtime_versions.put(ctx.allocator, "bun", .{ .string = provenance.bun_runtime_version });
+        switch (main_process) {
+            .bun => try runtime_versions.put(ctx.allocator, "bun", .{ .string = provenance.bun_runtime_version }),
+            .cottontail => try runtime_versions.put(ctx.allocator, "cottontail", .{ .string = provenance.cottontail_runtime_version.? }),
+            else => unreachable,
+        }
         try metadata.put(ctx.allocator, "runtimeVersions", .{ .object = runtime_versions });
     }
     try metadata.put(
@@ -7251,7 +7363,11 @@ fn writeBundledRuntimeMetadata(
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotPrepared;
     const build_json = try bundledRuntimeMetadataJson(ctx, config, .{
         .electrobun_version = devkit.version,
-        .bun_runtime_version = try configuredToolchainVersion(config.root, .bun, devkit.toolchains.bun),
+        .bun_runtime_version = if (devkit.runtime.bun != null)
+            devkit.toolchains.bun
+        else
+            try configuredToolchainVersion(config.root, .bun, devkit.toolchains.bun),
+        .cottontail_runtime_version = devkit.toolchains.cottontail,
     });
     const version_json = try std.fmt.allocPrint(
         ctx.allocator,
@@ -7316,6 +7432,7 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     const provenance: BundledRuntimeProvenance = .{
         .electrobun_version = "2.0.0-beta.1",
         .bun_runtime_version = "1.3.13",
+        .cottontail_runtime_version = "0.5.0",
     };
     const json = try bundledRuntimeMetadataJson(&ctx, .{
         .raw_json = "",
@@ -7326,7 +7443,10 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
 
     try std.testing.expectEqualStrings("dev", getStringField(metadata, "buildEnvironment").?);
     try std.testing.expectEqualStrings("2.0.0-beta.1", getStringField(metadata, "electrobunVersion").?);
-    try std.testing.expect(metadata.object.get("runtimeVersions") == null);
+    try std.testing.expectEqualStrings(
+        "0.5.0",
+        getStringFieldFromObject(metadata.object.get("runtimeVersions").?.object, "cottontail").?,
+    );
     try std.testing.expectEqualStrings("cef", getStringField(metadata, "defaultRenderer").?);
     const renderers = metadata.object.get("availableRenderers").?;
     try std.testing.expectEqual(@as(usize, 2), renderers.array.items.len);
@@ -7358,7 +7478,27 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     }, provenance);
     const packaged = try std.json.parseFromSliceLeaky(std.json.Value, allocator, packaged_json, .{});
     try std.testing.expectEqualStrings("stable", getStringField(packaged, "buildEnvironment").?);
+    try std.testing.expectEqualStrings(
+        "0.5.0",
+        getStringFieldFromObject(packaged.object.get("runtimeVersions").?.object, "cottontail").?,
+    );
     try std.testing.expect(packaged.object.get("chromiumFlags") == null);
+
+    const legacy_cottontail_json = try bundledRuntimeMetadataJson(&ctx, .{
+        .raw_json = "",
+        .root = packaged_root,
+        .build_env = .stable,
+    }, .{
+        .electrobun_version = "2.0.1-beta.18",
+        .bun_runtime_version = "1.3.13",
+    });
+    const legacy_cottontail = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        legacy_cottontail_json,
+        .{},
+    );
+    try std.testing.expect(legacy_cottontail.object.get("runtimeVersions") == null);
 
     const bun_root = try std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -7378,6 +7518,39 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
         "1.3.13",
         getStringFieldFromObject(runtime_versions.object, "bun").?,
     );
+}
+
+test "paired build-time and devkit-pinned Cottontail releases retain distinct reachability identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var objects: std.ArrayList(managed_store.ManagedObject) = .empty;
+
+    const paired: managed_store.ManagedObject = .{
+        .kind = .release,
+        .relative_root = "releases/cottontail/0.4.2/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/macos-arm64",
+        .version = "0.4.2",
+        .platform = "macos-arm64",
+        .release_product = "cottontail",
+        .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .archive_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    const bundled: managed_store.ManagedObject = .{
+        .kind = .release,
+        .relative_root = "releases/cottontail/0.5.0/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/macos-arm64",
+        .version = "0.5.0",
+        .platform = "macos-arm64",
+        .release_product = "cottontail",
+        .revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+
+    try appendManagedObjectIfDistinct(allocator, &objects, paired);
+    try appendManagedObjectIfDistinct(allocator, &objects, bundled);
+    try appendManagedObjectIfDistinct(allocator, &objects, bundled);
+    try std.testing.expectEqual(@as(usize, 2), objects.items.len);
+    try std.testing.expectEqualStrings("0.4.2", objects.items[0].version);
+    try std.testing.expectEqualStrings("0.5.0", objects.items[1].version);
 }
 
 test "Windows runtime metadata validates and deduplicates auto-granted permissions" {

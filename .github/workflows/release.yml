@@ -46,7 +46,7 @@ jobs:
           - platform: macos-arm64
             runner: macos-26
             os: macos
-            target: ""
+            target: aarch64-macos.14.0
           - platform: linux-x64
             runner: ubuntu-24.04
             os: linux
@@ -102,6 +102,10 @@ jobs:
           if [[ '${{ matrix.os }}' == 'linux' ]]; then
             node scripts/verify-linux-glibc.js zig-out/bin/hutch-engine 2.35
           fi
+          if [[ '${{ matrix.os }}' == 'macos' ]]; then
+            node scripts/verify-macos-deployment-target.js zig-out/bin/hutch 14.0
+            node scripts/verify-macos-deployment-target.js zig-out/bin/hutch-engine 14.0
+          fi
 
       - name: Build Hutch release executables
         if: matrix.os == 'windows'
@@ -114,7 +118,7 @@ jobs:
         if: matrix.os != 'windows'
         run: |
           ./vendors/zig/zig build test
-          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
+          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/verify-macos-deployment-target.test.js
           node scripts/local-stack.test.js
           node --test --test-concurrency=1 tests/storage-contract.test.js
           node --test --test-concurrency=1 \
@@ -124,6 +128,12 @@ jobs:
             tests/electrobun/non-index-main-entrypoint.test.js \
             tests/electrobun/published-platform-artifact.test.js \
             tests/electrobun/tsconfig-path-alias-bundle.test.js
+          if [[ '${{ matrix.platform }}' == 'linux-x64' ]]; then
+            package_manager_home="$RUNNER_TEMP/hutch-package-manager-home"
+            cottontail="$(HUTCH_HOME="$package_manager_home" ./zig-out/bin/hutch cottontail path)"
+            HUTCH_LOCAL_TEST_COTTONTAIL="$cottontail" \
+              node scripts/run-local-package-manager-tests.js --all
+          fi
 
       - name: Run Hutch tests
         if: matrix.os == 'windows'

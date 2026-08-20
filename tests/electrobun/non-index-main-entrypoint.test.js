@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import {
   chmodSync,
   copyFileSync,
@@ -24,6 +25,29 @@ import {
 const hutchRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const scratchRoot = join(hutchRoot, ".cottontail-tmp", "tests");
 const marker = "NON_INDEX_MAIN_ENTRYPOINT_EXECUTED";
+
+function run(command, args, options) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(command, args, {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (status, signal) => {
+      resolveRun({ status, signal, stdout, stderr });
+    });
+  });
+}
 
 function resolveCottontail() {
   const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
@@ -115,6 +139,33 @@ function installManagedBun(home, version, cottontail) {
   return executable;
 }
 
+function installManagedCottontail(home, { version, revision, source }) {
+  const root = join(
+    home,
+    "releases",
+    "cottontail",
+    version,
+    revision,
+    toolchainPlatformKey(),
+  );
+  const executable = join(root, "bin", executableName("cottontail"));
+  mkdirSync(dirname(executable), { recursive: true });
+  if (source) copyFileSync(source, executable);
+  else writeFixtureFile(executable, "devkit-pinned cottontail runtime fixture\n");
+  chmodSync(executable, 0o755);
+  writeFixtureFile(join(root, ".dash-installed"), "a".repeat(64));
+  writeFixtureFile(join(root, "cottontail-release.json"), `${JSON.stringify({
+    schema: 1,
+    kind: "archive",
+    product: "cottontail",
+    version,
+    revision,
+    platform: toolchainPlatformKey(),
+  })}\n`);
+  writeFixtureFile(`${root}.lock`, "");
+  return { executable, root };
+}
+
 function prepareBunDevkit(root, version, pinnedBunVersion, cottontail) {
   const host = hostContract();
   const manifest = createCoreFixture(root, version, host);
@@ -129,6 +180,34 @@ function prepareBunDevkit(root, version, pinnedBunVersion, cottontail) {
   );
   writeFixtureFile(join(root, manifest.layout.runtime.main), 'import "./app/bun/index.js";\n');
 
+  if (process.platform === "win32") {
+    copyFileSync(cottontail, launcher);
+  } else {
+    writeFixtureFile(
+      launcher,
+      '#!/bin/sh\nset -eu\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/bun" "$HERE/../Resources/main.js"\n',
+    );
+  }
+  chmodSync(launcher, 0o755);
+  return { host, manifest };
+}
+
+function prepareLegacyBunDevkit(root, version, pinnedBunVersion, cottontail) {
+  const host = hostContract();
+  const manifest = createCoreFixture(root, version, host);
+  delete manifest.toolchains.bun;
+  delete manifest.toolchains.cottontail;
+  manifest.runtimes = { bun: { version: pinnedBunVersion } };
+  manifest.layout.runtime.bun = executableName("bun");
+  copyFileSync(cottontail, join(root, manifest.layout.runtime.bun));
+  chmodSync(join(root, manifest.layout.runtime.bun), 0o755);
+  writeFixtureFile(
+    join(root, "native-devkit.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+  writeFixtureFile(join(root, manifest.layout.runtime.main), 'import "./app/bun/index.js";\n');
+
+  const launcher = join(root, manifest.layout.runtime.launcher);
   if (process.platform === "win32") {
     copyFileSync(cottontail, launcher);
   } else {
@@ -401,6 +480,10 @@ export default {
       join(project, "hutch.config.ts"),
       `export default { electrobun: { version: "${version}" }, packageManager: "bun", scripts: {} };\n`,
     );
+    writeFixtureFile(
+      join(project, ".hutch", "devkit", "projection.json"),
+      `${JSON.stringify({ product: { version: "8.8.8" } })}\n`,
+    );
 
     const env = {
       ...process.env,
@@ -411,6 +494,9 @@ export default {
       HUTCH_HOME: home,
       HUTCH_NO_UPDATE_CHECK: "1",
       HUTCH_PM_CAPTURE: externalBun.capture,
+      // The exact config pin must win over both the npm shim default above a
+      // project and a stale projection below it.
+      HUTCH_DEFAULT_ELECTROBUN: "latest",
     };
     delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
     prependExecutablePath(env, externalBun.bin);
@@ -472,6 +558,344 @@ export default {
     assert.match(launch.stdout, new RegExp(marker));
     assert.match(launch.stdout, /V2_DEVKIT_ALIAS/);
     assert.match(launch.stdout, new RegExp(bunCompatibilityVersion(cottontail).replaceAll(".", "\\.")));
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Electrobun 2.0.1-beta.18 keeps its exact embedded Bun runtime", { timeout: 120_000 }, () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const fixture = mkdtempSync(join(scratchRoot, "beta-18-embedded-bun-"));
+  const project = join(fixture, "project");
+  const coreRoot = join(fixture, "electrobun-core");
+  const home = join(fixture, "hutch-home");
+  const version = "2.0.1-beta.18";
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+
+  try {
+    const pinnedBunVersion = bunToolchainVersion(cottontail);
+    const { manifest } = prepareLegacyBunDevkit(
+      coreRoot,
+      version,
+      pinnedBunVersion,
+      cottontail,
+    );
+    const embeddedBun = join(coreRoot, manifest.layout.runtime.bun);
+    writeFixtureFile(
+      join(project, "src", "bun", "electrobun-main.ts"),
+      `console.log("${marker}", Bun.version);\n`,
+    );
+    writeFixtureFile(join(project, "electrobun.config.ts"), `
+export default {
+  app: {
+    name: "NonIndexEntrypoint",
+    identifier: "dev.electrobun.beta-18-embedded-bun",
+    version: "0.0.0",
+  },
+  build: {
+    mainProcess: "bun",
+    bun: { entrypoint: "src/bun/electrobun-main.ts" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+};
+`);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" }, packageManager: "bun", scripts: {} };\n`,
+    );
+
+    const env = {
+      ...process.env,
+      COTTONTAIL_BINARY: cottontail,
+      DASH_COTTONTAIL: cottontail,
+      DASH_RELEASE_OFFLINE: "1",
+      HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
+      HUTCH_ENGINE_BINARY: engine,
+      HUTCH_HOME: home,
+      HUTCH_NO_UPDATE_CHECK: "1",
+    };
+    delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+
+    const packageManager = spawnSync(hutch, ["pm", "--version"], {
+      cwd: project,
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(
+      packageManager.status,
+      0,
+      packageManager.stderr || packageManager.stdout,
+    );
+    assert.equal(packageManager.stdout.trim(), pinnedBunVersion);
+    assert.equal(
+      existsSync(join(home, "toolchains", "bun")),
+      false,
+      "beta.18 package-manager execution must use its embedded Bun",
+    );
+
+    const build = spawnSync(hutch, ["electrobun", "build", "--env=dev"], {
+      cwd: project,
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(build.status, 0, build.stderr || build.stdout);
+
+    const { execDir, resourcesDir } = bundlePaths(project);
+    const stagedBun = join(execDir, executableName("bun"));
+    assert.equal(sha256(stagedBun), sha256(embeddedBun));
+    const dependencyLock = readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8");
+    assert.doesNotMatch(
+      dependencyLock,
+      /toolchains\/bun\//,
+      "the embedded runtime is reachable through the Electrobun core, not a replacement toolchain",
+    );
+    const buildMetadata = JSON.parse(readFileSync(join(resourcesDir, "build.json"), "utf8"));
+    assert.equal(buildMetadata.electrobunVersion, version);
+    assert.equal(buildMetadata.runtimeVersions.bun, pinnedBunVersion);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("floating Electrobun packageManager bun follows npm default, projection, then channel", { timeout: 120_000 }, async () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const fixture = mkdtempSync(join(scratchRoot, "floating-package-manager-bun-"));
+  const coreRoot = join(fixture, "electrobun-core");
+  const home = join(fixture, "hutch-home");
+  const version = "2.0.0-test.floating-pm.1";
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const cottontail = resolveCottontail();
+  const pinnedBunVersion = bunToolchainVersion(cottontail);
+  prepareBunDevkit(coreRoot, version, pinnedBunVersion, cottontail);
+  installManagedBun(home, pinnedBunVersion, cottontail);
+  const externalBun = prepareExternalBun(fixture);
+
+  let baseUrl;
+  let channelRequests = 0;
+  const checksum = "b".repeat(64);
+  const server = createServer((request, response) => {
+    if (request.url !== "/channels/stable.json") {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    channelRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(`${JSON.stringify({
+      schema: 1,
+      kind: "electrobun-template-channel",
+      channel: "stable",
+      version,
+      revision: "a".repeat(40),
+      tools: { hutch: "0.23.0", cottontail: "0.5.0" },
+      templates: [{
+        id: "fixture",
+        name: "Fixture",
+        description: "Local channel fixture",
+        mainProcess: "bun",
+        archive: {
+          url: `${baseUrl}/artifacts/${checksum}.tar.gz`,
+          sha256: checksum,
+          size: 1,
+        },
+      }],
+    })}\n`);
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  baseUrl = `http://127.0.0.1:${address.port}`;
+
+  const commonEnv = {
+    ...process.env,
+    COTTONTAIL_BINARY: cottontail,
+    DASH_COTTONTAIL: cottontail,
+    ELECTROBUN_TEMPLATES_BASE_URL: baseUrl,
+    HUTCH_ACTIVE_CHANNEL: "stable",
+    HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
+    HUTCH_ENGINE_BINARY: engine,
+    HUTCH_HOME: home,
+    HUTCH_NO_UPDATE_CHECK: "1",
+  };
+  delete commonEnv.COTTONTAIL_ELECTROBUN_PACKAGE;
+  delete commonEnv.DASH_RELEASE_OFFLINE;
+  delete commonEnv.HUTCH_DEFAULT_ELECTROBUN;
+  prependExecutablePath(commonEnv, externalBun.bin);
+
+  const makeProject = (name) => {
+    const project = join(fixture, name);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      'export default { packageManager: "bun", scripts: {} };\n',
+    );
+    writeFixtureFile(join(project, "electrobun.config.ts"), "export default {};\n");
+    return project;
+  };
+
+  try {
+    const npmDefaultProject = makeProject("npm-default");
+    const npmDefault = spawnSync(hutch, ["pm", "--version"], {
+      cwd: npmDefaultProject,
+      encoding: "utf8",
+      env: {
+        ...commonEnv,
+        DASH_RELEASE_OFFLINE: "1",
+        HUTCH_DEFAULT_ELECTROBUN: version,
+      },
+    });
+    assert.equal(npmDefault.status, 0, npmDefault.stderr || npmDefault.stdout);
+    assert.equal(npmDefault.stdout.trim(), pinnedBunVersion);
+    assert.equal(channelRequests, 0, "the npm default must avoid channel resolution");
+
+    const projectionProject = makeProject("projection");
+    writeFixtureFile(
+      join(projectionProject, ".hutch", "devkit", "projection.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        kind: "electrobun-devkit-projection",
+        product: { name: "electrobun", version },
+      })}\n`,
+    );
+    const projection = spawnSync(hutch, ["pm", "--version"], {
+      cwd: projectionProject,
+      encoding: "utf8",
+      env: { ...commonEnv, DASH_RELEASE_OFFLINE: "1" },
+    });
+    assert.equal(projection.status, 0, projection.stderr || projection.stdout);
+    assert.equal(projection.stdout.trim(), pinnedBunVersion);
+    assert.equal(channelRequests, 0, "an existing projection must avoid channel resolution");
+
+    const channelProject = makeProject("channel");
+    const channel = await run(hutch, ["pm", "--version"], {
+      cwd: channelProject,
+      env: commonEnv,
+    });
+    assert.equal(channel.status, 0, channel.stderr || channel.stdout);
+    assert.equal(channel.stdout.trim(), pinnedBunVersion);
+    assert.equal(channelRequests, 1, "a fully floating project must resolve the active channel");
+
+    const genericProject = join(fixture, "generic-bun");
+    const genericHome = join(fixture, "generic-home");
+    writeFixtureFile(
+      join(genericProject, "hutch.config.ts"),
+      'export default { packageManager: "bun", scripts: {} };\n',
+    );
+    const generic = spawnSync(hutch, ["pm", "--version"], {
+      cwd: genericProject,
+      encoding: "utf8",
+      env: {
+        ...commonEnv,
+        DASH_RELEASE_OFFLINE: "1",
+        HUTCH_HOME: genericHome,
+      },
+    });
+    assert.equal(generic.status, 1, generic.stderr || generic.stdout);
+    assert.match(
+      generic.stderr,
+      /bun 1\.3\.13 is not installed/,
+      "a generic Bun project must retain Hutch's default instead of loading an Electrobun devkit",
+    );
+    assert.equal(channelRequests, 1, "generic Bun projects must not query Electrobun channels");
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose));
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("devkit-pinned Cottontail is registered and provenanced separately from Hutch's build runtime", { timeout: 120_000 }, () => {
+  mkdirSync(scratchRoot, { recursive: true });
+  const fixture = mkdtempSync(join(scratchRoot, "pinned-cottontail-runtime-"));
+  const project = join(fixture, "project");
+  const coreRoot = join(fixture, "electrobun-core");
+  const home = join(fixture, "hutch-home");
+  const version = "2.0.0-test.cottontail-runtime.1";
+  const pairedVersion = "9.7.6";
+  const pinnedVersion = "9.8.7";
+  const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
+  const engine = join(hutchRoot, "zig-out", "bin", executableName("hutch-engine"));
+  const localCottontail = resolveCottontail();
+
+  try {
+    const paired = installManagedCottontail(home, {
+      version: pairedVersion,
+      revision: "a".repeat(40),
+      source: localCottontail,
+    });
+    const pinned = installManagedCottontail(home, {
+      version: pinnedVersion,
+      revision: "b".repeat(40),
+    });
+    const manifest = createCoreFixture(coreRoot, version, hostContract());
+    manifest.toolchains.cottontail = { defaultVersion: pinnedVersion };
+    writeFixtureFile(
+      join(coreRoot, "native-devkit.json"),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+    writeFixtureFile(
+      join(project, "src", "bun", "electrobun-main.ts"),
+      `console.log("${marker}");\n`,
+    );
+    writeFixtureFile(join(project, "electrobun.config.ts"), `
+export default {
+  app: {
+    name: "NonIndexEntrypoint",
+    identifier: "dev.electrobun.pinned-cottontail-runtime",
+    version: "0.0.0",
+  },
+  build: {
+    mainProcess: "cottontail",
+    cottontail: { entrypoint: "src/bun/electrobun-main.ts" },
+    mac: { icons: null, codesign: false, notarize: false, bundleCEF: false, bundleWGPU: false },
+    win: { bundleCEF: false, bundleWGPU: false },
+    linux: { bundleCEF: false, bundleWGPU: false },
+  },
+};
+`);
+    writeFixtureFile(
+      join(project, "hutch.config.ts"),
+      `export default { electrobun: { version: "${version}" }, scripts: {} };\n`,
+    );
+
+    const env = {
+      ...process.env,
+      COTTONTAIL_BINARY: paired.executable,
+      DASH_COTTONTAIL: paired.executable,
+      DASH_RELEASE_OFFLINE: "1",
+      HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
+      HUTCH_ENGINE_BINARY: engine,
+      HUTCH_HOME: home,
+      HUTCH_NO_UPDATE_CHECK: "1",
+    };
+    delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+
+    const build = spawnSync(hutch, ["electrobun", "build", "--env=dev"], {
+      cwd: project,
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(build.status, 0, build.stderr || build.stdout);
+
+    const dependencyLock = readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8");
+    const pairedRelative = `releases/cottontail/${pairedVersion}/${"a".repeat(40)}/${toolchainPlatformKey()}`;
+    const pinnedRelative = `releases/cottontail/${pinnedVersion}/${"b".repeat(40)}/${toolchainPlatformKey()}`;
+    assert.match(dependencyLock, new RegExp(pairedRelative));
+    assert.match(dependencyLock, new RegExp(pinnedRelative));
+
+    const { execDir, resourcesDir } = bundlePaths(project);
+    const stagedCottontail = join(execDir, executableName("cottontail"));
+    assert.equal(sha256(stagedCottontail), sha256(pinned.executable));
+    assert.notEqual(sha256(stagedCottontail), sha256(paired.executable));
+    const buildMetadata = JSON.parse(readFileSync(join(resourcesDir, "build.json"), "utf8"));
+    assert.equal(buildMetadata.mainProcess, "cottontail");
+    assert.equal(buildMetadata.runtimeVersions.cottontail, pinnedVersion);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

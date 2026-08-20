@@ -16,6 +16,7 @@ const reset_cli = @import("reset_cli.zig");
 const runtime_autoinstall = @import("runtime_autoinstall.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
 const status_cli = @import("status_cli.zig");
+const store_locks = @import("store_locks.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -29,7 +30,7 @@ const help_text_template =
     \\Usage:
     \\  hutch <entrypoint.js|entrypoint.ts> [args...]
     \\  hutch <script-name> [args...]
-    \\  hutch electrobun <init|build|run|dev> [args...]
+    \\  hutch electrobun <init|config|sync|prepare|build|run|dev> [args...]
     \\  hutch install [package-manager-options...]
     \\  hutch pm [package-manager-arguments...]
     \\  hutch run [--if-configured] [script-name] [args...]
@@ -38,6 +39,7 @@ const help_text_template =
     \\  hutch prune [--dry-run]
     \\  hutch reset
     \\  hutch status [--json]
+    \\  hutch upgrade [selector]
     \\  hutch self <path|version|update|pin> [selector] [--recursive]
     \\  hutch cottontail <path|version|pin> [selector] [--recursive]
     \\  hutch --help
@@ -51,10 +53,40 @@ const help_text_template =
     \\  without a selection, Hutch's built-in npm-compatible resolver installs
     \\  package.json registry, file, and git dependencies into hutch.lock,
     \\  ignoring any foreign lockfile, and never runs lifecycle scripts.
+    \\  Its `pm exec` runs only project-local node_modules/.bin commands.
     \\  Scripts invoke dependency managers and other external tools explicitly.
     \\  Test files and options are forwarded to the selected Cottontail runtime.
     \\
 ;
+
+const package_manager_help_text =
+    \\Hutch built-in package manager.
+    \\
+    \\Usage:
+    \\  hutch install [package-manager-options...]
+    \\  hutch pm exec [--] <command> [args...]
+    \\  hutch pm --version
+    \\  hutch pm --help
+    \\
+    \\`pm exec` runs an executable from the nearest package project's
+    \\node_modules/.bin. It never downloads a package or falls back to PATH.
+    \\
+;
+
+const upgrade_help_text =
+    \\Upgrade Hutch and its paired Cottontail release.
+    \\
+    \\Usage:
+    \\  hutch upgrade [production|stable|canary|latest|<semver>|build:<revision>]
+    \\  hutch self update [production|stable|canary|latest|<semver>|build:<revision>]
+    \\
+;
+
+const BuiltinPackageManagerCommand = union(enum) {
+    help,
+    version,
+    exec: []const [:0]const u8,
+};
 
 const Config = struct {
     root: std.json.Value,
@@ -70,6 +102,54 @@ fn isHelpFlag(arg: []const u8) bool {
 
 fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
+}
+
+fn parseBuiltinPackageManagerCommand(
+    args: []const [:0]const u8,
+) !BuiltinPackageManagerCommand {
+    if (args.len == 0) return .help;
+    if (isHelpFlag(args[0]) or std.mem.eql(u8, args[0], "help")) {
+        if (args.len != 1) return error.UnexpectedBuiltinPackageManagerArguments;
+        return .help;
+    }
+    if (isVersionFlag(args[0])) {
+        if (args.len != 1) return error.UnexpectedBuiltinPackageManagerArguments;
+        return .version;
+    }
+    if (!std.mem.eql(u8, args[0], "exec")) {
+        return error.UnsupportedBuiltinPackageManagerCommand;
+    }
+
+    var command_index: usize = 1;
+    if (command_index < args.len and std.mem.eql(u8, args[command_index], "--")) {
+        command_index += 1;
+    }
+    if (command_index >= args.len) return error.MissingBuiltinExecCommand;
+    return .{ .exec = args[command_index..] };
+}
+
+fn isSafeLocalBinName(name: []const u8) bool {
+    return name.len > 0 and
+        !std.mem.eql(u8, name, ".") and
+        !std.mem.eql(u8, name, "..") and
+        std.mem.indexOfScalar(u8, name, 0) == null and
+        std.mem.indexOfAny(u8, name, "/\\") == null and
+        !std.fs.path.isAbsolute(name);
+}
+
+fn appendUpgradeReleaseArguments(
+    allocator: std.mem.Allocator,
+    destination: *std.ArrayList([:0]const u8),
+    args: []const [:0]const u8,
+) !void {
+    try destination.append(allocator, "update");
+    try destination.appendSlice(allocator, args);
+}
+
+fn isHutchUpdateHelpRequest(args: []const [:0]const u8) bool {
+    return args.len == 2 and
+        std.mem.eql(u8, args[0], "update") and
+        isHelpFlag(args[1]);
 }
 
 fn isInstallerBootstrapInvocation(args: []const [:0]const u8) bool {
@@ -725,12 +805,82 @@ fn createPrivateTempDirectory(
     }
 }
 
-// The Electrobun release an app command targets, resolved as: explicit
-// config pin > shim-supplied default (the electrobun npm package's paired
-// version) > the version already projected into .hutch/devkit (floating
-// projects stay put between syncs) > the release channel head. `sync` skips
-// the projection step on purpose: it is the command that advances a
-// floating project.
+const ElectrobunVersionSource = enum {
+    explicit_config,
+    npm_default,
+    projection,
+    channel,
+};
+
+const ElectrobunVersionSelection = struct {
+    version: []const u8,
+    source: ElectrobunVersionSource,
+};
+
+fn preferredElectrobunVersion(
+    explicit_config: ?[]const u8,
+    npm_default: ?[]const u8,
+    projection: ?[]const u8,
+    channel: ?[]const u8,
+) ?ElectrobunVersionSelection {
+    if (explicit_config) |selected| return .{ .version = selected, .source = .explicit_config };
+    if (npm_default) |selected| return .{ .version = selected, .source = .npm_default };
+    if (projection) |selected| return .{ .version = selected, .source = .projection };
+    if (channel) |selected| return .{ .version = selected, .source = .channel };
+    return null;
+}
+
+fn configuredElectrobunVersion(root: std.json.Value) !?[]const u8 {
+    return electrobun_devkit.configuredVersion(root) catch |err| switch (err) {
+        error.ElectrobunVersionMissing => null,
+        else => return err,
+    };
+}
+
+fn configuredOrNpmDefaultElectrobunVersion(
+    config_root: std.json.Value,
+    npm_default: ?[]const u8,
+) !?ElectrobunVersionSelection {
+    if (try configuredElectrobunVersion(config_root)) |explicit| {
+        return .{ .version = explicit, .source = .explicit_config };
+    }
+    const configured = npm_default orelse return null;
+    electrobun_devkit.validateExactVersion(configured) catch
+        return error.InvalidDefaultElectrobunVersion;
+    return .{ .version = configured, .source = .npm_default };
+}
+
+// One selector feeds both Electrobun app commands and packageManager: "bun".
+// `sync` is the only caller that declines an existing projection, because it
+// intentionally advances a floating project to the current channel head.
+fn selectElectrobunProjectVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    config_root: std.json.Value,
+    project_root: []const u8,
+    preserve_projection: bool,
+) !ElectrobunVersionSelection {
+    if (try configuredOrNpmDefaultElectrobunVersion(
+        config_root,
+        init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN"),
+    )) |selected| {
+        return selected;
+    }
+    if (preserve_projection) {
+        if (projectedElectrobunVersionAtRoot(init, allocator, project_root)) |projection| {
+            return .{ .version = projection, .source = .projection };
+        }
+    }
+
+    const channel = try electrobun_templates.activeChannel(init.environ_map);
+    const catalog = try electrobun_templates.load(init, allocator, channel);
+    electrobun_devkit.validateExactVersion(catalog.version) catch
+        return error.InvalidElectrobunChannelVersion;
+    return preferredElectrobunVersion(null, null, null, catalog.version).?;
+}
+
+// The Electrobun release an app command targets, resolved as: explicit config
+// pin > shim-supplied npm default > existing projection > channel head.
 fn resolveElectrobunProjectVersion(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -738,28 +888,10 @@ fn resolveElectrobunProjectVersion(
     subcommand: []const u8,
     stderr: anytype,
 ) ![]const u8 {
-    if (loadHutchConfig(init, allocator, cottontail_path)) |hutch_config| {
-        if (electrobun_devkit.configuredVersion(hutch_config.root)) |pinned| {
-            return pinned;
-        } else |err| switch (err) {
-            error.ElectrobunVersionMissing => {},
-            error.InvalidElectrobunVersion => {
-                try stderr.writeAll(
-                    "hutch electrobun: electrobun.version in hutch.config.ts must be an exact semantic version; channels, ranges, and latest are not allowed\n",
-                );
-                try stderr.flush();
-                std.process.exit(1);
-            },
-            else => {
-                try stderr.writeAll(
-                    "hutch electrobun: electrobun in hutch.config.ts must be an object containing an exact string version\n",
-                );
-                try stderr.flush();
-                std.process.exit(1);
-            },
-        }
-    } else |err| switch (err) {
-        error.HutchConfigNotFound => {},
+    const config_root = if (loadHutchConfig(init, allocator, cottontail_path)) |hutch_config|
+        hutch_config.root
+    else |err| switch (err) {
+        error.HutchConfigNotFound => std.json.Value{ .object = .empty },
         else => {
             try stderr.print(
                 "hutch electrobun: failed to load hutch.config.ts: {s}\n",
@@ -768,61 +900,79 @@ fn resolveElectrobunProjectVersion(
             try stderr.flush();
             std.process.exit(1);
         },
-    }
+    };
 
-    // Supplied by the electrobun npm shim: the installed package's own
-    // version. This is what makes `npm install electrobun@X` select the
-    // toolchain — the project's lockfile, not the release channel, decides
-    // what an unpinned npm project builds against.
-    if (init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN")) |configured| {
-        electrobun_devkit.validateExactVersion(configured) catch {
-            try stderr.print(
-                "hutch electrobun: HUTCH_DEFAULT_ELECTROBUN must be an exact semantic version, got \"{s}\"\n",
-                .{configured},
+    const selected = selectElectrobunProjectVersion(
+        init,
+        allocator,
+        config_root,
+        ".",
+        !std.mem.eql(u8, subcommand, "sync"),
+    ) catch |err| switch (err) {
+        error.InvalidElectrobunVersion => {
+            try stderr.writeAll(
+                "hutch electrobun: electrobun.version in hutch.config.ts must be an exact semantic version; channels, ranges, and latest are not allowed\n",
             );
             try stderr.flush();
             std.process.exit(1);
-        };
-        return configured;
-    }
-
-    if (!std.mem.eql(u8, subcommand, "sync")) {
-        if (projectedElectrobunVersion(init, allocator)) |projected| return projected;
-    }
-
-    const channel = electrobun_templates.activeChannel(init.environ_map) catch {
-        try stderr.writeAll("hutch electrobun: invalid HUTCH_ACTIVE_CHANNEL\n");
-        try stderr.flush();
-        std.process.exit(1);
+        },
+        error.InvalidHutchConfig,
+        error.InvalidElectrobunVersionType,
+        => {
+            try stderr.writeAll(
+                "hutch electrobun: electrobun in hutch.config.ts must be an object containing an exact string version\n",
+            );
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        error.InvalidDefaultElectrobunVersion => {
+            try stderr.print(
+                "hutch electrobun: HUTCH_DEFAULT_ELECTROBUN must be an exact semantic version, got \"{s}\"\n",
+                .{init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN").?},
+            );
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        error.InvalidTemplateChannel => {
+            try stderr.writeAll("hutch electrobun: invalid HUTCH_ACTIVE_CHANNEL\n");
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        else => {
+            const channel = electrobun_templates.activeChannel(init.environ_map) catch unreachable;
+            try stderr.print(
+                "hutch electrobun: no electrobun.version is pinned and the {s} release channel " ++
+                    "could not be resolved ({s}). Pin electrobun: {{ version: \"<exact-semver>\" }} " ++
+                    "in hutch.config.ts, or retry with network access.\n",
+                .{ channel.name(), @errorName(err) },
+            );
+            try stderr.flush();
+            std.process.exit(1);
+        },
     };
-    const catalog = electrobun_templates.load(init, allocator, channel) catch |err| {
+
+    if (selected.source == .channel) {
+        const channel = electrobun_templates.activeChannel(init.environ_map) catch unreachable;
         try stderr.print(
-            "hutch electrobun: no electrobun.version is pinned and the {s} release channel " ++
-                "could not be resolved ({s}). Pin electrobun: {{ version: \"<exact-semver>\" }} " ++
-                "in hutch.config.ts, or retry with network access.\n",
-            .{ channel.name(), @errorName(err) },
+            "hutch electrobun: floating on the {s} channel: Electrobun {s} " ++
+                "(pin electrobun.version in hutch.config.ts to stop)\n",
+            .{ channel.name(), selected.version },
         );
         try stderr.flush();
-        std.process.exit(1);
-    };
-    try stderr.print(
-        "hutch electrobun: floating on the {s} channel: Electrobun {s} " ++
-            "(pin electrobun.version in hutch.config.ts to stop)\n",
-        .{ channel.name(), catalog.version },
-    );
-    try stderr.flush();
-    return catalog.version;
+    }
+    return selected.version;
 }
 
 // A floating project's devkit projection records the release it was last
 // synced to; reusing it keeps builds stable between explicit syncs.
-fn projectedElectrobunVersion(
+fn projectedElectrobunVersionAtRoot(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    project_root: []const u8,
 ) ?[]const u8 {
     const path = std.fs.path.join(
         allocator,
-        &.{ ".hutch", "devkit", "projection.json" },
+        &.{ project_root, ".hutch", "devkit", "projection.json" },
     ) catch return null;
     const source = std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -830,15 +980,30 @@ fn projectedElectrobunVersion(
         allocator,
         .limited(1024 * 1024),
     ) catch return null;
+    return projectedElectrobunVersionFromMetadata(allocator, source);
+}
+
+fn projectedElectrobunVersionFromMetadata(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
         allocator,
         source,
-        .{},
+        .{ .duplicate_field_behavior = .@"error" },
     ) catch return null;
     if (parsed != .object) return null;
+    const schema_version = parsed.object.get("schemaVersion") orelse return null;
+    if (schema_version != .integer or schema_version.integer != 1) return null;
+    const kind = parsed.object.get("kind") orelse return null;
+    if (kind != .string or
+        !std.mem.eql(u8, kind.string, "electrobun-devkit-projection")) return null;
     const product = parsed.object.get("product") orelse return null;
     if (product != .object) return null;
+    const product_name = product.object.get("name") orelse return null;
+    if (product_name != .string or
+        !std.mem.eql(u8, product_name.string, "electrobun")) return null;
     const project_version = product.object.get("version") orelse return null;
     if (project_version != .string or project_version.string.len == 0) return null;
     electrobun_devkit.validateExactVersion(project_version.string) catch return null;
@@ -1273,6 +1438,10 @@ fn runReleaseCommand(
         );
         return if (args.len == 0) 1 else 0;
     }
+    if (product == .hutch and isHutchUpdateHelpRequest(args)) {
+        try stdout.writeAll(upgrade_help_text);
+        return 0;
+    }
 
     const operation = args[0];
     if (std.mem.eql(u8, operation, "pin")) {
@@ -1281,7 +1450,7 @@ fn runReleaseCommand(
     if (product == .cottontail and std.mem.eql(u8, operation, "update")) {
         try stderr.print(
             "hutch cottontail: Cottontail is paired with the Hutch release " ++
-                "({s} for this launcher); 'hutch self update' advances both together. " ++
+                "({s} for this launcher); 'hutch upgrade' advances both together. " ++
                 "Pin a different version with the // @hutch pragma or 'hutch cottontail pin'.\n",
             .{hutch_version.paired_cottontail_version},
         );
@@ -1328,20 +1497,68 @@ fn runReleaseCommand(
         return 1;
     };
 
+    const updated_channel: ?[]const u8 = if (refresh)
+        activateResolvedUpdate(
+            init,
+            allocator,
+            product,
+            selector,
+            channel,
+            resolution,
+        ) catch |err| {
+            try stderr.print(
+                "hutch: could not activate {s}: {s}\n",
+                .{ product.name(), @errorName(err) },
+            );
+            return 1;
+        }
+    else
+        null;
+
     if (std.mem.eql(u8, operation, "path")) {
         try stdout.print("{s}\n", .{resolution.executable});
     } else if (std.mem.eql(u8, operation, "version")) {
         try stdout.print("{s}\n", .{resolution.version});
     } else {
-        try stdout.print(
-            "{s} {s}@{s} is active for {s}\n",
-            .{ product.name(), resolution.version, resolution.revision, selector.channel() orelse "this project" },
-        );
-        if (selector.channel()) |channel_name| {
-            notePragmaPin(init, allocator, product, channel_name, resolution.version, stderr) catch {};
-        }
+        const channel_name = updated_channel.?;
+        try writeReleaseUpdateSuccess(stdout, product, resolution, channel_name);
+        notePragmaPin(init, allocator, product, channel_name, resolution.version, stderr) catch {};
     }
     return 0;
+}
+
+// Channel selectors are activated by release_store.resolve itself. Exact and
+// build selectors have no inherent channel, so an update binds the selected
+// release to the channel of the launcher that performed the update.
+fn activateResolvedUpdate(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: release_store.Product,
+    selector: version_selector.Selector,
+    active_channel: []const u8,
+    resolution: release_store.Resolution,
+) ![]const u8 {
+    if (selector.channel()) |selected_channel| return selected_channel;
+    try release_store.activateChannel(
+        init,
+        allocator,
+        product,
+        active_channel,
+        resolution,
+    );
+    return active_channel;
+}
+
+fn writeReleaseUpdateSuccess(
+    writer: anytype,
+    product: release_store.Product,
+    resolution: release_store.Resolution,
+    channel: []const u8,
+) !void {
+    try writer.print(
+        "{s} {s}@{s} is active for {s}\n",
+        .{ product.name(), resolution.version, resolution.revision, channel },
+    );
 }
 
 // An updated channel selection changes nothing for a project whose pragma
@@ -1587,8 +1804,6 @@ fn maybePromptForUpdates(
     }
 }
 
-
-
 fn cottontailRuntimeOptionTakesValue(arg: []const u8) bool {
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
     const value_options = [_][]const u8{
@@ -1636,7 +1851,6 @@ fn cottontailRuntimeOptionTakesValue(arg: []const u8) bool {
     }
     return false;
 }
-
 
 const RuntimeAutoInstallInput = union(enum) {
     entrypoint: []const u8,
@@ -1776,9 +1990,11 @@ fn runNamedConfigScript(
 const PackageManagerResolution = struct {
     selection: package_manager_adapter.Selection,
     toolchain: ?toolchain_store.LeasedResolution = null,
+    electrobun_core_lease: ?store_locks.ObjectLease = null,
 
     fn close(self: PackageManagerResolution, io: std.Io) void {
         if (self.toolchain) |leased| leased.close(io);
+        if (self.electrobun_core_lease) |lease| lease.close(io);
     }
 };
 
@@ -1787,7 +2003,7 @@ fn resolvePackageManager(
     allocator: std.mem.Allocator,
     stderr: *std.Io.Writer,
 ) !?PackageManagerResolution {
-    if (findHutchConfig(init, allocator)) |_| {
+    if (findHutchConfig(init, allocator)) |config_path| {
         const no_args: [0][:0]const u8 = .{};
         const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
             try stderr.print(
@@ -1812,7 +2028,14 @@ fn resolvePackageManager(
             return null;
         };
         if (package_manager_adapter.eligibleForVendoredBun(selection)) {
-            return resolveVendoredBun(init, allocator, config.root, selection, stderr);
+            return resolveVendoredBun(
+                init,
+                allocator,
+                config.root,
+                std.fs.path.dirname(config_path) orelse ".",
+                selection,
+                stderr,
+            );
         }
         return .{ .selection = selection };
     } else |err| switch (err) {
@@ -1824,27 +2047,158 @@ fn resolvePackageManager(
     }
 }
 
+const LeasedElectrobunDevkit = struct {
+    resolution: electrobun_devkit.Resolution,
+    lease: ?store_locks.ObjectLease = null,
+};
 
+fn retainElectrobunCoreLeaseForBun(
+    io: std.Io,
+    lease: ?store_locks.ObjectLease,
+    embedded_bun: ?[]const u8,
+) ?store_locks.ObjectLease {
+    if (embedded_bun != null) return lease;
+    if (lease) |held| held.close(io);
+    return null;
+}
 
-// Bun is vendored like any other toolchain: the devkit of the pinned
-// electrobun.version supplies the version, and Hutch's own default covers
-// invocations without a pin. A version-matching system bun short-circuits the
-// download.
+fn electrobunConfigExists(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) bool {
+    for ([_][]const u8{
+        "electrobun.config.ts",
+        "electrobun.config.mts",
+        "electrobun.config.js",
+        "electrobun.config.mjs",
+    }) |name| {
+        const path = std.fs.path.join(allocator, &.{ project_root, name }) catch return false;
+        if (pathExists(io, path)) return true;
+    }
+    return false;
+}
+
+fn isElectrobunPackageManagerProject(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    config_root: std.json.Value,
+    project_root: []const u8,
+) bool {
+    if (config_root == .object and config_root.object.get("electrobun") != null) return true;
+    if (init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN") != null) return true;
+    if (projectedElectrobunVersionAtRoot(init, allocator, project_root) != null) return true;
+    return electrobunConfigExists(init.io, allocator, project_root);
+}
+
+fn loadElectrobunDevkitForPackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    electrobun_version: []const u8,
+) !LeasedElectrobunDevkit {
+    if (init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| {
+        if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
+        const core_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, configured, allocator);
+        return .{
+            .resolution = try electrobun_devkit.load(
+                init.io,
+                allocator,
+                core_root,
+                electrobun_version,
+            ),
+        };
+    }
+
+    // Keep graph discovery, devkit validation, and lease acquisition atomic
+    // with respect to pruning. The caller retains this lease only when Bun is
+    // embedded in the core; a modern devkit releases it after reading the pin.
+    const graph = try managed_store.acquireUsageLock(init, allocator);
+    defer graph.close(init.io);
+    const core_root = try electrobun_artifacts.ensureCore(init, allocator, electrobun_version);
+    const resolution = try electrobun_devkit.load(
+        init.io,
+        allocator,
+        core_root,
+        electrobun_version,
+    );
+    const home = try release_store.hutchHome(init, allocator);
+    return .{
+        .resolution = resolution,
+        .lease = try store_locks.acquireObjectLease(init.io, allocator, home, core_root),
+    };
+}
+
+// Explicit packageManager: "bun" is pinned by the selected Electrobun
+// devkit when this is an Electrobun project. Generic projects use Hutch's Bun
+// default. A current managed Bun holds its own toolchain lease; only a
+// historical embedded Bun retains the Electrobun core lease while it runs.
 fn resolveVendoredBun(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     config_root: std.json.Value,
+    project_root: []const u8,
     selection: package_manager_adapter.Selection,
     stderr: *std.Io.Writer,
 ) !?PackageManagerResolution {
-    const bun_version = vendoredBunVersion(init, allocator, config_root) catch |err| {
-        try stderr.print(
-            "hutch: could not determine the bun package-manager version: {s}\n",
-            .{@errorName(err)},
+    var electrobun_core_lease: ?store_locks.ObjectLease = null;
+    var bun_version: []const u8 = toolchain_store.default_bun_version;
+    const electrobun_project = isElectrobunPackageManagerProject(
+        init,
+        allocator,
+        config_root,
+        project_root,
+    );
+
+    if (electrobun_project) {
+        const selected = selectElectrobunProjectVersion(
+            init,
+            allocator,
+            config_root,
+            project_root,
+            true,
+        ) catch |err| {
+            try stderr.print(
+                "hutch: could not select the Electrobun release for packageManager: bun: {s}\n",
+                .{@errorName(err)},
+            );
+            return null;
+        };
+        const devkit = loadElectrobunDevkitForPackageManager(
+            init,
+            allocator,
+            selected.version,
+        ) catch |err| {
+            try stderr.print(
+                "hutch: could not resolve the Electrobun {s} devkit for packageManager: bun: {s}\n",
+                .{ selected.version, @errorName(err) },
+            );
+            return null;
+        };
+        const embedded_bun = devkit.resolution.runtime.bun;
+        const pinned_bun_version = devkit.resolution.toolchains.bun;
+        electrobun_core_lease = retainElectrobunCoreLeaseForBun(
+            init.io,
+            devkit.lease,
+            embedded_bun,
         );
-        return null;
-    };
-    const leased = toolchain_store.resolveVersion(init, allocator, .bun, bun_version) catch |err| {
+        if (embedded_bun) |path| {
+            var resolved = selection;
+            resolved.executable = path;
+            return .{
+                .selection = resolved,
+                .electrobun_core_lease = electrobun_core_lease,
+            };
+        }
+        bun_version = pinned_bun_version;
+    }
+
+    const leased = (if (electrobun_project)
+        toolchain_store.resolveManagedOnlyVersion(init, allocator, .bun, bun_version)
+    else
+        // Generic Bun projects retain Hutch's normal default-version behavior,
+        // including accepting an exact version match from PATH.
+        toolchain_store.resolveVersion(init, allocator, .bun, bun_version)) catch |err| {
+        if (electrobun_core_lease) |lease| lease.close(init.io);
         switch (err) {
             error.ToolchainNotInstalledOffline => try stderr.print(
                 "hutch: bun {s} is not installed; offline mode cannot download it\n",
@@ -1863,25 +2217,173 @@ fn resolveVendoredBun(
     };
     var resolved = selection;
     resolved.executable = leased.resolution.binary;
-    return .{ .selection = resolved, .toolchain = leased };
+    return .{
+        .selection = resolved,
+        .toolchain = leased,
+        .electrobun_core_lease = electrobun_core_lease,
+    };
 }
 
-fn vendoredBunVersion(
+fn findNearestPackageRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !?[]const u8 {
+    var current: []const u8 = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    while (true) {
+        const manifest = try std.fs.path.join(allocator, &.{ current, "package.json" });
+        if (pathExists(io, manifest)) return current;
+
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        current = try allocator.dupe(u8, parent);
+    }
+}
+
+fn localBinCandidateIsFile(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .file;
+}
+
+fn resolveLocalBinExecutable(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    bin_directory: []const u8,
+    command: []const u8,
+) !?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        // npm-compatible installs conventionally publish .cmd shims, but
+        // native executables and .bat shims are valid local bins too. Resolve
+        // every candidate by exact path so PATH and global installs can never
+        // satisfy the request.
+        for ([_][]const u8{ "", ".exe", ".cmd", ".bat" }) |suffix| {
+            const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command, suffix });
+            const candidate = try std.fs.path.join(allocator, &.{ bin_directory, filename });
+            if (localBinCandidateIsFile(io, candidate)) return candidate;
+        }
+        return null;
+    }
+
+    const candidate = try std.fs.path.join(allocator, &.{ bin_directory, command });
+    return if (localBinCandidateIsFile(io, candidate)) candidate else null;
+}
+
+fn runLocalPackageBin(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    config_root: std.json.Value,
-) ![]const u8 {
-    if (config_root != .object) return toolchain_store.default_bun_version;
-    const electrobun_version = electrobun_devkit.configuredVersion(config_root) catch |err| switch (err) {
-        error.ElectrobunVersionMissing => return toolchain_store.default_bun_version,
-        else => return err,
+    exec_args: []const [:0]const u8,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const command = exec_args[0];
+    if (!isSafeLocalBinName(command)) {
+        try stderr.print(
+            "hutch pm exec: command must be a bare name in node_modules/.bin: {s}\n",
+            .{command},
+        );
+        return 1;
+    }
+
+    const project_root = (try findNearestPackageRoot(init.io, allocator)) orelse {
+        try stderr.writeAll(
+            "hutch pm exec: no package.json found in this directory or its ancestors\n",
+        );
+        return 1;
     };
-    const core_root = if (init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| blk: {
-        if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
-        break :blk try std.Io.Dir.cwd().realPathFileAlloc(init.io, configured, allocator);
-    } else try electrobun_artifacts.ensureCore(init, allocator, electrobun_version);
-    const devkit = try electrobun_devkit.load(init.io, allocator, core_root, electrobun_version);
-    return devkit.toolchains.bun;
+    const bin_directory = try std.fs.path.join(
+        allocator,
+        &.{ project_root, "node_modules", ".bin" },
+    );
+    const executable = (try resolveLocalBinExecutable(
+        init.io,
+        allocator,
+        bin_directory,
+        command,
+    )) orelse {
+        try stderr.print(
+            "hutch pm exec: {s} was not found in {s}\n",
+            .{ command, bin_directory },
+        );
+        return 1;
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, executable);
+    for (exec_args[1..]) |arg| try argv.append(allocator, arg);
+
+    // Match package-manager exec environments for subprocesses while keeping
+    // resolution of argv[0] pinned to the exact local path above.
+    var environment = try init.environ_map.clone(allocator);
+    defer environment.deinit();
+    const path_key = if (builtin.os.tag == .windows) "Path" else "PATH";
+    const inherited_path = environment.get(path_key) orelse environment.get("PATH") orelse "";
+    const child_path = if (inherited_path.len == 0)
+        try allocator.dupe(u8, bin_directory)
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}{c}{s}",
+            .{ bin_directory, std.fs.path.delimiter, inherited_path },
+        );
+    try environment.put(path_key, child_path);
+
+    var child = std.process.spawn(init.io, .{
+        .argv = argv.items,
+        .environ_map = &environment,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        if (err == error.InvalidBatchScriptArg) {
+            try stderr.writeAll(
+                "hutch pm exec: Windows .cmd/.bat shims reject arguments containing NUL, CR, or LF\n",
+            );
+        } else {
+            try stderr.print(
+                "hutch pm exec: could not run {s}: {s}\n",
+                .{ executable, @errorName(err) },
+            );
+        }
+        return 1;
+    };
+    defer child.kill(init.io);
+    return termExitCode(try child.wait(init.io));
+}
+
+fn runBuiltinPackageManager(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const command = parseBuiltinPackageManagerCommand(args) catch |err| {
+        switch (err) {
+            error.MissingBuiltinExecCommand => try stderr.writeAll(
+                "hutch pm exec: expected [--] <command> [args...]\n",
+            ),
+            error.UnsupportedBuiltinPackageManagerCommand => try stderr.print(
+                "hutch pm: unsupported built-in command: {s}\n" ++
+                    "Use `hutch install`, `hutch pm exec`, or `hutch pm --help`.\n",
+                .{args[0]},
+            ),
+            error.UnexpectedBuiltinPackageManagerArguments => try stderr.writeAll(
+                "hutch pm: --help and --version do not accept arguments\n",
+            ),
+        }
+        return 1;
+    };
+
+    return switch (command) {
+        .help => help: {
+            try stdout.writeAll(package_manager_help_text);
+            break :help 0;
+        },
+        .version => version_output: {
+            try stdout.print("{s}\n", .{version});
+            break :version_output 0;
+        },
+        .exec => |exec_args| runLocalPackageBin(init, allocator, exec_args, stderr),
+    };
 }
 
 fn runPackageManager(
@@ -1897,10 +2399,13 @@ fn runPackageManager(
     const selection = resolution.selection;
     if (selection.name == .hutch) {
         if (subcommand == null) {
-            try stderr.writeAll(
-                "hutch: `hutch pm` forwards to an external package manager; select npm, bun, pnpm, or yarn in hutch.config.ts\n",
+            return runBuiltinPackageManager(
+                init,
+                allocator,
+                forwarded_args,
+                stdout,
+                stderr,
             );
-            return 1;
         }
         var builtin_args: std.ArrayList([:0]const u8) = .empty;
         defer builtin_args.deinit(allocator);
@@ -2024,6 +2529,29 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, selected_command, "status")) {
         managed_store.pruneAutomatic(init, allocator);
         const exit_code = try status_cli.run(init, args[2..], stdout, stderr);
+        try stdout.flush();
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    // `hutch upgrade` is the preferred spelling of `hutch self update`: it
+    // advances the global Hutch release and its paired Cottontail together.
+    // Bare `update` stays unclaimed so it can someday mean "update my
+    // dependencies", matching npm/bun muscle memory.
+    if (std.mem.eql(u8, selected_command, "upgrade")) {
+        var upgrade_args: std.ArrayList([:0]const u8) = .empty;
+        defer upgrade_args.deinit(allocator);
+        try appendUpgradeReleaseArguments(allocator, &upgrade_args, args[2..]);
+        const exit_code = try runReleaseCommand(
+            init,
+            allocator,
+            .hutch,
+            upgrade_args.items,
+            stdout,
+            stderr,
+        );
+        managed_store.pruneAutomatic(init, allocator);
         try stdout.flush();
         try stderr.flush();
         if (exit_code != 0) std.process.exit(exit_code);
@@ -2170,6 +2698,7 @@ pub fn main(init: std.process.Init) !void {
         const requires_project_version = args.len > 2 and
             (std.mem.eql(u8, args[2], "config") or
                 std.mem.eql(u8, args[2], "sync") or
+                std.mem.eql(u8, args[2], "prepare") or
                 std.mem.eql(u8, args[2], "build") or
                 std.mem.eql(u8, args[2], "run") or
                 std.mem.eql(u8, args[2], "dev"));
@@ -2249,6 +2778,7 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch test [files/options...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch install") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch pm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, package_manager_help_text, "pm exec [--]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "packageManager") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch prune [--dry-run]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "hutch reset") != null);
@@ -2260,6 +2790,337 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "argv string arrays") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Cottontail Bun.$ shell") != null);
+}
+
+test "Electrobun package manager version precedence is explicit default projection channel" {
+    const explicit = preferredElectrobunVersion(
+        "1.2.3",
+        "2.3.4",
+        "3.4.5",
+        "4.5.6",
+    ).?;
+    try std.testing.expectEqual(ElectrobunVersionSource.explicit_config, explicit.source);
+    try std.testing.expectEqualStrings("1.2.3", explicit.version);
+
+    const npm_default = preferredElectrobunVersion(
+        null,
+        "2.3.4",
+        "3.4.5",
+        "4.5.6",
+    ).?;
+    try std.testing.expectEqual(ElectrobunVersionSource.npm_default, npm_default.source);
+    try std.testing.expectEqualStrings("2.3.4", npm_default.version);
+
+    const projection = preferredElectrobunVersion(null, null, "3.4.5", "4.5.6").?;
+    try std.testing.expectEqual(ElectrobunVersionSource.projection, projection.source);
+    try std.testing.expectEqualStrings("3.4.5", projection.version);
+
+    const channel = preferredElectrobunVersion(null, null, null, "4.5.6").?;
+    try std.testing.expectEqual(ElectrobunVersionSource.channel, channel.source);
+    try std.testing.expectEqualStrings("4.5.6", channel.version);
+    try std.testing.expect(preferredElectrobunVersion(null, null, null, null) == null);
+}
+
+test "Electrobun version selection accepts only an authentic projection identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const valid = projectedElectrobunVersionFromMetadata(allocator,
+        \\{"schemaVersion":1,"kind":"electrobun-devkit-projection","product":{"name":"electrobun","version":"2.0.1-beta.27"}}
+    ).?;
+    try std.testing.expectEqualStrings("2.0.1-beta.27", valid);
+
+    const invalid = [_][]const u8{
+        \\{"kind":"electrobun-devkit-projection","product":{"name":"electrobun","version":"2.0.1"}}
+        ,
+        \\{"schemaVersion":2,"kind":"electrobun-devkit-projection","product":{"name":"electrobun","version":"2.0.1"}}
+        ,
+        \\{"schemaVersion":1,"kind":"other-projection","product":{"name":"electrobun","version":"2.0.1"}}
+        ,
+        \\{"schemaVersion":1,"kind":"electrobun-devkit-projection","product":{"name":"other","version":"2.0.1"}}
+        ,
+        \\{"schemaVersion":1,"kind":"electrobun-devkit-projection","product":{"version":"2.0.1"}}
+        ,
+        \\{"schemaVersion":1,"kind":"electrobun-devkit-projection","product":{"name":"electrobun","version":"latest"}}
+        ,
+        \\{"schemaVersion":1,"kind":"electrobun-devkit-projection","product":{"name":"electrobun","version":"2.0.1","version":"9.9.9"}}
+        ,
+    };
+    for (invalid) |source| {
+        try std.testing.expect(projectedElectrobunVersionFromMetadata(allocator, source) == null);
+    }
+}
+
+test "Electrobun explicit version bypasses a malformed lower-priority npm default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const explicit_root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{\"electrobun\":{\"version\":\"1.2.3\"}}",
+        .{},
+    );
+    const explicit = (try configuredOrNpmDefaultElectrobunVersion(
+        explicit_root,
+        "latest",
+    )).?;
+    try std.testing.expectEqual(ElectrobunVersionSource.explicit_config, explicit.source);
+    try std.testing.expectEqualStrings("1.2.3", explicit.version);
+
+    const floating_root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        "{}",
+        .{},
+    );
+    try std.testing.expectError(
+        error.InvalidDefaultElectrobunVersion,
+        configuredOrNpmDefaultElectrobunVersion(floating_root, "latest"),
+    );
+}
+
+test "only an embedded Electrobun Bun retains the core object lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "hutch-home" });
+    const core_root = try std.fs.path.join(allocator, &.{
+        home,
+        "releases",
+        "electrobun-core",
+        "2.0.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "macos-arm64",
+    });
+    try std.Io.Dir.cwd().createDirPath(io, core_root);
+
+    const modern_graph = try store_locks.acquireGraph(io, allocator, home, .shared);
+    const modern_lease = try store_locks.acquireObjectLease(
+        io,
+        allocator,
+        home,
+        core_root,
+    );
+    modern_graph.close(io);
+    try std.testing.expect(retainElectrobunCoreLeaseForBun(io, modern_lease, null) == null);
+    const modern_exclusive = (try store_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        core_root,
+    )).?;
+    modern_exclusive.close(io);
+
+    const legacy_graph = try store_locks.acquireGraph(io, allocator, home, .shared);
+    const legacy_lease = try store_locks.acquireObjectLease(
+        io,
+        allocator,
+        home,
+        core_root,
+    );
+    legacy_graph.close(io);
+    const retained_legacy = retainElectrobunCoreLeaseForBun(
+        io,
+        legacy_lease,
+        "runtime/bun",
+    ).?;
+    try std.testing.expect((try store_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        core_root,
+    )) == null);
+    retained_legacy.close(io);
+    const legacy_exclusive = (try store_locks.tryAcquireObjectExclusive(
+        io,
+        allocator,
+        core_root,
+    )).?;
+    legacy_exclusive.close(io);
+}
+
+test "built-in package manager parser handles help version and exec" {
+    const no_args = [_][:0]const u8{};
+    try std.testing.expectEqual(
+        BuiltinPackageManagerCommand.help,
+        std.meta.activeTag(try parseBuiltinPackageManagerCommand(&no_args)),
+    );
+
+    const help_args = [_][:0]const u8{"--help"};
+    try std.testing.expectEqual(
+        BuiltinPackageManagerCommand.help,
+        std.meta.activeTag(try parseBuiltinPackageManagerCommand(&help_args)),
+    );
+
+    const version_args = [_][:0]const u8{"-v"};
+    try std.testing.expectEqual(
+        BuiltinPackageManagerCommand.version,
+        std.meta.activeTag(try parseBuiltinPackageManagerCommand(&version_args)),
+    );
+
+    const exec_args = [_][:0]const u8{
+        "exec",
+        "--",
+        "local-tool",
+        "two words",
+        "--",
+        "$literal",
+        "",
+    };
+    const parsed = try parseBuiltinPackageManagerCommand(&exec_args);
+    switch (parsed) {
+        .exec => |forwarded| {
+            try std.testing.expectEqual(@as(usize, 5), forwarded.len);
+            for (exec_args[2..], forwarded) |expected, actual| {
+                try std.testing.expectEqualStrings(expected, actual);
+            }
+        },
+        else => return error.UnexpectedBuiltinPackageManagerParse,
+    }
+}
+
+test "built-in package manager parser rejects incomplete commands" {
+    const missing_exec = [_][:0]const u8{"exec"};
+    try std.testing.expectError(
+        error.MissingBuiltinExecCommand,
+        parseBuiltinPackageManagerCommand(&missing_exec),
+    );
+
+    const separator_only = [_][:0]const u8{ "exec", "--" };
+    try std.testing.expectError(
+        error.MissingBuiltinExecCommand,
+        parseBuiltinPackageManagerCommand(&separator_only),
+    );
+
+    const unsupported = [_][:0]const u8{"add"};
+    try std.testing.expectError(
+        error.UnsupportedBuiltinPackageManagerCommand,
+        parseBuiltinPackageManagerCommand(&unsupported),
+    );
+
+    const version_with_argument = [_][:0]const u8{ "--version", "extra" };
+    try std.testing.expectError(
+        error.UnexpectedBuiltinPackageManagerArguments,
+        parseBuiltinPackageManagerCommand(&version_with_argument),
+    );
+}
+
+test "built-in package manager exec accepts only bare local bin names" {
+    try std.testing.expect(isSafeLocalBinName("vite"));
+    try std.testing.expect(isSafeLocalBinName("tool.exe"));
+    try std.testing.expect(!isSafeLocalBinName(""));
+    try std.testing.expect(!isSafeLocalBinName("."));
+    try std.testing.expect(!isSafeLocalBinName(".."));
+    try std.testing.expect(!isSafeLocalBinName("../vite"));
+    try std.testing.expect(!isSafeLocalBinName("nested/vite"));
+    try std.testing.expect(!isSafeLocalBinName("nested\\vite"));
+}
+
+test "upgrade maps its optional selector to self update arguments" {
+    var mapped: std.ArrayList([:0]const u8) = .empty;
+    defer mapped.deinit(std.testing.allocator);
+    const selector = [_][:0]const u8{"canary"};
+    try appendUpgradeReleaseArguments(std.testing.allocator, &mapped, &selector);
+
+    try std.testing.expectEqual(@as(usize, 2), mapped.items.len);
+    try std.testing.expectEqualStrings("update", mapped.items[0]);
+    try std.testing.expectEqualStrings("canary", mapped.items[1]);
+
+    mapped.clearRetainingCapacity();
+    const help = [_][:0]const u8{"--help"};
+    try appendUpgradeReleaseArguments(std.testing.allocator, &mapped, &help);
+    try std.testing.expect(isHutchUpdateHelpRequest(mapped.items));
+
+    const help_with_extra = [_][:0]const u8{ "update", "--help", "extra" };
+    try std.testing.expect(!isHutchUpdateHelpRequest(&help_with_extra));
+}
+
+test "exact and build updates activate the launcher's current channel and report it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, allocator);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "hutch-home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HUTCH_HOME", home);
+    try environment.put("HUTCH_ACTIVE_CHANNEL", "canary");
+    const init: std.process.Init = .{
+        .minimal = .{
+            .environ = .empty,
+            .args = .{ .vector = &.{} },
+        },
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ_map = &environment,
+        .preopens = .empty,
+    };
+
+    const exact_revision = "0123456789abcdef0123456789abcdef01234567";
+    const build_revision = "abcdef0123456789abcdef0123456789abcdef01";
+    const cases = [_]struct {
+        selector: []const u8,
+        version: []const u8,
+        revision: []const u8,
+    }{
+        .{
+            .selector = "9.8.7",
+            .version = "9.8.7",
+            .revision = exact_revision,
+        },
+        .{
+            .selector = "build:" ++ build_revision,
+            .version = "9.8.8-canary.1",
+            .revision = build_revision,
+        },
+    };
+
+    for (cases) |case| {
+        const resolution: release_store.Resolution = .{
+            .root = "/managed/hutch",
+            .executable = "/managed/hutch/bin/hutch-engine",
+            .version = case.version,
+            .revision = case.revision,
+            .archive_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .installed = true,
+        };
+        const activated_channel = try activateResolvedUpdate(
+            init,
+            allocator,
+            .hutch,
+            try version_selector.parse(case.selector),
+            "canary",
+            resolution,
+        );
+        try std.testing.expectEqualStrings("canary", activated_channel);
+
+        const selections = try release_store.loadSelections(init, allocator);
+        const active = selections.hutch_canary.?;
+        try std.testing.expectEqualStrings(case.version, active.version);
+        try std.testing.expectEqualStrings(case.revision, active.revision);
+        try std.testing.expectEqualStrings(try release_store.platformKey(), active.platform);
+
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        try writeReleaseUpdateSuccess(&output.writer, .hutch, resolution, activated_channel);
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "hutch {s}@{s} is active for canary\n",
+            .{ case.version, case.revision },
+        );
+        try std.testing.expectEqualStrings(expected, output.written());
+    }
 }
 
 test "test is a reserved Cottontail command and preserves every argument" {

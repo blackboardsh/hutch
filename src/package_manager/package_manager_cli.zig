@@ -17,6 +17,7 @@ const Workspaces = @import("package_manager_workspaces.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
 const PackageJSON = @import("package_manager_json.zig");
 const Host = @import("package_manager_host.zig");
+const NoFollowFile = @import("../no_follow_file.zig");
 
 const version = @import("../version.zig").version;
 const Value = std.json.Value;
@@ -358,6 +359,114 @@ fn packageManagerFetchErrorName(err: anyerror) []const u8 {
     };
 }
 
+const SafeFetchResult = struct {
+    status: std.http.Status,
+};
+
+fn effectiveHttpPort(uri: std.Uri) ?u16 {
+    if (uri.port) |port| return port;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) return 80;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return 443;
+    return null;
+}
+
+fn httpOriginsEqual(left: std.Uri, right: std.Uri) !bool {
+    if (!std.ascii.eqlIgnoreCase(left.scheme, right.scheme)) return false;
+    if (effectiveHttpPort(left) != effectiveHttpPort(right)) return false;
+    var left_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    var right_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const left_host = try left.getHost(&left_buffer);
+    const right_host = try right.getHost(&right_buffer);
+    return left_host.eql(right_host);
+}
+
+/// Zig's FetchOptions.extra_headers survive automatic redirects. Drive GET
+/// redirects explicitly so registry credentials are sent on the first and
+/// same-origin hops, then permanently dropped after any origin transition.
+fn fetchFollowingSafeRedirects(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    response_writer: *std.Io.Writer,
+    ordinary_headers: []const std.http.Header,
+    sensitive_headers: []const std.http.Header,
+    max_response_bytes: usize,
+    keep_alive: bool,
+) !SafeFetchResult {
+    var current_uri = try std.Uri.parse(url);
+    var redirect_storage: [3][8 * 1024]u8 = undefined;
+    var redirect_count: usize = 0;
+    var send_sensitive = true;
+
+    while (true) {
+        var request_headers: [8]std.http.Header = undefined;
+        if (ordinary_headers.len + sensitive_headers.len > request_headers.len) return error.TooManyRequestHeaders;
+        @memcpy(request_headers[0..ordinary_headers.len], ordinary_headers);
+        var request_header_count = ordinary_headers.len;
+        if (send_sensitive) {
+            @memcpy(request_headers[request_header_count..][0..sensitive_headers.len], sensitive_headers);
+            request_header_count += sensitive_headers.len;
+        }
+
+        var request = try client.request(.GET, current_uri, .{
+            .redirect_behavior = .unhandled,
+            .extra_headers = request_headers[0..request_header_count],
+            .keep_alive = keep_alive,
+        });
+        defer request.deinit();
+        try request.sendBodiless();
+        var response = try request.receiveHead(&.{});
+
+        if (response.head.status.class() == .redirect and response.head.status != .not_modified) {
+            if (redirect_count == 3) return error.TooManyHttpRedirects;
+            const location = response.head.location orelse return error.HttpRedirectLocationMissing;
+            const storage = &redirect_storage[redirect_count];
+            if (location.len > storage.len) return error.HttpRedirectLocationOversize;
+            @memcpy(storage[0..location.len], location);
+            var remaining: []u8 = storage;
+            const next_uri = try current_uri.resolveInPlace(location.len, &remaining);
+            send_sensitive = send_sensitive and try httpOriginsEqual(current_uri, next_uri);
+
+            const body = response.reader(&.{});
+            _ = body.discardRemaining() catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr().?,
+            };
+            current_uri = next_uri;
+            redirect_count += 1;
+            continue;
+        }
+
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const body = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        var total: usize = 0;
+        while (true) {
+            if (total == max_response_bytes) {
+                var failing_writer = std.Io.Writer.failing;
+                _ = body.stream(&failing_writer, .limited(1)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return response.bodyErr().?,
+                    error.WriteFailed => return error.ResponseTooLarge,
+                };
+                continue;
+            }
+            total += body.stream(response_writer, .limited(max_response_bytes - total)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return response.bodyErr().?,
+                error.WriteFailed => return err,
+            };
+        }
+        return .{ .status = response.head.status };
+    }
+}
+
 const RegistryManifestFetch = struct {
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -382,31 +491,36 @@ const RegistryManifestFetch = struct {
         defer client.deinit();
         client.initDefaultProxies(std.heap.smp_allocator, fetch_state.environment) catch {};
 
-        var headers: [3]std.http.Header = undefined;
-        var header_count: usize = 0;
-        headers[header_count] = .{ .name = "accept", .value = fetch_state.accept };
-        header_count += 1;
+        const ordinary_headers = [_]std.http.Header{
+            .{ .name = "accept", .value = fetch_state.accept },
+        };
+        var sensitive_headers: [2]std.http.Header = undefined;
+        var sensitive_header_count: usize = 0;
         if (fetch_state.authorization) |authorization| {
-            headers[header_count] = .{ .name = "authorization", .value = authorization };
-            header_count += 1;
-            headers[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
-            header_count += 1;
+            sensitive_headers[sensitive_header_count] = .{ .name = "authorization", .value = authorization };
+            sensitive_header_count += 1;
+            sensitive_headers[sensitive_header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
+            sensitive_header_count += 1;
         }
 
         var attempt: usize = 0;
         while (attempt <= fetch_state.max_retry_count) : (attempt += 1) {
             var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
             defer output.deinit();
-            const result = client.fetch(.{
-                .location = .{ .url = fetch_state.url },
-                .response_writer = &output.writer,
-                .extra_headers = headers[0..header_count],
+            const result = fetchFollowingSafeRedirects(
+                &client,
+                std.heap.smp_allocator,
+                fetch_state.url,
+                &output.writer,
+                &ordinary_headers,
+                sensitive_headers[0..sensitive_header_count],
+                max_manifest_bytes,
                 // A keep-alive chunked response can occasionally leave the
                 // Windows threaded-I/O reader waiting after the terminating
                 // chunk. These short-lived per-task clients do not benefit
                 // enough from pooling to justify that correctness risk.
-                .keep_alive = builtin.os.tag != .windows,
-            }) catch |err| {
+                builtin.os.tag != .windows,
+            ) catch |err| {
                 if (attempt == fetch_state.max_retry_count) return err;
                 continue;
             };
@@ -430,6 +544,7 @@ const RegistryArchiveFetch = struct {
     authorization: ?[]const u8,
     integrity: ?[]const u8,
     verify_integrity: bool,
+    cache_directory: []const u8,
     cache_path: []const u8,
     failure: ?anyerror = null,
     fetched: bool = false,
@@ -442,48 +557,59 @@ const RegistryArchiveFetch = struct {
     }
 
     fn fetch(fetch_state: *RegistryArchiveFetch) !void {
-        if (std.Io.Dir.cwd().readFileAlloc(
+        var path_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer path_arena.deinit();
+        const path_allocator = path_arena.allocator();
+        var cache_file = try openLockedCacheFile(
             fetch_state.io,
+            path_allocator,
+            fetch_state.cache_directory,
             fetch_state.cache_path,
-            std.heap.smp_allocator,
-            .limited(max_tarball_bytes),
-        ) catch null) |cached| {
-            defer std.heap.smp_allocator.free(cached);
-            const valid = if (fetch_state.verify_integrity) blk: {
+        );
+        defer cache_file.close(fetch_state.io);
+        const cached = try readLockedCacheFileOrReset(
+            fetch_state.io,
+            path_allocator,
+            cache_file,
+            max_tarball_bytes,
+        );
+        const valid = cached.len > 0 and fetch_state.integrity != null and
+            fetch_state.integrity.?.len > 0 and blk: {
                 verifyIntegrity(cached, fetch_state.integrity) catch break :blk false;
                 break :blk true;
-            } else true;
-            if (valid) return;
-            std.Io.Dir.cwd().deleteFile(fetch_state.io, fetch_state.cache_path) catch {};
-        }
+            };
+        if (valid) return;
+        try cache_file.setLength(fetch_state.io, 0);
 
         var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
         defer client.deinit();
         client.initDefaultProxies(std.heap.smp_allocator, fetch_state.environment) catch {};
         fetch_state.fetched = true;
 
-        var headers: [1]std.http.Header = undefined;
-        const header_count: usize = if (fetch_state.authorization) |authorization| blk: {
-            headers[0] = .{ .name = "authorization", .value = authorization };
+        var sensitive_headers: [1]std.http.Header = undefined;
+        const sensitive_header_count: usize = if (fetch_state.authorization) |authorization| blk: {
+            sensitive_headers[0] = .{ .name = "authorization", .value = authorization };
             break :blk 1;
         } else 0;
 
         var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
         defer output.deinit();
-        const result = try client.fetch(.{
-            .location = .{ .url = fetch_state.url },
-            .response_writer = &output.writer,
-            .extra_headers = headers[0..header_count],
-            .keep_alive = builtin.os.tag != .windows,
-        });
+        const result = try fetchFollowingSafeRedirects(
+            &client,
+            std.heap.smp_allocator,
+            fetch_state.url,
+            &output.writer,
+            &.{},
+            sensitive_headers[0..sensitive_header_count],
+            max_tarball_bytes,
+            builtin.os.tag != .windows,
+        );
         const status: u16 = @intFromEnum(result.status);
         if (status < 200 or status >= 300) return error.RegistryArchiveRequestFailed;
         if (output.written().len > max_tarball_bytes) return error.ResponseTooLarge;
         if (fetch_state.verify_integrity) try verifyIntegrity(output.written(), fetch_state.integrity);
-        try std.Io.Dir.cwd().writeFile(fetch_state.io, .{
-            .sub_path = fetch_state.cache_path,
-            .data = output.written(),
-        });
+        try cache_file.setLength(fetch_state.io, 0);
+        try cache_file.writeStreamingAll(fetch_state.io, output.written());
     }
 };
 
@@ -1300,18 +1426,98 @@ fn readOptionalFile(
     };
 }
 
-fn openLockedCacheFile(io: std.Io, path: []const u8) !std.Io.File {
-    return std.Io.Dir.cwd().createFile(io, path, .{
-        .read = true,
-        .truncate = false,
-        .lock = .exclusive,
-    }) catch |err| switch (err) {
-        error.FileLocksUnsupported => std.Io.Dir.cwd().createFile(io, path, .{
+fn openLockedCacheFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    path: []const u8,
+) !std.Io.File {
+    const resolved_cache_dir = try std.fs.path.resolve(allocator, &.{cache_dir});
+    const resolved_path = try std.fs.path.resolve(allocator, &.{path});
+    if (resolved_path.len == resolved_cache_dir.len or !pathHasPrefix(resolved_path, resolved_cache_dir)) {
+        return error.InvalidPackageDestination;
+    }
+    try ensureContainedPathAncestorsAreNotLinks(io, allocator, resolved_cache_dir, resolved_path);
+    switch (pathLinkStatus(io, resolved_path)) {
+        .symbolic_link, .unknown => return error.InvalidPackageDestination,
+        .missing, .not_link => {},
+    }
+    while (true) {
+        const existing = NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.WouldBlock => blk: {
+                var waiting_file = NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
+                    .mode = .read_write,
+                    .allow_directory = false,
+                }) catch |fallback_err| switch (fallback_err) {
+                    error.FileNotFound => break :blk null,
+                    error.SymLinkLoop => return error.InvalidPackageDestination,
+                    else => return fallback_err,
+                };
+                errdefer waiting_file.close(io);
+                while (!(waiting_file.tryLock(io, .exclusive) catch |lock_err| switch (lock_err) {
+                    error.FileLocksUnsupported => break :blk waiting_file,
+                    else => return lock_err,
+                })) {
+                    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
+                }
+                break :blk waiting_file;
+            },
+            error.FileLocksUnsupported => NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
+                .mode = .read_write,
+                .allow_directory = false,
+            }) catch |fallback_err| switch (fallback_err) {
+                error.FileNotFound => null,
+                error.SymLinkLoop => return error.InvalidPackageDestination,
+                else => return fallback_err,
+            },
+            error.SymLinkLoop => return error.InvalidPackageDestination,
+            else => return err,
+        };
+        if (existing) |file| {
+            const stat = file.stat(io) catch |err| {
+                file.close(io);
+                return err;
+            };
+            if (stat.kind != .file or stat.nlink != 1) {
+                file.close(io);
+                return error.InvalidPackageDestination;
+            }
+            return file;
+        }
+
+        const created = std.Io.Dir.cwd().createFile(io, resolved_path, .{
             .read = true,
             .truncate = false,
-        }),
-        else => return err,
-    };
+            .exclusive = true,
+            .lock = .exclusive,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            error.FileLocksUnsupported => std.Io.Dir.cwd().createFile(io, resolved_path, .{
+                .read = true,
+                .truncate = false,
+                .exclusive = true,
+            }) catch |fallback_err| switch (fallback_err) {
+                error.PathAlreadyExists => continue,
+                else => return fallback_err,
+            },
+            else => return err,
+        };
+        const stat = created.stat(io) catch |err| {
+            created.close(io);
+            return err;
+        };
+        if (stat.kind != .file or stat.nlink != 1) {
+            created.close(io);
+            return error.InvalidPackageDestination;
+        }
+        return created;
+    }
 }
 
 fn readLockedCacheFile(
@@ -1325,6 +1531,21 @@ fn readLockedCacheFile(
     const bytes = try allocator.alloc(u8, @intCast(length));
     const read = try file.readPositionalAll(io, bytes, 0);
     return bytes[0..read];
+}
+
+fn readLockedCacheFileOrReset(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    limit: usize,
+) ![]const u8 {
+    return readLockedCacheFile(io, allocator, file, limit) catch |err| switch (err) {
+        error.ResponseTooLarge => {
+            try file.setLength(io, 0);
+            return &.{};
+        },
+        else => return err,
+    };
 }
 
 fn decodeConfigText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -1762,6 +1983,10 @@ const Manager = struct {
     interactive_changed_manifests: std.ArrayList(InteractiveChangedManifest) = .empty,
     patch_policy_changed: bool = false,
     omit_pnpm_workspace_versions: bool = false,
+    // A missing lock is immutable under --frozen-lockfile, but it is already
+    // a complete representation when both dependency and workspace graphs
+    // are provably empty. This mode must not create node_modules or a lock.
+    frozen_empty_install: bool = false,
     root_package_json: ?*Value = null,
     node_linker: Isolated.Linker = .hoisted,
     public_hoist_pattern: ?Isolated.HoistPattern = null,
@@ -2017,6 +2242,8 @@ const Manager = struct {
         }
         var duplicate_warning_workspaces = manager.workspaces.iterator();
         while (duplicate_warning_workspaces.next()) |entry| {
+            try validateDependencyAlias(entry.value_ptr.name);
+            try Lockfile.validateDependencyAliases(entry.value_ptr.package_json);
             try manager.warnDuplicateDependencies(entry.value_ptr.package_json);
         }
         try manager.validateLockfileWorkspaces();
@@ -2112,16 +2339,30 @@ const Manager = struct {
             if (!try manager.prepareInteractiveUpdate(&root, command_package_json, manager.invocation_package_dir)) return 0;
         }
 
+        if (manager.options.command == .remove) {
+            for (manager.options.positionals) |name| try validateDependencyAlias(name);
+        } else if (manager.options.command == .add or manager.options.command == .update) {
+            for (manager.options.positionals) |raw_spec| {
+                if (splitPackageSpec(raw_spec).name) |alias| try validateDependencyAlias(alias);
+            }
+        }
+
         try manager.validateCatalogReferences(&root);
         try manager.captureInitialDirectVersions(command_package_json, manager.invocation_package_dir);
-        try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
         if (manager.options.command == .install and manager.security_scanner == null) {
             // Network prefetch is opportunistic. The normal resolver remains the
             // source of diagnostics and retries if a speculative request fails.
-            manager.prefetchInstallNetwork(&root) catch {};
+            manager.prefetchInstallNetwork(&root) catch |err| switch (err) {
+                error.InvalidRegistryIntegrity,
+                error.RegistryPackageIdentityMismatch,
+                error.InvalidRegistryManifest,
+                => return err,
+                else => {},
+            };
             try manager.reserveDirectRootVersions(&root);
         }
+        try manager.prepareNodeModules();
 
         switch (manager.options.command) {
             .install => try manager.installRoot(&root, true),
@@ -2199,7 +2440,10 @@ const Manager = struct {
                 manager.deleteLockfiles();
                 if (manager.options.command == .remove and manager.changed and had_lockfile and !manager.options.silent) {
                     try manager.stderr.writeAll("\npackage.json has no dependencies! Deleted empty lockfile\n");
-                } else if (manager.options.command == .install and !manager.options.silent) {
+                } else if (manager.options.command == .install and
+                    !manager.options.silent and
+                    !manager.frozen_empty_install)
+                {
                     try manager.stderr.writeAll("No packages! Deleted empty lockfile\n");
                 }
             } else {
@@ -2708,7 +2952,7 @@ const Manager = struct {
             }
         }
 
-        const destination = try packageDestination(manager.allocator, manager.root_dir, scanner);
+        const destination = try manager.packageDestinationChecked(manager.root_dir, scanner);
         const installed_manifest = try std.fs.path.join(manager.allocator, &.{ destination, "package.json" });
         if (manager.pathExists(installed_manifest)) return;
 
@@ -3083,8 +3327,10 @@ const Manager = struct {
         var linked: usize = 0;
         for (manager.options.positionals) |positional| {
             const name = if (std.mem.indexOf(u8, positional, "@link:")) |index| positional[0..index] else positional;
+            const global_modules = try globalLinkNodeModulesPath(manager.init_data, allocator);
+            try ensurePackagePathAncestorsAreNotLinks(manager.init_data.io, allocator, global_modules, name);
             const global_path = try std.fs.path.join(allocator, &.{
-                try globalLinkNodeModulesPath(manager.init_data, allocator),
+                global_modules,
                 name,
             });
             const global_package_json = try std.fs.path.join(allocator, &.{ global_path, "package.json" });
@@ -3099,11 +3345,9 @@ const Manager = struct {
                 try manager.stderr.flush();
                 return 1;
             };
-            const destination = try std.fs.path.join(allocator, &.{
-                manager.invocation_package_dir,
-                "node_modules",
-                name,
-            });
+            const invocation_modules = try std.fs.path.resolve(allocator, &.{ manager.invocation_package_dir, "node_modules" });
+            try ensurePackagePathAncestorsAreNotLinks(manager.init_data.io, allocator, invocation_modules, name);
+            const destination = try std.fs.path.join(allocator, &.{ invocation_modules, name });
             try manager.linkRelativeDirectory(destination, resolved, true);
             if (manager.readInstalledPackageJSON(resolved) catch null) |metadata| {
                 const bin_dir = try std.fs.path.join(allocator, &.{
@@ -3151,6 +3395,7 @@ const Manager = struct {
         }
         if (!manager.options.dry_run) {
             const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+            try ensurePackagePathAncestorsAreNotLinks(manager.init_data.io, manager.allocator, node_modules, name);
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
             const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
             const link_result = try manager.linkDirectoryAtReportingFallback(destination, manager.invocation_package_dir);
@@ -3199,6 +3444,7 @@ const Manager = struct {
             try manager.stdout.print("bun unlink v{s} (cottontail v{s})\n\n", .{ bun_compat_version, version });
         }
         const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+        try ensurePackagePathAncestorsAreNotLinks(manager.init_data.io, manager.allocator, node_modules, name);
         const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
         const linked = std.Io.Dir.cwd().statFile(manager.init_data.io, destination, .{ .follow_symlinks = false }) catch null;
         const windows_link_status = if (builtin.os.tag == .windows)
@@ -3259,7 +3505,7 @@ const Manager = struct {
                 try ensurePathMissing(manager.init_data.io, destination);
             }
             const bin_dir = try globalBinPath(manager.init_data, manager.allocator);
-            try manager.unlinkBinsInDirectory(name, package_json, bin_dir);
+            try manager.unlinkBinsInDirectory(name, manager.invocation_package_dir, package_json, bin_dir);
         }
         if (!manager.options.silent) {
             try manager.stdout.print("success: unlinked package \"{s}\"\n", .{name});
@@ -3527,7 +3773,7 @@ const Manager = struct {
         while (iterator.next()) |entry| {
             const workspace = entry.value_ptr.*;
             if (!pathHasPrefix(destination, workspace.path) or destination.len == workspace.path.len) continue;
-            const linked_workspace = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
+            const linked_workspace = try manager.packageDestinationChecked(manager.root_dir, workspace.name);
             return std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ linked_workspace, destination[workspace.path.len..] });
         }
         return destination;
@@ -3620,13 +3866,14 @@ const Manager = struct {
     }
 
     fn prepareNodeModules(manager: *Manager) !void {
-        if (manager.options.lockfile_only or manager.options.dry_run) return;
+        if (manager.options.lockfile_only or manager.options.dry_run or manager.frozen_empty_install) return;
         if (manager.cache_directory) |install_cache| {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, install_cache);
         }
         const node_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
         const uses_explicit_install_cache = manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") != null;
         if (manager.node_linker == .isolated) {
+            try manager.ensureIsolatedStoreAncestorsAreOwned(node_modules);
             // Bun establishes the project cache before converting an add to
             // isolated layout. Preserve that ordering so the migration leaves
             // the same .old_modules-* holding directory on a first add.
@@ -3726,8 +3973,27 @@ const Manager = struct {
         }
     }
 
+    fn ensureIsolatedStoreAncestorsAreOwned(manager: *Manager, node_modules: []const u8) !void {
+        const guard = try std.fs.path.resolve(manager.allocator, &.{
+            node_modules,
+            ".bun",
+            "node_modules",
+            ".hutch-owned",
+        });
+        try ensureContainedPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            node_modules,
+            guard,
+        );
+    }
+
     fn finalizeIsolatedNodeModules(manager: *Manager) !void {
-        if (manager.node_linker != .isolated or manager.options.lockfile_only or manager.options.dry_run) return;
+        if (manager.node_linker != .isolated or manager.options.lockfile_only or
+            manager.options.dry_run or manager.frozen_empty_install) return;
+
+        const root_modules = try std.fs.path.resolve(manager.allocator, &.{ manager.root_dir, "node_modules" });
+        try manager.ensureIsolatedStoreAncestorsAreOwned(root_modules);
 
         var modules = manager.isolated_managed_modules.iterator();
         while (modules.next()) |entry| {
@@ -3755,6 +4021,11 @@ const Manager = struct {
     }
 
     fn pruneManagedModuleLinks(manager: *Manager, modules_dir: []const u8) !void {
+        switch (pathLinkStatus(manager.init_data.io, modules_dir)) {
+            .missing => return,
+            .symbolic_link, .unknown => return error.InvalidPackageDestination,
+            .not_link => {},
+        }
         try manager.pruneManagedBinLinks(try std.fs.path.join(manager.allocator, &.{ modules_dir, ".bin" }));
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, modules_dir, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
@@ -3778,6 +4049,11 @@ const Manager = struct {
     }
 
     fn pruneManagedBinLinks(manager: *Manager, bin_dir: []const u8) !void {
+        switch (pathLinkStatus(manager.init_data.io, bin_dir)) {
+            .missing => return,
+            .symbolic_link, .unknown => return error.InvalidPackageDestination,
+            .not_link => {},
+        }
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, bin_dir, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
@@ -3794,6 +4070,11 @@ const Manager = struct {
     }
 
     fn pruneManagedScopeLinks(manager: *Manager, scope_dir: []const u8) !void {
+        switch (pathLinkStatus(manager.init_data.io, scope_dir)) {
+            .missing => return,
+            .symbolic_link, .unknown => return error.InvalidPackageDestination,
+            .not_link => {},
+        }
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, scope_dir, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
@@ -4331,6 +4612,10 @@ const Manager = struct {
     }
 
     fn loadLockfile(manager: *Manager, root: *const Value) !void {
+        // Validate the whole root graph before node_modules preparation or
+        // any command-specific mutation. Individual transitive manifests are
+        // validated as soon as they are resolved as well.
+        try Lockfile.validateDependencyAliases(root);
         // hutch.lock is the only lockfile Hutch reads. Foreign lockfiles
         // route to their own package manager before the resolver runs, and
         // Hutch performs no migrations.
@@ -4361,7 +4646,10 @@ const Manager = struct {
             return;
         }
 
-        if (manager.options.frozen_lockfile) return error.FrozenLockfileNotFound;
+        if (manager.options.frozen_lockfile) {
+            if (!installGraphIsProvablyEmpty(root)) return error.FrozenLockfileNotFound;
+            manager.frozen_empty_install = true;
+        }
         manager.lockfile_config_version = .current;
         try manager.selectAutomaticLinker(root);
     }
@@ -4902,6 +5190,7 @@ const Manager = struct {
 
     fn removePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
+        for (manager.options.positionals) |name| try validateDependencyAlias(name);
         if (!hasAnyDependencies(package_json)) {
             manager.options.no_summary = true;
             if (!manager.options.silent) {
@@ -4929,16 +5218,16 @@ const Manager = struct {
                 }
             }
             const path = if (manager.node_linker == .isolated)
-                try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), name })
+                try manager.isolatedLinkDestination(try manager.isolatedConsumerModules(parent_dir), name)
             else
-                try packageDestination(manager.allocator, manager.root_dir, name);
+                try manager.packageDestinationChecked(manager.root_dir, name);
             if (name_removed) {
                 removed += 1;
                 if (manager.pathExists(path)) {
                     try manager.removed_materialized_names.append(try manager.allocator.dupe(u8, name));
                 }
             }
-            if (!manager.options.dry_run and !defer_hoisted_security_removal) {
+            if (name_removed and !manager.options.dry_run and !defer_hoisted_security_removal) {
                 deletePath(manager.init_data.io, path);
             }
         }
@@ -4949,7 +5238,7 @@ const Manager = struct {
             // removing direct entries. A removed direct package may still be
             // the valid materialization of a transitive dependency.
             for (manager.options.positionals) |name| {
-                const path = try packageDestination(manager.allocator, manager.root_dir, name);
+                const path = try manager.packageDestinationChecked(manager.root_dir, name);
                 if (!manager.securityFinalGraphUsesPath(path)) deletePath(manager.init_data.io, path);
             }
         }
@@ -5979,6 +6268,7 @@ const Manager = struct {
         optional: bool,
     ) anyerror!void {
         if (package_json.* != .object) return;
+        try Lockfile.validateDependencyAliases(package_json);
         const dependencies = package_json.object.get(key) orelse return;
         if (dependencies != .object) return;
         const aliases = try manager.allocator.dupe([]const u8, dependencies.object.keys());
@@ -6007,8 +6297,7 @@ const Manager = struct {
                 manager.node_linker == .hoisted and
                 manager.options.command == .install)
             existing: {
-                const destination = try packageDestination(
-                    manager.allocator,
+                const destination = try manager.packageDestinationChecked(
                     manager.installParentDir(parent_dir),
                     alias,
                 );
@@ -6218,6 +6507,7 @@ const Manager = struct {
         optional: bool,
         peer: bool,
     ) anyerror![]const u8 {
+        try validateDependencyAlias(alias);
         var workspace_package = manager.isWorkspaceDependency(alias, spec);
         const effective_spec = manager.manifest_policy.?.resolveDependency(alias, spec, workspace_package) catch |err| {
             if (err == error.CatalogDependencyNotFound or err == error.InvalidCatalogDependency) {
@@ -6289,7 +6579,7 @@ const Manager = struct {
         const inspect_direct_trust = manager.options.trust and manager.options.command == .add and direct;
         if (direct and !refresh_direct_registry and !refresh_direct_source and !inspect_direct_trust) {
             const direct_key = if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir)) blk: {
-                const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
+                const destination = try manager.packageDestinationChecked(manager.installParentDir(parent_dir), alias);
                 break :blk try manager.lockKeyForDestination(destination);
             } else alias;
             for (manager.records.items) |record| {
@@ -6387,13 +6677,13 @@ const Manager = struct {
                     peer_context,
                 )
             else if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir))
-                try packageDestination(manager.allocator, install_parent_dir, alias)
+                try manager.packageDestinationChecked(install_parent_dir, alias)
             else if (transitive_folder)
-                try packageDestination(manager.allocator, install_parent_dir, alias)
+                try manager.packageDestinationChecked(install_parent_dir, alias)
             else if (!std.mem.eql(u8, parent_dir, manager.root_dir) and manager.root_versions.contains(alias))
-                try packageDestination(manager.allocator, install_parent_dir, alias)
+                try manager.packageDestinationChecked(install_parent_dir, alias)
             else
-                try packageDestination(manager.allocator, manager.root_dir, alias);
+                try manager.packageDestinationChecked(manager.root_dir, alias);
             const newly_installed = !manager.pathExists(destination);
             if (!manager.options.lockfile_only) {
                 if (manager.node_linker == .isolated) {
@@ -6552,6 +6842,7 @@ const Manager = struct {
             }
             return err;
         };
+        try Lockfile.validateDependencyAliases(resolved.metadata);
         if (resolved.latest_version) |latest| {
             if (!std.mem.eql(u8, latest, resolved.version)) {
                 try manager.latest_versions.put(try manager.allocator.dupe(u8, alias), latest);
@@ -6696,7 +6987,7 @@ const Manager = struct {
             else
                 try manager.peerContextForPackage(package.info, parent_dir, false);
             const destination = if (package.kind == .workspace)
-                try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
+                try manager.isolatedLinkDestination(try manager.isolatedConsumerModules(parent_dir), alias)
             else blk: {
                 const placement = try manager.packagePlacementFromLock(package, peer_context);
                 try manager.rememberIsolatedParent(placement, logical_key);
@@ -6711,7 +7002,7 @@ const Manager = struct {
         const install_parent_dir = manager.installParentDir(parent_dir);
         var base = install_parent_dir;
         while (true) {
-            const destination = try packageDestination(manager.allocator, base, alias);
+            const destination = try manager.packageDestinationChecked(base, alias);
             if (try manager.workspaceLockKeyForDestination(destination)) |workspace_key| {
                 if (graph.get(workspace_key)) |package| {
                     if (try manager.lockedSelectionMatchesRootDependency(package, alias, parent_dir, base)) {
@@ -6729,7 +7020,7 @@ const Manager = struct {
                     {
                         return .{
                             .package = package,
-                            .destination = try packageDestination(manager.allocator, install_parent_dir, alias),
+                            .destination = try manager.packageDestinationChecked(install_parent_dir, alias),
                         };
                     }
                 }
@@ -7233,9 +7524,9 @@ const Manager = struct {
         const path = try manager.localPackagePath(spec, parent_dir);
         const normalized_source = try manager.normalizeLocalSpec(spec, path);
         const destination = if (manager.node_linker == .isolated)
-            try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
+            try manager.isolatedLinkDestination(try manager.isolatedConsumerModules(parent_dir), alias)
         else
-            try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
+            try manager.packageDestinationChecked(manager.installParentDir(parent_dir), alias);
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
             if (std.fs.path.dirname(destination)) |modules_dir| {
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, modules_dir);
@@ -7270,6 +7561,19 @@ const Manager = struct {
         return package_json == .object and
             std.mem.eql(u8, jsonString(&package_json, "name") orelse "", name) and
             std.mem.eql(u8, jsonString(&package_json, "version") orelse "", version_value);
+    }
+
+    fn registryArchiveMatchesIdentity(
+        manager: *Manager,
+        archive: []const u8,
+        expected_name: []const u8,
+        expected_version: []const u8,
+    ) bool {
+        const package_json = manager.readTarballPackageJSON(archive) catch return false;
+        const actual_name = jsonString(package_json, "name") orelse return false;
+        const actual_version = jsonString(package_json, "version") orelse return false;
+        return std.mem.eql(u8, actual_name, expected_name) and
+            registryVersionsEqual(actual_version, expected_version);
     }
 
     fn packagePatchPaths(
@@ -7418,7 +7722,7 @@ const Manager = struct {
 
     fn dependencyLockKey(manager: *Manager, parent_dir: []const u8, alias: []const u8) ![]const u8 {
         if (manager.node_linker != .isolated) {
-            const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
+            const destination = try manager.packageDestinationChecked(manager.installParentDir(parent_dir), alias);
             return manager.lockKeyForDestination(destination);
         }
         if (std.mem.eql(u8, parent_dir, manager.root_dir)) return manager.allocator.dupe(u8, alias);
@@ -7431,7 +7735,7 @@ const Manager = struct {
             if (!std.mem.eql(u8, parent_dir, workspace.path)) continue;
             return std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ workspace.name, alias });
         }
-        const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
+        const destination = try manager.packageDestinationChecked(manager.installParentDir(parent_dir), alias);
         return manager.lockKeyForDestination(destination);
     }
 
@@ -7781,7 +8085,7 @@ const Manager = struct {
             if (range_value != .string or packageHasRuntimeDependency(package_json, alias)) continue;
             const provider = try manager.findPeerProvider(alias, range_value.string, parent_dir) orelse continue;
             try manager.maybeWarnPeerConflict(range_value.string, provider);
-            const destination = try std.fs.path.join(manager.allocator, &.{ modules_dir, alias });
+            const destination = try manager.isolatedLinkDestination(modules_dir, alias);
             if (!std.mem.eql(u8, destination, provider.destination)) {
                 try manager.linkRelativeDirectory(destination, provider.destination, true);
             }
@@ -8040,7 +8344,7 @@ const Manager = struct {
                 result.package_dir,
             );
             if (record.metadata) |metadata| {
-                const public_package_dir = try std.fs.path.join(manager.allocator, &.{ consumer_modules, record.alias });
+                const public_package_dir = try manager.isolatedLinkDestination(consumer_modules, record.alias);
                 try manager.linkBinsInDirectory(
                     record.alias,
                     public_package_dir,
@@ -8064,7 +8368,7 @@ const Manager = struct {
                 const provider_record = manager.records.items[provider_index];
                 const provider = try manager.peerProviderFromRecord(provider_record);
                 try manager.maybeWarnPeerConflict(range_value.string, provider);
-                const destination = try std.fs.path.join(manager.allocator, &.{ result.modules_dir, alias });
+                const destination = try manager.isolatedLinkDestination(result.modules_dir, alias);
                 if (!std.mem.eql(u8, destination, provider.destination)) {
                     try manager.linkRelativeDirectory(destination, provider.destination, true);
                 }
@@ -8190,6 +8494,13 @@ const Manager = struct {
             source,
             peer_context,
         );
+        const root_modules = try std.fs.path.resolve(manager.allocator, &.{ manager.root_dir, "node_modules" });
+        try ensureContainedPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            root_modules,
+            placement.package_dir,
+        );
         return placement;
     }
 
@@ -8252,6 +8563,7 @@ const Manager = struct {
         direct: bool,
         peer_context: Isolated.PeerContext,
     ) ![]const u8 {
+        try validateDependencyAlias(alias);
         if (manager.node_linker != .isolated) return manager.chooseDestination(alias, version_value, parent_dir, direct);
         const placement = try manager.packagePlacementWithPeerContext(name, version_value, kind, source, peer_context);
         try manager.trackIsolatedPlacement(placement);
@@ -8339,6 +8651,16 @@ const Manager = struct {
         return modules;
     }
 
+    fn isolatedLinkDestination(manager: *Manager, modules: []const u8, alias: []const u8) ![]const u8 {
+        try ensurePackagePathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            modules,
+            alias,
+        );
+        return resolveContainedPath(manager.allocator, modules, alias);
+    }
+
     fn ensureIsolatedLinks(
         manager: *Manager,
         alias: []const u8,
@@ -8371,7 +8693,7 @@ const Manager = struct {
     ) !void {
         if (manager.options.lockfile_only or manager.options.dry_run) return;
         try manager.isolated_managed_modules.put(try manager.allocator.dupe(u8, consumer_modules), {});
-        const edge = try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias });
+        const edge = try manager.isolatedLinkDestination(consumer_modules, alias);
         if (!std.mem.eql(u8, edge, package_dir)) try manager.linkRelativeDirectory(edge, package_dir, true);
 
         const hidden_matches = if (manager.hidden_hoist_pattern) |pattern|
@@ -8383,7 +8705,7 @@ const Manager = struct {
             if (!hidden_entry.found_existing) {
                 const hidden_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bun", "node_modules" });
                 try manager.isolated_managed_modules.put(try manager.allocator.dupe(u8, hidden_modules), {});
-                const hoist = try std.fs.path.join(manager.allocator, &.{ hidden_modules, alias });
+                const hoist = try manager.isolatedLinkDestination(hidden_modules, alias);
                 try manager.linkRelativeDirectory(hoist, package_dir, true);
             }
         }
@@ -8397,14 +8719,14 @@ const Manager = struct {
             if (manager.public_hoist_pattern) |pattern| {
                 if (pattern.isMatch(alias)) {
                     const root_modules = try manager.isolatedConsumerModules(manager.root_dir);
-                    const public_link = try std.fs.path.join(manager.allocator, &.{ root_modules, alias });
+                    const public_link = try manager.isolatedLinkDestination(root_modules, alias);
                     try manager.linkRelativeDirectory(public_link, package_dir, true);
                 } else {
                     _ = manager.isolated_public_hoists.remove(alias);
                 }
             } else if (try manager.sharedWorkspaceDependencyShouldHoist(alias, package_dir)) {
                 const root_modules = try manager.isolatedConsumerModules(manager.root_dir);
-                const public_link = try std.fs.path.join(manager.allocator, &.{ root_modules, alias });
+                const public_link = try manager.isolatedLinkDestination(root_modules, alias);
                 try manager.linkRelativeDirectory(public_link, package_dir, true);
             } else {
                 _ = manager.isolated_public_hoists.remove(alias);
@@ -8581,6 +8903,8 @@ const Manager = struct {
                 }
                 break :blk alias_hint orelse gitRepositoryName(spec) orelse return error.InvalidPackageName;
             };
+            try validateDependencyAlias(package_name);
+            try Lockfile.validateDependencyAliases(metadata);
             package_version = jsonString(metadata, "version") orelse "0.0.0";
             const alias = alias_hint orelse package_name;
             commit = checkout.commit;
@@ -8663,6 +8987,8 @@ const Manager = struct {
             _ = try manager.peerContextForPackage(metadata, parent_dir, true);
         }
 
+        try validateDependencyAlias(package_name);
+        try Lockfile.validateDependencyAliases(metadata);
         const alias = alias_hint orelse package_name;
         // A loaded lock owns dependency edges; checkout metadata is still used
         // for materialization details such as package identity, bins, and scripts.
@@ -8723,9 +9049,9 @@ const Manager = struct {
         expected_integrity: ?[]const u8,
     ) !GitCheckoutResult {
         const repository = Git.githubRepositoryPath(spec) orelse return error.InvalidGitDependency;
+        const api_base = std.mem.trimEnd(u8, manager.init_data.environ_map.get("GITHUB_API_URL") orelse "https://api.github.com", "/");
         var reference = spec.committish;
         if (reference.len == 0) {
-            const api_base = std.mem.trimEnd(u8, manager.init_data.environ_map.get("GITHUB_API_URL") orelse "https://api.github.com", "/");
             const metadata_url = try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}", .{ api_base, repository });
             const metadata_bytes = try manager.fetchBytes(metadata_url, true, 4 * 1024 * 1024);
             const metadata = std.json.parseFromSliceLeaky(Value, manager.allocator, metadata_bytes, .{}) catch
@@ -8734,25 +9060,72 @@ const Manager = struct {
         }
         const repository_slug = try manager.allocator.dupe(u8, repository);
         std.mem.replaceScalar(u8, repository_slug, '/', '-');
-        const requested_name = try std.fmt.allocPrint(manager.allocator, "{s}-{s}", .{
-            repository_slug,
-            reference[0..@min(reference.len, 7)],
+        const cache_identity = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{ api_base, repository, reference });
+        const requested_name = try std.fmt.allocPrint(manager.allocator, "github-{x}", .{
+            std.hash.Wyhash.hash(0, cache_identity),
         });
         const cache_dir = try packageCachePath(manager.init_data, manager.allocator);
-        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
         const archive_path = try std.fs.path.join(manager.allocator, &.{ cache_dir, try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{requested_name}) });
-        var archive = try readOptionalFile(manager.init_data.io, manager.allocator, archive_path, max_tarball_bytes);
-        var archive_identity = if (archive) |bytes| try githubArchiveIdentity(manager.allocator, bytes) else null;
-        if (archive == null or archive_identity == null) {
-            const api_base = std.mem.trimEnd(u8, manager.init_data.environ_map.get("GITHUB_API_URL") orelse "https://api.github.com", "/");
+        var cache_file: ?std.Io.File = null;
+        defer if (cache_file) |file| file.close(manager.init_data.io);
+        var archive: ?[]const u8 = null;
+        var archive_identity: ?GithubArchiveIdentity = null;
+        if (!manager.options.no_cache) {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
+            cache_file = try openLockedCacheFile(
+                manager.init_data.io,
+                manager.allocator,
+                cache_dir,
+                archive_path,
+            );
+            if (!manager.options.force) {
+                const cached = try readLockedCacheFileOrReset(
+                    manager.init_data.io,
+                    manager.allocator,
+                    cache_file.?,
+                    max_tarball_bytes,
+                );
+                if (cached.len > 0) {
+                    const identity = githubArchiveIdentity(manager.allocator, cached) catch null;
+                    const integrity_bound = if (expected_integrity) |expected|
+                        if (manager.options.verify_integrity) blk: {
+                            verifyIntegrity(cached, expected) catch break :blk false;
+                            break :blk true;
+                        } else false
+                    else
+                        false;
+                    if (identity != null and githubArchiveCacheHitMatches(
+                        identity.?,
+                        repository_slug,
+                        reference,
+                        integrity_bound,
+                    ))
+                    {
+                        archive = cached;
+                        archive_identity = identity;
+                    } else {
+                        try cache_file.?.setLength(manager.init_data.io, 0);
+                    }
+                }
+            }
+        }
+        if (archive == null) {
             const archive_url = try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}/tarball/{s}", .{ api_base, repository, reference });
             const downloaded = try manager.fetchBytes(archive_url, false, max_tarball_bytes);
-            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = archive_path, .data = downloaded });
+            const downloaded_identity = (try githubArchiveIdentity(manager.allocator, downloaded)) orelse
+                return error.InvalidGitArchiveIdentity;
+            if (!githubArchiveIdentityMatches(downloaded_identity, repository_slug, reference)) {
+                return error.GitArchiveIdentityMismatch;
+            }
+            if (manager.options.verify_integrity) try verifyIntegrity(downloaded, expected_integrity);
+            if (cache_file) |file| {
+                try file.setLength(manager.init_data.io, 0);
+                try file.writeStreamingAll(manager.init_data.io, downloaded);
+            }
             archive = downloaded;
-            archive_identity = try githubArchiveIdentity(manager.allocator, downloaded);
+            archive_identity = downloaded_identity;
         }
         const archive_bytes = archive.?;
-        if (manager.options.verify_integrity) try verifyIntegrity(archive_bytes, expected_integrity);
         const integrity = try sha512Integrity(manager.allocator, archive_bytes);
         const resolved_name = if (archive_identity) |identity| identity.root_name else requested_name;
         const commit = if (archive_identity) |identity| identity.commit else reference;
@@ -9053,6 +9426,8 @@ const Manager = struct {
         };
         const metadata = try manager.readTarballPackageJSON(archive);
         const package_name = jsonString(metadata, "name") orelse return error.InvalidPackageName;
+        try validateDependencyAlias(package_name);
+        try Lockfile.validateDependencyAliases(metadata);
         const package_version = jsonString(metadata, "version") orelse "0.0.0";
         const alias = alias_hint orelse package_name;
         const package_kind: Lockfile.Kind = if (isRemoteTarballSpec(spec)) .remote_tarball else .local_tarball;
@@ -9114,6 +9489,10 @@ const Manager = struct {
     }
 
     fn readTarballPackageJSON(manager: *Manager, archive: []const u8) !*Value {
+        return manager.readTarballPackageJSONBody(archive);
+    }
+
+    fn readTarballPackageJSONBody(manager: *Manager, archive: []const u8) !*Value {
         var compressed_reader: std.Io.Reader = .fixed(archive);
         var decompression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
         var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &decompression_buffer);
@@ -9181,18 +9560,18 @@ const Manager = struct {
                 {
                     const root_npm = parseNpmAlias(alias, unwrapped);
                     if (!semverSatisfies(manager.allocator, root_npm[1], version_value)) {
-                        return packageDestination(manager.allocator, install_parent_dir, alias);
+                        return manager.packageDestinationChecked(install_parent_dir, alias);
                     }
                 }
             }
         }
         if ((direct and std.mem.eql(u8, parent_dir, manager.root_dir)) or manager.root_versions.get(alias) == null) {
-            return packageDestination(manager.allocator, manager.root_dir, alias);
+            return manager.packageDestinationChecked(manager.root_dir, alias);
         }
         if (manager.root_versions.get(alias)) |existing| {
-            if (std.mem.eql(u8, existing, version_value)) return packageDestination(manager.allocator, manager.root_dir, alias);
+            if (std.mem.eql(u8, existing, version_value)) return manager.packageDestinationChecked(manager.root_dir, alias);
         }
-        return packageDestination(manager.allocator, install_parent_dir, alias);
+        return manager.packageDestinationChecked(install_parent_dir, alias);
     }
 
     fn rootDependencySpec(manager: *Manager, alias: []const u8) ?[]const u8 {
@@ -9275,7 +9654,7 @@ const Manager = struct {
             }
 
             const consumer_modules = try manager.isolatedConsumerModules(parent_dir);
-            const destination = try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias });
+            const destination = try manager.isolatedLinkDestination(consumer_modules, alias);
             if (!manager.pathIsWorkspace(destination)) {
                 const identity = manager.readInstalledPackageJSON(destination) catch return null;
                 const installed_name = jsonString(identity, "name") orelse alias;
@@ -9339,7 +9718,7 @@ const Manager = struct {
         }
         const candidates = [_][]const u8{ manager.installParentDir(parent_dir), manager.root_dir };
         for (candidates) |base| {
-            const destination = try packageDestination(manager.allocator, base, alias);
+            const destination = try manager.packageDestinationChecked(base, alias);
             const destination_key = try manager.lockKeyForDestination(destination);
             for (manager.records.items) |record| {
                 if (record.kind != .npm or
@@ -9403,19 +9782,39 @@ const Manager = struct {
     }
 
     fn registryManifestCachePath(manager: *Manager, registry_url: []const u8, encoded_name: []const u8) !?[]const u8 {
-        const cache_dir = manager.cache_directory orelse return null;
-        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
-        const registry_hash = std.hash.Wyhash.hash(0, registry_url);
-        const filename = try std.fmt.allocPrint(manager.allocator, "{x}-{s}.npm", .{ registry_hash, encoded_name });
-        return try std.fs.path.join(manager.allocator, &.{ cache_dir, filename });
+        // Registry manifests are not content-addressed. A disk entry cannot
+        // authenticate its own dist.tarball or integrity fields, so it must
+        // never become the trust anchor for a fresh resolution.
+        _ = manager;
+        _ = registry_url;
+        _ = encoded_name;
+        return null;
     }
 
     fn registryArchiveCachePath(manager: *Manager, name: []const u8, version_value: []const u8, tarball_url: []const u8) !?[]const u8 {
         const cache_dir = manager.cache_directory orelse return null;
-        const package_cache = try std.fs.path.join(manager.allocator, &.{ cache_dir, name });
+        try validateDependencyAlias(name);
+        const resolved_cache_dir = try std.fs.path.resolve(manager.allocator, &.{cache_dir});
+        const package_cache = try std.fs.path.resolve(manager.allocator, &.{ resolved_cache_dir, name });
+        if (!pathHasPrefix(package_cache, resolved_cache_dir) or package_cache.len == resolved_cache_dir.len) {
+            return error.InvalidPackageDestination;
+        }
+        const package_cache_guard = try std.fs.path.join(manager.allocator, &.{ package_cache, ".hutch-owned" });
+        try ensureContainedPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            resolved_cache_dir,
+            package_cache_guard,
+        );
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, package_cache);
-        const source_hash = std.hash.Wyhash.hash(0, tarball_url);
-        const filename = try std.fmt.allocPrint(manager.allocator, "{s}-{x}.tgz", .{ version_value, source_hash });
+        const cache_identity = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{
+            name,
+            version_value,
+            tarball_url,
+        });
+        const filename = try std.fmt.allocPrint(manager.allocator, "archive-{x}.tgz", .{
+            std.hash.Wyhash.hash(0, cache_identity),
+        });
         return try std.fs.path.join(manager.allocator, &.{ package_cache, filename });
     }
 
@@ -9435,8 +9834,14 @@ const Manager = struct {
         return if (port > 0) authority[0..port] else null;
     }
 
-    fn registryExtractedCachePath(manager: *Manager, name: []const u8, version_value: []const u8) !?[]const u8 {
+    fn registryExtractedCachePath(
+        manager: *Manager,
+        name: []const u8,
+        version_value: []const u8,
+        tarball_url: []const u8,
+    ) !?[]const u8 {
         const cache_dir = manager.cache_directory orelse return null;
+        try validateDependencyAlias(name);
         const parsed = Semver.Version.parseUTF8(version_value);
         if (!parsed.valid) return null;
 
@@ -9450,11 +9855,20 @@ const Manager = struct {
             null,
             !custom_registry,
         );
-        if (!custom_registry) return try std.fs.path.join(manager.allocator, &.{ cache_dir, basename });
-
-        const hostname = manager.registryURLHostname(registry.url) orelse return null;
-        const custom_basename = try std.fmt.allocPrint(manager.allocator, "{s}@@{s}@@@1", .{ basename, hostname });
-        return try std.fs.path.join(manager.allocator, &.{ cache_dir, custom_basename });
+        const source_hash = std.hash.Wyhash.hash(0, tarball_url);
+        const bound_basename = try std.fmt.allocPrint(manager.allocator, "{s}@@source-{x}", .{ basename, source_hash });
+        const path = try resolveContainedPath(manager.allocator, cache_dir, bound_basename);
+        try ensureContainedPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            cache_dir,
+            path,
+        );
+        switch (pathLinkStatus(manager.init_data.io, path)) {
+            .symbolic_link, .unknown => return error.InvalidPackageDestination,
+            .missing, .not_link => {},
+        }
+        return path;
     }
 
     fn materializeRegistryArchive(
@@ -9465,25 +9879,31 @@ const Manager = struct {
         log_level: FetchLogLevel,
         prefetched_archive: ?[]const u8,
     ) !void {
-        const cache_path = try manager.registryExtractedCachePath(package.name, package.version);
+        const cache_path = try manager.registryExtractedCachePath(package.name, package.version, package.tarball);
         if (cache_path) |path| {
             const archive_cache_path = (try manager.registryArchiveCachePath(
                 package.name,
                 package.version,
                 package.tarball,
             )).?;
-            var cache_file = try openLockedCacheFile(manager.init_data.io, archive_cache_path);
+            var cache_file = try openLockedCacheFile(
+                manager.init_data.io,
+                manager.allocator,
+                manager.cache_directory.?,
+                archive_cache_path,
+            );
             defer cache_file.close(manager.init_data.io);
 
-            if (!try manager.installedPackageMatches(path, package.name, package.version)) {
-                const archive = prefetched_archive orelse
-                    try manager.fetchRegistryArchiveLocked(package, log_level, cache_file);
-                deletePath(manager.init_data.io, path);
-                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, path);
-                var extraction_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, path, .{});
-                defer extraction_dir.close(manager.init_data.io);
-                try extractTarballArchive(manager.init_data.io, manager.allocator, extraction_dir, archive);
-            }
+            // An extracted directory cannot be authenticated by the tarball's
+            // SRI after the fact. Rebuild it from the identity-checked archive
+            // cache instead of trusting a swappable directory cache hit.
+            const archive = prefetched_archive orelse
+                try manager.fetchRegistryArchiveLocked(package, log_level, cache_file);
+            deletePath(manager.init_data.io, path);
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, path);
+            var extraction_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, path, .{});
+            defer extraction_dir.close(manager.init_data.io);
+            try extractTarballArchive(manager.init_data.io, manager.allocator, extraction_dir, archive);
 
             deletePath(manager.init_data.io, destination);
             try copyDirectoryTree(manager.init_data.io, manager.allocator, path, destination);
@@ -9498,10 +9918,12 @@ const Manager = struct {
         try manager.applyPatchPaths(destination, patch_paths);
     }
 
-    fn parseRegistryManifest(manager: *Manager, bytes: []const u8) !?*Value {
+    fn parseRegistryManifest(manager: *Manager, bytes: []const u8, expected_name: []const u8) !?*Value {
         const parsed = try manager.allocator.create(Value);
         parsed.* = std.json.parseFromSliceLeaky(Value, manager.allocator, bytes, .{}) catch return null;
         if (parsed.* != .object) return null;
+        const manifest_name = parsed.object.get("name") orelse return null;
+        if (manifest_name != .string or !std.mem.eql(u8, manifest_name.string, expected_name)) return null;
         const versions = parsed.object.get("versions") orelse return null;
         if (versions != .object) return null;
         return parsed;
@@ -9555,6 +9977,7 @@ const Manager = struct {
         fetch_log_level: FetchLogLevel,
         force_manifest_refresh: bool,
     ) !RegistryPackage {
+        try validateDependencyAlias(name);
         const refresh_manifest = force_manifest_refresh or (manager.refresh_direct_registry and
             !manager.refreshed_update_manifests.contains(name));
         var manifest_was_cached = false;
@@ -9570,7 +9993,7 @@ const Manager = struct {
             if (!refresh_manifest) {
                 if (cache_path) |path| {
                     if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
-                        if (try manager.parseRegistryManifest(cached)) |parsed| {
+                        if (try manager.parseRegistryManifest(cached, name)) |parsed| {
                             if (manager.cachedRegistryManifestIsUsable(parsed)) {
                                 const owned_name = try manager.allocator.dupe(u8, name);
                                 try manager.registry_manifests.put(owned_name, parsed);
@@ -9592,7 +10015,7 @@ const Manager = struct {
                 fetch_log_level,
                 name,
             );
-            const parsed = (try manager.parseRegistryManifest(bytes)) orelse return error.InvalidRegistryManifest;
+            const parsed = (try manager.parseRegistryManifest(bytes, name)) orelse return error.InvalidRegistryManifest;
             if (cache_path) |path| {
                 try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes });
             }
@@ -9658,14 +10081,26 @@ const Manager = struct {
         if (dist != .object) return error.InvalidRegistryManifest;
         const tarball_value = dist.object.get("tarball") orelse return error.InvalidRegistryManifest;
         if (tarball_value != .string) return error.InvalidRegistryManifest;
-        const integrity = if (dist.object.get("integrity")) |value|
-            if (value == .string) value.string else null
-        else
-            null;
+        if (metadata.object.get("name")) |metadata_name| {
+            if (metadata_name != .string or !std.mem.eql(u8, metadata_name.string, name)) {
+                return error.RegistryPackageIdentityMismatch;
+            }
+        }
+        if (metadata.object.get("version")) |metadata_version| {
+            if (metadata_version != .string or !registryVersionsEqual(metadata_version.string, version_value)) {
+                return error.RegistryPackageIdentityMismatch;
+            }
+        }
+        const integrity = if (dist.object.get("integrity")) |value| blk: {
+            if (value != .string) return error.InvalidRegistryIntegrity;
+            if (value.string.len == 0) break :blk null;
+            _ = parseIntegrity(value.string) catch return error.InvalidRegistryIntegrity;
+            break :blk value.string;
+        } else null;
         const configured_registry = manager.registryConfigForPackage(name);
         const tarball_url = try resolveRegistryTarballURL(manager.allocator, configured_registry.url, tarball_value.string);
         return .{
-            .name = if (metadata.object.get("name")) |value| if (value == .string) value.string else name else name,
+            .name = name,
             .version = try normalizeRegistryVersion(manager.allocator, version_value),
             .latest_version = if (latest_version) |latest|
                 try normalizeRegistryVersion(manager.allocator, latest)
@@ -9756,7 +10191,13 @@ const Manager = struct {
             try manager.prefetchRegistryManifests(manifest_names.items);
             for (wave_requests.items) |request| {
                 if (!manager.registry_manifests.contains(request.name)) continue;
-                const resolved = manager.resolveRegistryPackage(request.name, request.spec) catch continue;
+                const resolved = manager.resolveRegistryPackage(request.name, request.spec) catch |err| switch (err) {
+                    error.InvalidRegistryIntegrity,
+                    error.RegistryPackageIdentityMismatch,
+                    error.InvalidRegistryManifest,
+                    => return err,
+                    else => continue,
+                };
                 if (request.optional and !packageSupportsPlatform(
                     resolved.metadata,
                     manager.options.cpu,
@@ -9890,6 +10331,7 @@ const Manager = struct {
         defer fetches.deinit();
 
         for (names) |name| {
+            try validateDependencyAlias(name);
             if (manager.registry_manifests.contains(name) or queued.contains(name)) continue;
             try queued.put(name, {});
 
@@ -9898,7 +10340,7 @@ const Manager = struct {
             const cache_path = try manager.registryManifestCachePath(configured_registry.url, encoded_name);
             if (cache_path) |path| {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
-                    if (try manager.parseRegistryManifest(cached)) |parsed| {
+                    if (try manager.parseRegistryManifest(cached, name)) |parsed| {
                         if (manager.cachedRegistryManifestIsUsable(parsed)) {
                             const owned_name = try manager.allocator.dupe(u8, name);
                             try manager.registry_manifests.put(owned_name, parsed);
@@ -9943,7 +10385,7 @@ const Manager = struct {
                 }
                 const bytes = fetch.bytes orelse continue;
                 defer std.heap.smp_allocator.free(bytes);
-                const parsed = (try manager.parseRegistryManifest(bytes)) orelse {
+                const parsed = (try manager.parseRegistryManifest(bytes, fetch.name)) orelse {
                     // A successful HTTP response with an invalid npm manifest is
                     // terminal. Retrying it in the synchronous resolver duplicates
                     // the request and cannot produce a different document.
@@ -9982,6 +10424,7 @@ const Manager = struct {
                 .authorization = archive.authorization,
                 .integrity = archive.integrity,
                 .verify_integrity = manager.options.verify_integrity,
+                .cache_directory = manager.cache_directory.?,
                 .cache_path = cache_path,
             });
         }
@@ -10046,29 +10489,35 @@ const Manager = struct {
         log_level: FetchLogLevel,
         manifest_name: ?[]const u8,
     ) ![]const u8 {
-        var headers_buffer: [3]std.http.Header = undefined;
-        var header_count: usize = 0;
+        var ordinary_headers: [1]std.http.Header = undefined;
+        var ordinary_header_count: usize = 0;
         if (manifest) {
-            headers_buffer[header_count] = .{ .name = "accept", .value = manager.registryManifestAccept() };
-            header_count += 1;
+            ordinary_headers[ordinary_header_count] = .{ .name = "accept", .value = manager.registryManifestAccept() };
+            ordinary_header_count += 1;
         }
+        var sensitive_headers: [2]std.http.Header = undefined;
+        var sensitive_header_count: usize = 0;
         if (authorization) |value| {
-            headers_buffer[header_count] = .{ .name = "authorization", .value = value };
-            header_count += 1;
+            sensitive_headers[sensitive_header_count] = .{ .name = "authorization", .value = value };
+            sensitive_header_count += 1;
             if (manifest) {
-                headers_buffer[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
-                header_count += 1;
+                sensitive_headers[sensitive_header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
+                sensitive_header_count += 1;
             }
         }
-        const headers = headers_buffer[0..header_count];
         var attempt: usize = 0;
         while (attempt <= manager.max_retry_count) : (attempt += 1) {
             var output: std.Io.Writer.Allocating = .init(manager.allocator);
-            const result = manager.client.fetch(.{
-                .location = .{ .url = url },
-                .response_writer = &output.writer,
-                .extra_headers = headers,
-            }) catch |err| {
+            const result = fetchFollowingSafeRedirects(
+                &manager.client,
+                manager.allocator,
+                url,
+                &output.writer,
+                ordinary_headers[0..ordinary_header_count],
+                sensitive_headers[0..sensitive_header_count],
+                limit,
+                true,
+            ) catch |err| {
                 if (attempt == manager.max_retry_count) {
                     if (manifest_name) |name| {
                         try manager.stderr.print("{s}: {s} downloading package manifest {s}\n", .{
@@ -10099,25 +10548,31 @@ const Manager = struct {
     }
 
     fn fetchInfoManifest(manager: *Manager, url: []const u8) !?[]const u8 {
-        var headers_buffer: [3]std.http.Header = undefined;
-        var header_count: usize = 0;
-        headers_buffer[header_count] = .{ .name = "accept", .value = "application/json" };
-        header_count += 1;
+        const ordinary_headers = [_]std.http.Header{
+            .{ .name = "accept", .value = "application/json" },
+        };
+        var sensitive_headers: [2]std.http.Header = undefined;
+        var sensitive_header_count: usize = 0;
         if (manager.authorizationForURL(url)) |authorization| {
-            headers_buffer[header_count] = .{ .name = "authorization", .value = authorization };
-            header_count += 1;
-            headers_buffer[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
-            header_count += 1;
+            sensitive_headers[sensitive_header_count] = .{ .name = "authorization", .value = authorization };
+            sensitive_header_count += 1;
+            sensitive_headers[sensitive_header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
+            sensitive_header_count += 1;
         }
 
         var attempt: usize = 0;
         while (attempt <= manager.max_retry_count) : (attempt += 1) {
             var output: std.Io.Writer.Allocating = .init(manager.allocator);
-            const result = manager.client.fetch(.{
-                .location = .{ .url = url },
-                .response_writer = &output.writer,
-                .extra_headers = headers_buffer[0..header_count],
-            }) catch |err| {
+            const result = fetchFollowingSafeRedirects(
+                &manager.client,
+                manager.allocator,
+                url,
+                &output.writer,
+                &ordinary_headers,
+                sensitive_headers[0..sensitive_header_count],
+                max_manifest_bytes,
+                true,
+            ) catch |err| {
                 if (attempt == manager.max_retry_count) {
                     try manager.stderr.print("error: GET {s} - {s}\n", .{ url, packageManagerFetchErrorName(err) });
                     try manager.stderr.flush();
@@ -10141,14 +10596,25 @@ const Manager = struct {
 
     fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive, log_level: FetchLogLevel) ![]const u8 {
         if (manager.registry_archives.get(package.tarball)) |archive| {
-            if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
-            return archive;
+            const integrity_valid = if (manager.options.verify_integrity) blk: {
+                verifyIntegrity(archive, package.integrity) catch break :blk false;
+                break :blk true;
+            } else true;
+            if (integrity_valid and manager.registryArchiveMatchesIdentity(archive, package.name, package.version)) {
+                return archive;
+            }
+            _ = manager.registry_archives.remove(package.tarball);
         }
 
         const cache_path = try manager.registryArchiveCachePath(package.name, package.version, package.tarball);
 
         if (cache_path) |path| {
-            var cache_file = try openLockedCacheFile(manager.init_data.io, path);
+            var cache_file = try openLockedCacheFile(
+                manager.init_data.io,
+                manager.allocator,
+                manager.cache_directory.?,
+                path,
+            );
             defer cache_file.close(manager.init_data.io);
             return manager.fetchRegistryArchiveLocked(package, log_level, cache_file);
         }
@@ -10162,6 +10628,9 @@ const Manager = struct {
             null,
         );
         if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
+        if (!manager.registryArchiveMatchesIdentity(archive, package.name, package.version)) {
+            return error.RegistryPackageIdentityMismatch;
+        }
         try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), archive);
         return archive;
     }
@@ -10172,16 +10641,22 @@ const Manager = struct {
         log_level: FetchLogLevel,
         cache_file: std.Io.File,
     ) ![]const u8 {
-        const cached = try readLockedCacheFile(
+        const cached = try readLockedCacheFileOrReset(
             manager.init_data.io,
             manager.allocator,
             cache_file,
             max_tarball_bytes,
         );
-        const valid = cached.len > 0 and if (manager.options.verify_integrity) blk: {
-            verifyIntegrity(cached, package.integrity) catch break :blk false;
-            break :blk true;
-        } else true;
+        // A persistent archive cache is outside the trust boundary. Identity
+        // metadata alone is forgeable, so accept a disk hit only when a
+        // nonempty registry SRI authenticates its exact bytes. `--no-verify`
+        // still controls network responses; it does not make pre-seeded disk
+        // content trusted.
+        const valid = cached.len > 0 and package.integrity != null and package.integrity.?.len > 0 and
+            manager.registryArchiveMatchesIdentity(cached, package.name, package.version) and blk: {
+                verifyIntegrity(cached, package.integrity) catch break :blk false;
+                break :blk true;
+            };
         if (valid) {
             try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), cached);
             return cached;
@@ -10196,6 +10671,9 @@ const Manager = struct {
             null,
         );
         if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
+        if (!manager.registryArchiveMatchesIdentity(archive, package.name, package.version)) {
+            return error.RegistryPackageIdentityMismatch;
+        }
         try cache_file.setLength(manager.init_data.io, 0);
         try cache_file.writeStreamingAll(manager.init_data.io, archive);
         try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), archive);
@@ -10240,6 +10718,8 @@ const Manager = struct {
         package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, source);
         if (package_json.* != .object) return error.InvalidPackageJSON;
         const name = jsonString(package_json, "name") orelse return error.InvalidPackageName;
+        try validateDependencyAlias(name);
+        try Lockfile.validateDependencyAliases(package_json);
         return .{
             .name = name,
             .version = jsonString(package_json, "version") orelse "0.0.0",
@@ -10252,6 +10732,12 @@ const Manager = struct {
         if (std.mem.eql(u8, spec, "link:")) return manager.allocator.dupe(u8, manager.root_dir);
         if (isGlobalLinkSpec(spec)) {
             const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+            try ensurePackagePathAncestorsAreNotLinks(
+                manager.init_data.io,
+                manager.allocator,
+                node_modules,
+                localSpecPath(spec),
+            );
             return std.fs.path.join(manager.allocator, &.{ node_modules, localSpecPath(spec) });
         }
         return absolutePathFrom(manager.allocator, parent_dir, localSpecPath(spec));
@@ -10276,8 +10762,20 @@ const Manager = struct {
         return try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ prefix, normalized });
     }
 
+    fn packageDestinationChecked(manager: *Manager, base: []const u8, alias: []const u8) ![]const u8 {
+        const destination = try packageDestination(manager.allocator, base, alias);
+        const modules = try std.fs.path.resolve(manager.allocator, &.{ base, "node_modules" });
+        try ensurePackagePathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            modules,
+            alias,
+        );
+        return destination;
+    }
+
     fn linkDirectory(manager: *Manager, alias: []const u8, target: []const u8) !void {
-        const destination = try packageDestination(manager.allocator, manager.root_dir, alias);
+        const destination = try manager.packageDestinationChecked(manager.root_dir, alias);
         return manager.linkDirectoryAt(destination, target);
     }
 
@@ -10333,7 +10831,7 @@ const Manager = struct {
         else
             try manager.binDirectoryForPackage(package_dir);
         const target_package_dir = if (manager.node_linker == .isolated and report_direct)
-            try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias })
+            try manager.isolatedLinkDestination(consumer_modules, alias)
         else
             package_dir;
         return manager.linkBinsInDirectory(alias, target_package_dir, metadata, report_direct, bin_dir);
@@ -10366,7 +10864,17 @@ const Manager = struct {
         }
 
         const bin_directory = packageBinDirectory(metadata) orelse return;
-        const directory_path = try std.fs.path.join(manager.allocator, &.{ package_dir, bin_directory });
+        const directory_path = try resolveContainedPath(manager.allocator, package_dir, bin_directory);
+        try ensureContainedChildPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            package_dir,
+            directory_path,
+        );
+        switch (pathLinkStatus(manager.init_data.io, directory_path)) {
+            .symbolic_link, .unknown => return error.InvalidBinPath,
+            .missing, .not_link => {},
+        }
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, directory_path, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
@@ -10384,6 +10892,7 @@ const Manager = struct {
     fn unlinkBinsInDirectory(
         manager: *Manager,
         alias: []const u8,
+        package_dir: []const u8,
         metadata: *const Value,
         bin_dir: []const u8,
     ) !void {
@@ -10398,7 +10907,17 @@ const Manager = struct {
         }
 
         const bin_directory = packageBinDirectory(metadata) orelse return;
-        const directory_path = try std.fs.path.join(manager.allocator, &.{ manager.invocation_package_dir, bin_directory });
+        const directory_path = try resolveContainedPath(manager.allocator, package_dir, bin_directory);
+        try ensureContainedChildPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            package_dir,
+            directory_path,
+        );
+        switch (pathLinkStatus(manager.init_data.io, directory_path)) {
+            .symbolic_link, .unknown => return error.InvalidBinPath,
+            .missing, .not_link => {},
+        }
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, directory_path, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
@@ -10408,22 +10927,56 @@ const Manager = struct {
     }
 
     fn unlinkBin(manager: *Manager, bin_dir: []const u8, name: []const u8) void {
-        const destination = std.fs.path.join(manager.allocator, &.{ bin_dir, name }) catch return;
+        const destination = manager.binDestination(bin_dir, name) catch return;
+        const command_path: ?[]const u8 = if (builtin.os.tag == .windows)
+            windowsBinCommandPathContained(
+                manager.allocator,
+                manager.init_data.io,
+                bin_dir,
+                destination,
+            ) catch return
+        else
+            null;
         _ = manager.linked_bins.remove(destination);
         deletePath(manager.init_data.io, destination);
-        if (builtin.os.tag == .windows) {
-            const command_path = std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination}) catch return;
-            deletePath(manager.init_data.io, command_path);
-        }
+        if (command_path) |path| deleteWindowsBinCommand(manager.init_data.io, path) catch {};
     }
 
     fn linkBin(manager: *Manager, bin_dir: []const u8, name: []const u8, package_dir: []const u8, relative_target: []const u8) !bool {
-        const target = try std.fs.path.join(manager.allocator, &.{ package_dir, relative_target });
+        const target = try resolveContainedPath(manager.allocator, package_dir, relative_target);
+        try ensureContainedChildPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            package_dir,
+            target,
+        );
+        const package_base_is_link = switch (pathLinkStatus(manager.init_data.io, package_dir)) {
+            .symbolic_link => true,
+            .unknown => return error.InvalidBinPath,
+            .missing, .not_link => false,
+        };
+        const target_is_link = package_base_is_link or switch (pathLinkStatus(manager.init_data.io, target)) {
+            .symbolic_link => true,
+            .unknown => return error.InvalidBinPath,
+            .missing, .not_link => false,
+        };
         const stat = std.Io.Dir.cwd().statFile(manager.init_data.io, target, .{}) catch return false;
         if (stat.kind != .file) return false;
         const bun_shebang = builtin.os.tag != .windows and manager.posixBinHasBunShebang(target);
-        if (builtin.os.tag != .windows) try manager.preparePosixBin(target, stat);
-        const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
+        // Folder/link dependencies intentionally expose source files through
+        // symlinks. Never chmod or rewrite the symlink target outside the
+        // materialized package boundary.
+        if (builtin.os.tag != .windows and !target_is_link) try manager.preparePosixBin(target, stat);
+        const destination = try manager.binDestination(bin_dir, name);
+        const windows_command_path: ?[]const u8 = if (builtin.os.tag == .windows)
+            try windowsBinCommandDestination(
+                manager.allocator,
+                manager.init_data.io,
+                bin_dir,
+                destination,
+            )
+        else
+            null;
         const seen = try manager.linked_bins.getOrPut(destination);
         if (seen.found_existing) {
             // Isolated peer-graph reconciliation rebuilds the live-link set
@@ -10432,7 +10985,7 @@ const Manager = struct {
             // install. Re-mark it so finalization does not prune it as stale.
             if (manager.node_linker == .isolated) {
                 const live_path = if (builtin.os.tag == .windows)
-                    try std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination})
+                    try manager.allocator.dupe(u8, windows_command_path.?)
                 else
                     try manager.allocator.dupe(u8, destination);
                 try manager.isolated_live_links.put(live_path, {});
@@ -10444,10 +10997,10 @@ const Manager = struct {
         const destination_parent = std.fs.path.dirname(destination) orelse bin_dir;
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
         if (builtin.os.tag == .windows) {
-            const command_path = try std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination});
+            const command_path = windows_command_path.?;
             const executable = try Host.runtimeExecutable(manager.init_data, manager.allocator);
             const command = try std.fmt.allocPrint(manager.allocator, "@\"{s}\" \"{s}\" %*\r\n", .{ executable, target });
-            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = command_path, .data = command });
+            try replaceWindowsBinCommand(manager.init_data.io, command_path, command);
             if (manager.node_linker == .isolated) {
                 try manager.isolated_live_links.put(try manager.allocator.dupe(u8, command_path), {});
             }
@@ -10490,6 +11043,18 @@ const Manager = struct {
             }
         }
         return true;
+    }
+
+    fn binDestination(manager: *Manager, bin_dir: []const u8, name: []const u8) ![]const u8 {
+        if (!binNameIsSafe(name)) return error.InvalidBinPath;
+        const destination = try resolveContainedPath(manager.allocator, bin_dir, name);
+        try ensureContainedPathAncestorsAreNotLinks(
+            manager.init_data.io,
+            manager.allocator,
+            bin_dir,
+            destination,
+        );
+        return destination;
     }
 
     fn posixBinHasBunShebang(manager: *Manager, target: []const u8) bool {
@@ -10566,12 +11131,12 @@ const Manager = struct {
             const candidate_dir = if (candidate.install_dir.len > 0)
                 candidate.install_dir
             else
-                try packageDestination(manager.allocator, manager.root_dir, candidate.alias);
+                try manager.packageDestinationChecked(manager.root_dir, candidate.alias);
             const bin_dir = if (manager.node_linker == .isolated)
                 try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bin" })
             else
                 try manager.binDirectoryForPackage(main_record.install_dir);
-            try manager.unlinkBinsInDirectory(main_record.alias, metadata, bin_dir);
+            try manager.unlinkBinsInDirectory(main_record.alias, main_record.install_dir, metadata, bin_dir);
             try manager.linkBinsInDirectory(main_record.alias, candidate_dir, metadata, false, bin_dir);
             return;
         }
@@ -10587,7 +11152,9 @@ const Manager = struct {
     fn discoverWorkspaces(manager: *Manager, root: *Value) !void {
         // v1 scope: the built-in resolver does not implement workspace
         // installs; projects using workspaces select an external manager.
-        if (root.* == .object and root.object.get("workspaces") != null) {
+        if (root.* == .object and root.object.get("workspaces") != null and
+            !workspaceConfigurationIsProvablyEmpty(root))
+        {
             try manager.stderr.writeAll(
                 "error: Hutch's built-in resolver does not support workspaces yet; select an external packageManager (npm, bun, pnpm, or yarn) in hutch.config.ts\n",
             );
@@ -10831,7 +11398,7 @@ const Manager = struct {
         if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
         _ = try manager.peerContextForPackage(workspace.package_json, parent_dir, true);
         const destination = if (manager.node_linker == .isolated)
-            try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
+            try manager.isolatedLinkDestination(try manager.isolatedConsumerModules(parent_dir), alias)
         else
             try manager.chooseDestination(alias, workspace.version, parent_dir, direct);
         try manager.countWorkspaceInstall(workspace, destination);
@@ -10926,7 +11493,7 @@ const Manager = struct {
                 if (manager.initial_root_versions.contains(alias)) continue;
                 var base = parent_dir;
                 while (true) {
-                    const destination = try packageDestination(manager.allocator, base, alias);
+                    const destination = try manager.packageDestinationChecked(base, alias);
                     if (manager.readInstalledPackageJSON(destination) catch null) |installed_package_json| {
                         const installed_version = jsonString(installed_package_json, "version") orelse "0.0.0";
                         try manager.initial_root_versions.put(
@@ -11118,7 +11685,7 @@ const Manager = struct {
             try manager.rememberPackageMetadata(workspace.path, workspace.package_json);
             _ = try manager.peerContextForPackage(workspace.package_json, workspace.path, true);
             if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
-                const destination = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
+                const destination = try manager.packageDestinationChecked(manager.root_dir, workspace.name);
                 try manager.countWorkspaceInstall(workspace, destination);
                 if (!manager.options.lockfile_only) try manager.linkRelativeDirectory(destination, workspace.path, true);
                 if (!manager.options.lockfile_only) try manager.linkBins(workspace.name, destination, workspace.package_json, true, manager.root_dir);
@@ -12075,7 +12642,7 @@ fn isGlobalLinkSpec(spec: []const u8) bool {
 }
 
 fn isValidGlobalLinkName(name: []const u8) bool {
-    return PackageName.isNPMPackageName(name);
+    return Lockfile.packageNameIsSafe(name);
 }
 
 fn localSpecPath(spec: []const u8) []const u8 {
@@ -12220,7 +12787,35 @@ fn hasUnknownURLScheme(spec: []const u8) bool {
 }
 
 fn packageDestination(allocator: std.mem.Allocator, base: []const u8, alias: []const u8) ![]const u8 {
-    return std.fs.path.join(allocator, &.{ base, "node_modules", alias });
+    try validateDependencyAlias(alias);
+    const modules = try std.fs.path.resolve(allocator, &.{ base, "node_modules" });
+    const destination = try std.fs.path.resolve(allocator, &.{ modules, alias });
+    if (destination.len == modules.len or !pathHasPrefix(destination, modules)) return error.InvalidPackageDestination;
+    return destination;
+}
+
+fn ensurePackagePathAncestorsAreNotLinks(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    modules: []const u8,
+    alias: []const u8,
+) !void {
+    try validateDependencyAlias(alias);
+    switch (pathLinkStatus(io, modules)) {
+        .symbolic_link, .unknown => return error.InvalidPackageDestination,
+        .missing, .not_link => {},
+    }
+    if (alias[0] != '@') return;
+    const slash = std.mem.indexOfScalar(u8, alias, '/') orelse return error.InvalidPackageName;
+    const scope = try std.fs.path.join(allocator, &.{ modules, alias[0..slash] });
+    switch (pathLinkStatus(io, scope)) {
+        .symbolic_link, .unknown => return error.InvalidPackageDestination,
+        .missing, .not_link => {},
+    }
+}
+
+fn validateDependencyAlias(alias: []const u8) !void {
+    if (!Lockfile.packageNameIsSafe(alias)) return error.InvalidPackageName;
 }
 
 fn packageNameFromNodeModulesPath(path: []const u8) ?[]const u8 {
@@ -12355,6 +12950,154 @@ fn normalizedBinObjectName(name: []const u8) []const u8 {
         }
     }
     return name;
+}
+
+fn binNameIsSafe(name: []const u8) bool {
+    if (name.len == 0 or std.fs.path.isAbsolute(name)) return false;
+    var components = std.mem.splitAny(u8, name, "/\\");
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return false;
+        for (component) |byte| if (byte == 0 or byte < ' ' or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+fn windowsBinCommandPathContained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bin_dir: []const u8,
+    destination: []const u8,
+) ![]const u8 {
+    const command_path = try std.fmt.allocPrint(allocator, "{s}.cmd", .{destination});
+    const resolved_bin_dir = try std.fs.path.resolve(allocator, &.{bin_dir});
+    const resolved_command_path = try std.fs.path.resolve(allocator, &.{command_path});
+    if (resolved_command_path.len == resolved_bin_dir.len or
+        !pathHasPrefix(resolved_command_path, resolved_bin_dir))
+    {
+        return error.InvalidBinPath;
+    }
+    try ensureContainedPathAncestorsAreNotLinks(
+        io,
+        allocator,
+        resolved_bin_dir,
+        resolved_command_path,
+    );
+    return resolved_command_path;
+}
+
+fn windowsBinCommandDestination(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bin_dir: []const u8,
+    destination: []const u8,
+) ![]const u8 {
+    const resolved_command_path = try windowsBinCommandPathContained(
+        allocator,
+        io,
+        bin_dir,
+        destination,
+    );
+    switch (pathLinkStatus(io, resolved_command_path)) {
+        .symbolic_link, .unknown => return error.InvalidBinPath,
+        .missing, .not_link => {},
+    }
+    return resolved_command_path;
+}
+
+fn deleteWindowsBinCommand(io: std.Io, command_path: []const u8) !void {
+    std.Io.Dir.cwd().deleteFile(io, command_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        error.IsDir => std.Io.Dir.cwd().deleteDir(io, command_path) catch |dir_err| switch (dir_err) {
+            error.FileNotFound => {},
+            else => return dir_err,
+        },
+        else => return err,
+    };
+}
+
+fn replaceWindowsBinCommand(io: std.Io, command_path: []const u8, command: []const u8) !void {
+    switch (pathLinkStatus(io, command_path)) {
+        .symbolic_link, .unknown => return error.InvalidBinPath,
+        .missing => {},
+        .not_link => std.Io.Dir.cwd().deleteFile(io, command_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.InvalidBinPath,
+        },
+    }
+    try ensurePathMissing(io, command_path);
+    var file = std.Io.Dir.cwd().createFile(io, command_path, .{
+        .read = false,
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.InvalidBinPath,
+        else => return err,
+    };
+    defer file.close(io);
+    try file.writeStreamingAll(io, command);
+}
+
+fn resolveContainedPath(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    child: []const u8,
+) ![]const u8 {
+    const resolved_base = try std.fs.path.resolve(allocator, &.{base});
+    const resolved = try std.fs.path.resolve(allocator, &.{ resolved_base, child });
+    if (resolved.len == resolved_base.len or !pathHasPrefix(resolved, resolved_base)) {
+        return error.InvalidBinPath;
+    }
+    return resolved;
+}
+
+fn ensureContainedPathAncestorsAreNotLinks(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    destination: []const u8,
+) !void {
+    return ensureContainedPathAncestorsAreNotLinksImpl(io, allocator, base, destination, true);
+}
+
+fn ensureContainedChildPathAncestorsAreNotLinks(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    destination: []const u8,
+) !void {
+    return ensureContainedPathAncestorsAreNotLinksImpl(io, allocator, base, destination, false);
+}
+
+fn ensureContainedPathAncestorsAreNotLinksImpl(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    destination: []const u8,
+    check_base: bool,
+) !void {
+    const resolved_base = try std.fs.path.resolve(allocator, &.{base});
+    if (!pathHasPrefix(destination, resolved_base) or destination.len == resolved_base.len) {
+        return error.InvalidBinPath;
+    }
+    if (check_base) {
+        switch (pathLinkStatus(io, resolved_base)) {
+            .symbolic_link, .unknown => return error.InvalidBinPath,
+            .missing, .not_link => {},
+        }
+    }
+    const relative = destination[resolved_base.len + 1 ..];
+    var components = std.mem.tokenizeAny(u8, relative, "/\\");
+    var current = try allocator.dupe(u8, resolved_base);
+    var component = components.next() orelse return error.InvalidBinPath;
+    while (components.next()) |next| {
+        current = try std.fs.path.join(allocator, &.{ current, component });
+        switch (pathLinkStatus(io, current)) {
+            .symbolic_link, .unknown => return error.InvalidBinPath,
+            .missing, .not_link => {},
+        }
+        component = next;
+    }
 }
 
 fn platformMatches(metadata: *const Value) bool {
@@ -12539,6 +13282,14 @@ fn normalizeRegistryVersion(allocator: std.mem.Allocator, version_value: []const
     return std.fmt.allocPrint(allocator, "{f}", .{parsed.version.min().fmt(version_value)});
 }
 
+fn registryVersionsEqual(left: []const u8, right: []const u8) bool {
+    if (std.mem.eql(u8, left, right)) return true;
+    const left_parsed = Semver.Version.parseUTF8(left);
+    const right_parsed = Semver.Version.parseUTF8(right);
+    if (!left_parsed.valid or !right_parsed.valid) return false;
+    return left_parsed.version.min().order(right_parsed.version.min(), left, right) == .eq;
+}
+
 fn semverSatisfies(allocator: std.mem.Allocator, range: []const u8, version_value: []const u8) bool {
     if (std.mem.eql(u8, range, "") or std.mem.eql(u8, range, "*") or std.mem.eql(u8, range, "latest")) return true;
     const parsed_version = Semver.Version.parseUTF8(version_value);
@@ -12593,17 +13344,94 @@ fn sha512Integrity(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 
     return integrity;
 }
 
+const IntegrityAlgorithm = enum(u8) {
+    sha1 = 1,
+    sha256 = 2,
+    sha384 = 3,
+    sha512 = 4,
+
+    fn digestLength(algorithm: IntegrityAlgorithm) usize {
+        return switch (algorithm) {
+            .sha1 => 20,
+            .sha256 => 32,
+            .sha384 => 48,
+            .sha512 => 64,
+        };
+    }
+};
+
+const ParsedIntegrity = struct {
+    algorithm: IntegrityAlgorithm,
+    encoded: []const u8,
+};
+
+fn parseIntegrity(value: []const u8) !ParsedIntegrity {
+    var selected: ?ParsedIntegrity = null;
+    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n");
+    while (tokens.next()) |token| {
+        const parsed = parseIntegrityToken(token) catch |err| switch (err) {
+            error.UnsupportedIntegrityAlgorithm => continue,
+            else => return err,
+        };
+        if (selected == null or @intFromEnum(parsed.algorithm) > @intFromEnum(selected.?.algorithm)) {
+            selected = parsed;
+        }
+    }
+    return selected orelse error.InvalidIntegrity;
+}
+
+fn parseIntegrityToken(token: []const u8) !ParsedIntegrity {
+    const dash = std.mem.indexOfScalar(u8, token, '-') orelse return error.InvalidIntegrity;
+    const algorithm: IntegrityAlgorithm = if (std.mem.eql(u8, token[0..dash], "sha1"))
+        .sha1
+    else if (std.mem.eql(u8, token[0..dash], "sha256"))
+        .sha256
+    else if (std.mem.eql(u8, token[0..dash], "sha384"))
+        .sha384
+    else if (std.mem.eql(u8, token[0..dash], "sha512"))
+        .sha512
+    else
+        return error.UnsupportedIntegrityAlgorithm;
+    const encoded = token[dash + 1 ..];
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidIntegrity;
+    if (decoded_len != algorithm.digestLength()) return error.InvalidIntegrity;
+    var decoded: [64]u8 = undefined;
+    std.base64.standard.Decoder.decode(decoded[0..decoded_len], encoded) catch return error.InvalidIntegrity;
+    return .{ .algorithm = algorithm, .encoded = encoded };
+}
+
+fn verifyIntegrityHash(comptime Hash: type, bytes: []const u8, encoded: []const u8) !void {
+    var expected: [Hash.digest_length]u8 = undefined;
+    std.base64.standard.Decoder.decode(&expected, encoded) catch return error.InvalidIntegrity;
+    var actual: [Hash.digest_length]u8 = undefined;
+    Hash.hash(bytes, &actual, .{});
+    if (!std.crypto.timing_safe.eql([Hash.digest_length]u8, expected, actual)) return error.IntegrityCheckFailed;
+}
+
 fn verifyIntegrity(bytes: []const u8, integrity: ?[]const u8) !void {
     const value = integrity orelse return;
-    if (!std.mem.startsWith(u8, value, "sha512-")) return;
-    const encoded = value["sha512-".len..];
-    var expected: [64]u8 = undefined;
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return;
-    if (decoded_len != expected.len) return;
-    _ = std.base64.standard.Decoder.decode(&expected, encoded) catch return;
-    var actual: [64]u8 = undefined;
-    std.crypto.hash.sha2.Sha512.hash(bytes, &actual, .{});
-    if (!std.crypto.timing_safe.eql([64]u8, expected, actual)) return error.IntegrityCheckFailed;
+    if (value.len == 0) return;
+    const strongest = (try parseIntegrity(value)).algorithm;
+    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n");
+    while (tokens.next()) |token| {
+        const parsed = parseIntegrityToken(token) catch |err| switch (err) {
+            error.UnsupportedIntegrityAlgorithm => continue,
+            else => return err,
+        };
+        if (parsed.algorithm != strongest) continue;
+        const result = switch (parsed.algorithm) {
+            .sha1 => verifyIntegrityHash(std.crypto.hash.Sha1, bytes, parsed.encoded),
+            .sha256 => verifyIntegrityHash(std.crypto.hash.sha2.Sha256, bytes, parsed.encoded),
+            .sha384 => verifyIntegrityHash(std.crypto.hash.sha2.Sha384, bytes, parsed.encoded),
+            .sha512 => verifyIntegrityHash(std.crypto.hash.sha2.Sha512, bytes, parsed.encoded),
+        };
+        result catch |err| switch (err) {
+            error.IntegrityCheckFailed => continue,
+            else => return err,
+        };
+        return;
+    }
+    return error.IntegrityCheckFailed;
 }
 
 const GithubArchiveIdentity = struct {
@@ -12640,6 +13468,32 @@ fn githubArchiveIdentity(allocator: std.mem.Allocator, archive: []const u8) !?Gi
         };
     }
     return null;
+}
+
+fn githubArchiveIdentityMatches(
+    identity: GithubArchiveIdentity,
+    repository_slug: []const u8,
+    reference: []const u8,
+) bool {
+    if (identity.root_name.len != repository_slug.len + 1 + identity.commit.len or
+        !std.ascii.eqlIgnoreCase(identity.root_name[0..repository_slug.len], repository_slug) or
+        identity.root_name[repository_slug.len] != '-' or
+        !std.mem.eql(u8, identity.root_name[repository_slug.len + 1 ..], identity.commit))
+    {
+        return false;
+    }
+    if (!isGitCommitish(reference)) return true;
+    const prefix_len = @min(identity.commit.len, reference.len);
+    return std.ascii.eqlIgnoreCase(identity.commit[0..prefix_len], reference[0..prefix_len]);
+}
+
+fn githubArchiveCacheHitMatches(
+    identity: GithubArchiveIdentity,
+    repository_slug: []const u8,
+    reference: []const u8,
+    integrity_verified: bool,
+) bool {
+    return integrity_verified and githubArchiveIdentityMatches(identity, repository_slug, reference);
 }
 
 pub fn extractTarballArchive(
@@ -13055,6 +13909,28 @@ fn hasAnyDependencies(root: *const Value) bool {
     return false;
 }
 
+fn installGraphIsProvablyEmpty(root: *const Value) bool {
+    if (root.* != .object) return false;
+    for (all_dependency_sections) |key| {
+        const section = root.object.get(key) orelse continue;
+        if (section != .object or section.object.count() != 0) return false;
+    }
+    return workspaceConfigurationIsProvablyEmpty(root);
+}
+
+fn workspaceConfigurationIsProvablyEmpty(root: *const Value) bool {
+    if (root.* != .object) return false;
+    const workspaces = root.object.get("workspaces") orelse return true;
+    return switch (workspaces) {
+        .array => |items| items.items.len == 0,
+        .object => |object| blk: {
+            const packages = object.get("packages") orelse break :blk false;
+            break :blk packages == .array and packages.array.items.len == 0;
+        },
+        else => false,
+    };
+}
+
 fn removedDependencyCount(previous: *const Value, current: *const Value) usize {
     if (previous.* != .object or current.* != .object) return 0;
     var count: usize = 0;
@@ -13080,6 +13956,7 @@ fn containsString(values: []const []const u8, needle: []const u8) bool {
 }
 
 fn lockAliasFromKey(allocator: std.mem.Allocator, key: []const u8) ![]const u8 {
+    if (!Lockfile.packageKeyIsSafe(key)) return error.InvalidPackageKey;
     var alias: []const u8 = key;
     var components = std.mem.splitScalar(u8, key, '/');
     while (components.next()) |component| {
@@ -13562,6 +14439,152 @@ test "package specs preserve scoped names and ranges" {
     const raw_git = splitPackageSpec("git@github.com:owner/repository.git");
     try std.testing.expect(raw_git.name == null);
     try std.testing.expectEqualStrings("git@github.com:owner/repository.git", raw_git.spec);
+}
+
+test "registry integrity is optional only when absent or empty" {
+    try verifyIntegrity("payload", null);
+    try verifyIntegrity("payload", "");
+
+    const valid = try sha512Integrity(std.testing.allocator, "payload");
+    defer std.testing.allocator.free(valid);
+    try verifyIntegrity("payload", valid);
+    const multiple = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA== {s}",
+        .{valid},
+    );
+    defer std.testing.allocator.free(multiple);
+    try verifyIntegrity("payload", multiple);
+    const mixed_supported = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "md5-not-a-supported-digest {s}",
+        .{valid},
+    );
+    defer std.testing.allocator.free(mixed_supported);
+    try verifyIntegrity("payload", mixed_supported);
+    try std.testing.expectError(error.IntegrityCheckFailed, verifyIntegrity("changed", valid));
+    try std.testing.expectError(error.InvalidIntegrity, verifyIntegrity("payload", "md5-AAAAAAAAAAAAAAAAAAAAAA=="));
+    try std.testing.expectError(error.InvalidIntegrity, verifyIntegrity("payload", "sha512-not-base64 md5-ignored"));
+    try std.testing.expectError(error.InvalidIntegrity, verifyIntegrity("payload", "sha512-not-base64"));
+    try std.testing.expectError(error.InvalidIntegrity, verifyIntegrity("payload", "   \t\n"));
+}
+
+test "redirect credentials are retained only for the exact HTTP origin" {
+    const https = try std.Uri.parse("https://registry.example/path");
+    const explicit_https = try std.Uri.parse("https://REGISTRY.example:443/other");
+    const other_port = try std.Uri.parse("https://registry.example:444/path");
+    const subdomain = try std.Uri.parse("https://cdn.registry.example/path");
+    const downgraded = try std.Uri.parse("http://registry.example/path");
+
+    try std.testing.expect(try httpOriginsEqual(https, explicit_https));
+    try std.testing.expect(!try httpOriginsEqual(https, other_port));
+    try std.testing.expect(!try httpOriginsEqual(https, subdomain));
+    try std.testing.expect(!try httpOriginsEqual(https, downgraded));
+}
+
+test "Windows bin command replacement rejects a preseeded symlink" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.cmd", .data = "preserve\n" });
+    tmp.dir.symLink(io, "../outside.cmd", "bin/tool.cmd", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const bin_dir = try std.fs.path.join(allocator, &.{ root, "bin" });
+    const destination = try std.fs.path.join(allocator, &.{ bin_dir, "tool" });
+    const contained_command_path = try windowsBinCommandPathContained(allocator, io, bin_dir, destination);
+    try std.testing.expectError(
+        error.InvalidBinPath,
+        windowsBinCommandDestination(allocator, io, bin_dir, destination),
+    );
+    try std.testing.expectError(
+        error.InvalidBinPath,
+        replaceWindowsBinCommand(
+            io,
+            try std.fs.path.join(allocator, &.{ bin_dir, "tool.cmd" }),
+            "overwritten\r\n",
+        ),
+    );
+    const outside = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "outside.cmd" }),
+        allocator,
+        .limited(1024),
+    );
+    try std.testing.expectEqualStrings("preserve\n", outside);
+
+    try deleteWindowsBinCommand(io, contained_command_path);
+    try std.testing.expectEqualStrings("preserve\n", try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "outside.cmd" }),
+        allocator,
+        .limited(1024),
+    ));
+    const command_path = try windowsBinCommandDestination(allocator, io, bin_dir, destination);
+    try replaceWindowsBinCommand(io, command_path, "@echo safe\r\n");
+    const command = try std.Io.Dir.cwd().readFileAlloc(io, command_path, allocator, .limited(1024));
+    try std.testing.expectEqualStrings("@echo safe\r\n", command);
+}
+
+test "Windows bin command replacement unlinks an existing hard link before writing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "bin");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.cmd", .data = "preserve\n" });
+    tmp.dir.hardLink("outside.cmd", tmp.dir, "bin/tool.cmd", io, .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.OperationUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const bin_dir = try std.fs.path.join(allocator, &.{ root, "bin" });
+    const destination = try std.fs.path.join(allocator, &.{ bin_dir, "tool" });
+    const command_path = try windowsBinCommandDestination(allocator, io, bin_dir, destination);
+    try replaceWindowsBinCommand(io, command_path, "@echo safe\r\n");
+
+    const outside = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fs.path.join(allocator, &.{ root, "outside.cmd" }),
+        allocator,
+        .limited(1024),
+    );
+    try std.testing.expectEqualStrings("preserve\n", outside);
+    const command = try std.Io.Dir.cwd().readFileAlloc(io, command_path, allocator, .limited(1024));
+    try std.testing.expectEqualStrings("@echo safe\r\n", command);
+}
+
+test "GitHub archive identity binds repository and pinned commit" {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    const identity: GithubArchiveIdentity = .{
+        .root_name = "owner-repository-0123456789abcdef0123456789abcdef01234567",
+        .commit = commit,
+    };
+    try std.testing.expect(githubArchiveIdentityMatches(identity, "owner-repository", "main"));
+    try std.testing.expect(githubArchiveIdentityMatches(identity, "OWNER-REPOSITORY", "main"));
+    try std.testing.expect(githubArchiveIdentityMatches(identity, "owner-repository", commit));
+    try std.testing.expect(githubArchiveIdentityMatches(identity, "owner-repository", commit[0..7]));
+    const abbreviated: GithubArchiveIdentity = .{
+        .root_name = "owner-repository-0123456",
+        .commit = commit[0..7],
+    };
+    try std.testing.expect(githubArchiveIdentityMatches(abbreviated, "owner-repository", commit));
+    try std.testing.expect(!githubArchiveCacheHitMatches(abbreviated, "owner-repository", commit, false));
+    try std.testing.expect(githubArchiveCacheHitMatches(abbreviated, "owner-repository", commit, true));
+    try std.testing.expect(!githubArchiveIdentityMatches(identity, "other-repository", commit));
+    try std.testing.expect(!githubArchiveIdentityMatches(identity, "owner-repository", "abcdef0"));
 }
 
 test "package platform metadata includes libc" {

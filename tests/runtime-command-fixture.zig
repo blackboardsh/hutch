@@ -49,7 +49,22 @@ const expected_package_manager_adversarial_args = [_][]const u8{
     "--hutch-test-package-manager=forwarded",
 };
 
+const expected_local_exec_args = [_][]const u8{
+    "two words",
+    "$literal",
+    "%PATH%",
+    "!HUTCH_BATCH_DELAYED!",
+    "quote\"value",
+    "amp&value",
+    "pipe|value",
+    "caret^value",
+    "",
+    "--flag=value",
+    "工作-🚀",
+};
+
 const package_manager_marker = "--hutch-test-package-manager=";
+const local_bin_marker = "--hutch-test-local-bin=";
 
 const PackageManagerInvocation = struct {
     name: []const u8,
@@ -112,6 +127,27 @@ fn expectPackageManagerInvocation(
         return error.UnexpectedConfigCommand;
     }
     return expectArgs(invocation.forwarded_args, expected_args);
+}
+
+fn expectLocalBinInvocation(
+    args: []const [:0]const u8,
+    expected_name: []const u8,
+    expected_args: []const []const u8,
+) !void {
+    if (args.len == 0) return error.MissingLocalBinExecutable;
+    if (comptime builtin.os.tag == .windows) {
+        if (args.len < 2 or !std.mem.startsWith(u8, args[1], local_bin_marker)) {
+            return error.MissingLocalBinMarker;
+        }
+        if (!std.mem.eql(u8, args[1][local_bin_marker.len..], expected_name)) {
+            return error.UnexpectedLocalBinExecutable;
+        }
+        return expectArgs(args[2..], expected_args);
+    }
+    if (!std.mem.eql(u8, std.fs.path.basename(args[0]), expected_name)) {
+        return error.UnexpectedLocalBinExecutable;
+    }
+    return expectArgs(args[1..], expected_args);
 }
 
 fn expectArgs(actual: []const [:0]const u8, expected: []const []const u8) !void {
@@ -441,6 +477,13 @@ pub fn main(init: std.process.Init) !void {
                 &.{ "add", "left-pad", "--exact" },
             );
         }
+        if (std.mem.eql(u8, mode, "config-pm-external-exec")) {
+            return expectPackageManagerInvocation(
+                args,
+                "npm",
+                &.{ "exec", "--", "local-probe", "two words" },
+            );
+        }
         if (std.mem.eql(u8, mode, "config-pm-custom-install")) {
             return expectPackageManagerInvocation(
                 args,
@@ -457,6 +500,20 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, mode, "config-list")) return error.UnexpectedConfigCommand;
         return error.UnknownFixtureMode;
+    }
+
+    if (std.mem.eql(u8, mode, "pm-exec-success")) {
+        try expectConfiguredCwd(init);
+        return expectLocalBinInvocation(args, "local-probe", &expected_local_exec_args);
+    }
+    if (std.mem.eql(u8, mode, "pm-exec-exit")) {
+        try expectConfiguredCwd(init);
+        try expectLocalBinInvocation(args, "local-fail", &.{"exit"});
+        std.process.exit(37);
+    }
+    if (std.mem.eql(u8, mode, "pm-exec-bat")) {
+        try expectConfiguredCwd(init);
+        return expectLocalBinInvocation(args, "local-bat-probe", &expected_local_exec_args);
     }
 
     if (std.mem.eql(u8, mode, "runtime-options")) {

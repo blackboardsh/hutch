@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Live validation of the vendored bun toolchain on the current OS. Unlike the
 // hermetic suites, this intentionally reaches bun's upstream releases: it
-// shadows any system bun with a version-mismatched stub, runs `hutch pm
-// --version` in a config-free directory, and requires Hutch to download the
-// default bun into a scratch HUTCH_HOME and execute it. Run it on each release
+// shadows any system bun with a version-mismatched stub, explicitly selects
+// Bun for a project, and requires `hutch pm --version` to download the default
+// Bun into a scratch HUTCH_HOME and execute it. Run it on each release
 // platform before shipping a bun default bump: `hutch run smoke:bun-toolchain`
 // (needs a built zig-out; no tooling beyond Hutch itself).
 
@@ -46,10 +46,14 @@ assert(pinned, "could not read default_bun_version from src/toolchain_store.zig"
 const fixture = mkdtempSync(join(tmpdir(), "hutch-bun-toolchain-smoke-"));
 try {
   const home = join(fixture, "home");
-  const project = join(fixture, "empty-project");
+  const project = join(fixture, "bun-project");
   const shadowBin = join(fixture, "shadow-bin");
   mkdirSync(project, { recursive: true });
   mkdirSync(shadowBin, { recursive: true });
+  writeFileSync(
+    join(project, "hutch.config.ts"),
+    'export default { packageManager: "bun" };\n',
+  );
 
   // A PATH bun that can never satisfy the pin, so resolution must download.
   if (process.platform === "win32") {

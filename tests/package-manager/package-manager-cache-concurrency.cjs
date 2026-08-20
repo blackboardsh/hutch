@@ -105,6 +105,15 @@ function countCacheFiles(root, extension) {
   return count;
 }
 
+function findCacheFiles(root, predicate, matches = []) {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const filename = path.join(root, entry.name);
+    if (entry.isDirectory()) findCacheFiles(filename, predicate, matches);
+    else if (predicate(filename, entry.name)) matches.push(filename);
+  }
+  return matches;
+}
+
 fs.mkdirSync(registryRoot, { recursive: true });
 fs.mkdirSync(projectRoot, { recursive: true });
 fs.mkdirSync(home, { recursive: true });
@@ -213,7 +222,11 @@ try {
   );
 
   const cacheRoot = path.join(home, ".hutch", "cache", "npm");
-  assert.equal(countCacheFiles(cacheRoot, ".npm"), packageCount);
+  assert.equal(
+    countCacheFiles(cacheRoot, ".npm"),
+    0,
+    "unauthenticated registry manifests must not be persisted as trusted cache entries",
+  );
   assert.equal(countCacheFiles(cacheRoot, ".tgz"), packageCount);
 
   removeInstall({ lockfile: false });
@@ -224,7 +237,12 @@ try {
   removeInstall({ lockfile: true });
   const warmUnlocked = runInstall();
   expectSuccess(warmUnlocked);
-  assert.equal(readStats().requests, coldStats.requests, "manifest-cache reinstall contacted the registry");
+  const warmUnlockedStats = readStats();
+  assert.equal(
+    warmUnlockedStats.requests,
+    coldStats.requests + packageCount,
+    "a fresh resolution did not refetch every unauthenticated registry manifest",
+  );
 
   const upgradedName = "delayed-package-0";
   const upgradedMetadata = { name: upgradedName, version: "2.0.0" };
@@ -248,8 +266,8 @@ try {
   const staleStats = readStats();
   assert.equal(
     staleStats.requests,
-    coldStats.requests + 2,
-    "an exact version missing from cached metadata did not fetch one fresh manifest and archive",
+    warmUnlockedStats.requests + packageCount + 1,
+    "an exact-version refresh did not fetch fresh manifests and the changed archive",
   );
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(projectRoot, "node_modules", upgradedName, "package.json"), "utf8")).version,
@@ -264,6 +282,142 @@ try {
     staleStats.requests + packageCount * 2,
     "--no-cache reused registry artifacts",
   );
+
+  const poisonVictim = "delayed-package-1";
+  const archiveFiles = findCacheFiles(
+    path.join(cacheRoot, poisonVictim),
+    (_filename, basename) => basename.endsWith(".tgz"),
+  );
+  assert.equal(archiveFiles.length, 1, "expected one identity-bound archive cache entry");
+  fs.writeFileSync(archiveFiles[0], packageArchive({ name: "swapped-package", version: "9.9.9" }));
+  removeInstall({ lockfile: false });
+  const beforeSwappedArchive = readStats().requests;
+  const swappedArchive = runInstall(["--no-verify"]);
+  expectSuccess(swappedArchive);
+  assert.equal(
+    readStats().requests,
+    beforeSwappedArchive + 1,
+    "a swapped archive cache entry was trusted instead of refetched",
+  );
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(projectRoot, "node_modules", poisonVictim, "package.json"), "utf8")),
+    { name: poisonVictim, version: "1.0.0" },
+  );
+
+  // Keep this sparse: the cache reader must reject it from its length without
+  // allocating or reading the payload, reset the file, and fetch a replacement.
+  const oversizedArchiveFd = fs.openSync(archiveFiles[0], "w");
+  fs.ftruncateSync(oversizedArchiveFd, 512 * 1024 * 1024 + 1);
+  fs.closeSync(oversizedArchiveFd);
+  removeInstall({ lockfile: false });
+  const beforeOversizedArchive = readStats().requests;
+  const oversizedArchive = runInstall(["--no-verify"]);
+  expectSuccess(oversizedArchive);
+  assert.equal(
+    readStats().requests,
+    beforeOversizedArchive + 1,
+    "an oversized archive cache entry did not reset and refetch",
+  );
+
+  const extractedDirectories = fs
+    .readdirSync(cacheRoot, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        entry.name.startsWith(`${poisonVictim}@`) &&
+        entry.name.includes("@@source-"),
+    );
+  assert.equal(extractedDirectories.length, 1, "expected one source-bound extracted cache entry");
+  const extractedDirectory = path.join(cacheRoot, extractedDirectories[0].name);
+  fs.writeFileSync(path.join(extractedDirectory, "poison-marker"), "untrusted\n");
+  removeInstall({ lockfile: false });
+  const beforeExtractedPoison = readStats().requests;
+  const extractedPoison = runInstall(["--no-verify"]);
+  expectSuccess(extractedPoison);
+  assert.equal(
+    readStats().requests,
+    beforeExtractedPoison,
+    "rebuilding a poisoned extracted cache unexpectedly contacted the registry",
+  );
+  assert.equal(
+    fs.existsSync(path.join(projectRoot, "node_modules", poisonVictim, "poison-marker")),
+    false,
+    "a poisoned extracted cache entry was copied into node_modules",
+  );
+
+  if (process.platform !== "win32") {
+    const cacheWriteSentinel = path.join(scratch, "cache-write-sentinel");
+    fs.writeFileSync(cacheWriteSentinel, "preserve\n");
+    fs.rmSync(archiveFiles[0]);
+    fs.symlinkSync(cacheWriteSentinel, archiveFiles[0]);
+    removeInstall({ lockfile: false });
+    const symlinkedArchive = runInstall(["--no-verify"]);
+    assert.equal(symlinkedArchive.result.status, 1, "a symlinked archive cache entry was opened for writing");
+    assert.match(symlinkedArchive.result.stderr, /InvalidPackageDestination/);
+    assert.equal(fs.readFileSync(cacheWriteSentinel, "utf8"), "preserve\n");
+
+    fs.rmSync(archiveFiles[0]);
+    fs.copyFileSync(path.join(registryRoot, `${poisonVictim}.tgz`), archiveFiles[0]);
+
+    const brokenVictim = "delayed-package-2";
+    const brokenArchive = findCacheFiles(
+      path.join(cacheRoot, brokenVictim),
+      (_filename, basename) => basename.endsWith(".tgz"),
+    );
+    assert.equal(brokenArchive.length, 1);
+    const brokenTarget = path.join(scratch, "missing-cache-target");
+    fs.rmSync(brokenArchive[0]);
+    fs.symlinkSync(brokenTarget, brokenArchive[0]);
+    removeInstall({ lockfile: false });
+    const brokenSymlinkArchive = runInstall(["--no-verify"]);
+    assert.equal(brokenSymlinkArchive.result.status, 1, "prefetch followed a broken cache symlink");
+    assert.match(brokenSymlinkArchive.result.stderr, /InvalidPackageDestination/);
+    assert.equal(fs.existsSync(brokenTarget), false, "prefetch created a broken symlink target");
+
+    fs.rmSync(brokenArchive[0]);
+    fs.copyFileSync(path.join(registryRoot, `${brokenVictim}.tgz`), brokenArchive[0]);
+
+    const oversizedTargetVictim = "delayed-package-3";
+    const oversizedTargetArchive = findCacheFiles(
+      path.join(cacheRoot, oversizedTargetVictim),
+      (_filename, basename) => basename.endsWith(".tgz"),
+    );
+    assert.equal(oversizedTargetArchive.length, 1);
+    const oversizedTarget = path.join(scratch, "oversized-cache-target");
+    const oversizedTargetFd = fs.openSync(oversizedTarget, "w");
+    fs.ftruncateSync(oversizedTargetFd, 512 * 1024 * 1024 + 1);
+    fs.closeSync(oversizedTargetFd);
+    fs.rmSync(oversizedTargetArchive[0]);
+    fs.symlinkSync(oversizedTarget, oversizedTargetArchive[0]);
+    removeInstall({ lockfile: false });
+    const oversizedSymlinkArchive = runInstall(["--no-verify"]);
+    assert.equal(oversizedSymlinkArchive.result.status, 1, "prefetch followed an oversized cache symlink target");
+    assert.match(oversizedSymlinkArchive.result.stderr, /InvalidPackageDestination/);
+    assert.equal(
+      fs.statSync(oversizedTarget).size,
+      512 * 1024 * 1024 + 1,
+      "prefetch truncated an oversized cache symlink target",
+    );
+
+    fs.rmSync(oversizedTargetArchive[0]);
+    fs.copyFileSync(path.join(registryRoot, `${oversizedTargetVictim}.tgz`), oversizedTargetArchive[0]);
+  }
+
+  const hardLinkVictim = "delayed-package-4";
+  const hardLinkArchive = findCacheFiles(
+    path.join(cacheRoot, hardLinkVictim),
+    (_filename, basename) => basename.endsWith(".tgz"),
+  );
+  assert.equal(hardLinkArchive.length, 1);
+  const hardLinkSentinel = path.join(scratch, "hard-link-cache-sentinel");
+  fs.writeFileSync(hardLinkSentinel, "preserve\n");
+  fs.rmSync(hardLinkArchive[0]);
+  fs.linkSync(hardLinkSentinel, hardLinkArchive[0]);
+  removeInstall({ lockfile: false });
+  const hardLinkedArchive = runInstall(["--no-verify"]);
+  assert.equal(hardLinkedArchive.result.status, 1, "prefetch wrote through a hard-linked cache entry");
+  assert.match(hardLinkedArchive.result.stderr, /InvalidPackageDestination/);
+  assert.equal(fs.readFileSync(hardLinkSentinel, "utf8"), "preserve\n");
 
   console.log(
     `package-manager cache concurrency: pass ` +

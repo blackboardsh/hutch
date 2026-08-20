@@ -1,4 +1,5 @@
 const std = @import("std");
+const Lockfile = @import("package_manager_lockfile.zig");
 
 pub const Protocol = struct {
     base_spec: []const u8,
@@ -75,6 +76,7 @@ pub fn destinationForLockKey(
     root_dir: []const u8,
     key: []const u8,
 ) ![]const u8 {
+    if (!Lockfile.packageKeyIsSafe(key)) return error.InvalidPackageKey;
     var output = std.Io.Writer.Allocating.init(allocator);
     try output.writer.writeAll(root_dir);
 
@@ -181,6 +183,17 @@ test "parse patch protocol and package targets" {
     try std.testing.expectEqualStrings("@scope/pkg", target.name);
     try std.testing.expectEqualStrings("1.2.3", target.version.?);
     try std.testing.expectEqualStrings("@scope%2Fpkg@1.2.3.patch", try escapeFilename(allocator, "@scope/pkg@1.2.3.patch"));
+}
+
+test "lock destinations reject traversal components" {
+    try std.testing.expectError(
+        error.InvalidPackageKey,
+        destinationForLockKey(std.testing.allocator, "/project", "parent/../../outside"),
+    );
+    try std.testing.expectError(
+        error.InvalidPackageKey,
+        destinationForLockKey(std.testing.allocator, "/project", "@scope/.."),
+    );
 }
 
 test "convert nested lock keys to node_modules paths" {

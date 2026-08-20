@@ -23,12 +23,12 @@ pub fn main(init: std.process.Init) !void {
             return exitWithError(init.io, "invalid // @hutch pragma", err);
         };
         if (pragma.cli) |pinned| break :selector pinned;
-        // Supplied by the electrobun npm shim, which vendors a launcher and
-        // engine in node_modules: without this, that launcher would resolve
-        // the channel-head engine from the store instead of the adjacent
-        // engine it shipped with, forfeiting lockfile determinism and the
-        // zero-download install. A default, never an override — an explicit
-        // pragma always wins.
+        // Supplied by the electrobun npm shim after it downloads the
+        // version-paired launcher and engine from GitHub release assets into
+        // its cache. Without this, that launcher would resolve the
+        // channel-head engine from the store instead of the adjacent cached
+        // engine it was paired with, forfeiting lockfile determinism. A
+        // default, never an override — an explicit pragma always wins.
         if (init.environ_map.get("HUTCH_DEFAULT_CLI")) |configured| {
             break :selector version_selector.parse(configured) catch |err| {
                 return exitWithError(init.io, "invalid HUTCH_DEFAULT_CLI selector", err);
@@ -56,7 +56,10 @@ fn commandUsesGlobalSelector(command_args: []const [:0]const u8) bool {
     return std.mem.eql(u8, command_args[0], "prune") or
         std.mem.eql(u8, command_args[0], "reset") or
         std.mem.eql(u8, command_args[0], "cache") or
-        std.mem.eql(u8, command_args[0], "clean");
+        std.mem.eql(u8, command_args[0], "clean") or
+        // Upgrading moves the global pair, and a project-pinned engine may
+        // predate the verb; only the current global engine runs it.
+        std.mem.eql(u8, command_args[0], "upgrade");
 }
 
 const ResolvedEngine = struct {
@@ -280,6 +283,7 @@ test "global maintenance commands bypass project CLI selectors" {
     const prune = [_][:0]const u8{ "prune", "--dry-run" };
     const reset = [_][:0]const u8{"reset"};
     const status = [_][:0]const u8{"status"};
+    const upgrade = [_][:0]const u8{ "upgrade", "canary" };
     const nested_legacy_prune = [_][:0]const u8{ "cache", "prune" };
     const legacy_clean = [_][:0]const u8{"clean"};
 
@@ -287,6 +291,7 @@ test "global maintenance commands bypass project CLI selectors" {
     try std.testing.expect(commandUsesGlobalSelector(&reset));
     try std.testing.expect(commandUsesGlobalSelector(&nested_legacy_prune));
     try std.testing.expect(commandUsesGlobalSelector(&legacy_clean));
+    try std.testing.expect(commandUsesGlobalSelector(&upgrade));
     try std.testing.expect(!commandUsesGlobalSelector(&status));
     try std.testing.expect(!commandUsesGlobalSelector(&.{}));
 }

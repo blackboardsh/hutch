@@ -12,7 +12,8 @@ node --test \
   "$SCRIPT_DIR/r2-settings.test.js" \
   "$SCRIPT_DIR/release-contract.test.js" \
   "$SCRIPT_DIR/release-version.test.js" \
-  "$SCRIPT_DIR/verify-linux-glibc.test.js"
+  "$SCRIPT_DIR/verify-linux-glibc.test.js" \
+  "$SCRIPT_DIR/verify-macos-deployment-target.test.js"
 node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/storage-contract.test.js"
 node --test --test-concurrency=1 \
