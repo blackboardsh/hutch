@@ -836,7 +836,7 @@ pub fn main(init: std.process.Init) !void {
         vendored_home,
         "toolchains",
         "bun",
-        "1.3.13",
+        "1.4.0",
         toolchainPlatformKey(),
     });
     const vendored_bun = try std.fs.path.join(allocator, &.{
@@ -853,7 +853,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ vendored_root, ".hutch-toolchain" }),
-        .data = "1.3.13",
+        .data = "1.4.0",
     });
     const vendored_install = try runConfigCommandWithOverrides(
         init,
@@ -869,7 +869,7 @@ pub fn main(init: std.process.Init) !void {
         &.{
             .{ .key = "HUTCH_HOME", .value = vendored_home },
             .{ .key = "HUTCH_TEST_VENDORED_BUN_PATH", .value = vendored_bun },
-            .{ .key = "HUTCH_TEST_VENDORED_BUN_VERSION", .value = "1.3.13" },
+            .{ .key = "HUTCH_TEST_VENDORED_BUN_VERSION", .value = "1.4.0" },
             .{ .key = "HUTCH_TEST_PATH_BUN_VERSION", .value = "0.0.1" },
         },
     );

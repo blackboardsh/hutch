@@ -1024,7 +1024,7 @@ test "matching core markers do not hide incomplete manifest layouts" {
         \\    "rust": { "defaultVersion": "1.88.0" },
         \\    "go": { "defaultVersion": "1.26.4" },
         \\    "odin": { "defaultVersion": "1.0.0" },
-        \\    "bun": { "defaultVersion": "1.3.13" }
+        \\    "bun": { "defaultVersion": "1.4.0" }
         \\  },
         \\  "layout": {
         \\    "runtime": {

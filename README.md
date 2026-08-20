@@ -127,8 +127,10 @@ so its native operations remain available (`hutch pm add three`, for example).
 `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) are ignored entirely:
 never read, migrated, or modified. Hutch resolves from `package.json` and
 creates `hutch.lock`; projects that want their previous tool declare it
-explicitly. Selecting `bun` resolves the toolchain-vendored Bun (the same
-managed binary `mainProcess: "bun"` apps bundle), so no PATH tooling is
+explicitly. In a generic project, selecting `bun` resolves exact Bun 1.4.0,
+reusing an exact PATH match or installing it as a managed toolchain. An
+Electrobun project instead resolves the exact managed Bun pin from its devkit,
+the same binary that `mainProcess: "bun"` apps bundle, so PATH tooling is not
 required in either mode.
 
 On Windows, Hutch invokes npm/pnpm/yarn `.cmd` and `.bat` shims only through its

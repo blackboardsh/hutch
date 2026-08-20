@@ -800,7 +800,7 @@ test("floating Electrobun packageManager bun follows npm default, projection, th
     assert.equal(generic.status, 1, generic.stderr || generic.stdout);
     assert.match(
       generic.stderr,
-      /bun 1\.3\.13 is not installed/,
+      /bun 1\.4\.0 is not installed/,
       "a generic Bun project must retain Hutch's default instead of loading an Electrobun devkit",
     );
     assert.equal(channelRequests, 1, "generic Bun projects must not query Electrobun channels");

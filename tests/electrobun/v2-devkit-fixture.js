@@ -83,7 +83,7 @@ export function createCoreFixture(root, version, host = hostContract()) {
       rust: { defaultVersion: "1.88.0" },
       go: { defaultVersion: "1.26.4" },
       odin: { defaultVersion: "dev-2026-07a" },
-      bun: { defaultVersion: "1.3.13" },
+      bun: { defaultVersion: "1.4.0" },
     },
     layout: {
       runtime,

@@ -7435,7 +7435,7 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     );
     const provenance: BundledRuntimeProvenance = .{
         .electrobun_version = "2.0.0-beta.1",
-        .bun_runtime_version = "1.3.13",
+        .bun_runtime_version = "1.4.0",
         .cottontail_runtime_version = "0.5.0",
     };
     const json = try bundledRuntimeMetadataJson(&ctx, .{
@@ -7519,7 +7519,7 @@ test "bundled runtime metadata carries resolved provenance and CEF debugging pol
     const bun_metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bun_json, .{});
     const runtime_versions = bun_metadata.object.get("runtimeVersions").?;
     try std.testing.expectEqualStrings(
-        "1.3.13",
+        "1.4.0",
         getStringFieldFromObject(runtime_versions.object, "bun").?,
     );
 }

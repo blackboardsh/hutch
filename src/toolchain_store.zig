@@ -6,9 +6,9 @@ const release_store = @import("release_store.zig");
 
 const max_archive_bytes = 1536 * 1024 * 1024;
 
-// Hutch's own bun default for invocations with no hutch.config.ts, where no
-// devkit manifest exists to supply toolchains.bun.defaultVersion.
-pub const default_bun_version = "1.3.13";
+// Hutch's own Bun default for generic packageManager: "bun" projects, where
+// no Electrobun devkit exists to supply toolchains.bun.defaultVersion.
+pub const default_bun_version = "1.4.0";
 
 pub const Kind = enum {
     zig,
@@ -791,17 +791,17 @@ test "toolchain versions cannot escape their toolchain path" {
     try validateVersion(.rust, "1.88.0");
     try validateVersion(.go, "1.26.4");
     try validateVersion(.odin, "dev-2026-07a");
-    try validateVersion(.bun, "1.3.13");
+    try validateVersion(.bun, "1.4.0");
 }
 
 test "bun archives resolve from upstream oven-sh releases" {
-    const archive = try archiveFor(std.testing.allocator, .bun, "1.3.13");
+    const archive = try archiveFor(std.testing.allocator, .bun, "1.4.0");
     defer std.testing.allocator.free(archive.url);
     defer std.testing.allocator.free(archive.filename);
     try std.testing.expect(std.mem.startsWith(
         u8,
         archive.url,
-        "https://github.com/oven-sh/bun/releases/download/bun-v1.3.13/bun-",
+        "https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-",
     ));
     try std.testing.expect(std.mem.endsWith(u8, archive.filename, ".zip"));
     if (builtin.os.tag == .windows) {

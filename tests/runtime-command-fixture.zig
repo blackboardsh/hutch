@@ -332,7 +332,7 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         }
-        const path_version = init.environ_map.get("HUTCH_TEST_PATH_BUN_VERSION") orelse "1.3.13";
+        const path_version = init.environ_map.get("HUTCH_TEST_PATH_BUN_VERSION") orelse "1.4.0";
         try stdout.writeStreamingAll(init.io, path_version);
         try stdout.writeStreamingAll(init.io, "\n");
         return;

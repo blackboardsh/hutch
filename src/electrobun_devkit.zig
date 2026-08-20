@@ -1081,7 +1081,7 @@ const test_manifest_template =
     \\    "rust": { "defaultVersion": "1.88.0" },
     \\    "go": { "defaultVersion": "1.26.4" },
     \\    "odin": { "defaultVersion": "dev-2026-07a" },
-    \\    "bun": { "defaultVersion": "1.3.13" },
+    \\    "bun": { "defaultVersion": "1.4.0" },
     \\    "cottontail": { "defaultVersion": "0.5.0" }
     \\  },
     \\  "layout": {
@@ -1180,7 +1180,7 @@ fn legacyTestManifestSource(allocator: std.mem.Allocator, version: []const u8) !
         allocator,
         current,
         \\    "odin": { "defaultVersion": "dev-2026-07a" },
-        \\    "bun": { "defaultVersion": "1.3.13" },
+        \\    "bun": { "defaultVersion": "1.4.0" },
         \\    "cottontail": { "defaultVersion": "0.5.0" }
     ,
         \\    "odin": { "defaultVersion": "dev-2026-07a" }
@@ -1241,7 +1241,7 @@ test "package-free v2 devkit resolves runtime SDKs and toolchain defaults" {
 
     try std.testing.expectEqualStrings("2.0.0-beta.1", resolution.version);
     try std.testing.expectEqualStrings("0.16.0", resolution.toolchains.zig);
-    try std.testing.expectEqualStrings("1.3.13", resolution.toolchains.bun);
+    try std.testing.expectEqualStrings("1.4.0", resolution.toolchains.bun);
     try std.testing.expectEqualStrings("0.5.0", resolution.toolchains.cottontail.?);
     try std.testing.expect(resolution.runtime.bun == null);
     try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.preload_full, "preload-full.js"));
@@ -1304,7 +1304,7 @@ test "v2 devkit requires an exact bun toolchain default" {
         .limited(max_manifest_bytes),
     );
 
-    for ([_][]const u8{ "latest", "^1.3.13" }) |invalid_version| {
+    for ([_][]const u8{ "latest", "^1.4.0" }) |invalid_version| {
         const replacement = try std.fmt.allocPrint(
             arena.allocator(),
             "\"bun\": {{ \"defaultVersion\": \"{s}\" }}",
@@ -1314,7 +1314,7 @@ test "v2 devkit requires an exact bun toolchain default" {
             u8,
             arena.allocator(),
             valid_source,
-            "\"bun\": { \"defaultVersion\": \"1.3.13\" }",
+            "\"bun\": { \"defaultVersion\": \"1.4.0\" }",
             replacement,
         );
         try std.testing.expect(std.mem.indexOf(u8, malformed, invalid_version) != null);
@@ -1329,7 +1329,7 @@ test "v2 devkit requires an exact bun toolchain default" {
         u8,
         arena.allocator(),
         valid_source,
-        "    \"bun\": { \"defaultVersion\": \"1.3.13\" },\n",
+        "    \"bun\": { \"defaultVersion\": \"1.4.0\" },\n",
         "",
     );
     try std.testing.expect(missing.len < valid_source.len);
