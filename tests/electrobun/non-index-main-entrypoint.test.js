@@ -211,33 +211,48 @@ test("v2 Electrobun product versions are exact Hutch config pins", { timeout: 60
     ...process.env,
     COTTONTAIL_BINARY: cottontail,
     DASH_COTTONTAIL: cottontail,
+    // Floating resolution must never reach the real channel in this test.
+    ELECTROBUN_TEMPLATES_BASE_URL: "https://127.0.0.1:1/electrobun/templates",
     HUTCH_ELECTROBUN_DEVKIT_ROOT: coreRoot,
     HUTCH_ENGINE_BINARY: engine,
     HUTCH_NO_UPDATE_CHECK: "1",
   };
   delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
+  delete env.HUTCH_DEFAULT_ELECTROBUN;
   writeFixtureFile(join(fixture, "electrobun.config.ts"), "export default {};\n");
 
-  const runConfig = () => spawnSync(hutch, ["electrobun", "config"], {
+  const runConfig = (extraEnv = {}) => spawnSync(hutch, ["electrobun", "config"], {
     cwd: fixture,
     encoding: "utf8",
-    env,
+    env: { ...env, ...extraEnv },
   });
 
   try {
+    // Unpinned projects float on the release channel; with the channel
+    // unreachable the failure names the pin escape hatch.
     const missingConfig = runConfig();
     assert.equal(missingConfig.status, 1, missingConfig.stderr || missingConfig.stdout);
-    assert.match(missingConfig.stderr, /hutch\.config\.ts is required/);
+    assert.match(missingConfig.stderr, /no electrobun\.version is pinned/);
 
     for (const source of [
       "export default {};\n",
       "export default { electrobun: {} };\n",
     ]) {
       writeFixtureFile(join(fixture, "hutch.config.ts"), source);
-      const missingVersion = runConfig();
-      assert.equal(missingVersion.status, 1, missingVersion.stderr || missingVersion.stdout);
-      assert.match(missingVersion.stderr, /must set electrobun: \{ version: \"<exact-semver>\" \}/);
+      const floating = runConfig();
+      assert.equal(floating.status, 1, floating.stderr || floating.stdout);
+      assert.match(floating.stderr, /no electrobun\.version is pinned/);
     }
+
+    // A shim-supplied default resolves without a config pin...
+    rmSync(join(fixture, "hutch.config.ts"), { force: true });
+    const viaDefault = runConfig({ HUTCH_DEFAULT_ELECTROBUN: "2.0.0-test.1" });
+    assert.equal(viaDefault.status, 0, viaDefault.stderr || viaDefault.stdout);
+
+    // ...but must itself be an exact version.
+    const badDefault = runConfig({ HUTCH_DEFAULT_ELECTROBUN: "latest" });
+    assert.equal(badDefault.status, 1, badDefault.stderr || badDefault.stdout);
+    assert.match(badDefault.stderr, /HUTCH_DEFAULT_ELECTROBUN must be an exact semantic version/);
 
     for (const version of ["latest", "^2.0.0", "2.x", "not-semver"]) {
       writeFixtureFile(

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const bootstrap_pragma = @import("bootstrap_pragma.zig");
 const managed_store = @import("managed_store.zig");
+const hutch_version = @import("version.zig");
 const release_store = @import("release_store.zig");
 const version_selector = @import("version_selector.zig");
 
@@ -18,7 +19,7 @@ const help_text =
     "the report itself is a read-only snapshot of the store.\n";
 
 /// The `--json` document version. Any incompatible field change bumps this.
-pub const json_schema_version = 4;
+pub const json_schema_version = 5;
 
 const max_walk_depth = 64;
 
@@ -267,8 +268,9 @@ pub const PinEntry = struct {
     /// The version this directory actually runs. Null when unknowable
     /// (a build-revision pin, or no selection recorded yet).
     resolved: ?[]const u8,
-    /// The active channel's current selection.
-    channel_version: ?[]const u8,
+    /// What runs when nothing pins: the active channel's selection for
+    /// Hutch, the launcher's paired release for Cottontail.
+    default_version: ?[]const u8,
     behind: bool,
 };
 
@@ -347,7 +349,12 @@ fn collectPins(
 
     for ([_]release_store.Product{ .hutch, .cottontail }) |product| {
         const field = if (product == .hutch) pragma.cli else pragma.cottontail;
-        const channel_version = selectionVersion(report, product, report.pins.channel);
+        // Hutch's unpinned default is the channel selection; Cottontail's is
+        // the launcher's paired release.
+        const default_version: ?[]const u8 = if (product == .hutch)
+            selectionVersion(report, product, report.pins.channel)
+        else
+            hutch_version.paired_cottontail_version;
         const selector: ?[]const u8 = if (field) |value| switch (value.kind) {
             .version, .production, .canary => value.value,
             .build => try std.fmt.allocPrint(allocator, "build:{s}", .{value.value}),
@@ -356,15 +363,15 @@ fn collectPins(
             .version => value.value,
             .build => null,
             .production, .canary => selectionVersion(report, product, value.value),
-        } else channel_version;
+        } else default_version;
         try report.pins.entries.append(allocator, .{
             .product = product.name(),
             .field = if (product == .hutch) "cli" else "cottontail",
             .selector = selector,
             .resolved = resolved,
-            .channel_version = channel_version,
-            .behind = resolved != null and channel_version != null and
-                !std.mem.eql(u8, resolved.?, channel_version.?),
+            .default_version = default_version,
+            .behind = resolved != null and default_version != null and
+                !std.mem.eql(u8, resolved.?, default_version.?),
         });
     }
 }
@@ -799,7 +806,7 @@ pub fn writeText(
         try writer.print("  (pragma unreadable: {s})\n", .{parse_error});
     } else {
         var table: Table = .{
-            .headers = &.{ "product", "pragma", "runs", "channel", "action" },
+            .headers = &.{ "product", "pragma", "runs", "default", "action" },
             .aligns = &.{ .left, .left, .left, .left, .left },
         };
         for (report.pins.entries.items) |entry| {
@@ -810,10 +817,7 @@ pub fn writeText(
                 else
                     "(default)",
                 entry.resolved orelse "?",
-                try std.fmt.allocPrint(allocator, "{s} {s}", .{
-                    report.pins.channel,
-                    entry.channel_version orelse "-",
-                }),
+                entry.default_version orelse "-",
                 if (entry.behind)
                     try std.fmt.allocPrint(allocator, "hutch {s} pin", .{
                         if (std.mem.eql(u8, entry.product, "hutch")) "self" else entry.product,
@@ -1019,8 +1023,8 @@ fn jsonDocument(allocator: std.mem.Allocator, report: Report) !std.json.Value {
             .{ .string = resolved }
         else
             .null);
-        try value.put(allocator, "channelVersion", if (entry.channel_version) |channel_version|
-            .{ .string = channel_version }
+        try value.put(allocator, "defaultVersion", if (entry.default_version) |default_version|
+            .{ .string = default_version }
         else
             .null);
         try value.put(allocator, "behind", .{ .bool = entry.behind });

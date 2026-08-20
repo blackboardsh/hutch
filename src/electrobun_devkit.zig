@@ -666,7 +666,7 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 
 const ExpectedPathKind = enum { file, directory };
 
-fn validateExactVersion(version: []const u8) !void {
+pub fn validateExactVersion(version: []const u8) !void {
     if (version.len == 0 or version.len > 128) return error.InvalidElectrobunVersion;
     _ = std.SemanticVersion.parse(version) catch return error.InvalidElectrobunVersion;
 }

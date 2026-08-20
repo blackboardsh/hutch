@@ -34,8 +34,15 @@ pub fn resolveCottontail(
         else selector: {
             const pragma = try bootstrap_pragma.discover(init, allocator, command_args);
             if (pragma.cottontail) |selected| break :selector selected;
-            const channel = init.environ_map.get("HUTCH_ACTIVE_CHANNEL") orelse "production";
-            break :selector try version_selector.parse(channel);
+            // Shim-supplied default (the electrobun npm shim's paired pins).
+            if (init.environ_map.get("HUTCH_DEFAULT_COTTONTAIL")) |configured| {
+                break :selector try version_selector.parse(configured);
+            }
+            // Unpinned projects run the Cottontail this Hutch release was
+            // paired with; `hutch self update` advances both together.
+            break :selector try version_selector.parse(
+                @import("version.zig").paired_cottontail_version,
+            );
         };
 
         const release = try release_store.resolveLeased(

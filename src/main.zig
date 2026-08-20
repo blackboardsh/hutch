@@ -8,6 +8,7 @@ const prune_cli = @import("prune_cli.zig");
 const electrobun = @import("electrobun.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
+const electrobun_templates = @import("electrobun_templates.zig");
 const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
 const release_store = @import("release_store.zig");
@@ -19,6 +20,7 @@ const toolchain_store = @import("toolchain_store.zig");
 const version_selector = @import("version_selector.zig");
 
 const version = @import("version.zig").version;
+const hutch_version = @import("version.zig");
 
 const help_text_template =
     \\hutch {s}
@@ -37,7 +39,7 @@ const help_text_template =
     \\  hutch reset
     \\  hutch status [--json]
     \\  hutch self <path|version|update|pin> [selector] [--recursive]
-    \\  hutch cottontail <path|version|update|pin> [selector] [--recursive]
+    \\  hutch cottontail <path|version|pin> [selector] [--recursive]
     \\  hutch --help
     \\  hutch --version
     \\
@@ -723,6 +725,122 @@ fn createPrivateTempDirectory(
     }
 }
 
+// The Electrobun release an app command targets, resolved as: explicit
+// config pin > shim-supplied default (the electrobun npm package's paired
+// version) > the version already projected into .hutch/devkit (floating
+// projects stay put between syncs) > the release channel head. `sync` skips
+// the projection step on purpose: it is the command that advances a
+// floating project.
+fn resolveElectrobunProjectVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cottontail_path: []const u8,
+    subcommand: []const u8,
+    stderr: anytype,
+) ![]const u8 {
+    if (loadHutchConfig(init, allocator, cottontail_path)) |hutch_config| {
+        if (electrobun_devkit.configuredVersion(hutch_config.root)) |pinned| {
+            return pinned;
+        } else |err| switch (err) {
+            error.ElectrobunVersionMissing => {},
+            error.InvalidElectrobunVersion => {
+                try stderr.writeAll(
+                    "hutch electrobun: electrobun.version in hutch.config.ts must be an exact semantic version; channels, ranges, and latest are not allowed\n",
+                );
+                try stderr.flush();
+                std.process.exit(1);
+            },
+            else => {
+                try stderr.writeAll(
+                    "hutch electrobun: electrobun in hutch.config.ts must be an object containing an exact string version\n",
+                );
+                try stderr.flush();
+                std.process.exit(1);
+            },
+        }
+    } else |err| switch (err) {
+        error.HutchConfigNotFound => {},
+        else => {
+            try stderr.print(
+                "hutch electrobun: failed to load hutch.config.ts: {s}\n",
+                .{@errorName(err)},
+            );
+            try stderr.flush();
+            std.process.exit(1);
+        },
+    }
+
+    if (init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN")) |configured| {
+        electrobun_devkit.validateExactVersion(configured) catch {
+            try stderr.print(
+                "hutch electrobun: HUTCH_DEFAULT_ELECTROBUN must be an exact semantic version, got \"{s}\"\n",
+                .{configured},
+            );
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        return configured;
+    }
+
+    if (!std.mem.eql(u8, subcommand, "sync")) {
+        if (projectedElectrobunVersion(init, allocator)) |projected| return projected;
+    }
+
+    const channel = electrobun_templates.activeChannel(init.environ_map) catch {
+        try stderr.writeAll("hutch electrobun: invalid HUTCH_ACTIVE_CHANNEL\n");
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    const catalog = electrobun_templates.load(init, allocator, channel) catch |err| {
+        try stderr.print(
+            "hutch electrobun: no electrobun.version is pinned and the {s} release channel " ++
+                "could not be resolved ({s}). Pin electrobun: {{ version: \"<exact-semver>\" }} " ++
+                "in hutch.config.ts, or retry with network access.\n",
+            .{ channel.name(), @errorName(err) },
+        );
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    try stderr.print(
+        "hutch electrobun: floating on the {s} channel: Electrobun {s} " ++
+            "(pin electrobun.version in hutch.config.ts to stop)\n",
+        .{ channel.name(), catalog.version },
+    );
+    try stderr.flush();
+    return catalog.version;
+}
+
+// A floating project's devkit projection records the release it was last
+// synced to; reusing it keeps builds stable between explicit syncs.
+fn projectedElectrobunVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+) ?[]const u8 {
+    const path = std.fs.path.join(
+        allocator,
+        &.{ ".hutch", "devkit", "projection.json" },
+    ) catch return null;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        path,
+        allocator,
+        .limited(1024 * 1024),
+    ) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        source,
+        .{},
+    ) catch return null;
+    if (parsed != .object) return null;
+    const product = parsed.object.get("product") orelse return null;
+    if (product != .object) return null;
+    const project_version = product.object.get("version") orelse return null;
+    if (project_version != .string or project_version.string.len == 0) return null;
+    electrobun_devkit.validateExactVersion(project_version.string) catch return null;
+    return project_version.string;
+}
+
 fn loadHutchConfig(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1141,12 +1259,13 @@ fn runReleaseCommand(
         };
         return 0;
     }
+    const namespace = if (product == .hutch) "self" else "cottontail";
     if (args.len == 0 or isHelpFlag(args[0])) {
-        const namespace = if (product == .hutch) "self" else "cottontail";
+        const verbs = if (product == .hutch) "path|version|update|pin" else "path|version|pin";
         try stderr.print(
-            "Usage: hutch {s} <path|version|update|pin> " ++
+            "Usage: hutch {s} <{s}> " ++
                 "[production|stable|canary|latest|<semver>|build:<revision>] [--recursive]\n",
-            .{namespace},
+            .{ namespace, verbs },
         );
         return if (args.len == 0) 1 else 0;
     }
@@ -1155,8 +1274,17 @@ fn runReleaseCommand(
     if (std.mem.eql(u8, operation, "pin")) {
         return runPinCommand(init, allocator, product, args[1..], stdout, stderr);
     }
+    if (product == .cottontail and std.mem.eql(u8, operation, "update")) {
+        try stderr.print(
+            "hutch cottontail: Cottontail is paired with the Hutch release " ++
+                "({s} for this launcher); 'hutch self update' advances both together. " ++
+                "Pin a different version with the // @hutch pragma or 'hutch cottontail pin'.\n",
+            .{hutch_version.paired_cottontail_version},
+        );
+        return 1;
+    }
     if (args.len > 2) {
-        try stderr.print("hutch {s}: too many arguments\n", .{product.name()});
+        try stderr.print("hutch {s}: too many arguments\n", .{namespace});
         return 1;
     }
     const channel = activeReleaseChannel(init.environ_map) catch |err| {
@@ -1169,13 +1297,13 @@ fn runReleaseCommand(
             return 1;
         }
     else
-        version_selector.parse(channel) catch unreachable;
+        version_selector.parse(defaultProductVersion(init.environ_map, product, channel)) catch unreachable;
     const refresh = std.mem.eql(u8, operation, "update");
     if (!refresh and
         !std.mem.eql(u8, operation, "path") and
         !std.mem.eql(u8, operation, "version"))
     {
-        try stderr.print("hutch {s}: unknown command: {s}\n", .{ product.name(), operation });
+        try stderr.print("hutch {s}: unknown command: {s}\n", .{ namespace, operation });
         return 1;
     }
 
@@ -1277,14 +1405,17 @@ fn runPinCommand(
         };
     }
 
-    // Without a selector, pin the exact version currently selected for the
-    // active channel; `latest`/`stable`/`canary` write the floating alias.
+    // Without a selector, pin what would run unpinned today: the active
+    // channel's Hutch, or Cottontail's paired default. `latest`/`stable`/
+    // `canary` write the floating alias instead.
     const value = requested orelse concrete: {
         const channel = activeReleaseChannel(init.environ_map) catch |err| {
             try stderr.print("hutch: invalid active channel: {s}\n", .{@errorName(err)});
             return 1;
         };
-        const selector = version_selector.parse(channel) catch unreachable;
+        const selector = version_selector.parse(
+            defaultProductVersion(init.environ_map, product, channel),
+        ) catch unreachable;
         const resolution = release_store.resolve(init, allocator, product, selector, .{
             .offline = environmentFlag(init.environ_map, "DASH_RELEASE_OFFLINE"),
         }) catch |err| {
@@ -1358,6 +1489,20 @@ fn activeReleaseChannel(environment: *const std.process.Environ.Map) ![]const u8
     return version_selector.normalizeChannel(channel);
 }
 
+// The no-selector default: Hutch floats on the channel, Cottontail floats on
+// this release's tested pair (or a wrapping shim's supplied default).
+fn defaultProductVersion(
+    environment: *const std.process.Environ.Map,
+    product: release_store.Product,
+    channel: []const u8,
+) []const u8 {
+    if (product != .cottontail) return channel;
+    if (environment.get("HUTCH_DEFAULT_COTTONTAIL")) |configured| {
+        if (version_selector.parse(configured)) |_| return configured else |_| {}
+    }
+    return hutch_version.paired_cottontail_version;
+}
+
 fn environmentFlag(environment: *const std.process.Environ.Map, name: []const u8) bool {
     const value = environment.get(name) orelse return false;
     return std.mem.eql(u8, value, "1") or
@@ -1382,7 +1527,9 @@ fn maybePromptForUpdates(
     var reader_buffer: [1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &reader_buffer);
 
-    for ([_]release_store.Product{ .hutch, .cottontail }) |product| {
+    // Cottontail is paired with the Hutch release, so only Hutch itself has
+    // a floating channel worth prompting about; updating it moves the pair.
+    for ([_]release_store.Product{.hutch}) |product| {
         const available = release_store.checkForUpdate(
             init,
             allocator,
@@ -2024,36 +2171,10 @@ pub fn main(init: std.process.Init) !void {
                 std.mem.eql(u8, args[2], "build") or
                 std.mem.eql(u8, args[2], "run") or
                 std.mem.eql(u8, args[2], "dev"));
-        const electrobun_version: ?[]const u8 = if (requires_project_version) blk: {
-            const hutch_config = loadHutchConfig(init, allocator, cottontail.executable) catch |err| {
-                switch (err) {
-                    error.HutchConfigNotFound => try stderr.writeAll(
-                        "hutch electrobun: hutch.config.ts is required and must pin electrobun.version\n",
-                    ),
-                    else => try stderr.print(
-                        "hutch electrobun: failed to load hutch.config.ts: {s}\n",
-                        .{@errorName(err)},
-                    ),
-                }
-                try stderr.flush();
-                std.process.exit(1);
-            };
-            break :blk electrobun_devkit.configuredVersion(hutch_config.root) catch |err| {
-                switch (err) {
-                    error.ElectrobunVersionMissing => try stderr.writeAll(
-                        "hutch electrobun: hutch.config.ts must set electrobun: { version: \"<exact-semver>\" }\n",
-                    ),
-                    error.InvalidElectrobunVersion => try stderr.writeAll(
-                        "hutch electrobun: electrobun.version in hutch.config.ts must be an exact semantic version; channels, ranges, and latest are not allowed\n",
-                    ),
-                    else => try stderr.writeAll(
-                        "hutch electrobun: electrobun in hutch.config.ts must be an object containing an exact string version\n",
-                    ),
-                }
-                try stderr.flush();
-                std.process.exit(1);
-            };
-        } else null;
+        const electrobun_version: ?[]const u8 = if (requires_project_version)
+            try resolveElectrobunProjectVersion(init, allocator, cottontail.executable, args[2], stderr)
+        else
+            null;
         const exit_code = electrobun.run(
             init,
             args[2..],

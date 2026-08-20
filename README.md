@@ -62,6 +62,16 @@ config field; omitted fields continue to use the invocation channel.
 Malformed pragmas and unavailable releases are hard errors. A project pin never
 replaces the global production or canary selection.
 
+Without a pragma, the CLI floats on the active channel and Cottontail runs the
+release paired with that CLI. A wrapping distribution (the `electrobun` npm
+package) may supply its own paired defaults through `HUTCH_DEFAULT_CLI`,
+`HUTCH_DEFAULT_COTTONTAIL`, and `HUTCH_DEFAULT_ELECTROBUN`; those are
+defaults, not overrides — an explicit pragma or config pin always wins.
+Electrobun projects may also omit `electrobun.version` entirely: the project
+then floats on the Electrobun release channel, `hutch electrobun sync`
+advances it to the current channel head, and every other command reuses the
+release recorded in `.hutch/devkit` so builds stay stable between syncs.
+
 `hutch self pin` and `hutch cottontail pin` rewrite the nearest config's pragma
 in place. Without a selector they pin the exact version currently selected for
 the active channel; an explicit selector — including the floating `latest` — is
@@ -199,8 +209,13 @@ external package manager are a separate concern.
 
 ```sh
 hutch self update
-hutch cottontail update
 ```
+
+Cottontail is paired with the Hutch release: an unpinned project runs the
+Cottontail version this launcher was built and tested with, and
+`hutch self update` advances both together. There is no separate
+`hutch cottontail update`; a project that needs a different Cottontail pins
+one with the pragma or `hutch cottontail pin`.
 
 Interactive use checks for newer remote-channel releases at most every six
 hours. Each check fetches current metadata rather than reading a persistent
@@ -406,7 +421,7 @@ for the release workflow.
 - `hutch build [args...]`
 - `hutch electrobun <init|sync|build|run|dev> [args...]`
 - `hutch self <path|version|update|pin> [selector] [--recursive]`
-- `hutch cottontail <path|version|update|pin> [selector] [--recursive]`
+- `hutch cottontail <path|version|pin> [selector] [--recursive]`
 - `hutch status [--json]`
 - `hutch prune [--dry-run]`
 - `hutch reset`

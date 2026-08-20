@@ -22,7 +22,15 @@ pub fn main(init: std.process.Init) !void {
         const pragma = bootstrap_pragma.discover(init, allocator, command_args) catch |err| {
             return exitWithError(init.io, "invalid // @hutch pragma", err);
         };
-        break :selector pragma.cli orelse version_selector.parse(channel) catch unreachable;
+        if (pragma.cli) |pinned| break :selector pinned;
+        // A wrapping distribution (the electrobun npm shim) supplies its
+        // paired CLI version as a default; an explicit pragma still wins.
+        if (init.environ_map.get("HUTCH_DEFAULT_CLI")) |configured| {
+            break :selector version_selector.parse(configured) catch |err| {
+                return exitWithError(init.io, "invalid HUTCH_DEFAULT_CLI selector", err);
+            };
+        }
+        break :selector version_selector.parse(channel) catch unreachable;
     };
 
     var engine = resolveEngine(init, allocator, selector, channel) catch |err| {
