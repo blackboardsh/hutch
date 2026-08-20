@@ -219,7 +219,7 @@ fn windowsHandleIsSynchronous(file: std.Io.File) !bool {
     }
 }
 
-test "Windows no-follow lock handles synchronously wait through live contention" {
+test "Windows no-follow lock handles are synchronous and report live contention" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
@@ -261,4 +261,94 @@ test "Windows no-follow lock handles synchronously wait through live contention"
     owner.close(io);
     owner_open = false;
     try std.testing.expect(try tryLock(io, waiter, .shared));
+}
+
+const WindowsBlockingHandoffContext = struct {
+    path: []const u8,
+    contended: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+    acquired: bool = false,
+
+    fn run(context: *@This()) void {
+        const probe = openNonblocking(
+            std.testing.io,
+            std.Io.Dir.cwd(),
+            context.path,
+            .read_write,
+            .shared,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                context.contended.set(std.testing.io);
+                return context.waitForSharedLock();
+            },
+            else => {
+                context.failure = err;
+                context.contended.set(std.testing.io);
+                return;
+            },
+        };
+        probe.close(std.testing.io);
+        context.failure = error.ExpectedExclusiveLockContention;
+        context.contended.set(std.testing.io);
+    }
+
+    fn waitForSharedLock(context: *@This()) void {
+        const lease = openBlocking(
+            std.testing.io,
+            std.Io.Dir.cwd(),
+            context.path,
+            .read_write,
+            .shared,
+        ) catch |err| {
+            context.failure = err;
+            return;
+        };
+        defer lease.close(std.testing.io);
+        context.acquired = true;
+    }
+};
+
+test "Windows blocking shared lock completes after exclusive owner release" {
+    if (builtin.os.tag != .windows or builtin.single_threaded) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    const path = try std.fs.path.join(arena.allocator(), &.{ root, "blocking-handoff.lock" });
+    const initializer = try std.Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+    });
+    initializer.close(io);
+
+    const owner = try openBlocking(
+        io,
+        std.Io.Dir.cwd(),
+        path,
+        .read_write,
+        .exclusive,
+    );
+    var owner_open = true;
+    var waiter: ?std.Thread = null;
+    defer {
+        if (owner_open) owner.close(io);
+        if (waiter) |thread| thread.join();
+    }
+
+    var context: WindowsBlockingHandoffContext = .{ .path = path };
+    waiter = try std.Thread.spawn(.{}, WindowsBlockingHandoffContext.run, .{&context});
+
+    try context.contended.wait(io);
+    owner.close(io);
+    owner_open = false;
+    waiter.?.join();
+    waiter = null;
+
+    if (context.failure) |err| return err;
+    try std.testing.expect(context.acquired);
 }

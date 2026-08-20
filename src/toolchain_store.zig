@@ -1179,7 +1179,10 @@ test "offline toolchain resolution rejects missing and damaged installs before H
 }
 
 test "offline toolchain resolution revalidates after waiting for an installer" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+    // This fixture publishes a POSIX shell executable. Windows lock handoff is
+    // covered directly in file_locks.zig and by the cross-process release
+    // store smoke instead of weakening this toolchain fixture with a fake PE.
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
