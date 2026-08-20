@@ -63,7 +63,10 @@ const tar = spawnSync(
 assert.equal(tar.status, 0, tar.stderr || tar.stdout);
 const archive = readFileSync(archivePath);
 const checksum = createHash("sha256").update(archive).digest("hex");
-const concurrentResolverCount = 12;
+// Windows is the platform where the exclusive installer lock hands off to a
+// shared object lease while other exclusive installers are still queued. Use
+// extra processes there so every release exercises that native lock sequence.
+const concurrentResolverCount = process.platform === "win32" ? 24 : 12;
 const requestCounts = { channel: 0, release: 0, archive: 0 };
 const pendingMetadataResponses = { channel: [], release: [] };
 
@@ -157,10 +160,19 @@ try {
     HUTCH_ACTIVE_CHANNEL: "canary",
     DASH_ARTIFACTS_BASE_URL: `http://127.0.0.1:${server.address().port}`,
   };
-  const coldResolvers = await Promise.all(
+  const coldSettled = await Promise.allSettled(
     Array.from({ length: concurrentResolverCount }, () =>
       runAsync(engine, ["cottontail", "path", "canary"], environment)),
   );
+  const coldFailures = coldSettled.flatMap((result, index) =>
+    result.status === "rejected" ? [`resolver ${index + 1}: ${result.reason?.stack ?? result.reason}`] : []);
+  if (coldFailures.length > 0) {
+    throw new Error(
+      `${coldFailures.length}/${concurrentResolverCount} concurrent release resolvers failed\n` +
+        coldFailures.join("\n\n"),
+    );
+  }
+  const coldResolvers = coldSettled.map((result) => result.value);
   const installed = coldResolvers[0].stdout.trim();
   for (const resolution of coldResolvers) {
     assert.equal(resolution.stdout.trim(), installed);

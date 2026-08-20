@@ -17,6 +17,7 @@ const Workspaces = @import("package_manager_workspaces.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
 const PackageJSON = @import("package_manager_json.zig");
 const Host = @import("package_manager_host.zig");
+const FileLocks = @import("../file_locks.zig");
 const NoFollowFile = @import("../no_follow_file.zig");
 
 const version = @import("../version.zig").version;
@@ -1443,7 +1444,27 @@ fn openLockedCacheFile(
         .missing, .not_link => {},
     }
     while (true) {
-        const existing = NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
+        const existing = if (builtin.os.tag == .windows) windows: {
+            const candidate = NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
+                .mode = .read_write,
+                .allow_directory = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                error.SymLinkLoop => return error.InvalidPackageDestination,
+                else => return err,
+            };
+            if (candidate) |file| {
+                errdefer file.close(io);
+                FileLocks.lockBlocking(io, file, .exclusive) catch |lock_err| switch (lock_err) {
+                    // Match the historical fallback for file systems without
+                    // advisory locks: retain the no-follow handle and rely on
+                    // atomic publication rather than rejecting the cache.
+                    error.FileLocksUnsupported => {},
+                    else => return lock_err,
+                };
+            }
+            break :windows candidate;
+        } else NoFollowFile.openForRead(std.Io.Dir.cwd(), io, resolved_path, .{
             .mode = .read_write,
             .allow_directory = false,
             .lock = .exclusive,
@@ -1460,7 +1481,7 @@ fn openLockedCacheFile(
                     else => return fallback_err,
                 };
                 errdefer waiting_file.close(io);
-                while (!(waiting_file.tryLock(io, .exclusive) catch |lock_err| switch (lock_err) {
+                while (!(FileLocks.tryLock(io, waiting_file, .exclusive) catch |lock_err| switch (lock_err) {
                     error.FileLocksUnsupported => break :blk waiting_file,
                     else => return lock_err,
                 })) {

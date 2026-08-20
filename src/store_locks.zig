@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_locks = @import("file_locks.zig");
 
 pub const state_relative_root = "state";
 
@@ -59,11 +60,13 @@ pub fn acquireGraph(
     const lock_path = try std.fs.path.join(allocator, &.{ locks_root, "graph.lock" });
     try initializePersistentFile(io, lock_path);
     if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidStoreStatePath;
-    return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = mode,
-        .follow_symlinks = false,
-    }) };
+    return .{ .file = try file_locks.openBlocking(
+        io,
+        std.Io.Dir.cwd(),
+        lock_path,
+        .read_write,
+        mode,
+    ) };
 }
 
 /// Acquires the store graph exclusively without waiting. Automatic
@@ -81,12 +84,13 @@ pub fn tryAcquireGraphExclusive(
     const lock_path = try std.fs.path.join(allocator, &.{ locks_root, "graph.lock" });
     try initializePersistentFile(io, lock_path);
     if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidStoreStatePath;
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
+    const file = file_locks.openNonblocking(
+        io,
+        std.Io.Dir.cwd(),
+        lock_path,
+        .read_write,
+        .exclusive,
+    ) catch |err| switch (err) {
         error.WouldBlock, error.AccessDenied, error.PermissionDenied => return null,
         else => return err,
     };
@@ -105,11 +109,13 @@ pub fn acquireObjectLease(
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     try initializePersistentFile(io, lock_path);
     if (!try pathResolvesWithin(io, allocator, home, lock_path)) return error.InvalidManagedObjectPath;
-    return .{ .file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = .shared,
-        .follow_symlinks = false,
-    }) };
+    return .{ .file = try file_locks.openBlocking(
+        io,
+        std.Io.Dir.cwd(),
+        lock_path,
+        .read_write,
+        .shared,
+    ) };
 }
 
 pub fn tryAcquireObjectExclusive(
@@ -118,12 +124,13 @@ pub fn tryAcquireObjectExclusive(
     root: []const u8,
 ) !?std.Io.File {
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
-    return std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
+    return file_locks.openNonblocking(
+        io,
+        std.Io.Dir.cwd(),
+        lock_path,
+        .read_write,
+        .exclusive,
+    ) catch |err| switch (err) {
         error.FileNotFound, error.WouldBlock, error.AccessDenied, error.PermissionDenied => null,
         else => return err,
     };

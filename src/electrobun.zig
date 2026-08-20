@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_locks = @import("file_locks.zig");
 const managed_store = @import("managed_store.zig");
 const store_locks = @import("store_locks.zig");
 const version_selector = @import("version_selector.zig");
@@ -851,12 +852,13 @@ fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
     };
     if (initializer) |file| file.close(ctx.io);
 
-    return locks.openFile(ctx.io, "electrobun-build.lock", .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
+    return file_locks.openNonblocking(
+        ctx.io,
+        locks,
+        "electrobun-build.lock",
+        .read_write,
+        .exclusive,
+    ) catch |err| switch (err) {
         error.WouldBlock => {
             // Never wait for the project lock while retaining a managed object
             // lease. A cold peer can hold this lock while taking the same
@@ -865,11 +867,13 @@ fn acquireProjectBuildLock(ctx: *const Context) !std.Io.File {
             // the invalidated devkit before using it again.
             suspendManagedRootLeasesBeforeProjectBuildLockWait(ctx);
             ctx.writeStdout("[electrobun] Waiting for the project build lock...\n", .{});
-            return locks.openFile(ctx.io, "electrobun-build.lock", .{
-                .mode = .read_write,
-                .lock = .exclusive,
-                .follow_symlinks = false,
-            });
+            return file_locks.openBlocking(
+                ctx.io,
+                locks,
+                "electrobun-build.lock",
+                .read_write,
+                .exclusive,
+            );
         },
         else => return err,
     };
@@ -961,13 +965,13 @@ fn waitForProjectBuildReaders(ctx: *const Context) !void {
         var active = false;
         for (leases.items) |*lease| {
             const lease_name = lease.* orelse continue;
-            const stale = readers.openFile(ctx.io, lease_name, .{
-                .mode = .read_write,
-                .allow_directory = false,
-                .lock = .exclusive,
-                .lock_nonblocking = true,
-                .follow_symlinks = false,
-            }) catch |err| switch (err) {
+            const stale = file_locks.openNonblocking(
+                ctx.io,
+                readers,
+                lease_name,
+                .read_write,
+                .exclusive,
+            ) catch |err| switch (err) {
                 error.WouldBlock => {
                     active = true;
                     continue;

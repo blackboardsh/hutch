@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_locks = @import("file_locks.zig");
 const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
 
@@ -1178,7 +1179,7 @@ test "offline toolchain resolution rejects missing and damaged installs before H
 }
 
 test "offline toolchain resolution revalidates after waiting for an installer" {
-    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1255,12 +1256,13 @@ const OfflineWaitContext = struct {
     fn run(context: *@This()) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const probe = std.Io.Dir.cwd().openFile(std.testing.io, context.lock_path, .{
-            .mode = .read_write,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
+        const probe = file_locks.openNonblocking(
+            std.testing.io,
+            std.Io.Dir.cwd(),
+            context.lock_path,
+            .read_write,
+            .exclusive,
+        ) catch |err| switch (err) {
             error.WouldBlock => {
                 context.contended.set(std.testing.io);
                 return context.resolve(&arena);

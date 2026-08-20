@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_locks = @import("file_locks.zig");
 const store_locks = @import("store_locks.zig");
 const project_state = @import("project_state.zig");
 const release_store = @import("release_store.zig");
@@ -390,11 +391,13 @@ fn registerProjectAt(
     );
     try store_locks.initializePersistentFile(io, registration_lock_path);
     if (!try pathResolvesWithin(io, allocator, home, registration_lock_path)) return error.InvalidStoreStatePath;
-    const registration_lock = try std.Io.Dir.cwd().openFile(io, registration_lock_path, .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .follow_symlinks = false,
-    });
+    const registration_lock = try file_locks.openBlocking(
+        io,
+        std.Io.Dir.cwd(),
+        registration_lock_path,
+        .read_write,
+        .exclusive,
+    );
     defer registration_lock.close(io);
 
     const objects = try allocator.dupe(ManagedObject, objects_input);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_locks = @import("file_locks.zig");
 const no_follow_file = @import("no_follow_file.zig");
 const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
@@ -454,12 +455,13 @@ fn acquireLocksBelow(
             .file => if (std.mem.endsWith(u8, entry.name, ".lock") and
                 !pathEqual(child, retained_lock))
             {
-                const file = std.Io.Dir.cwd().openFile(io, child, .{
-                    .mode = .read_write,
-                    .lock = .exclusive,
-                    .lock_nonblocking = true,
-                    .follow_symlinks = false,
-                }) catch |err| switch (err) {
+                const file = file_locks.openNonblocking(
+                    io,
+                    std.Io.Dir.cwd(),
+                    child,
+                    .read_write,
+                    .exclusive,
+                ) catch |err| switch (err) {
                     error.WouldBlock, error.AccessDenied, error.PermissionDenied => return error.HutchStoreInUse,
                     else => return err,
                 };

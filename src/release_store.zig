@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
+const file_locks = @import("file_locks.zig");
 const no_follow_file = @import("no_follow_file.zig");
 const project_state = @import("project_state.zig");
 const store_locks = @import("store_locks.zig");
@@ -166,37 +167,14 @@ pub fn acquirePersistentFileLock(
     };
     if (initializer) |file| file.close(io);
 
-    const open_options: std.Io.Dir.OpenFileOptions = .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .follow_symlinks = false,
-    };
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
-        .mode = open_options.mode,
-        .lock = open_options.lock,
-        .lock_nonblocking = true,
-        .follow_symlinks = open_options.follow_symlinks,
-    }) catch |err| switch (err) {
-        error.WouldBlock => {
-            if (builtin.os.tag == .windows) {
-                const waiting_file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
-                    .mode = open_options.mode,
-                    .follow_symlinks = open_options.follow_symlinks,
-                });
-                errdefer waiting_file.close(io);
-                while (!try waiting_file.tryLock(io, .exclusive)) {
-                    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
-                }
-                return .{ .file = waiting_file, .contended = true };
-            }
-            return .{
-                .file = try std.Io.Dir.cwd().openFile(io, lock_path, open_options),
-                .contended = true,
-            };
-        },
-        else => return err,
-    };
-    return .{ .file = file, .contended = false };
+    const locked = try file_locks.openBlockingWithContention(
+        io,
+        std.Io.Dir.cwd(),
+        lock_path,
+        .read_write,
+        .exclusive,
+    );
+    return .{ .file = locked.file, .contended = locked.contended };
 }
 
 fn acquirePersistentFileLockAt(
@@ -214,37 +192,14 @@ fn acquirePersistentFileLockAt(
     };
     if (initializer) |file| file.close(io);
 
-    const open_options: std.Io.Dir.OpenFileOptions = .{
-        .mode = .read_write,
-        .lock = .exclusive,
-        .follow_symlinks = false,
-    };
-    const file = directory.openFile(io, name, .{
-        .mode = open_options.mode,
-        .lock = open_options.lock,
-        .lock_nonblocking = true,
-        .follow_symlinks = open_options.follow_symlinks,
-    }) catch |err| switch (err) {
-        error.WouldBlock => {
-            if (builtin.os.tag == .windows) {
-                const waiting_file = try directory.openFile(io, name, .{
-                    .mode = open_options.mode,
-                    .follow_symlinks = open_options.follow_symlinks,
-                });
-                errdefer waiting_file.close(io);
-                while (!try waiting_file.tryLock(io, .exclusive)) {
-                    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake);
-                }
-                return .{ .file = waiting_file, .contended = true };
-            }
-            return .{
-                .file = try directory.openFile(io, name, open_options),
-                .contended = true,
-            };
-        },
-        else => return err,
-    };
-    return .{ .file = file, .contended = false };
+    const locked = try file_locks.openBlockingWithContention(
+        io,
+        directory,
+        name,
+        .read_write,
+        .exclusive,
+    );
+    return .{ .file = locked.file, .contended = locked.contended };
 }
 
 pub fn acquireFileLock(
