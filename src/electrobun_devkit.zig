@@ -20,6 +20,12 @@ pub const ToolchainVersions = struct {
     go: []const u8,
     odin: []const u8,
     bun: []const u8,
+    /// The Cottontail runtime this Electrobun release bundles into apps with
+    /// `mainProcess: "cottontail"` — an app runtime component like the
+    /// bundled Bun, distinct from the build-time Cottontail that executes
+    /// configs and scripts. Null for devkits published before the pin
+    /// existed; those bundle the build-time binary they were tested with.
+    cottontail: ?[]const u8 = null,
 };
 
 pub const RuntimePaths = struct {
@@ -223,6 +229,7 @@ pub fn load(
         .go = try toolchainVersion(toolchains, "go"),
         .odin = try toolchainVersion(toolchains, "odin"),
         .bun = try toolchainVersion(toolchains, "bun"),
+        .cottontail = try optionalToolchainVersion(toolchains, "cottontail"),
     };
 
     const layout = try requiredObjectField(root, "layout");
@@ -678,6 +685,14 @@ fn validateAbi(object: std.json.ObjectMap, expected_name: []const u8, expected_v
     if (try requiredInteger(object, "version") != expected_version) {
         return error.UnsupportedElectrobunDevkitAbi;
     }
+}
+
+fn optionalToolchainVersion(
+    toolchains: std.json.ObjectMap,
+    name: []const u8,
+) !?[]const u8 {
+    if (toolchains.get(name) == null) return null;
+    return try toolchainVersion(toolchains, name);
 }
 
 fn toolchainVersion(toolchains: std.json.ObjectMap, name: []const u8) ![]const u8 {

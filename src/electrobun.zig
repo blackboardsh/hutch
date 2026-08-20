@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const managed_store = @import("managed_store.zig");
 const store_locks = @import("store_locks.zig");
+const version_selector = @import("version_selector.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
@@ -3050,7 +3051,7 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         project_dir,
     );
     ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
-    try prepareInstalledProject(ctx, project_dir, false);
+    try prepareInstalledProject(ctx, project_dir, false, catalog.version);
     if (!skip_install) {
         ctx.writeStdout("Running hutch.config.ts install task if configured...\n", .{});
         try runOptionalConfiguredTask(ctx, project_dir, "install");
@@ -3090,10 +3091,21 @@ fn prepareInstalledProject(
     ctx: *const Context,
     project_dir: []const u8,
     asset_offline: bool,
+    default_electrobun_version: ?[]const u8,
 ) !void {
     var asset_environment = try ctx.environ_map.clone(ctx.allocator);
     defer asset_environment.deinit();
     if (asset_offline) try asset_environment.put("DASH_RELEASE_OFFLINE", "1");
+    // Seed an unpinned template from the catalog it installed from: the
+    // initial sync records this release in the projection, so the project
+    // floats from the version it shipped with rather than re-resolving a
+    // possibly different channel. A pinned config still wins (default, not
+    // override), and later explicit syncs advance normally.
+    if (default_electrobun_version) |seeded| {
+        if (ctx.environ_map.get("HUTCH_DEFAULT_ELECTROBUN") == null) {
+            try asset_environment.put("HUTCH_DEFAULT_ELECTROBUN", seeded);
+        }
+    }
     const hutch = ctx.environ_map.get("HUTCH_LAUNCHER_PATH") orelse ctx.self_exe_path;
     var child = try std.process.spawn(ctx.io, .{
         .argv = &[_][]const u8{ hutch, "electrobun", "sync", "--env=dev" },
@@ -4614,7 +4626,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         try copyPath(ctx, bun_toolchain.resolution.binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
     }
     if (main_process == .cottontail) {
-        try copyPath(ctx, try resolveCottontailBinary(ctx), try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, cottontailBinaryFileName() }));
+        const bundled = try resolveBundledCottontailBinary(ctx, platform_paths);
+        defer if (bundled.lease) |lease| lease.close(ctx.io);
+        try copyPath(ctx, bundled.executable, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, cottontailBinaryFileName() }));
     }
     try copyPath(ctx, platform_paths.core_lib, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.core_lib) }));
     const native_wrapper_source = selectNativeWrapperPath(
@@ -6112,6 +6126,48 @@ fn cottontailBinaryFileName() []const u8 {
     return switch (builtin.os.tag) {
         .windows => "cottontail.exe",
         else => "cottontail",
+    };
+}
+
+const BundledCottontail = struct {
+    executable: []const u8,
+    lease: ?store_locks.ObjectLease = null,
+};
+
+// The bundled Cottontail is an app runtime component: the Electrobun
+// release's devkit manifest pins its exact version, the same way the
+// bundled Bun is pinned, so the shipped runtime never varies with the
+// build machine's tooling. The build-time Cottontail (ctx.cottontail_binary,
+// selected by the pragma or the launcher's paired default) only executes
+// configs, scripts, and the build pipeline. Devkits published before the
+// manifest pin existed bundle the build-time binary their releases were
+// tested with.
+fn resolveBundledCottontailBinary(
+    ctx: *const Context,
+    platform_paths: PlatformPaths,
+) !BundledCottontail {
+    const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
+    const pinned = devkit.toolchains.cottontail orelse {
+        return .{ .executable = try resolveCottontailBinary(ctx) };
+    };
+    const selector = version_selector.parse(pinned) catch
+        return error.InvalidElectrobunToolchainVersion;
+    const release = release_store.resolveLeased(
+        ctx.init,
+        ctx.allocator,
+        .cottontail,
+        selector,
+        .{ .offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE") },
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not resolve the bundled Cottontail {s}: {s}\n",
+            .{ pinned, @errorName(err) },
+        );
+        return err;
+    };
+    return .{
+        .executable = release.resolution.executable,
+        .lease = release.lease,
     };
 }
 

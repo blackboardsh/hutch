@@ -770,6 +770,10 @@ fn resolveElectrobunProjectVersion(
         },
     }
 
+    // Supplied by the electrobun npm shim: the installed package's own
+    // version. This is what makes `npm install electrobun@X` select the
+    // toolchain — the project's lockfile, not the release channel, decides
+    // what an unpinned npm project builds against.
     if (init.environ_map.get("HUTCH_DEFAULT_ELECTROBUN")) |configured| {
         electrobun_devkit.validateExactVersion(configured) catch {
             try stderr.print(
@@ -1489,17 +1493,15 @@ fn activeReleaseChannel(environment: *const std.process.Environ.Map) ![]const u8
     return version_selector.normalizeChannel(channel);
 }
 
-// The no-selector default: Hutch floats on the channel, Cottontail floats on
-// this release's tested pair (or a wrapping shim's supplied default).
+// The no-selector default: Hutch floats on the channel, Cottontail runs
+// this release's tested pair.
 fn defaultProductVersion(
     environment: *const std.process.Environ.Map,
     product: release_store.Product,
     channel: []const u8,
 ) []const u8 {
+    _ = environment;
     if (product != .cottontail) return channel;
-    if (environment.get("HUTCH_DEFAULT_COTTONTAIL")) |configured| {
-        if (version_selector.parse(configured)) |_| return configured else |_| {}
-    }
     return hutch_version.paired_cottontail_version;
 }
 

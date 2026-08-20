@@ -23,8 +23,12 @@ pub fn main(init: std.process.Init) !void {
             return exitWithError(init.io, "invalid // @hutch pragma", err);
         };
         if (pragma.cli) |pinned| break :selector pinned;
-        // A wrapping distribution (the electrobun npm shim) supplies its
-        // paired CLI version as a default; an explicit pragma still wins.
+        // Supplied by the electrobun npm shim, which vendors a launcher and
+        // engine in node_modules: without this, that launcher would resolve
+        // the channel-head engine from the store instead of the adjacent
+        // engine it shipped with, forfeiting lockfile determinism and the
+        // zero-download install. A default, never an override — an explicit
+        // pragma always wins.
         if (init.environ_map.get("HUTCH_DEFAULT_CLI")) |configured| {
             break :selector version_selector.parse(configured) catch |err| {
                 return exitWithError(init.io, "invalid HUTCH_DEFAULT_CLI selector", err);

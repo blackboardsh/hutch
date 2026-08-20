@@ -34,12 +34,11 @@ pub fn resolveCottontail(
         else selector: {
             const pragma = try bootstrap_pragma.discover(init, allocator, command_args);
             if (pragma.cottontail) |selected| break :selector selected;
-            // Shim-supplied default (the electrobun npm shim's paired pins).
-            if (init.environ_map.get("HUTCH_DEFAULT_COTTONTAIL")) |configured| {
-                break :selector try version_selector.parse(configured);
-            }
             // Unpinned projects run the Cottontail this Hutch release was
-            // paired with; `hutch self update` advances both together.
+            // built and tested with; `hutch self update` advances both
+            // together. This is the build-time runtime only — the Cottontail
+            // bundled into an app is pinned by the Electrobun release's
+            // devkit manifest instead.
             break :selector try version_selector.parse(
                 @import("version.zig").paired_cottontail_version,
             );

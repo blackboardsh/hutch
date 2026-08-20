@@ -63,10 +63,12 @@ Malformed pragmas and unavailable releases are hard errors. A project pin never
 replaces the global production or canary selection.
 
 Without a pragma, the CLI floats on the active channel and Cottontail runs the
-release paired with that CLI. A wrapping distribution (the `electrobun` npm
-package) may supply its own paired defaults through `HUTCH_DEFAULT_CLI`,
-`HUTCH_DEFAULT_COTTONTAIL`, and `HUTCH_DEFAULT_ELECTROBUN`; those are
-defaults, not overrides — an explicit pragma or config pin always wins.
+release paired with that CLI — the build-time runtime only; the Cottontail
+bundled into an app is pinned by the Electrobun release's devkit manifest,
+exactly like the bundled Bun. A wrapping distribution (the `electrobun` npm
+package) may supply its paired CLI and Electrobun versions through
+`HUTCH_DEFAULT_CLI` and `HUTCH_DEFAULT_ELECTROBUN`; those are defaults,
+not overrides — an explicit pragma or config pin always wins.
 Electrobun projects may also omit `electrobun.version` entirely: the project
 then floats on the Electrobun release channel, `hutch electrobun sync`
 advances it to the current channel head, and every other command reuses the
