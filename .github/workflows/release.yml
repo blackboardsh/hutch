@@ -127,7 +127,8 @@ jobs:
             tests/electrobun/javascript-sdk-subpaths.test.js \
             tests/electrobun/non-index-main-entrypoint.test.js \
             tests/electrobun/published-platform-artifact.test.js \
-            tests/electrobun/tsconfig-path-alias-bundle.test.js
+            tests/electrobun/tsconfig-path-alias-bundle.test.js \
+            tests/electrobun/update-command.test.js
           if [[ '${{ matrix.platform }}' == 'linux-x64' ]]; then
             package_manager_home="$RUNNER_TEMP/hutch-package-manager-home"
             cottontail="$(HUTCH_HOME="$package_manager_home" ./zig-out/bin/hutch cottontail path)"

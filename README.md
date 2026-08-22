@@ -296,6 +296,12 @@ version already projected into `.hutch/devkit`; an explicit
 `electrobun.config.ts` owns application, build, packaging, and release settings;
 it cannot select the Electrobun framework or SDK version.
 
+`hutch electrobun update` resolves the latest stable release, safely rewrites
+the exact `electrobun.version` string literal in the nearest parent
+`hutch.config.ts`, and then runs `sync` for the current app. It requires network
+access and fails closed rather than rewriting a computed, missing, or ambiguous
+version field.
+
 `hutch electrobun init` prepares the extracted project before reporting
 success. `hutch electrobun prepare` repeats that work without advancing an
 existing floating projection, while `hutch electrobun sync` deliberately
@@ -443,7 +449,7 @@ for the release workflow.
 - `hutch install [args...]`
 - `hutch pm exec [--] <command> [args...]`
 - `hutch build [args...]`
-- `hutch electrobun <init|prepare|sync|build|run|dev> [args...]`
+- `hutch electrobun <init|update|config|prepare|sync|build|run|dev> [args...]`
 - `hutch upgrade [selector]`
 - `hutch self <path|version|update|pin> [selector] [--recursive]`
 - `hutch cottontail <path|version|pin> [selector] [--recursive]`

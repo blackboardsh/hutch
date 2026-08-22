@@ -323,6 +323,7 @@ fn printHelp(writer: anytype) !void {
         \\
         \\Usage:
         \\  hutch electrobun init [project-name] [--template=name] [--beta] [--skip-install]
+        \\  hutch electrobun update
         \\  hutch electrobun config [--env=dev|canary|stable]
         \\  hutch electrobun sync [--env=dev|canary|stable]
         \\  hutch electrobun prepare [--env=dev|canary|stable]
@@ -331,6 +332,7 @@ fn printHelp(writer: anytype) !void {
         \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
+        \\  - update rewrites the nearest parent hutch.config.ts to the latest stable exact version, then runs sync.
         \\  - prepare reuses an existing valid projection for a floating direct-Hutch project; sync advances it to the active channel.
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by Cottontail through Hutch.

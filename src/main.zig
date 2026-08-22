@@ -8,6 +8,7 @@ const prune_cli = @import("prune_cli.zig");
 const electrobun = @import("electrobun.zig");
 const electrobun_artifacts = @import("electrobun_artifacts.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
+const electrobun_pin = @import("electrobun_pin.zig");
 const electrobun_templates = @import("electrobun_templates.zig");
 const package_manager_adapter = @import("package_manager_adapter.zig");
 const process_replace = @import("process_replace.zig");
@@ -30,7 +31,7 @@ const help_text_template =
     \\Usage:
     \\  hutch <entrypoint.js|entrypoint.ts> [args...]
     \\  hutch <script-name> [args...]
-    \\  hutch electrobun <init|config|sync|prepare|build|run|dev> [args...]
+    \\  hutch electrobun <init|update|config|sync|prepare|build|run|dev> [args...]
     \\  hutch install [package-manager-options...]
     \\  hutch pm [package-manager-arguments...]
     \\  hutch run [--if-configured] [script-name] [args...]
@@ -961,6 +962,101 @@ fn resolveElectrobunProjectVersion(
         try stderr.flush();
     }
     return selected.version;
+}
+
+fn updateElectrobunProjectVersion(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cottontail_path: []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !?[]const u8 {
+    const config_path = (try bootstrap_pragma.findNearestConfig(init.io, allocator)) orelse {
+        try stderr.writeAll(
+            "hutch electrobun update: no hutch.config.ts found from the current directory\n",
+        );
+        return null;
+    };
+    const config = loadHutchConfig(init, allocator, cottontail_path) catch |err| {
+        try stderr.print(
+            "hutch electrobun update: failed to load {s}: {s}\n",
+            .{ config_path, @errorName(err) },
+        );
+        return null;
+    };
+    const previous = configuredElectrobunVersion(config.root) catch |err| {
+        try stderr.print(
+            "hutch electrobun update: {s} has an invalid electrobun.version: {s}\n",
+            .{ config_path, @errorName(err) },
+        );
+        return null;
+    } orelse {
+        try stderr.print(
+            "hutch electrobun update: {s} does not contain an exact electrobun.version pin\n",
+            .{config_path},
+        );
+        return null;
+    };
+
+    const catalog = electrobun_templates.load(init, allocator, .stable) catch |err| {
+        try stderr.print(
+            "hutch electrobun update: could not resolve the stable Electrobun release: {s}\n",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    electrobun_templates.validateToolCompatibility(
+        catalog,
+        hutch_version.version,
+        hutch_version.paired_cottontail_version,
+    ) catch |err| {
+        switch (err) {
+            error.TemplateRequiresNewerHutch => try stderr.print(
+                "hutch electrobun update: stable Electrobun requires Hutch {s}; " ++
+                    "this is Hutch {s}. Run `hutch upgrade` and retry\n",
+                .{ catalog.hutch_version, hutch_version.version },
+            ),
+            error.IncompatibleTemplateCottontail => try stderr.print(
+                "hutch electrobun update: stable Electrobun requires Cottontail {s}; " ++
+                    "Hutch {s} is paired with Cottontail {s}. Run `hutch upgrade` and retry\n",
+                .{
+                    catalog.cottontail_version,
+                    hutch_version.version,
+                    hutch_version.paired_cottontail_version,
+                },
+            ),
+            else => try stderr.print(
+                "hutch electrobun update: invalid stable release metadata: {s}\n",
+                .{@errorName(err)},
+            ),
+        }
+        return null;
+    };
+    electrobun_devkit.validateExactVersion(catalog.version) catch {
+        try stderr.writeAll(
+            "hutch electrobun update: the stable catalog does not contain an exact Electrobun version\n",
+        );
+        return null;
+    };
+
+    const rewrite = electrobun_pin.pinConfigFile(
+        init.io,
+        allocator,
+        config_path,
+        previous,
+        catalog.version,
+    ) catch |err| {
+        try stderr.print(
+            "hutch electrobun update: could not safely rewrite {s}: {s}\n",
+            .{ config_path, @errorName(err) },
+        );
+        return null;
+    };
+    try stdout.print(
+        "{s}: electrobun.version={s} (was {s})\n",
+        .{ config_path, catalog.version, rewrite.previous },
+    );
+    return catalog.version;
 }
 
 // A floating project's devkit projection records the release it was last
@@ -2695,6 +2791,35 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
+        if (args.len > 2 and std.mem.eql(u8, args[2], "update")) {
+            if (args.len != 3) {
+                try stderr.writeAll("hutch electrobun update: this command does not accept arguments\n");
+                try stderr.flush();
+                std.process.exit(1);
+            }
+            const updated_version = (try updateElectrobunProjectVersion(
+                init,
+                allocator,
+                cottontail.executable,
+                stdout,
+                stderr,
+            )) orelse {
+                try stdout.flush();
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            try stdout.flush();
+            const sync_args = [_][:0]const u8{"sync"};
+            const exit_code = try electrobun.run(
+                init,
+                &sync_args,
+                cottontail.executable,
+                cottontail.root,
+                updated_version,
+            );
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         const requires_project_version = args.len > 2 and
             (std.mem.eql(u8, args[2], "config") or
                 std.mem.eql(u8, args[2], "sync") or
