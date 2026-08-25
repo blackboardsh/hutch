@@ -4804,6 +4804,11 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         },
     }
 
+    if (main_process == .cottontail) {
+        const main_output = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun", "index.js" });
+        try installCottontailRuntimeCapabilities(ctx, config.root, platform_paths, bundle, main_output);
+    }
+
     try buildViews(ctx, config.root, platform_paths, bundle.app_code_dir);
     try copyStaticAssets(ctx, config.root, bundle.app_code_dir);
     try installBundleAssets(ctx, config, bundle, true);
@@ -4816,6 +4821,162 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         try runHook(ctx, config, "postBuild", &extra_env);
     } else {
         try runHook(ctx, config, "postBuild", null);
+    }
+}
+
+const CottontailCapability = struct {
+    config_name: []const u8,
+    directory_name: []const u8,
+    scan_needles: []const []const u8,
+};
+
+const cottontail_capabilities = [_]CottontailCapability{
+    .{ .config_name = "ffi", .directory_name = "ffi", .scan_needles = &.{ "bun:ffi", "Cottontail.ffi", "Cottontail.bun.ffi" } },
+    .{ .config_name = "sqlite", .directory_name = "sqlite", .scan_needles = &.{ "bun:sqlite", "node:sqlite", "Cottontail.sqlite", "Cottontail.node.sqlite", "Cottontail.bun.sqlite" } },
+    .{ .config_name = "sql", .directory_name = "sql", .scan_needles = &.{ "bun:sql", "Cottontail.sql", "Cottontail.bun.sql" } },
+    .{ .config_name = "redis", .directory_name = "redis", .scan_needles = &.{ "bun:redis", "Cottontail.redis", "Cottontail.bun.redis" } },
+    .{ .config_name = "s3", .directory_name = "s3", .scan_needles = &.{ "bun:s3", "Cottontail.s3", "Cottontail.bun.s3" } },
+    .{ .config_name = "toml", .directory_name = "toml", .scan_needles = &.{ "bun:toml", "Cottontail.toml", "Cottontail.bun.toml" } },
+    .{ .config_name = "json5", .directory_name = "json5", .scan_needles = &.{ "bun:json5", "Cottontail.json5", "Cottontail.bun.json5" } },
+    .{ .config_name = "colors", .directory_name = "colors", .scan_needles = &.{ "bun:color", "Cottontail.colors", "Cottontail.bun.color" } },
+    .{ .config_name = "jscTools", .directory_name = "jsc-tools", .scan_needles = &.{ "bun:jsc", "Cottontail.jscTools", "Cottontail.bun.jsc" } },
+    .{ .config_name = "yaml", .directory_name = "yaml", .scan_needles = &.{ "bun:yaml", "Cottontail.yaml", "Cottontail.bun.yaml" } },
+    .{ .config_name = "test", .directory_name = "test", .scan_needles = &.{ "bun:test", "node:test", "Cottontail.test", "Cottontail.node.test", "Cottontail.bun.test" } },
+    .{ .config_name = "shell", .directory_name = "shell", .scan_needles = &.{ "bun:shell", "Cottontail.shell", "Cottontail.bun.shell" } },
+    .{ .config_name = "build", .directory_name = "build", .scan_needles = &.{ "bun:build", "Cottontail.build", "Cottontail.bun.build" } },
+    .{ .config_name = "bake", .directory_name = "bake", .scan_needles = &.{ "bun:bake", "Cottontail.bake", "Cottontail.bun.bake" } },
+    .{ .config_name = "cookies", .directory_name = "cookies", .scan_needles = &.{ "bun:cookie", "Cottontail.cookies", "Cottontail.bun.cookie" } },
+    .{ .config_name = "websocket", .directory_name = "websocket", .scan_needles = &.{ "bun:websocket", "Cottontail.websocket", "Cottontail.bun.websocket" } },
+    .{ .config_name = "glob", .directory_name = "glob", .scan_needles = &.{ "bun:glob", "Cottontail.glob", "Cottontail.bun.glob" } },
+    .{ .config_name = "text", .directory_name = "text", .scan_needles = &.{ "bun:text", "Cottontail.text", "Cottontail.bun.text" } },
+    .{ .config_name = "uuid", .directory_name = "uuid", .scan_needles = &.{ "bun:uuid", "Cottontail.uuid", "Cottontail.bun.uuid" } },
+    .{ .config_name = "password", .directory_name = "password", .scan_needles = &.{ "bun:password", "Cottontail.password", "Cottontail.bun.password" } },
+    .{ .config_name = "hashing", .directory_name = "hashing", .scan_needles = &.{ "bun:hashing", "Cottontail.hashing", "Cottontail.bun.hashing" } },
+    .{ .config_name = "data", .directory_name = "data", .scan_needles = &.{ "bun:data", "Cottontail.data", "Cottontail.bun.data" } },
+    .{ .config_name = "markdown", .directory_name = "markdown", .scan_needles = &.{ "bun:markdown", "Cottontail.markdown", "Cottontail.bun.markdown" } },
+    .{ .config_name = "compression", .directory_name = "compression", .scan_needles = &.{ "node:zlib", "Cottontail.compression", "Cottontail.node.zlib", "gzipSync", "deflateSync", "inflateSync" } },
+    .{ .config_name = "archive", .directory_name = "archive", .scan_needles = &.{ "bun:archive", "Cottontail.archive", "Cottontail.bun.archive" } },
+    .{ .config_name = "filesystemRouter", .directory_name = "filesystem-router", .scan_needles = &.{ "bun:filesystem-router", "Cottontail.filesystemRouter", "Cottontail.bun.filesystemRouter" } },
+    .{ .config_name = "htmlRewriter", .directory_name = "html-rewriter", .scan_needles = &.{ "bun:html-rewriter", "Cottontail.htmlRewriter", "Cottontail.bun.htmlRewriter" } },
+    .{ .config_name = "terminal", .directory_name = "terminal", .scan_needles = &.{ "bun:terminal", "Cottontail.terminal", "Cottontail.bun.terminal" } },
+    .{ .config_name = "csrf", .directory_name = "csrf", .scan_needles = &.{ "bun:csrf", "Cottontail.csrf", "Cottontail.bun.csrf" } },
+    .{ .config_name = "secrets", .directory_name = "secrets", .scan_needles = &.{ "bun:secrets", "Cottontail.secrets", "Cottontail.bun.secrets" } },
+    .{ .config_name = "inspector", .directory_name = "inspector", .scan_needles = &.{ "node:inspector", "Cottontail.node.inspector" } },
+    .{ .config_name = "repl", .directory_name = "repl", .scan_needles = &.{ "node:repl", "Cottontail.node.repl" } },
+    .{ .config_name = "sea", .directory_name = "sea", .scan_needles = &.{ "node:sea", "Cottontail.node.sea" } },
+};
+
+fn cottontailCapabilityByName(name: []const u8) ?*const CottontailCapability {
+    for (&cottontail_capabilities) |*capability| {
+        if (std.mem.eql(u8, name, capability.config_name) or std.mem.eql(u8, name, capability.directory_name)) return capability;
+    }
+    return null;
+}
+
+fn appendCottontailCapability(
+    allocator: std.mem.Allocator,
+    selected: *std.ArrayList(*const CottontailCapability),
+    capability: *const CottontailCapability,
+) !void {
+    for (selected.items) |existing| if (existing == capability) return;
+    try selected.append(allocator, capability);
+}
+
+fn cottontailCapabilityAppearsInSource(capability: *const CottontailCapability, source: []const u8) bool {
+    for (capability.scan_needles) |needle| {
+        if (std.mem.indexOf(u8, source, needle) != null) return true;
+    }
+    return false;
+}
+
+fn selectedCottontailCapabilities(
+    ctx: *const Context,
+    root: std.json.Value,
+    bundled_main_path: []const u8,
+) !std.ArrayList(*const CottontailCapability) {
+    var selected: std.ArrayList(*const CottontailCapability) = .empty;
+    // Electrobun's main-process SDK always enters its native wrapper through FFI.
+    try appendCottontailCapability(ctx.allocator, &selected, cottontailCapabilityByName("ffi").?);
+
+    const build = getObjectField(root, "build") orelse return selected;
+    const cottontail = getObjectFieldFromObject(build, "cottontail") orelse return selected;
+    if (cottontail.get("capabilities")) |configured| {
+        if (configured != .array) return error.InvalidCottontailCapabilities;
+        for (configured.array.items) |item| {
+            if (item != .string) return error.InvalidCottontailCapabilities;
+            const capability = cottontailCapabilityByName(item.string) orelse {
+                ctx.writeStderr("hutch electrobun: unknown Cottontail capability {s}\n", .{item.string});
+                return error.UnknownCottontailCapability;
+            };
+            try appendCottontailCapability(ctx.allocator, &selected, capability);
+        }
+        return selected;
+    }
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        bundled_main_path,
+        ctx.allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    for (&cottontail_capabilities) |*capability| {
+        if (cottontailCapabilityAppearsInSource(capability, source))
+            try appendCottontailCapability(ctx.allocator, &selected, capability);
+    }
+    return selected;
+}
+
+test "Cottontail capability names accept public and on-disk spellings" {
+    try std.testing.expectEqualStrings("filesystem-router", cottontailCapabilityByName("filesystemRouter").?.directory_name);
+    try std.testing.expectEqualStrings("filesystem-router", cottontailCapabilityByName("filesystem-router").?.directory_name);
+    try std.testing.expectEqualStrings("jsc-tools", cottontailCapabilityByName("jscTools").?.directory_name);
+    try std.testing.expect(cottontailCapabilityByName("not-a-capability") == null);
+}
+
+test "Cottontail capability scanner recognizes namespace and compatibility surfaces" {
+    try std.testing.expect(cottontailCapabilityAppearsInSource(
+        cottontailCapabilityByName("sqlite").?,
+        "import { Database } from 'bun:sqlite';",
+    ));
+    try std.testing.expect(cottontailCapabilityAppearsInSource(
+        cottontailCapabilityByName("compression").?,
+        "const zlib = require(\"node:zlib\");",
+    ));
+    try std.testing.expect(cottontailCapabilityAppearsInSource(
+        cottontailCapabilityByName("htmlRewriter").?,
+        "new Cottontail.htmlRewriter.HTMLRewriter()",
+    ));
+    try std.testing.expect(!cottontailCapabilityAppearsInSource(
+        cottontailCapabilityByName("sqlite").?,
+        "console.log('no optional runtime APIs');",
+    ));
+}
+
+fn installCottontailRuntimeCapabilities(
+    ctx: *const Context,
+    root: std.json.Value,
+    platform_paths: PlatformPaths,
+    bundle: AppBundlePaths,
+    bundled_main_path: []const u8,
+) !void {
+    const runtime = try resolveBundledCottontailBinary(ctx, platform_paths);
+    defer if (runtime.lease) |lease| lease.close(ctx.io);
+    const runtime_dir = std.fs.path.dirname(runtime.executable) orelse return error.InvalidCottontailRuntimeLayout;
+
+    try copyPath(
+        ctx,
+        try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-core" }),
+        try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "cottontail-core" }),
+    );
+
+    var selected = try selectedCottontailCapabilities(ctx, root, bundled_main_path);
+    defer selected.deinit(ctx.allocator);
+    for (selected.items) |capability| {
+        try copyPath(
+            ctx,
+            try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-stdlib", capability.directory_name }),
+            try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "cottontail-stdlib", capability.directory_name }),
+        );
     }
 }
 
