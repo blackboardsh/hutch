@@ -23,10 +23,11 @@ function resolveCottontail() {
   const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
   if (configured) return resolve(configured);
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
-  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
-    cwd: hutchRoot,
-    encoding: "utf8",
-  });
+	const result = spawnSync(hutch, ["cottontail", "path"], {
+		cwd: hutchRoot,
+		encoding: "utf8",
+		env: { ...process.env, HUTCH_ENGINE_BINARY: join(hutchRoot, "zig-out", "bin", executableName("hutch-engine")), HUTCH_NO_UPDATE_CHECK: "1" },
+	});
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout.trim();
 }

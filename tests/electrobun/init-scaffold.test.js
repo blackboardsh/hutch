@@ -30,8 +30,8 @@ const currentHutchVersion = hutchPragma[1];
 const pairedCottontailVersion = hutchPragma[2];
 
 function nextPatchVersion(version) {
-  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  assert.ok(match, `expected a stable version, got ${version}`);
+	const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+	assert.ok(match, `expected an exact semantic version, got ${version}`);
   return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
 }
 
@@ -53,10 +53,11 @@ function resolveCottontail() {
   const configured = process.env.COTTONTAIL_BINARY ?? process.env.DASH_COTTONTAIL;
   if (configured) return resolve(configured);
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
-  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
-    cwd: hutchRoot,
-    encoding: "utf8",
-  });
+	const result = spawnSync(hutch, ["cottontail", "path"], {
+		cwd: hutchRoot,
+		encoding: "utf8",
+		env: { ...process.env, HUTCH_ENGINE_BINARY: join(hutchRoot, "zig-out", "bin", executableName("hutch-engine")), HUTCH_NO_UPDATE_CHECK: "1" },
+	});
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout.trim();
 }

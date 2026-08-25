@@ -3,7 +3,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import {
-  chmodSync,
+	chmodSync,
+	cpSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -56,10 +57,11 @@ function resolveCottontail() {
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
   assert.ok(existsSync(hutch), `Hutch must be built before this test: ${hutch}`);
 
-  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
-    cwd: hutchRoot,
-    encoding: "utf8",
-  });
+	const result = spawnSync(hutch, ["cottontail", "path"], {
+		cwd: hutchRoot,
+		encoding: "utf8",
+		env: { ...process.env, HUTCH_ENGINE_BINARY: join(hutchRoot, "zig-out", "bin", executableName("hutch-engine")), HUTCH_NO_UPDATE_CHECK: "1" },
+	});
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout.trim();
 }
@@ -134,6 +136,7 @@ function installManagedBun(home, version, cottontail) {
   const executable = join(root, executableName("bun"));
   mkdirSync(root, { recursive: true });
   copyFileSync(cottontail, executable);
+  cpSync(join(dirname(cottontail), "cottontail-core"), join(root, "cottontail-core"), { recursive: true });
   chmodSync(executable, 0o755);
   writeFixtureFile(join(root, ".hutch-toolchain"), version);
   return executable;
@@ -152,6 +155,13 @@ function installManagedCottontail(home, { version, revision, source }) {
   mkdirSync(dirname(executable), { recursive: true });
   if (source) copyFileSync(source, executable);
   else writeFixtureFile(executable, "devkit-pinned cottontail runtime fixture\n");
+  const core = join(dirname(executable), "cottontail-core");
+  if (source) {
+    cpSync(join(dirname(source), "cottontail-core"), core, { recursive: true });
+    cpSync(join(dirname(source), "cottontail-stdlib"), join(dirname(executable), "cottontail-stdlib"), { recursive: true });
+  } else {
+    writeFixtureFile(join(core, "capability-namespace.jsc"), "fixture core bytecode\n");
+  }
   chmodSync(executable, 0o755);
   writeFixtureFile(join(root, ".dash-installed"), "a".repeat(64));
   writeFixtureFile(join(root, "cottontail-release.json"), `${JSON.stringify({
@@ -550,6 +560,11 @@ export default {
     const projectionMarker = readFileSync(join(project, ".hutch", "devkit", ".complete"), "utf8");
     assert.match(projectionMarker, new RegExp(`electrobun=${version.replaceAll(".", "\\.")}`));
     assert.match(projectionMarker, new RegExp(`source-manifest-sha256=${devkitManifestSha256}`));
+
+    // This fixture uses Cottontail as a Bun-compatible stand-in. A real Bun
+    // binary is monolithic, whereas current Cottontail releases keep their
+    // bootstrap bytecode adjacent to the executable.
+    cpSync(join(dirname(cottontail), "cottontail-core"), join(execDir, "cottontail-core"), { recursive: true });
 
     const launch = process.platform === "win32"
       ? spawnSync(stagedBun, [launchBridge], { cwd: execDir, encoding: "utf8", env })
