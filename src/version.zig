@@ -4,7 +4,7 @@ pub const version = "0.25.0";
 /// With no pragma and no shim-supplied default, this pair is what runs:
 /// `hutch self update` therefore advances both halves atomically. Explicit
 /// pins (pragma, `hutch cottontail pin`) remain the way to stop floating.
-pub const paired_cottontail_version = "0.6.0-canary.4";
+pub const paired_cottontail_version = "0.6.0-canary.5";
 
 test "the paired cottontail version is an exact semantic version" {
     const std = @import("std");
