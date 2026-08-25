@@ -1,4 +1,4 @@
-pub const version = "0.26.0-canary.1";
+pub const version = "0.26.0-canary.2";
 
 /// The Cottontail release this Hutch release was built and tested with.
 /// With no pragma and no shim-supplied default, this pair is what runs:
