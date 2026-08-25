@@ -4895,8 +4895,17 @@ fn selectedCottontailCapabilities(
     bundled_main_path: []const u8,
 ) !std.ArrayList(*const CottontailCapability) {
     var selected: std.ArrayList(*const CottontailCapability) = .empty;
-    // Electrobun's main-process SDK always enters its native wrapper through FFI.
-    try appendCottontailCapability(ctx.allocator, &selected, cottontailCapabilityByName("ffi").?);
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        bundled_main_path,
+        ctx.allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    for (&cottontail_capabilities) |*capability| {
+        if (cottontailCapabilityAppearsInSource(capability, source))
+            try appendCottontailCapability(ctx.allocator, &selected, capability);
+    }
 
     const build = getObjectField(root, "build") orelse return selected;
     const cottontail = getObjectFieldFromObject(build, "cottontail") orelse return selected;
@@ -4910,18 +4919,6 @@ fn selectedCottontailCapabilities(
             };
             try appendCottontailCapability(ctx.allocator, &selected, capability);
         }
-        return selected;
-    }
-
-    const source = try std.Io.Dir.cwd().readFileAlloc(
-        ctx.io,
-        bundled_main_path,
-        ctx.allocator,
-        .limited(64 * 1024 * 1024),
-    );
-    for (&cottontail_capabilities) |*capability| {
-        if (cottontailCapabilityAppearsInSource(capability, source))
-            try appendCottontailCapability(ctx.allocator, &selected, capability);
     }
     return selected;
 }
