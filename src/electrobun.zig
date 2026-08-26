@@ -3163,6 +3163,8 @@ fn runInit(ctx: *const Context, args: []const [:0]const u8) !void {
         ctx.allocator,
         template,
         project_dir,
+        catalog.hutch_version,
+        catalog.cottontail_version,
     );
     ctx.writeStdout("Preparing the Electrobun devkit and required toolchain...\n", .{});
     try prepareInstalledProject(ctx, project_dir, false, catalog.version);

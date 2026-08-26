@@ -294,6 +294,10 @@ export default {
     );
     assert.doesNotMatch(readFileSync(join(projectRoot, "electrobun.config.ts"), "utf8"), /electrobun:/);
     assert.match(readFileSync(join(projectRoot, "hutch.config.ts"), "utf8"), /electrobun: \{ version: "2\.0\.0" \}/);
+    assert.match(
+      readFileSync(join(projectRoot, "hutch.config.ts"), "utf8"),
+      new RegExp(`^// @hutch cli=${requiredHutchVersion.replaceAll(".", "\\.")} cottontail=${requiredCottontailVersion.replaceAll(".", "\\.")}\\n`),
+    );
     assert.ok(existsSync(join(projectRoot, ".hutch", "devkit", "projection.json")));
     assert.equal(readFileSync(join(projectRoot, ".configured-install-ran"), "utf8"), projectRoot);
     assert.equal(requestCounts.channel, 4);

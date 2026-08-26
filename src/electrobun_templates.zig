@@ -115,6 +115,8 @@ pub fn install(
     allocator: std.mem.Allocator,
     template: Template,
     destination: []const u8,
+    hutch_version: []const u8,
+    cottontail_version: []const u8,
 ) !void {
     if (pathExists(init.io, destination)) return error.ProjectAlreadyExists;
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidProjectPath;
@@ -153,7 +155,40 @@ pub fn install(
     }
     const electrobun_config = try std.fs.path.join(allocator, &.{ temporary, "electrobun.config.ts" });
     if (!pathExists(init.io, electrobun_config)) return error.InvalidTemplateArchive;
+    try stampInstalledToolchain(
+        init,
+        allocator,
+        temporary,
+        hutch_version,
+        cottontail_version,
+    );
     try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), destination, init.io);
+}
+
+fn stampInstalledToolchain(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    template_root: []const u8,
+    hutch_version: []const u8,
+    cottontail_version: []const u8,
+) !void {
+    const config_path = try std.fs.path.join(allocator, &.{ template_root, "hutch.config.ts" });
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        config_path,
+        allocator,
+        .limited(1024 * 1024),
+    ) catch return error.InvalidTemplateArchive;
+    if (std.mem.startsWith(u8, source, "// @hutch")) return error.InvalidTemplateArchive;
+    const stamped = try std.fmt.allocPrint(
+        allocator,
+        "// @hutch cli={s} cottontail={s}\n{s}",
+        .{ hutch_version, cottontail_version, source },
+    );
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = config_path,
+        .data = stamped,
+    });
 }
 
 fn createTemplateTemporaryDirectory(
