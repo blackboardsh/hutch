@@ -32,7 +32,7 @@ function resolveCottontail() {
   if (configured) return resolve(configured);
 
   const hutch = join(hutchRoot, "zig-out", "bin", executableName("hutch"));
-  const result = spawnSync(hutch, ["cottontail", "path", "production"], {
+  const result = spawnSync(hutch, ["cottontail", "path"], {
     cwd: hutchRoot,
     encoding: "utf8",
   });
