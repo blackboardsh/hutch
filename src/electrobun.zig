@@ -4905,23 +4905,49 @@ fn cottontailCapabilityAppearsInSource(capability: *const CottontailCapability, 
     return false;
 }
 
+fn scanCottontailCapabilities(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !std.ArrayList(*const CottontailCapability) {
+    var discovered: std.ArrayList(*const CottontailCapability) = .empty;
+    errdefer discovered.deinit(allocator);
+    for (&cottontail_capabilities) |*capability| {
+        if (cottontailCapabilityAppearsInSource(capability, source))
+            try discovered.append(allocator, capability);
+    }
+    return discovered;
+}
+
+fn writeCottontailCapabilityScan(
+    writer: *std.Io.Writer,
+    discovered: []const *const CottontailCapability,
+) !void {
+    try writer.writeAll("hutch electrobun: Cottontail capabilities discovered by scan: [");
+    for (discovered, 0..) |capability, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writer.writeAll(capability.config_name);
+    }
+    try writer.writeAll("]\n");
+}
+
 fn selectedCottontailCapabilities(
     ctx: *const Context,
     root: std.json.Value,
     bundled_main_path: []const u8,
 ) !std.ArrayList(*const CottontailCapability) {
-    var selected: std.ArrayList(*const CottontailCapability) = .empty;
-
     const source = try std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
         bundled_main_path,
         ctx.allocator,
         .limited(64 * 1024 * 1024),
     );
-    for (&cottontail_capabilities) |*capability| {
-        if (cottontailCapabilityAppearsInSource(capability, source))
-            try appendCottontailCapability(ctx.allocator, &selected, capability);
-    }
+    var selected = try scanCottontailCapabilities(ctx.allocator, source);
+    errdefer selected.deinit(ctx.allocator);
+
+    var scan_output: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer scan_output.deinit();
+    try writeCottontailCapabilityScan(&scan_output.writer, selected.items);
+    ctx.writeStdout("{s}", .{scan_output.written()});
 
     const build = getObjectField(root, "build") orelse return selected;
     const cottontail = getObjectFieldFromObject(build, "cottontail") orelse return selected;
@@ -4963,6 +4989,42 @@ test "Cottontail capability scanner recognizes namespace and compatibility surfa
         cottontailCapabilityByName("sqlite").?,
         "console.log('no optional runtime APIs');",
     ));
+}
+
+test "Cottontail capability scan reports discoveries in deterministic catalog order" {
+    var discovered = try scanCottontailCapabilities(
+        std.testing.allocator,
+        "Cottontail.compression.gzipSync('later'); import { Database } from 'node:sqlite'; require('node:sqlite');",
+    );
+    defer discovered.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), discovered.items.len);
+    try std.testing.expectEqualStrings("sqlite", discovered.items[0].config_name);
+    try std.testing.expectEqualStrings("compression", discovered.items[1].config_name);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeCottontailCapabilityScan(&output.writer, discovered.items);
+    try std.testing.expectEqualStrings(
+        "hutch electrobun: Cottontail capabilities discovered by scan: [sqlite, compression]\n",
+        output.written(),
+    );
+}
+
+test "Cottontail capability scan reports an explicit empty list" {
+    var discovered = try scanCottontailCapabilities(
+        std.testing.allocator,
+        "console.log('no optional runtime APIs');",
+    );
+    defer discovered.deinit(std.testing.allocator);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeCottontailCapabilityScan(&output.writer, discovered.items);
+    try std.testing.expectEqualStrings(
+        "hutch electrobun: Cottontail capabilities discovered by scan: []\n",
+        output.written(),
+    );
 }
 
 fn installCottontailRuntimeCapabilities(
