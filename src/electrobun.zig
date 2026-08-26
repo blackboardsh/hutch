@@ -2026,6 +2026,7 @@ fn appendXmlEscaped(
 const SigningTarget = struct {
     path: []const u8,
     relative_path: []const u8,
+    is_macho: bool = false,
 
     fn deepestFirst(_: void, lhs: SigningTarget, rhs: SigningTarget) bool {
         if (lhs.relative_path.len != rhs.relative_path.len) {
@@ -2064,10 +2065,12 @@ fn codesignBundle(
         const absolute_path = try std.fs.path.join(ctx.allocator, &.{ bundle_root, entry.path });
         switch (entry.kind) {
             .file => {
-                if (!try isMachOFile(ctx, absolute_path)) continue;
+                const is_macho = try isMachOFile(ctx, absolute_path);
+                if (!is_macho and !isJscBytecodePath(entry.path)) continue;
                 try binaries.append(ctx.allocator, .{
                     .path = absolute_path,
                     .relative_path = try ctx.allocator.dupe(u8, entry.path),
+                    .is_macho = is_macho,
                 });
             },
             .directory => {
@@ -2090,7 +2093,7 @@ fn codesignBundle(
             ctx,
             developer_id,
             target.path,
-            if (machOUsesEntitlements(target.relative_path)) entitlements_path else null,
+            if (target.is_macho and machOUsesEntitlements(target.relative_path)) entitlements_path else null,
             true,
         );
     }
@@ -2118,6 +2121,17 @@ fn isNestedCodeBundle(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".bundle") or
         std.mem.endsWith(u8, path, ".xpc") or
         std.mem.endsWith(u8, path, ".appex");
+}
+
+fn isJscBytecodePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".jsc");
+}
+
+test "macOS signing treats Cottontail bytecode as generic nested code" {
+    try std.testing.expect(isJscBytecodePath("Contents/MacOS/cottontail-core/host-bootstrap.jsc"));
+    try std.testing.expect(isJscBytecodePath("Contents/MacOS/cottontail-stdlib/sqlite/main.jsc"));
+    try std.testing.expect(!isJscBytecodePath("Contents/MacOS/cottontail"));
+    try std.testing.expect(!isJscBytecodePath("Contents/MacOS/cottontail-stdlib/sqlite/sqlite.dylib"));
 }
 
 fn machOUsesEntitlements(path: []const u8) bool {
