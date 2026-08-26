@@ -150,7 +150,11 @@ const path = require("node:path");
 const [root, portFile, statsFile, delayText] = process.argv.slice(2);
 const delay = Number(delayText);
 const stats = { active: 0, maxActive: 0, requests: 0 };
-function saveStats() { fs.writeFileSync(statsFile, JSON.stringify(stats)); }
+const statsTemporaryFile = statsFile + ".tmp";
+function saveStats() {
+  fs.writeFileSync(statsTemporaryFile, JSON.stringify(stats));
+  fs.renameSync(statsTemporaryFile, statsFile);
+}
 const server = http.createServer((request, response) => {
   stats.active += 1;
   stats.requests += 1;
