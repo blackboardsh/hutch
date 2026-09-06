@@ -316,6 +316,11 @@ not supported workflows, and a later sync may replace it. The optional
 come from the projected devkit rather than `node_modules/electrobun`.
 Third-party JavaScript dependencies use Hutch's built-in resolver by default,
 or an external package manager selected explicitly in `hutch.config.ts`.
+Cottontail runtime components are a separate graph: Hutch scans the bundled
+application for component roots, reads the exact runtime release's
+`cottontail-stdlib/capabilities.json`, and includes the transitive `requires`
+closure. The selected JavaScript package manager never resolves those private
+runtime components.
 
 For development against an unpublished local core, set
 `HUTCH_ELECTROBUN_DEVKIT_ROOT` to its absolute directory containing the exact

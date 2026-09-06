@@ -4846,6 +4846,8 @@ const CottontailCapability = struct {
     scan_needles: []const []const u8,
 };
 
+const cottontail_capability_manifest_file = "capabilities.json";
+
 const cottontail_capabilities = [_]CottontailCapability{
     .{ .config_name = "ffi", .directory_name = "ffi", .scan_needles = &.{ "bun:ffi", "Cottontail.ffi", "Cottontail.bun.ffi" } },
     .{ .config_name = "sqlite", .directory_name = "sqlite", .scan_needles = &.{ "bun:sqlite", "node:sqlite", "Cottontail.sqlite", "Cottontail.node.sqlite", "Cottontail.bun.sqlite" } },
@@ -4896,6 +4898,136 @@ fn appendCottontailCapability(
 ) !void {
     for (selected.items) |existing| if (existing == capability) return;
     try selected.append(allocator, capability);
+}
+
+fn isCottontailCapabilityId(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if ((byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+fn parseCottontailCapabilityManifest(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !std.json.ObjectMap {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, source, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.InvalidCottontailCapabilityManifest;
+    if (root != .object) return error.InvalidCottontailCapabilityManifest;
+
+    const schema = root.object.get("schema") orelse return error.InvalidCottontailCapabilityManifest;
+    if (schema != .integer) return error.InvalidCottontailCapabilityManifest;
+    if (schema.integer != 1) return error.UnsupportedCottontailCapabilityManifestSchema;
+
+    const capabilities_value = root.object.get("capabilities") orelse
+        return error.InvalidCottontailCapabilityManifest;
+    if (capabilities_value != .object) return error.InvalidCottontailCapabilityManifest;
+    const capabilities = capabilities_value.object;
+
+    var capability_iterator = capabilities.iterator();
+    while (capability_iterator.next()) |entry| {
+        if (!isCottontailCapabilityId(entry.key_ptr.*))
+            return error.InvalidCottontailCapabilityManifest;
+        if (entry.value_ptr.* != .object) return error.InvalidCottontailCapabilityManifest;
+        const requires = entry.value_ptr.*.object.get("requires") orelse
+            return error.InvalidCottontailCapabilityManifest;
+        if (requires != .array) return error.InvalidCottontailCapabilityManifest;
+
+        for (requires.array.items) |dependency| {
+            if (dependency != .string or !isCottontailCapabilityId(dependency.string))
+                return error.InvalidCottontailCapabilityManifest;
+            if (capabilities.get(dependency.string) == null)
+                return error.UnknownCottontailCapabilityDependency;
+        }
+    }
+
+    return capabilities;
+}
+
+fn appendCottontailCapabilityId(
+    allocator: std.mem.Allocator,
+    selected: *std.ArrayList([]const u8),
+    capability: []const u8,
+) !void {
+    for (selected.items) |existing| {
+        if (std.mem.eql(u8, existing, capability)) return;
+    }
+    try selected.append(allocator, capability);
+}
+
+fn expandCottontailCapabilityDependencies(
+    allocator: std.mem.Allocator,
+    roots: []const *const CottontailCapability,
+    manifest: std.json.ObjectMap,
+) !std.ArrayList([]const u8) {
+    var selected: std.ArrayList([]const u8) = .empty;
+    errdefer selected.deinit(allocator);
+
+    for (roots) |capability| {
+        try appendCottontailCapabilityId(allocator, &selected, capability.directory_name);
+    }
+
+    var index: usize = 0;
+    while (index < selected.items.len) : (index += 1) {
+        const capability = manifest.get(selected.items[index]) orelse
+            return error.CottontailCapabilityMissingFromManifest;
+        const requires = capability.object.get("requires") orelse
+            return error.InvalidCottontailCapabilityManifest;
+        for (requires.array.items) |dependency| {
+            try appendCottontailCapabilityId(allocator, &selected, dependency.string);
+        }
+    }
+    return selected;
+}
+
+fn cottontailCapabilityRootIds(
+    allocator: std.mem.Allocator,
+    roots: []const *const CottontailCapability,
+) !std.ArrayList([]const u8) {
+    var selected: std.ArrayList([]const u8) = .empty;
+    errdefer selected.deinit(allocator);
+    for (roots) |capability| {
+        try appendCottontailCapabilityId(allocator, &selected, capability.directory_name);
+    }
+    return selected;
+}
+
+fn loadCottontailCapabilityManifest(
+    ctx: *const Context,
+    runtime_dir: []const u8,
+) !?std.json.ObjectMap {
+    const manifest_path = try std.fs.path.join(ctx.allocator, &.{
+        runtime_dir,
+        "cottontail-stdlib",
+        cottontail_capability_manifest_file,
+    });
+    // Capability manifests were added after the split runtime layout. Older
+    // and local runtimes retain their original flat, root-only selection.
+    if (!pathExists(ctx.io, manifest_path)) return null;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        manifest_path,
+        ctx.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: could not read the Cottontail capability manifest at {s}: {s}\n",
+            .{ manifest_path, @errorName(err) },
+        );
+        return error.CottontailCapabilityManifestUnreadable;
+    };
+    return parseCottontailCapabilityManifest(ctx.allocator, source) catch |err| {
+        ctx.writeStderr(
+            "hutch electrobun: invalid Cottontail capability manifest at {s}: {s}\n",
+            .{ manifest_path, @errorName(err) },
+        );
+        return err;
+    };
 }
 
 fn cottontailCapabilityAppearsInSource(capability: *const CottontailCapability, source: []const u8) bool {
@@ -5027,6 +5159,99 @@ test "Cottontail capability scan reports an explicit empty list" {
     );
 }
 
+test "Cottontail capability manifest expands transitive dependencies once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const manifest = try parseCottontailCapabilityManifest(
+        allocator,
+        \\{
+        \\  "schema": 1,
+        \\  "capabilities": {
+        \\    "archive": {"requires": ["compression", "capability-support"]},
+        \\    "compression": {"requires": ["data"]},
+        \\    "capability-support": {"requires": ["data"]},
+        \\    "data": {"requires": ["archive"]}
+        \\  }
+        \\}
+        ,
+    );
+    const roots = [_]*const CottontailCapability{
+        cottontailCapabilityByName("archive").?,
+    };
+    var selected = try expandCottontailCapabilityDependencies(allocator, &roots, manifest);
+    defer selected.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), selected.items.len);
+    try std.testing.expectEqualStrings("archive", selected.items[0]);
+    try std.testing.expectEqualStrings("compression", selected.items[1]);
+    try std.testing.expectEqualStrings("capability-support", selected.items[2]);
+    try std.testing.expectEqualStrings("data", selected.items[3]);
+}
+
+test "Cottontail capability manifest rejects malformed and unresolved graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expectError(
+        error.UnsupportedCottontailCapabilityManifestSchema,
+        parseCottontailCapabilityManifest(
+            allocator,
+            \\{"schema":2,"capabilities":{}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.UnknownCottontailCapabilityDependency,
+        parseCottontailCapabilityManifest(
+            allocator,
+            \\{"schema":1,"capabilities":{"archive":{"requires":["compression"]}}}
+            ,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCottontailCapabilityManifest,
+        parseCottontailCapabilityManifest(
+            allocator,
+            \\{"schema":1,"capabilities":{"../archive":{"requires":[]}}}
+            ,
+        ),
+    );
+}
+
+test "Cottontail capability roots must exist in the runtime manifest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const manifest = try parseCottontailCapabilityManifest(
+        allocator,
+        \\{"schema":1,"capabilities":{"archive":{"requires":[]}}}
+        ,
+    );
+    const roots = [_]*const CottontailCapability{
+        cottontailCapabilityByName("terminal").?,
+    };
+    try std.testing.expectError(
+        error.CottontailCapabilityMissingFromManifest,
+        expandCottontailCapabilityDependencies(allocator, &roots, manifest),
+    );
+}
+
+test "Cottontail runtimes without manifests retain flat root selection" {
+    const roots = [_]*const CottontailCapability{
+        cottontailCapabilityByName("archive").?,
+        cottontailCapabilityByName("compression").?,
+        cottontailCapabilityByName("archive").?,
+    };
+    var selected = try cottontailCapabilityRootIds(std.testing.allocator, &roots);
+    defer selected.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), selected.items.len);
+    try std.testing.expectEqualStrings("archive", selected.items[0]);
+    try std.testing.expectEqualStrings("compression", selected.items[1]);
+}
+
 fn installCottontailRuntimeCapabilities(
     ctx: *const Context,
     root: std.json.Value,
@@ -5038,19 +5263,32 @@ fn installCottontailRuntimeCapabilities(
     defer if (runtime.lease) |lease| lease.close(ctx.io);
     const runtime_dir = std.fs.path.dirname(runtime.executable) orelse return error.InvalidCottontailRuntimeLayout;
 
+    var roots = try selectedCottontailCapabilities(ctx, root, bundled_main_path);
+    defer roots.deinit(ctx.allocator);
+    const manifest = try loadCottontailCapabilityManifest(ctx, runtime_dir);
+    var selected = if (manifest) |capabilities|
+        expandCottontailCapabilityDependencies(ctx.allocator, roots.items, capabilities) catch |err| {
+            ctx.writeStderr(
+                "hutch electrobun: could not resolve Cottontail capability dependencies: {s}\n",
+                .{@errorName(err)},
+            );
+            return err;
+        }
+    else
+        try cottontailCapabilityRootIds(ctx.allocator, roots.items);
+    defer selected.deinit(ctx.allocator);
+
     try copyPath(
         ctx,
         try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-core" }),
         try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "cottontail-core" }),
     );
 
-    var selected = try selectedCottontailCapabilities(ctx, root, bundled_main_path);
-    defer selected.deinit(ctx.allocator);
     for (selected.items) |capability| {
         try copyPath(
             ctx,
-            try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-stdlib", capability.directory_name }),
-            try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "cottontail-stdlib", capability.directory_name }),
+            try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-stdlib", capability }),
+            try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "cottontail-stdlib", capability }),
         );
     }
 }
