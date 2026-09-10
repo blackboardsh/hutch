@@ -2,7 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const archive_util = @import("archive.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
+const file_locks = @import("file_locks.zig");
 const release_store = @import("release_store.zig");
+const store_locks = @import("store_locks.zig");
 
 const default_releases_base_url =
     "https://github.com/blackboardsh/electrobun/releases/download";
@@ -110,25 +112,15 @@ fn ensure(
     });
     const parent = std.fs.path.dirname(root) orelse return error.InvalidElectrobunInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
-    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
-    const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
-    defer lock.close(init.io);
-
-    const offline = environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE");
-    const local_status = try localInstallationStatus(
+    const lock = (try lockForInstallation(
         init.io,
         allocator,
         root,
         kind,
         version,
-    );
-    if (local_status == .valid) return root;
-    if (offline) {
-        return if (local_status == .invalid)
-            error.ElectrobunReleaseInvalid
-        else
-            error.ElectrobunReleaseNotInstalled;
-    }
+        environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE"),
+    )) orelse return root;
+    defer lock.close(init.io);
 
     const base_url = try releasesBaseUrl(init, allocator);
     const selection = try resolveArtifactSelection(
@@ -157,6 +149,75 @@ fn ensure(
         .cef => try installCef(init.io, allocator, root, archive, selection),
     }
     return root;
+}
+
+// A valid cached core is immutable and can be read alongside a running app's
+// shared object lease. Taking the installation writer lock before this check
+// would make even `electrobun sync` wait for every app using this release.
+// The caller keeps the store graph shared until it acquires its object lease,
+// so the validated object cannot be detached during that handoff.
+fn lockForInstallation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    kind: Kind,
+    version: []const u8,
+    offline: bool,
+) !?release_store.PersistentFileLock {
+    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
+    try store_locks.initializePersistentFile(io, lock_path);
+    var contended = false;
+    while (true) {
+        // Repeated validation while an invalid installation is leased must
+        // not accumulate parsed manifests for the lifetime of that app.
+        var check_arena = std.heap.ArenaAllocator.init(allocator);
+        defer check_arena.deinit();
+        {
+            const reader = try file_locks.openBlocking(
+                io,
+                std.Io.Dir.cwd(),
+                lock_path,
+                .read_write,
+                .shared,
+            );
+            defer reader.close(io);
+            const local_status = try localInstallationStatus(io, check_arena.allocator(), root, kind, version);
+            if (local_status == .valid) return null;
+            if (offline) {
+                return if (local_status == .invalid)
+                    error.ElectrobunReleaseInvalid
+                else
+                    error.ElectrobunReleaseNotInstalled;
+            }
+        }
+
+        // Never upgrade a retained reader: two cold peers could deadlock.
+        // Also avoid queuing indefinitely for exclusive access: a peer can
+        // install the release and immediately acquire a long-lived app lease.
+        // Re-enter shared validation after contention to reuse that result.
+        const writer = file_locks.openNonblocking(
+            io,
+            std.Io.Dir.cwd(),
+            lock_path,
+            .read_write,
+            .exclusive,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                contended = true;
+                try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer writer.close(io);
+        // A peer may publish in the reader-to-writer gap. Check again before
+        // downloading or replacing anything, now under the writer lock.
+        if (try localInstallationStatus(io, check_arena.allocator(), root, kind, version) == .valid) {
+            writer.close(io);
+            return null;
+        }
+        return .{ .file = writer, .contended = contended };
+    }
 }
 
 fn resolveArtifactSelection(
@@ -1002,6 +1063,63 @@ test "Electrobun index URLs and versions cannot escape the release URL" {
     try std.testing.expectError(error.InvalidElectrobunVersion, validateVersion("2.0.0/path"));
 }
 
+const test_core_manifest_template =
+    \\{
+    \\  "schemaVersion": 1,
+    \\  "product": { "name": "electrobun", "version": "2.0.0" },
+    \\  "target": { "os": "__OS__", "arch": "__ARCH__" },
+    \\  "abi": {
+    \\    "core": { "name": "electrobun-core", "version": 1 },
+    \\    "sdk": { "name": "electrobun-sdk", "version": 1 }
+    \\  },
+    \\  "toolchains": {
+    \\    "zig": { "defaultVersion": "0.16.0" },
+    \\    "rust": { "defaultVersion": "1.88.0" },
+    \\    "go": { "defaultVersion": "1.26.4" },
+    \\    "odin": { "defaultVersion": "1.0.0" },
+    \\    "bun": { "defaultVersion": "1.4.0" }
+    \\  },
+    \\  "layout": {
+    \\    "runtime": {
+    \\      "main": "missing/main.js",
+    \\      "preloadFull": "missing/preload-full.js",
+    \\      "preloadSandboxed": "missing/preload-sandboxed.js",
+    \\      "launcher": "missing/launcher",
+    \\      "extractor": "missing/extractor",
+    \\      "coreLibrary": "missing/core",
+    \\      "nativeWrapper": "missing/native",
+    \\      "nativeWrapperCef": "missing/native-cef",
+    \\      "asarLibrary": "missing/asar",
+    \\      "wgpuLibrary": "missing/wgpu",
+    \\      "processHelper": "missing/helper",
+    \\      "bsdiff": "missing/bsdiff",
+    \\      "bspatch": "missing/bspatch",
+    \\      "zigAsar": "missing/zig-asar",
+    \\      "zigZstd": "missing/zig-zstd"
+    \\    },
+    \\    "sdks": {
+    \\      "javascript": {
+    \\        "root": "missing/api",
+    \\        "main": "missing/api/main.ts",
+    \\        "browser": "missing/api/browser.ts",
+    \\        "config": "missing/api/config.ts",
+    \\        "preload": "missing/api/preload",
+    \\        "exports": { ".": "missing/api/main.ts" }
+    \\      },
+    \\      "zig": { "root": "missing/zig", "entrypoint": "missing/zig/electrobun.zig" },
+    \\      "rust": { "root": "missing/rust", "manifest": "missing/rust/Cargo.toml" },
+    \\      "go": { "root": "missing/go", "manifest": "missing/go/go.mod", "module": "electrobun" },
+    \\      "odin": {
+    \\        "root": "missing/odin/electrobun",
+    \\        "entrypoint": "missing/odin/electrobun/electrobun.odin",
+    \\        "collection": "missing/odin",
+    \\        "collectionName": "electrobun_sdk"
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
 test "matching core markers do not hide incomplete manifest layouts" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1010,66 +1128,10 @@ test "matching core markers do not hide incomplete manifest layouts" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const manifest_template =
-        \\{
-        \\  "schemaVersion": 1,
-        \\  "product": { "name": "electrobun", "version": "2.0.0" },
-        \\  "target": { "os": "__OS__", "arch": "__ARCH__" },
-        \\  "abi": {
-        \\    "core": { "name": "electrobun-core", "version": 1 },
-        \\    "sdk": { "name": "electrobun-sdk", "version": 1 }
-        \\  },
-        \\  "toolchains": {
-        \\    "zig": { "defaultVersion": "0.16.0" },
-        \\    "rust": { "defaultVersion": "1.88.0" },
-        \\    "go": { "defaultVersion": "1.26.4" },
-        \\    "odin": { "defaultVersion": "1.0.0" },
-        \\    "bun": { "defaultVersion": "1.4.0" }
-        \\  },
-        \\  "layout": {
-        \\    "runtime": {
-        \\      "main": "missing/main.js",
-        \\      "preloadFull": "missing/preload-full.js",
-        \\      "preloadSandboxed": "missing/preload-sandboxed.js",
-        \\      "launcher": "missing/launcher",
-        \\      "extractor": "missing/extractor",
-        \\      "coreLibrary": "missing/core",
-        \\      "nativeWrapper": "missing/native",
-        \\      "nativeWrapperCef": "missing/native-cef",
-        \\      "asarLibrary": "missing/asar",
-        \\      "wgpuLibrary": "missing/wgpu",
-        \\      "processHelper": "missing/helper",
-        \\      "bsdiff": "missing/bsdiff",
-        \\      "bspatch": "missing/bspatch",
-        \\      "zigAsar": "missing/zig-asar",
-        \\      "zigZstd": "missing/zig-zstd"
-        \\    },
-        \\    "sdks": {
-        \\      "javascript": {
-        \\        "root": "missing/api",
-        \\        "main": "missing/api/main.ts",
-        \\        "browser": "missing/api/browser.ts",
-        \\        "config": "missing/api/config.ts",
-        \\        "preload": "missing/api/preload",
-        \\        "exports": { ".": "missing/api/main.ts" }
-        \\      },
-        \\      "zig": { "root": "missing/zig", "entrypoint": "missing/zig/electrobun.zig" },
-        \\      "rust": { "root": "missing/rust", "manifest": "missing/rust/Cargo.toml" },
-        \\      "go": { "root": "missing/go", "manifest": "missing/go/go.mod", "module": "electrobun" },
-        \\      "odin": {
-        \\        "root": "missing/odin/electrobun",
-        \\        "entrypoint": "missing/odin/electrobun/electrobun.odin",
-        \\        "collection": "missing/odin",
-        \\        "collectionName": "electrobun_sdk"
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
     const with_os = try std.mem.replaceOwned(
         u8,
         allocator,
-        manifest_template,
+        test_core_manifest_template,
         "__OS__",
         targetOsName(),
     );
@@ -1135,4 +1197,147 @@ test "matching core markers do not hide incomplete manifest layouts" {
         InstallationStatus.invalid,
         try installationStatus(io, allocator, root, .core, selection),
     );
+}
+
+fn createTestCoreInstallation(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    const with_os = try std.mem.replaceOwned(u8, allocator, test_core_manifest_template, "__OS__", targetOsName());
+    const manifest = try std.mem.replaceOwned(u8, allocator, with_os, "__ARCH__", releaseArchName());
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ root, native_devkit_manifest_file_name }),
+        .data = manifest,
+    });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, manifest, .{});
+    try materializeTestLayout(io, allocator, root, try jsonObject(parsed, "layout"));
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try markerPath(allocator, root, .core),
+        .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    });
+}
+
+fn materializeTestLayout(io: std.Io, allocator: std.mem.Allocator, root: []const u8, layout: std.json.Value) !void {
+    var fields = layout.object.iterator();
+    while (fields.next()) |field| {
+        const value = field.value_ptr.*;
+        if (value == .object) {
+            try materializeTestLayout(io, allocator, root, value);
+        } else if (value == .string and std.mem.startsWith(u8, value.string, "missing/")) {
+            const path = try std.fs.path.join(allocator, &.{ root, value.string });
+            const is_directory = std.mem.eql(u8, field.key_ptr.*, "root") or
+                std.mem.eql(u8, field.key_ptr.*, "preload") or
+                std.mem.eql(u8, field.key_ptr.*, "collection");
+            if (is_directory) {
+                try std.Io.Dir.cwd().createDirPath(io, path);
+            } else {
+                try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+                try std.Io.Dir.cwd().writeFile(io, .{
+                    .sub_path = path,
+                    .data = if (std.mem.endsWith(u8, path, "go.mod")) "module electrobun\n" else "fixture\n",
+                });
+            }
+        }
+    }
+}
+
+const CachedInstallationContext = struct {
+    root: []const u8,
+    kind: Kind = .core,
+    version: []const u8 = "2.0.0",
+    offline: bool = true,
+    done: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+    reused: bool = false,
+
+    fn run(context: *@This()) void {
+        const io = std.testing.io;
+        defer context.done.set(io);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const writer = lockForInstallation(io, arena.allocator(), context.root, context.kind, context.version, context.offline) catch |err| {
+            context.failure = err;
+            return;
+        };
+        if (writer) |lock| lock.close(io);
+        context.reused = writer == null;
+    }
+};
+
+fn checkWhileCoreIsLeased(allocator: std.mem.Allocator, context: *CachedInstallationContext) !void {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const io = std.testing.io;
+    const lock_path = try std.mem.concat(allocator, u8, &.{ context.root, ".lock" });
+    try store_locks.initializePersistentFile(io, lock_path);
+    const app_lease = try file_locks.openBlocking(io, std.Io.Dir.cwd(), lock_path, .read_write, .shared);
+    var waiter: ?std.Thread = null;
+    defer {
+        // If a regression blocks on exclusive access, release this fixture's
+        // lease before joining so the test fails with a timeout, not a hang.
+        app_lease.close(io);
+        if (waiter) |thread| thread.join();
+    }
+    waiter = try std.Thread.spawn(.{}, CachedInstallationContext.run, .{context});
+    try context.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    waiter.?.join();
+    waiter = null;
+    try std.testing.expect((try store_locks.tryAcquireObjectExclusive(io, allocator, context.root)) == null);
+}
+
+test "cached Electrobun core is reusable while an app holds its shared lease" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ fixture, "core" });
+    try createTestCoreInstallation(io, allocator, root);
+
+    for ([_]bool{ false, true }) |offline| {
+        var context: CachedInstallationContext = .{ .root = root, .offline = offline };
+        try checkWhileCoreIsLeased(allocator, &context);
+        if (context.failure) |err| return err;
+        try std.testing.expect(context.reused);
+    }
+}
+
+test "leased Electrobun offline validation rejects wrong versions damaged layouts and missing markers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ fixture, "core" });
+    try createTestCoreInstallation(io, allocator, root);
+
+    var wrong_version: CachedInstallationContext = .{ .root = root, .version = "2.0.1" };
+    try checkWhileCoreIsLeased(allocator, &wrong_version);
+    try std.testing.expectEqual(error.ElectrobunReleaseInvalid, wrong_version.failure.?);
+
+    try std.Io.Dir.cwd().deleteFile(io, try std.fs.path.join(allocator, &.{ root, "missing", "main.js" }));
+    var damaged: CachedInstallationContext = .{ .root = root };
+    try checkWhileCoreIsLeased(allocator, &damaged);
+    try std.testing.expectEqual(error.ElectrobunReleaseInvalid, damaged.failure.?);
+
+    try std.Io.Dir.cwd().deleteFile(io, try markerPath(allocator, root, .core));
+    var missing: CachedInstallationContext = .{ .root = root };
+    try checkWhileCoreIsLeased(allocator, &missing);
+    try std.testing.expectEqual(error.ElectrobunReleaseNotInstalled, missing.failure.?);
+}
+
+test "missing Electrobun core requires an exclusive installation lock" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ fixture, "core" });
+    const writer = (try lockForInstallation(io, allocator, root, .core, "2.0.0", false)).?;
+    defer writer.close(io);
+    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
+    try std.testing.expectError(error.WouldBlock, file_locks.openNonblocking(io, std.Io.Dir.cwd(), lock_path, .read_write, .shared));
 }
