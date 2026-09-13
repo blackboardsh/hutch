@@ -564,13 +564,12 @@ fn bootstrapInstalledHutchAt(
             staged,
             forbidden_unmarked_roots,
         ) catch |validation_err| switch (validation_err) {
-            // A concurrent installer can publish the store marker between the
-            // probe above and this validation, making its store entries look
-            // like unrelated files. A home that is marked by the time the
-            // validation fails is this store, not a foreign directory; the
-            // locked publisher below owns all remaining contention.
+            // The initializer writes a temporary marker under store.lock.
+            // Wait for that existing transaction before deciding whether its
+            // in-progress state belongs to this store. Never create plumbing
+            // or claim a home merely because unmarked validation failed.
             error.UnsafeUnmarkedHutchHome => {
-                _ = loadStoreIdentityAt(io, allocator, canonical_home) catch
+                _ = loadStoreIdentityAfterInitialization(io, allocator, canonical_home) catch
                     return validation_err;
             },
             else => return validation_err,
@@ -796,7 +795,23 @@ fn validateUnmarkedStatePlumbing(
     home: []const u8,
 ) !void {
     const state = try std.fs.path.join(allocator, &.{ home, state_directory_name });
-    try requireOnlyDirectoryChild(io, state, "locks");
+    var state_dir = try std.Io.Dir.cwd().openDir(io, state, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer state_dir.close(io);
+    var state_iterator = state_dir.iterate();
+    var saw_locks = false;
+    while (try state_iterator.next(io)) |entry| {
+        if (saw_locks or !std.mem.eql(u8, entry.name, "locks") or
+            try resolvedEntryKind(io, state_dir, entry) != .directory)
+        {
+            return error.UnsafeUnmarkedHutchHome;
+        }
+        saw_locks = true;
+    }
+    // Another initializer can pause between creating state and state/locks.
+    if (!saw_locks) return;
     const locks = try std.fs.path.join(allocator, &.{ state, "locks" });
     var locks_dir = try std.Io.Dir.cwd().openDir(io, locks, .{
         .iterate = true,
@@ -1369,6 +1384,34 @@ fn loadStoreIdentityAt(
         root_directory,
         state_directory,
     );
+}
+
+fn loadStoreIdentityAfterInitialization(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+) !StoreIdentity {
+    var root = try openStoreRootNoFollow(io, home);
+    defer root.close(io);
+    var state = try openStoreStateNoFollow(io, root);
+    defer state.close(io);
+    var locks = try openStoreChildDirectoryNoFollow(
+        io,
+        state,
+        "locks",
+        error.InvalidHutchStoreStatePath,
+    );
+    defer locks.close(io);
+    const lock_stat = try locks.statFile(io, store_lock_file_name, .{
+        .follow_symlinks = false,
+    });
+    if (lock_stat.kind != .file) return error.InvalidHutchStoreStatePath;
+    const lock = try no_follow_file.openForRead(locks, io, store_lock_file_name, .{
+        .allow_directory = false,
+    });
+    defer lock.close(io);
+    try file_locks.lockBlocking(io, lock, .shared);
+    return loadStoreIdentityFromOpenDirectories(io, allocator, root, state);
 }
 
 fn loadStoreIdentityFromOpenDirectories(
@@ -2936,6 +2979,146 @@ test "installer bootstrap atomically publishes a staged Hutch release" {
     const selections = try loadSelectionsAt(io, allocator, home);
     try std.testing.expectEqualStrings(version, selections.hutch_production.?.version);
     try std.testing.expect(pathExists(io, try std.mem.concat(allocator, u8, &.{ final_root, ".lock" })));
+}
+
+const TestInstallerMarkerPublication = struct {
+    var active: ?*@This() = null;
+
+    state: std.Io.Dir,
+    owner: ?PersistentFileLock,
+    published: bool = false,
+    failure: ?anyerror = null,
+
+    // The initializer is paused with its real lock held and temporary marker
+    // written. Publish only after the contender actually observes contention.
+    fn publishOnContention(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self = active.?;
+        if (self.published) return error.Canceled;
+        self.state.rename(
+            ".store.json.tmp-paused",
+            self.state,
+            store_marker_file_name,
+            std.testing.io,
+        ) catch |err| {
+            self.failure = err;
+            return error.Canceled;
+        };
+        self.owner.?.close(std.testing.io);
+        self.owner = null;
+        self.published = true;
+    }
+};
+
+test "installer bootstrap waits for a concurrent ownership marker publication" {
+    const base_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(base_io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    const stage = try createTestStagedHutchArchive(
+        base_io,
+        allocator,
+        home,
+        "0.8.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "markerwait",
+    );
+    const state_path = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+    const lock_path = try std.fs.path.join(allocator, &.{ state_path, "locks", store_lock_file_name });
+    const owner = try acquirePersistentFileLock(base_io, lock_path);
+    var state = try std.Io.Dir.cwd().openDir(base_io, state_path, .{});
+    defer state.close(base_io);
+    var publication: TestInstallerMarkerPublication = .{ .state = state, .owner = owner };
+    defer if (publication.owner) |held| held.close(base_io);
+    TestInstallerMarkerPublication.active = &publication;
+    defer TestInstallerMarkerPublication.active = null;
+
+    const marker = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":1,\"kind\":\"hutch-store\",\"canonicalRoot\":{f}}}\n",
+        .{std.json.fmt(home, .{})},
+    );
+    try state.writeFile(base_io, .{ .sub_path = ".store.json.tmp-paused", .data = marker });
+    var vtable = base_io.vtable.*;
+    vtable.sleep = TestInstallerMarkerPublication.publishOnContention;
+    const io: std.Io = .{ .userdata = base_io.userdata, .vtable = &vtable };
+
+    try bootstrapInstalledHutchAt(io, allocator, home, "canary", stage, &.{});
+    if (publication.failure) |err| return err;
+    try std.testing.expect(publication.published);
+    _ = try loadStoreIdentityAt(base_io, allocator, home);
+    const selections = try loadSelectionsAt(base_io, allocator, home);
+    try std.testing.expectEqualStrings("0.8.0", selections.hutch_canary.?.version);
+}
+
+test "installer bootstrap accepts empty state during concurrent initialization" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    const home = try std.fs.path.join(allocator, &.{ fixture, "home" });
+    const stage = try createTestStagedHutchArchive(
+        io,
+        allocator,
+        home,
+        "0.8.0",
+        "0123456789abcdef0123456789abcdef01234567",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "emptystate",
+    );
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ home, state_directory_name }));
+    try bootstrapInstalledHutchAt(io, allocator, home, "canary", stage, &.{});
+    _ = try loadStoreIdentityAt(io, allocator, home);
+}
+
+test "installer bootstrap does not treat an existing initialization lock as ownership" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = try testAbsoluteRoot(io, allocator, &tmp);
+    for ([_][]const u8{ "stale-file", "directory", "symlink" }) |kind| {
+        if (builtin.os.tag == .windows and std.mem.eql(u8, kind, "symlink")) continue;
+        const home = try std.fs.path.join(allocator, &.{ fixture, kind });
+        const stage = try createTestStagedHutchArchive(
+            io,
+            allocator,
+            home,
+            "0.8.0",
+            "0123456789abcdef0123456789abcdef01234567",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unclaimed",
+        );
+        const state_path = try std.fs.path.join(allocator, &.{ home, state_directory_name });
+        const lock_path = try std.fs.path.join(allocator, &.{ state_path, "locks", store_lock_file_name });
+        const owner = try acquirePersistentFileLock(io, lock_path);
+        owner.close(io);
+        const sentinel = try std.fs.path.join(allocator, &.{ state_path, ".store.json.tmp-unowned" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "unrelated data" });
+        if (std.mem.eql(u8, kind, "directory")) {
+            try std.Io.Dir.cwd().deleteFile(io, lock_path);
+            try std.Io.Dir.cwd().createDir(io, lock_path, .default_dir);
+        } else if (std.mem.eql(u8, kind, "symlink")) {
+            try std.Io.Dir.cwd().deleteFile(io, lock_path);
+            try std.Io.Dir.cwd().symLink(io, sentinel, lock_path, .{});
+        }
+        try std.testing.expectError(
+            error.UnsafeUnmarkedHutchHome,
+            bootstrapInstalledHutchAt(io, allocator, home, "canary", stage, &.{}),
+        );
+        try std.testing.expect(!pathExists(io, try storeMarkerPath(allocator, home)));
+        try std.testing.expectEqualStrings("unrelated data", try std.Io.Dir.cwd().readFileAlloc(io, sentinel, allocator, .limited(64)));
+        try std.Io.Dir.cwd().access(io, stage, .{});
+    }
 }
 
 test "installer bootstrap fails closed on damaged selections before publication" {
