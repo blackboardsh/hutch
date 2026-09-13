@@ -138,6 +138,7 @@ function localEnvironment() {
 		COTTONTAIL_ROOT: cottontailRoot,
 		DASH_COTTONTAIL: cottontailBinary,
 		COTTONTAIL_BINARY: cottontailBinary,
+		HUTCH_ELECTROBUN_COTTONTAIL_BINARY: cottontailBinary,
 		HUTCH_ROOT: hutchRoot,
 		HUTCH_ENGINE_BINARY: hutchEngineBinary,
 		HUTCH_BINARY: hutchBinary,

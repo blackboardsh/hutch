@@ -576,9 +576,9 @@ const RegistryArchiveFetch = struct {
         );
         const valid = cached.len > 0 and fetch_state.integrity != null and
             fetch_state.integrity.?.len > 0 and blk: {
-                verifyIntegrity(cached, fetch_state.integrity) catch break :blk false;
-                break :blk true;
-            };
+            verifyIntegrity(cached, fetch_state.integrity) catch break :blk false;
+            break :blk true;
+        };
         if (valid) return;
         try cache_file.setLength(fetch_state.io, 0);
 
@@ -609,8 +609,7 @@ const RegistryArchiveFetch = struct {
         if (status < 200 or status >= 300) return error.RegistryArchiveRequestFailed;
         if (output.written().len > max_tarball_bytes) return error.ResponseTooLarge;
         if (fetch_state.verify_integrity) try verifyIntegrity(output.written(), fetch_state.integrity);
-        try cache_file.setLength(fetch_state.io, 0);
-        try cache_file.writeStreamingAll(fetch_state.io, output.written());
+        try replaceLockedCacheFile(fetch_state.io, cache_file, output.written());
     }
 };
 
@@ -1245,7 +1244,6 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
     }
 }
 
-
 fn readProjectPackageName(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1259,8 +1257,6 @@ fn readProjectPackageName(
     if (name != .string or name.string.len == 0) return null;
     return name.string;
 }
-
-
 
 fn packageNameForInfo(
     io: std.Io,
@@ -1279,11 +1275,6 @@ fn packageNameForInfo(
     }
     return std.fs.path.basename(fallback_dir);
 }
-
-
-
-
-
 
 fn runPmWhoami(
     init: std.process.Init,
@@ -1331,7 +1322,6 @@ fn runPmWhoami(
     try stdout.flush();
     return 0;
 }
-
 
 fn rootInstalledAliases(io: std.Io, allocator: std.mem.Allocator, root_dir: []const u8) ![]const []const u8 {
     const modules_path = try std.fs.path.join(allocator, &.{ root_dir, "node_modules" });
@@ -1567,6 +1557,42 @@ fn readLockedCacheFileOrReset(
         },
         else => return err,
     };
+}
+
+fn replaceLockedCacheFile(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
+    try file.setLength(io, 0);
+    // Reopened Windows cache files are asynchronous no-follow handles. They
+    // have no streaming cursor; NtWriteFile requires an explicit byte offset.
+    // Match the positional reads and always replace from the start on every OS.
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+test "locked cache rewrites a reopened no-follow handle and truncates old bytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ root, "archive.tgz" });
+    {
+        const file = try openLockedCacheFile(io, allocator, root, path);
+        defer file.close(io);
+        try replaceLockedCacheFile(io, file, "old cached archive with a longer trailing payload");
+    }
+    {
+        const file = try openLockedCacheFile(io, allocator, root, path);
+        defer file.close(io);
+        try replaceLockedCacheFile(io, file, "fresh");
+        try std.testing.expectEqualStrings("fresh", try readLockedCacheFile(io, allocator, file, 1024));
+        try std.testing.expectEqual(@as(u64, 5), try file.length(io));
+        try std.testing.expectEqual(@as(usize, 0), (try readLockedCacheFileOrReset(io, allocator, file, 1)).len);
+        try replaceLockedCacheFile(io, file, "recovered");
+    }
+    const file = try openLockedCacheFile(io, allocator, root, path);
+    defer file.close(io);
+    try std.testing.expectEqualStrings("recovered", try readLockedCacheFile(io, allocator, file, 1024));
 }
 
 fn decodeConfigText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -2477,7 +2503,6 @@ const Manager = struct {
                 }
             }
         }
-
 
         if (!manager.options.silent and manager.options.lockfile_only and !manager.options.no_save and !manager.options.dry_run) {
             try manager.stdout.print("Saved {s} ({d} packages)", .{
@@ -4713,7 +4738,6 @@ const Manager = struct {
             manager.changed = true;
         }
     }
-
 
     fn filterPatternMatches(
         manager: *Manager,
@@ -9120,8 +9144,7 @@ const Manager = struct {
                         repository_slug,
                         reference,
                         integrity_bound,
-                    ))
-                    {
+                    )) {
                         archive = cached;
                         archive_identity = identity;
                     } else {
@@ -9140,8 +9163,7 @@ const Manager = struct {
             }
             if (manager.options.verify_integrity) try verifyIntegrity(downloaded, expected_integrity);
             if (cache_file) |file| {
-                try file.setLength(manager.init_data.io, 0);
-                try file.writeStreamingAll(manager.init_data.io, downloaded);
+                try replaceLockedCacheFile(manager.init_data.io, file, downloaded);
             }
             archive = downloaded;
             archive_identity = downloaded_identity;
@@ -10675,9 +10697,9 @@ const Manager = struct {
         // content trusted.
         const valid = cached.len > 0 and package.integrity != null and package.integrity.?.len > 0 and
             manager.registryArchiveMatchesIdentity(cached, package.name, package.version) and blk: {
-                verifyIntegrity(cached, package.integrity) catch break :blk false;
-                break :blk true;
-            };
+            verifyIntegrity(cached, package.integrity) catch break :blk false;
+            break :blk true;
+        };
         if (valid) {
             try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), cached);
             return cached;
@@ -10695,8 +10717,7 @@ const Manager = struct {
         if (!manager.registryArchiveMatchesIdentity(archive, package.name, package.version)) {
             return error.RegistryPackageIdentityMismatch;
         }
-        try cache_file.setLength(manager.init_data.io, 0);
-        try cache_file.writeStreamingAll(manager.init_data.io, archive);
+        try replaceLockedCacheFile(manager.init_data.io, cache_file, archive);
         try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), archive);
         return archive;
     }
@@ -12153,7 +12174,6 @@ const Manager = struct {
         if (manager.loaded_text_lockfile) return true;
         return manager.save_text_lockfile;
     }
-
 
     fn lockfileNeedsRewrite(manager: *const Manager) bool {
         _ = manager;

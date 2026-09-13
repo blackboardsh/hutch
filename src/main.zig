@@ -209,8 +209,31 @@ fn termExitCode(term: std.process.Child.Term) u8 {
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
+    if (builtin.os.tag == .windows) {
+        // Task names are arbitrary strings, not necessarily Windows paths.
+        // Zig 0.16's access implementation panics on OBJECT_NAME_INVALID
+        // (for example "test:p2p:webrtc"); openFile returns BadPathName.
+        // Keep directories eligible and let the normal script lookup handle
+        // every failed probe, including malformed names.
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = true }) catch return false;
+        file.close(io);
+        return true;
+    }
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
+}
+
+test "command path probes tolerate Windows task names and preserve real paths" {
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(io, .{ .sub_path = "entry with spaces.js", .data = "" });
+    const path = try temp.dir.realPathFileAlloc(io, "entry with spaces.js", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(pathExists(io, path));
+    try std.testing.expect(pathExists(io, std.fs.path.dirname(path).?));
+    try std.testing.expect(!pathExists(io, "hutch-test-nonexistent-task:p2p:webrtc"));
+    try std.testing.expect(!pathExists(io, "hutch-test-nonexistent-task:*?<>|"));
 }
 
 fn pathJoin(allocator: std.mem.Allocator, parts: []const []const u8) ![]const u8 {

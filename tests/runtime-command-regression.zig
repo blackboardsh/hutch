@@ -523,6 +523,27 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(npm_run.term, 0);
 
+    // Bare multi-colon task names must reach config lookup, not crash in a
+    // Windows file-existence probe. Exercise the explicit run spelling too.
+    for ([_][]const []const u8{
+        &.{ "test:p2p:webrtc", "two words", "$literal" },
+        &.{ "run", "test:p2p:webrtc", "two words", "$literal" },
+    }) |invocation| {
+        const colon_task = try runConfigCommand(
+            init,
+            allocator,
+            launcher,
+            engine,
+            runtime,
+            fixture_root,
+            fake_bin,
+            "config-npm",
+            "{\"scripts\":{\"test:p2p:webrtc\":[\"npm\",\"install\",\"--offline\"]}}",
+            invocation,
+        );
+        try expectExit(colon_task.term, 0);
+    }
+
     const builtin_root = try std.fs.path.join(allocator, &.{ fixture_root, "builtin-default" });
     try std.Io.Dir.cwd().createDirPath(init.io, builtin_root);
     try std.Io.Dir.cwd().writeFile(init.io, .{

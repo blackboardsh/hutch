@@ -87,6 +87,44 @@ pub fn build(b: *std.Build) void {
     });
     engine_tests.root_module.link_libc = true;
 
+    const cache_tests = b.addTest(.{
+        .name = "hutch-package-cache-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/package_manager_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"locked cache"},
+    });
+    cache_tests.root_module.link_libc = true;
+    const run_cache_tests = b.addRunArtifact(cache_tests);
+    const cache_test_step = b.step("test:package-cache", "Test locked package-cache replacement");
+    cache_test_step.dependOn(&run_cache_tests.step);
+
+    const routing_tests = b.addTest(.{
+        .name = "hutch-command-path-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"command path probes"},
+    });
+    const local_runtime_tests = b.addTest(.{
+        .name = "hutch-local-runtime-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/electrobun.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"bundled Cottontail"},
+    });
+    const dev_runtime_test_step = b.step("test:dev-runtime", "Test development runtime overrides and command path routing");
+    dev_runtime_test_step.dependOn(&b.addRunArtifact(routing_tests).step);
+    dev_runtime_test_step.dependOn(&b.addRunArtifact(local_runtime_tests).step);
+
     const hostname_connect_regression_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/hostname-connect-regression.zig"),
@@ -124,9 +162,12 @@ pub fn build(b: *std.Build) void {
     run_runtime_command_regression.addArtifactArg(launcher);
     run_runtime_command_regression.addArtifactArg(engine);
     run_runtime_command_regression.addArtifactArg(runtime_command_fixture);
+    const runtime_command_test_step = b.step("test:commands", "Test real launcher and engine command routing");
+    runtime_command_test_step.dependOn(&run_runtime_command_regression.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_engine_tests.step);
+    test_step.dependOn(&run_cache_tests.step);
     test_step.dependOn(&run_launcher_tests.step);
     test_step.dependOn(&run_windows_icon_tests.step);
     test_step.dependOn(&run_status_tests.step);

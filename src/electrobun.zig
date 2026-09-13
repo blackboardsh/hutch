@@ -156,6 +156,12 @@ const BundledRuntimeProvenance = struct {
     /// explicit local-runtime override is enabled. This is separate from the
     /// Cottontail paired with Hutch for build-time work.
     cottontail_runtime_version: ?[]const u8 = null,
+    cottontail_local_override: ?LocalCottontailProvenance = null,
+};
+
+const LocalCottontailProvenance = struct {
+    executable: []const u8,
+    sourceExecutableSha256: []const u8,
 };
 
 const ReleaseState = struct {
@@ -697,6 +703,10 @@ fn projectedDevkitMatchesProductVersion(ctx: *const Context) bool {
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     const main_process = try getMainProcess(config.root);
+    const local_cottontail = if (main_process == .cottontail)
+        try configuredBundledCottontailOverride(ctx, config.build_env)
+    else
+        null;
     if (main_process == .zig) {
         try validateProjectZigConfig(ctx, config.root);
         _ = try requireProjectZigBuildFile(ctx);
@@ -709,7 +719,7 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     // separate dependency below. Explicit local-runtime builds do not resolve
     // or register the published app runtime they will not bundle.
     var bundled_cottontail: ?BundledCottontail = null;
-    if (main_process == .cottontail and !environmentFlagEnabled(ctx.environ_map, "DASH_USE_LOCAL_COTTONTAIL")) {
+    if (main_process == .cottontail and local_cottontail == null) {
         const pinned_cottontail_version = blk: {
             const product_graph = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
             defer product_graph.close(ctx.io);
@@ -4751,7 +4761,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         }
     }
     if (main_process == .cottontail) {
-        const bundled = try resolveBundledCottontailBinary(ctx, platform_paths);
+        const bundled = try resolveBundledCottontailBinary(ctx, config.build_env, platform_paths);
         defer if (bundled.lease) |lease| lease.close(ctx.io);
         try copyPath(ctx, bundled.executable, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, cottontailBinaryFileName() }));
     }
@@ -4826,7 +4836,7 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
 
     if (main_process == .cottontail) {
         const main_output = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun", "index.js" });
-        try installCottontailRuntimeCapabilities(ctx, config.root, platform_paths, bundle, main_output);
+        try installCottontailRuntimeCapabilities(ctx, config, platform_paths, bundle, main_output);
     }
 
     try buildViews(ctx, config.root, platform_paths, bundle.app_code_dir);
@@ -5258,16 +5268,16 @@ test "Cottontail runtimes without manifests retain flat root selection" {
 
 fn installCottontailRuntimeCapabilities(
     ctx: *const Context,
-    root: std.json.Value,
+    config: CommandContext,
     platform_paths: PlatformPaths,
     bundle: AppBundlePaths,
     bundled_main_path: []const u8,
 ) !void {
-    const runtime = try resolveBundledCottontailBinary(ctx, platform_paths);
+    const runtime = try resolveBundledCottontailBinary(ctx, config.build_env, platform_paths);
     defer if (runtime.lease) |lease| lease.close(ctx.io);
     const runtime_dir = std.fs.path.dirname(runtime.executable) orelse return error.InvalidCottontailRuntimeLayout;
 
-    var roots = try selectedCottontailCapabilities(ctx, root, bundled_main_path);
+    var roots = try selectedCottontailCapabilities(ctx, config.root, bundled_main_path);
     defer roots.deinit(ctx.allocator);
     const manifest = try loadCottontailCapabilityManifest(ctx, runtime_dir);
     var selected = if (manifest) |capabilities|
@@ -6724,20 +6734,159 @@ const BundledCottontail = struct {
 // selected by the pragma or the launcher's paired default) only executes
 // configs, scripts, and the build pipeline. Devkits published before the
 // manifest pin existed bundle the build-time binary their releases were
-// tested with. DASH_USE_LOCAL_COTTONTAIL explicitly opts local development
-// into bundling that selected binary; DASH_COTTONTAIL alone does not.
+// tested with. HUTCH_ELECTROBUN_COTTONTAIL_BINARY explicitly selects a local
+// app runtime in dev builds. DASH_USE_LOCAL_COTTONTAIL is the compatibility
+// alias that selects the build-time binary with the same validation and
+// provenance; DASH_COTTONTAIL alone does not override the app runtime.
 fn resolveBundledCottontailBinary(
     ctx: *const Context,
+    build_env: BuildEnvironment,
     platform_paths: PlatformPaths,
 ) !BundledCottontail {
-    if (environmentFlagEnabled(ctx.environ_map, "DASH_USE_LOCAL_COTTONTAIL")) {
-        return .{ .executable = try resolveCottontailBinary(ctx) };
+    if (try configuredBundledCottontailOverride(ctx, build_env)) |executable| {
+        return .{ .executable = executable };
     }
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const pinned = devkit.toolchains.cottontail orelse {
         return .{ .executable = try resolveCottontailBinary(ctx) };
     };
     return resolvePinnedBundledCottontailBinary(ctx, pinned);
+}
+
+const bundled_cottontail_override_variable = "HUTCH_ELECTROBUN_COTTONTAIL_BINARY";
+
+fn requireLocalCottontailFile(ctx: *const Context, path: []const u8) !void {
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch
+        return error.InvalidLocalCottontailRuntime;
+    if (stat.kind != .file or stat.size == 0) return error.InvalidLocalCottontailRuntime;
+}
+
+fn configuredBundledCottontailOverride(ctx: *const Context, build_env: BuildEnvironment) !?[]const u8 {
+    const explicit_binary = ctx.environ_map.get(bundled_cottontail_override_variable);
+    const legacy_local_mode = environmentFlagEnabled(ctx.environ_map, "DASH_USE_LOCAL_COTTONTAIL");
+    if (explicit_binary == null and !legacy_local_mode) return null;
+    // A deliberately named app-runtime override is distinct from build-time
+    // COTTONTAIL_BINARY. Never let an inherited development setting alter a
+    // canary/stable release, and never mutate or masquerade as a managed pin.
+    if (build_env != .dev) {
+        ctx.writeStderr("hutch electrobun: {s} is only allowed with --env=dev\n", .{if (explicit_binary != null) bundled_cottontail_override_variable else "DASH_USE_LOCAL_COTTONTAIL"});
+        return error.LocalCottontailOverrideRequiresDev;
+    }
+    const configured = explicit_binary orelse try resolveCottontailBinary(ctx);
+    if (configured.len == 0 or !std.fs.path.isAbsolute(configured)) return error.InvalidLocalCottontailRuntime;
+    try requireLocalCottontailFile(ctx, configured);
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, configured, ctx.allocator);
+    const runtime_dir = std.fs.path.dirname(executable) orelse return error.InvalidLocalCottontailRuntime;
+    for ([_][]const u8{ "host-bootstrap.jsc", "capability-namespace.jsc" }) |file| {
+        try requireLocalCottontailFile(ctx, try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-core", file }));
+    }
+    var core_runtime = std.Io.Dir.cwd().openDir(ctx.io, try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-core", "runtime" }), .{}) catch
+        return error.InvalidLocalCottontailRuntime;
+    core_runtime.close(ctx.io);
+    const capabilities = (try loadCottontailCapabilityManifest(ctx, runtime_dir)) orelse
+        return error.InvalidLocalCottontailRuntime;
+    var capability_iterator = capabilities.iterator();
+    while (capability_iterator.next()) |entry| {
+        try requireLocalCottontailFile(ctx, try std.fs.path.join(ctx.allocator, &.{ runtime_dir, "cottontail-stdlib", entry.key_ptr.*, "main.jsc" }));
+    }
+    return executable;
+}
+
+fn localCottontailProvenance(ctx: *const Context, executable: []const u8) !LocalCottontailProvenance {
+    const file = try std.Io.Dir.cwd().openFile(ctx.io, executable, .{});
+    defer file.close(ctx.io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var reader_buffer: [64 * 1024]u8 = undefined;
+    var content_buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(ctx.io, &reader_buffer);
+    while (true) {
+        const count = try reader.interface.readSliceShort(&content_buffer);
+        if (count == 0) break;
+        hasher.update(content_buffer[0..count]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return .{ .executable = executable, .sourceExecutableSha256 = try ctx.allocator.dupe(u8, &hex) };
+}
+
+test "local bundled Cottontail override requires a complete absolute dev runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var environment = std.process.Environ.Map.init(allocator);
+    const ctx: Context = .{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "build-time-runtime",
+        .project_root = "",
+    };
+    // Ordinary build-time overrides do not alter the release-selected bundle.
+    try environment.put("COTTONTAIL_BINARY", "unrelated-build-time-runtime");
+    try std.testing.expect(try configuredBundledCottontailOverride(&ctx, .dev) == null);
+    try environment.put(bundled_cottontail_override_variable, "relative/cottontail");
+    try std.testing.expectError(error.InvalidLocalCottontailRuntime, configuredBundledCottontailOverride(&ctx, .dev));
+    try std.testing.expectError(error.LocalCottontailOverrideRequiresDev, configuredBundledCottontailOverride(&ctx, .stable));
+    try std.testing.expectError(error.LocalCottontailOverrideRequiresDev, configuredBundledCottontailOverride(&ctx, .canary));
+
+    try temp.dir.writeFile(io, .{ .sub_path = cottontailBinaryFileName(), .data = "runtime fixture" });
+    const executable = try temp.dir.realPathFileAlloc(io, cottontailBinaryFileName(), allocator);
+    try environment.put(bundled_cottontail_override_variable, executable);
+    try std.testing.expectError(error.InvalidLocalCottontailRuntime, configuredBundledCottontailOverride(&ctx, .dev));
+    try temp.dir.createDirPath(io, "cottontail-core/runtime");
+    try temp.dir.createDirPath(io, "cottontail-stdlib/compression");
+    for ([_][]const u8{ "cottontail-core/host-bootstrap.jsc", "cottontail-core/capability-namespace.jsc", "cottontail-core/runtime/fs.jsc" }) |path| {
+        try temp.dir.writeFile(io, .{ .sub_path = path, .data = "core fixture" });
+    }
+    try temp.dir.writeFile(io, .{
+        .sub_path = "cottontail-stdlib/capabilities.json",
+        .data = "{\"schema\":1,\"capabilities\":{\"compression\":{\"requires\":[]}}}",
+    });
+    try std.testing.expectError(error.InvalidLocalCottontailRuntime, configuredBundledCottontailOverride(&ctx, .dev));
+    try temp.dir.writeFile(io, .{ .sub_path = "cottontail-stdlib/compression/main.jsc", .data = "capability fixture" });
+    try std.testing.expectEqualStrings(executable, (try configuredBundledCottontailOverride(&ctx, .dev)).?);
+    const provenance = try localCottontailProvenance(&ctx, executable);
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("runtime fixture", &expected_digest, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(expected_digest, .lower), provenance.sourceExecutableSha256);
+}
+
+test "local bundled Cottontail provenance never claims the published runtime pin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    const ctx: Context = .{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = "",
+    };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"build\":{\"mainProcess\":\"cottontail\"}}", .{});
+    const json = try bundledRuntimeMetadataJson(&ctx, .{ .raw_json = "", .root = root, .build_env = .dev }, .{
+        .electrobun_version = "2.0.2-beta.22",
+        .bun_runtime_version = "1.4.0",
+        .cottontail_runtime_version = "0.7.0-canary.6",
+        .cottontail_local_override = .{ .executable = "local runtime/cottontail", .sourceExecutableSha256 = "local-source-digest" },
+    });
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+    try std.testing.expect(metadata.object.get("runtimeVersions") == null);
+    try std.testing.expectEqualStrings("2.0.2-beta.22", getStringField(metadata, "electrobunVersion").?);
+    const runtime = metadata.object.get("runtimeOverrides").?.object.get("cottontail").?;
+    try std.testing.expectEqualStrings("local", getStringField(runtime, "source").?);
+    try std.testing.expectEqualStrings("local runtime/cottontail", getStringField(runtime, "executable").?);
+    try std.testing.expectEqualStrings("local-source-digest", getStringField(runtime, "sourceExecutableSha256").?);
 }
 
 fn resolvePinnedBundledCottontailBinary(
@@ -6768,6 +6917,18 @@ fn resolvePinnedBundledCottontailBinary(
 fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
     if (!pathExists(ctx.io, ctx.cottontail_binary)) return error.CottontailNotFound;
     return ctx.cottontail_binary;
+}
+
+fn writeLocalCottontailTestComponents(dir: std.Io.Dir, io: std.Io) !void {
+    try dir.createDirPath(io, "cottontail-core/runtime");
+    try dir.createDirPath(io, "cottontail-stdlib/compression");
+    for ([_][]const u8{ "cottontail-core/host-bootstrap.jsc", "cottontail-core/capability-namespace.jsc", "cottontail-core/runtime/fs.jsc", "cottontail-stdlib/compression/main.jsc" }) |path| {
+        try dir.writeFile(io, .{ .sub_path = path, .data = "local runtime component fixture" });
+    }
+    try dir.writeFile(io, .{
+        .sub_path = "cottontail-stdlib/capabilities.json",
+        .data = "{\"schema\":1,\"capabilities\":{\"compression\":{\"requires\":[]}}}",
+    });
 }
 
 test "bundled Cottontail only overrides the pinned runtime for explicit local mode" {
@@ -6801,19 +6962,31 @@ test "bundled Cottontail only overrides the pinned runtime for explicit local mo
     devkit.toolchains.cottontail = "invalid test pin";
     paths.devkit = devkit;
 
-    try std.testing.expectError(error.InvalidElectrobunToolchainVersion, resolveBundledCottontailBinary(&ctx, paths));
+    try std.testing.expectError(error.InvalidElectrobunToolchainVersion, resolveBundledCottontailBinary(&ctx, .dev, paths));
     for ([_][]const u8{ "", "0", "false" }) |disabled| {
         try env_map.put("DASH_USE_LOCAL_COTTONTAIL", disabled);
-        try std.testing.expectError(error.InvalidElectrobunToolchainVersion, resolveBundledCottontailBinary(&ctx, paths));
+        try std.testing.expectError(error.InvalidElectrobunToolchainVersion, resolveBundledCottontailBinary(&ctx, .dev, paths));
     }
+    try env_map.put("DASH_USE_LOCAL_COTTONTAIL", "1");
+    try std.testing.expectError(error.InvalidLocalCottontailRuntime, resolveBundledCottontailBinary(&ctx, .dev, paths));
+    try writeLocalCottontailTestComponents(tmp.dir, io);
     for ([_][]const u8{ "1", "true", "yes" }) |enabled| {
         try env_map.put("DASH_USE_LOCAL_COTTONTAIL", enabled);
-        const bundled = try resolveBundledCottontailBinary(&ctx, paths);
+        const bundled = try resolveBundledCottontailBinary(&ctx, .dev, paths);
         try std.testing.expectEqualStrings(binary, bundled.executable);
         try std.testing.expect(bundled.lease == null);
+        try std.testing.expectError(error.LocalCottontailOverrideRequiresDev, resolveBundledCottontailBinary(&ctx, .canary, paths));
+        try std.testing.expectError(error.LocalCottontailOverrideRequiresDev, resolveBundledCottontailBinary(&ctx, .stable, paths));
     }
+    // An explicit binary is authoritative even if the compatibility alias is
+    // enabled: an invalid override must not silently select the build runtime.
+    try env_map.put(bundled_cottontail_override_variable, "relative/cottontail");
+    try std.testing.expectError(error.InvalidLocalCottontailRuntime, resolveBundledCottontailBinary(&ctx, .dev, paths));
+    try env_map.put(bundled_cottontail_override_variable, binary);
+    try std.testing.expectEqualStrings(binary, (try resolveBundledCottontailBinary(&ctx, .dev, paths)).executable);
+    _ = env_map.swapRemove(bundled_cottontail_override_variable);
     try tmp.dir.deleteFile(io, "local-cottontail");
-    try std.testing.expectError(error.CottontailNotFound, resolveBundledCottontailBinary(&ctx, paths));
+    try std.testing.expectError(error.CottontailNotFound, resolveBundledCottontailBinary(&ctx, .dev, paths));
 }
 
 fn getPlatformPaths(ctx: *const Context, config_root: std.json.Value) !PlatformPaths {
@@ -7850,7 +8023,7 @@ fn bundledRuntimeMetadataJson(
     try metadata.put(ctx.allocator, "mainProcess", .{ .string = mainProcessName(main_process) });
     try metadata.put(ctx.allocator, "electrobunVersion", .{ .string = provenance.electrobun_version });
     if (main_process == .bun or
-        (main_process == .cottontail and provenance.cottontail_runtime_version != null))
+        (main_process == .cottontail and provenance.cottontail_runtime_version != null and provenance.cottontail_local_override == null))
     {
         var runtime_versions: std.json.ObjectMap = .empty;
         switch (main_process) {
@@ -7859,6 +8032,17 @@ fn bundledRuntimeMetadataJson(
             else => unreachable,
         }
         try metadata.put(ctx.allocator, "runtimeVersions", .{ .object = runtime_versions });
+    }
+    if (main_process == .cottontail) {
+        if (provenance.cottontail_local_override) |local| {
+            var runtime_override: std.json.ObjectMap = .empty;
+            try runtime_override.put(ctx.allocator, "source", .{ .string = "local" });
+            try runtime_override.put(ctx.allocator, "executable", .{ .string = local.executable });
+            try runtime_override.put(ctx.allocator, "sourceExecutableSha256", .{ .string = local.sourceExecutableSha256 });
+            var overrides: std.json.ObjectMap = .empty;
+            try overrides.put(ctx.allocator, "cottontail", .{ .object = runtime_override });
+            try metadata.put(ctx.allocator, "runtimeOverrides", .{ .object = overrides });
+        }
     }
     try metadata.put(
         ctx.allocator,
@@ -7895,16 +8079,18 @@ fn writeBundledRuntimeMetadata(
     const app_name = try appDisplayName(ctx, config);
     const version_name = try getAppVersion(ctx, config.root);
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotPrepared;
+    const local_cottontail = if (try getMainProcess(config.root) == .cottontail)
+        try configuredBundledCottontailOverride(ctx, config.build_env)
+    else
+        null;
     const build_json = try bundledRuntimeMetadataJson(ctx, config, .{
         .electrobun_version = devkit.version,
         .bun_runtime_version = if (devkit.runtime.bun != null)
             devkit.toolchains.bun
         else
             try configuredToolchainVersion(config.root, .bun, devkit.toolchains.bun),
-        .cottontail_runtime_version = if (environmentFlagEnabled(ctx.environ_map, "DASH_USE_LOCAL_COTTONTAIL"))
-            "local"
-        else
-            devkit.toolchains.cottontail,
+        .cottontail_runtime_version = if (local_cottontail != null) null else devkit.toolchains.cottontail,
+        .cottontail_local_override = if (local_cottontail) |executable| try localCottontailProvenance(ctx, executable) else null,
     });
     const version_json = try std.fmt.allocPrint(
         ctx.allocator,
@@ -7933,7 +8119,10 @@ test "bundled Cottontail metadata distinguishes explicit local mode from build-t
     const root_path = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
-    try env_map.put("DASH_COTTONTAIL", "/local/build-time-cottontail");
+    try tmp.dir.writeFile(io, .{ .sub_path = cottontailBinaryFileName(), .data = "local runtime fixture" });
+    try writeLocalCottontailTestComponents(tmp.dir, io);
+    const binary = try tmp.dir.realPathFileAlloc(io, cottontailBinaryFileName(), allocator);
+    try env_map.put("DASH_COTTONTAIL", binary);
     const ctx = Context{
         .init = undefined,
         .io = io,
@@ -7941,7 +8130,7 @@ test "bundled Cottontail metadata distinguishes explicit local mode from build-t
         .environ_map = &env_map,
         .self_exe_path = "",
         .cottontail_home = "",
-        .cottontail_binary = "",
+        .cottontail_binary = binary,
         .project_root = root_path,
     };
     const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
@@ -7962,10 +8151,16 @@ test "bundled Cottontail metadata distinguishes explicit local mode from build-t
         try writeBundledRuntimeMetadata(&ctx, config, bundle, paths);
         const json = try tmp.dir.readFileAlloc(io, "build.json", allocator, .limited(64 * 1024));
         const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
-        try std.testing.expectEqualStrings(
-            if (flag != null and std.mem.eql(u8, flag.?, "1")) "local" else "0.7.0-canary.6",
-            getStringFieldFromObject(metadata.object.get("runtimeVersions").?.object, "cottontail").?,
-        );
+        if (flag != null and std.mem.eql(u8, flag.?, "1")) {
+            try std.testing.expect(metadata.object.get("runtimeVersions") == null);
+            const runtime = metadata.object.get("runtimeOverrides").?.object.get("cottontail").?;
+            try std.testing.expectEqualStrings("local", getStringField(runtime, "source").?);
+            try std.testing.expectEqualStrings(binary, getStringField(runtime, "executable").?);
+            try std.testing.expectEqualStrings((try localCottontailProvenance(&ctx, binary)).sourceExecutableSha256, getStringField(runtime, "sourceExecutableSha256").?);
+        } else {
+            try std.testing.expect(metadata.object.get("runtimeOverrides") == null);
+            try std.testing.expectEqualStrings("0.7.0-canary.6", getStringFieldFromObject(metadata.object.get("runtimeVersions").?.object, "cottontail").?);
+        }
     }
 }
 

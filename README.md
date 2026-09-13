@@ -260,6 +260,15 @@ changes the global store (default `~/.hutch`) and must remain set when a
 non-default install root is used.
 `DASH_ARTIFACTS_BASE_URL` selects another trusted artifact origin.
 
+For Electrobun app bundles, build-time overrides alone do not replace the
+devkit-pinned runtime. In `--env=dev` only, set
+`HUTCH_ELECTROBUN_COTTONTAIL_BINARY` to an absolute local executable path, or
+use `DASH_USE_LOCAL_COTTONTAIL=1` to bundle the selected build-time Cottontail.
+The explicit executable takes precedence. Both forms require the sibling core
+and capability artifacts and record local executable SHA-256 provenance in
+`build.json`, without claiming the published app-runtime version. Canary and
+stable builds reject either local mode; unset these variables before release.
+
 ## Electrobun Projects
 
 Run `hutch electrobun init` to choose a release template interactively, then
