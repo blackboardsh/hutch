@@ -174,7 +174,7 @@ fn containsAscii(haystack: []const windows.WCHAR, needle: []const u8) bool {
 
 fn writeFailure(io: std.Io, comptime format: []const u8, args: anytype) void {
     var stderr_buffer: [2048]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     stderr.print(format, args) catch {};
     stderr.flush() catch {};

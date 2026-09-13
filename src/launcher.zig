@@ -230,7 +230,7 @@ fn termExitCode(term: std.process.Child.Term) u8 {
 
 fn exitWithError(io: std.Io, context: []const u8, err: anyerror) void {
     var buffer: [2048]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(io, &buffer);
+    var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
     writer.interface.print(
         "hutch: {s}: {s}\n",
         .{ context, @errorName(err) },

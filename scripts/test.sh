@@ -9,6 +9,7 @@ node "$SCRIPT_DIR/local-stack.test.js"
 node "$SCRIPT_DIR/release-store-smoke.js"
 node "$SCRIPT_DIR/run-local-package-manager-tests.js" --all
 node --test \
+  "$SCRIPT_DIR/stdio-redirection.test.js" \
   "$SCRIPT_DIR/r2-settings.test.js" \
   "$SCRIPT_DIR/release-contract.test.js" \
   "$SCRIPT_DIR/release-version.test.js" \

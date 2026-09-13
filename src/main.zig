@@ -1137,14 +1137,14 @@ fn loadHutchConfig(
     cleanupPrivateTempBeforeSignal(init.io, execution.term, &tmp_dir, &tmp_dir_live);
     if (execution.stdout.len > 0) {
         var stdout_buffer: [2048]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
         try stdout_writer.interface.writeAll(execution.stdout);
         try stdout_writer.interface.flush();
     }
     if (termExitCode(execution.term) != 0) {
         if (execution.stderr.len > 0) {
             var stderr_buffer: [2048]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+            var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
             try stderr_writer.interface.writeAll(execution.stderr);
             try stderr_writer.interface.flush();
         }
@@ -2538,11 +2538,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     // A directly invoked engine does not have a launcher parent to retain its

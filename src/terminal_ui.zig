@@ -83,7 +83,7 @@ pub fn select(
     defer terminal.restore();
 
     var output_buffer: [4096]u8 = undefined;
-    var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output_file = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     const output = &output_file.interface;
     const size = terminal.size(init.environ_map);
     const page_size = @max(@min(items.len, size.rows -| 6), 1);
@@ -137,7 +137,7 @@ pub fn prompt(
     }
 
     var output_buffer: [1024]u8 = undefined;
-    var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output_file = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     const output = &output_file.interface;
     try output.print("{s} [{s}]: ", .{ label, suggested });
     try output.flush();

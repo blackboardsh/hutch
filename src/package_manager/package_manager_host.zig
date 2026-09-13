@@ -169,7 +169,7 @@ fn reportRuntimeServiceFailure(
     child_stderr: []const u8,
 ) void {
     var buffer: [4096]u8 = undefined;
-    var file_writer = std.Io.File.stderr().writer(io, &buffer);
+    var file_writer = std.Io.File.stderr().writerStreaming(io, &buffer);
     const writer = &file_writer.interface;
     writer.print(
         "hutch: Cottontail service '{s} {s}' failed\n",
