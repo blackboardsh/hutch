@@ -207,6 +207,69 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) return error.ExpectedTextMissing;
 }
 
+fn expectInterruptedScriptCleanup(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    launcher: []const u8,
+    engine: []const u8,
+    runtime: []const u8,
+    project_dir: []const u8,
+    script: []const u8,
+    behavior: []const u8,
+) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    const ready = try std.fs.path.join(allocator, &.{ project_dir, "interrupt-ready" });
+    const cleanup = try std.fs.path.join(allocator, &.{ project_dir, "interrupt-cleanup" });
+    defer std.Io.Dir.cwd().deleteFile(init.io, ready) catch {};
+    defer std.Io.Dir.cwd().deleteFile(init.io, cleanup) catch {};
+
+    var environment = try init.environ_map.clone(allocator);
+    defer environment.deinit();
+    try environment.put("HUTCH_ENGINE_BINARY", engine);
+    try environment.put("DASH_COTTONTAIL", runtime);
+    try environment.put("HUTCH_NO_UPDATE_CHECK", "1");
+    try environment.put("HUTCH_TEST_FIXTURE_MODE", "config-script-interrupt");
+    try environment.put("HUTCH_TEST_INTERRUPT_BEHAVIOR", behavior);
+    const runtime_json = try std.json.Stringify.valueAlloc(allocator, runtime, .{});
+    const config = try std.fmt.allocPrint(
+        allocator,
+        "{{\"scripts\":{{\"argv\":[{s}],\"shell\":\"fixture\",\"nested\":[\"hutch\",\"run\",\"argv\"]}}}}",
+        .{runtime_json},
+    );
+    try environment.put("HUTCH_TEST_CONFIG_JSON", config);
+    var child = try std.process.spawn(init.io, .{
+        .argv = &.{ launcher, script },
+        .cwd = .{ .path = project_dir },
+        .environ_map = &environment,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+        .pgid = 0,
+    });
+    const group = child.id.?;
+    // Every descendant belongs to this new group; failed assertions must not
+    // leave fixture children alive or signal another invocation's processes.
+    defer std.posix.kill(-group, .KILL) catch {};
+    defer child.kill(init.io);
+    for (0..500) |_| {
+        if (std.Io.Dir.cwd().access(init.io, ready, .{})) |_| break else |_| {}
+        try std.Io.sleep(init.io, .fromMilliseconds(10), .awake);
+    } else return error.InterruptFixtureNeverStarted;
+    const sent_signal: std.posix.SIG = if (std.mem.eql(u8, behavior, "terminate")) .TERM else .INT;
+    try std.posix.kill(-group, sent_signal);
+    const term = try child.wait(init.io);
+    if (std.mem.eql(u8, behavior, "default") or std.mem.eql(u8, behavior, "terminate")) {
+        switch (term) {
+            .signal => |signal| if (signal != sent_signal) return error.UnexpectedSignal,
+            else => return error.ScriptInterruptWasNotPropagated,
+        }
+    } else {
+        // The marker must exist as soon as Hutch exits, before any extra wait.
+        try expectPathExists(init.io, cleanup);
+        try expectExit(term, if (std.mem.eql(u8, behavior, "fail")) 37 else 0);
+    }
+}
+
 fn expectMissing(init: std.process.Init, path: []const u8) !void {
     std.Io.Dir.cwd().access(init.io, path, .{}) catch return;
     return error.UnexpectedInjectionMarker;
@@ -1439,4 +1502,13 @@ pub fn main(init: std.process.Init) !void {
     );
     try expectExit(non_object_config.term, 1);
     try expectContains(non_object_config.stderr, "InvalidHutchConfig");
+
+    for ([_][]const u8{ "argv", "shell", "nested" }) |script| {
+        try expectInterruptedScriptCleanup(init, allocator, launcher, engine, runtime, fixture_root, script, "cleanup");
+        try expectInterruptedScriptCleanup(init, allocator, launcher, engine, runtime, fixture_root, script, "fail");
+    }
+    for ([_][]const u8{ "argv", "nested" }) |script| {
+        try expectInterruptedScriptCleanup(init, allocator, launcher, engine, runtime, fixture_root, script, "default");
+        try expectInterruptedScriptCleanup(init, allocator, launcher, engine, runtime, fixture_root, script, "terminate");
+    }
 }

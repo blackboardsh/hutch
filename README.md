@@ -492,6 +492,12 @@ looks like a JavaScript or TypeScript filename. Hutch does not infer an
 execution mode from a filename extension and does not send string tasks to the
 host's `/bin/sh` or `cmd.exe`.
 
+On macOS and Linux, Ctrl-C reaches the foreground command and Hutch waits for
+it to finish, including asynchronous shutdown handlers. Nested named scripts
+preserve this behavior. Automation should send SIGINT to the command's process
+group, as a terminal does; Hutch does not forward an interrupt sent only to the
+outer orchestrator, which could otherwise deliver a terminal interrupt twice.
+
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
 emulate npm lifecycle variables when running these tasks. Invoke a local binary
 explicitly with `hutch pm exec`, or select and call an external package manager.

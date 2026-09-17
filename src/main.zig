@@ -1228,6 +1228,32 @@ fn configuredScriptEnvironment(
 const hutch_shell_wrapper_name = "hutch-shell-wrapper.mjs";
 const hutch_private_bunfig_name = "bunfig.toml";
 
+// Terminal interrupts reach every foreground process. Keep the orchestrator
+// alive until its child has handled Ctrl-C and completed asynchronous cleanup;
+// otherwise its exit can close the terminal and hang up the child mid-cleanup.
+// Use a caught signal rather than SIG_IGN so exec resets the child's disposition.
+const ForegroundScriptInterrupt = struct {
+    previous: if (builtin.os.tag == .windows) void else std.posix.Sigaction,
+
+    fn begin() ForegroundScriptInterrupt {
+        if (comptime builtin.os.tag == .windows) return .{ .previous = {} };
+        var previous: std.posix.Sigaction = undefined;
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = keepWaiting },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.INT, &action, &previous);
+        return .{ .previous = previous };
+    }
+
+    fn end(self: ForegroundScriptInterrupt) void {
+        if (comptime builtin.os.tag != .windows) std.posix.sigaction(.INT, &self.previous, null);
+    }
+
+    fn keepWaiting(_: std.posix.SIG) callconv(.c) void {}
+};
+
 const hutch_shell_wrapper_source =
     \\const [command, ...args] = process.argv.slice(2);
     \\const clearPrivateArgv = () => {
@@ -1364,6 +1390,9 @@ fn runCottontailShellScript(
     );
     defer env.deinit();
 
+    const interrupt = ForegroundScriptInterrupt.begin();
+    var interrupt_live = true;
+    defer if (interrupt_live) interrupt.end();
     var child = try std.process.spawn(init.io, .{
         .argv = argv.items,
         .environ_map = &env,
@@ -1376,6 +1405,8 @@ fn runCottontailShellScript(
     const term = try child.wait(init.io);
     task_dir.deinit(init.io);
     task_dir_live = false;
+    interrupt.end();
+    interrupt_live = false;
     return termExitCode(term);
 }
 
@@ -1425,6 +1456,9 @@ fn runArgvScript(
 
     var env = try configuredScriptEnvironment(init, allocator, null);
     defer env.deinit();
+    const interrupt = ForegroundScriptInterrupt.begin();
+    var interrupt_live = true;
+    defer if (interrupt_live) interrupt.end();
     var child = std.process.spawn(init.io, .{
         .argv = argv.items,
         .environ_map = &env,
@@ -1439,7 +1473,10 @@ fn runArgvScript(
         return 1;
     };
     defer child.kill(init.io);
-    return termExitCode(try child.wait(init.io));
+    const term = try child.wait(init.io);
+    interrupt.end();
+    interrupt_live = false;
+    return termExitCode(term);
 }
 
 fn isConfiguredScriptValue(value: std.json.Value) bool {

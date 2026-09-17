@@ -1,6 +1,35 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+var interrupt_received: std.atomic.Value(u32) = .init(0);
+
+fn recordInterrupt(_: std.posix.SIG) callconv(.c) void {
+    _ = interrupt_received.fetchAdd(1, .release);
+}
+
+fn interruptCleanupFixture(init: std.process.Init) !void {
+    if (comptime builtin.os.tag == .windows) return error.PosixFixtureOnly;
+    const behavior = init.environ_map.get("HUTCH_TEST_INTERRUPT_BEHAVIOR") orelse "cleanup";
+    if (!std.mem.eql(u8, behavior, "default")) {
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = recordInterrupt },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.INT, &action, null);
+    }
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "interrupt-ready", .data = "ready" });
+    for (0..500) |_| {
+        if (interrupt_received.load(.acquire) != 0) break;
+        try std.Io.sleep(init.io, .fromMilliseconds(10), .awake);
+    } else return error.InterruptFixtureTimedOut;
+    // Model a script stopping owned background services asynchronously.
+    try std.Io.sleep(init.io, .fromMilliseconds(200), .awake);
+    if (interrupt_received.load(.acquire) != 1) return error.DuplicateInterrupt;
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "interrupt-cleanup", .data = "done" });
+    if (std.mem.eql(u8, behavior, "fail")) std.process.exit(37);
+}
+
 const expected_test_args = [_][]const u8{
     "test",
     "tests/pass fixture.test.ts",
@@ -395,6 +424,10 @@ pub fn main(init: std.process.Init) !void {
                 .data = config_json,
             });
             return;
+        }
+
+        if (std.mem.eql(u8, mode, "config-script-interrupt")) {
+            return interruptCleanupFixture(init);
         }
 
         if (args.len >= 6 and
