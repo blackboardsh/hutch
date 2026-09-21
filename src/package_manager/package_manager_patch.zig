@@ -268,8 +268,7 @@ fn applyParsedPatch(
         .file_patch => |file_patch| try applyFilePatch(allocator, io, package_dir, file_patch, diagnostic),
         .file_mode_change => |mode_change| {
             const path = try safePatchPath(allocator, io, package_dir, mode_change.path);
-            const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(mode_change.new_mode));
-            std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch |err| return applyFailure(diagnostic, "chmod", err);
+            try applyFileMode(io, path, mode_change.new_mode, diagnostic);
         },
     };
 }
@@ -299,7 +298,20 @@ fn applyFileCreation(
     }
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents.written() }) catch |err|
         return applyFailure(diagnostic, "write", err);
-    const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(creation.mode));
+    try applyFileMode(io, path, creation.mode, diagnostic);
+}
+
+fn applyFileMode(io: std.Io, path: []const u8, mode: Patch.FileMode, diagnostic: *?ApplyDiagnostic) !void {
+    // Git patch modes describe POSIX permissions, not Windows file attributes.
+    // Zig's dirSetFilePermissions is also unimplemented on Windows.
+    if (@import("builtin").os.tag == .windows) {
+        // A mode-only patch must still fail if its target does not exist.
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err|
+            return applyFailure(diagnostic, "chmod", err);
+        return;
+    }
+
+    const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(mode));
     std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch |err|
         return applyFailure(diagnostic, "chmod", err);
 }
@@ -501,6 +513,140 @@ test "patch application uses Hutch-owned parser and hash" {
     const output_path = try std.fs.path.join(allocator, &.{ package_dir, "index.txt" });
     const output = try std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .limited(1024));
     try std.testing.expectEqualStrings("one\nthree\n", output);
+}
+
+test "patch application creates files and applies POSIX executable modes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "package");
+    try tmp.dir.writeFile(io, .{ .sub_path = "package/promote.sh", .data = "echo promote\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "package/demote.sh",
+        .data = "echo demote\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "change.patch",
+        .data =
+        \\diff --git a/nested/plain.txt b/nested/plain.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/nested/plain.txt
+        \\@@ -0,0 +1 @@
+        \\+plain file
+        \\diff --git a/nested/run.sh b/nested/run.sh
+        \\new file mode 100755
+        \\--- /dev/null
+        \\+++ b/nested/run.sh
+        \\@@ -0,0 +1 @@
+        \\+echo created
+        \\diff --git a/promote.sh b/promote.sh
+        \\old mode 100644
+        \\new mode 100755
+        \\diff --git a/demote.sh b/demote.sh
+        \\old mode 100755
+        \\new mode 100644
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const package_dir = try std.fs.path.join(allocator, &.{ root, "package" });
+
+    var diagnostic: ?ApplyDiagnostic = null;
+    try apply(allocator, io, root, package_dir, &.{"change.patch"}, &diagnostic);
+    try std.testing.expectEqual(@as(?ApplyDiagnostic, null), diagnostic);
+    try std.testing.expect(try installedStateMatches(allocator, io, root, package_dir, &.{"change.patch"}));
+
+    const cases = .{
+        .{ "nested/plain.txt", "plain file\n", 0o644 },
+        .{ "nested/run.sh", "echo created\n", 0o755 },
+        .{ "promote.sh", "echo promote\n", 0o755 },
+        .{ "demote.sh", "echo demote\n", 0o644 },
+    };
+    inline for (cases) |case| {
+        const path = try std.fs.path.join(allocator, &.{ package_dir, case[0] });
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024));
+        try std.testing.expectEqualStrings(case[1], contents);
+        if (@import("builtin").os.tag != .windows) {
+            const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+            try std.testing.expectEqual(@as(std.posix.mode_t, case[2]), stat.permissions.toMode() & 0o777);
+        }
+    }
+}
+
+test "patch application validates creation and mode change paths on every platform" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "package");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "preserve\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const package_dir = try std.fs.path.join(allocator, &.{ root, "package" });
+
+    const patches = [_][]const u8{
+        \\diff --git a/../outside.txt b/../outside.txt
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ b/../outside.txt
+        \\@@ -0,0 +1 @@
+        \\+overwritten
+        ,
+        \\diff --git a/../outside.txt b/../outside.txt
+        \\old mode 100644
+        \\new mode 100755
+        ,
+    };
+    for (patches) |patch| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "change.patch", .data = patch });
+        var diagnostic: ?ApplyDiagnostic = null;
+        try std.testing.expectError(
+            error.PatchApplyFailed,
+            apply(allocator, io, root, package_dir, &.{"change.patch"}, &diagnostic),
+        );
+    }
+    const outside = try tmp.dir.readFileAlloc(io, "outside.txt", allocator, .limited(1024));
+    try std.testing.expectEqualStrings("preserve\n", outside);
+}
+
+test "patch application rejects mode changes for missing files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "package");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "change.patch",
+        .data =
+        \\diff --git a/missing.sh b/missing.sh
+        \\old mode 100644
+        \\new mode 100755
+        ,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const package_dir = try std.fs.path.join(allocator, &.{ root, "package" });
+
+    var diagnostic: ?ApplyDiagnostic = null;
+    try std.testing.expectError(
+        error.PatchApplyFailed,
+        apply(allocator, io, root, package_dir, &.{"change.patch"}, &diagnostic),
+    );
+    try std.testing.expectEqual(error.FileNotFound, diagnostic.?.cause);
+    try std.testing.expectEqualStrings("chmod", diagnostic.?.operation.?);
+    try std.testing.expect(!try installedStateMatches(allocator, io, root, package_dir, &.{"change.patch"}));
 }
 
 test "patch application rejects symlink targets outside the package" {

@@ -101,6 +101,19 @@ pub fn build(b: *std.Build) void {
     const cache_test_step = b.step("test:package-cache", "Test locked package-cache replacement");
     cache_test_step.dependOn(&run_cache_tests.step);
 
+    // Root patch application tests directly so file creation and mode changes
+    // also run in the Windows release test job.
+    const patch_tests = b.addTest(.{
+        .name = "hutch-package-patch-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/package_manager/package_manager_patch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_patch_tests = b.addRunArtifact(patch_tests);
+
     const routing_tests = b.addTest(.{
         .name = "hutch-command-path-tests",
         .root_module = b.createModule(.{
@@ -168,6 +181,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_cache_tests.step);
+    test_step.dependOn(&run_patch_tests.step);
     test_step.dependOn(&run_launcher_tests.step);
     test_step.dependOn(&run_windows_icon_tests.step);
     test_step.dependOn(&run_status_tests.step);
