@@ -4030,9 +4030,15 @@ fn buildRustMainExecutable(ctx: *const Context, config: CommandContext, platform
     const project = try rustProject(ctx, config.root);
     if (!pathExists(ctx.io, project.manifest)) return error.RustManifestNotFound;
 
-    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-rust-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
-    try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
-    const cargo_target_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "target" });
+    // bundle.build_root already ends in `{env}-{os}-{arch}` (e.g.
+    // `dev-win-x64`), so nesting another `{os}-{arch}` under a `.rust-main`
+    // segment just deepens the cargo output tree; on Windows the resulting
+    // `target/debug/build/<crate>-<hash>/build_script_build-<hash>.exe`
+    // already runs into MSVC link.exe's MAX_PATH ceiling (link.exe's
+    // manifest doesn't opt into long paths). Anchor CARGO_TARGET_DIR
+    // directly under build_root instead.
+    const cargo_target_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, "rust-target" });
+    try createOutputDirWithin(ctx, bundle.build_root, cargo_target_dir);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);

@@ -567,7 +567,7 @@ export default {
     assert.equal(readFileSync(join(project, "Cargo.lock"), "utf8"), lockContents);
     assert.equal(existsSync(join(project, "node_modules")), false);
     assert.equal(
-      existsSync(join(buildRoot, ".electrobun-rust-main", `${host.os}-${host.arch}`, "main.rs")),
+      existsSync(join(buildRoot, "rust-target", "main.rs")),
       false,
       "Hutch must not synthesize a Rust wrapper",
     );
