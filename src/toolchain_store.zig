@@ -300,10 +300,44 @@ fn install(
     if (kind == .rust) {
         try installRustDistribution(init, allocator, extracted_root, temporary);
     } else {
-        try std.Io.Dir.cwd().rename(extracted_root, std.Io.Dir.cwd(), temporary, init.io);
+        try renameWithWindowsRetries(init.io, std.Io.Dir.cwd(), extracted_root, std.Io.Dir.cwd(), temporary);
     }
 
     try publishInstalledToolchain(init.io, allocator, root, temporary, kind, version);
+}
+
+// On Windows, freshly-written toolchain files (extracted `.zip` / `.tar.xz`
+// contents) are often still held by antivirus / SmartScreen scanners when
+// hutch publishes the install directory. MoveFileEx then returns AccessDenied
+// or SharingViolation. Retry with backoff until the scanner releases the
+// handle; ~15s worst case, dominated by tail 1s attempts.
+fn renameWithWindowsRetries(
+    io: std.Io,
+    old_dir: std.Io.Dir,
+    old_sub_path: []const u8,
+    new_dir: std.Io.Dir,
+    new_sub_path: []const u8,
+) std.Io.Dir.RenameError!void {
+    if (comptime builtin.os.tag != .windows) {
+        return old_dir.rename(old_sub_path, new_dir, new_sub_path, io);
+    }
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        old_dir.rename(old_sub_path, new_dir, new_sub_path, io) catch |err| switch (err) {
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.FileBusy,
+            error.AntivirusInterference,
+            => {
+                if (attempt >= 25) return err;
+                const delay_ms: i64 = @min(@as(i64, 50) * @as(i64, @intCast(attempt + 1)), 1000);
+                std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
 }
 
 fn temporaryArchivePath(
@@ -356,7 +390,7 @@ fn publishInstalledToolchain(
     const marker = try std.fs.path.join(allocator, &.{ temporary, ".hutch-toolchain" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = version });
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
-    try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), root, io);
+    try renameWithWindowsRetries(io, std.Io.Dir.cwd(), temporary, std.Io.Dir.cwd(), root);
 }
 
 fn extractArchive(
@@ -370,7 +404,20 @@ fn extractArchive(
     if (std.mem.endsWith(u8, archive_path, ".zip.tmp")) {
         return extractZipArchive(init.io, archive_path, destination);
     }
-    try runCommand(init, allocator, &.{ "tar", "-xf", archive_path, "-C", destination });
+    const tar_argv0 = try systemTarBinary(init.environ_map, allocator);
+    try runCommand(init, allocator, &.{ tar_argv0, "-xf", archive_path, "-C", destination });
+}
+
+// On Windows, MSYS/Git-Bash's `tar` misreads drive-letter paths like `C:\...`
+// as `HOST:PATH` and fails with "Cannot connect to C: resolve failed". The
+// system tar (bsdtar in %SystemRoot%\System32\tar.exe on Windows 10 1803+)
+// handles Windows paths natively, so hutch invokes it by absolute path
+// instead of relying on PATH. Shared with electrobun.zig so bundle-time tar
+// invocations get the same fix.
+pub fn systemTarBinary(environ_map: *const std.process.Environ.Map, allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.os.tag != .windows) return "tar";
+    const system_root = environ_map.get("SystemRoot") orelse "C:\\Windows";
+    return std.fs.path.join(allocator, &.{ system_root, "System32", "tar.exe" });
 }
 
 fn extractZipArchive(io: std.Io, archive_path: []const u8, destination: []const u8) !void {
@@ -892,6 +939,27 @@ test "zip archives extract natively without external tools" {
         .limited(1024),
     );
     try std.testing.expectEqualStrings(content, extracted);
+}
+
+test "system tar resolves through SystemRoot on Windows and stays bare elsewhere" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+
+    if (builtin.os.tag == .windows) {
+        try environ_map.put("SystemRoot", "D:\\CustomWindows");
+        const resolved = try systemTarBinary(&environ_map, allocator);
+        try std.testing.expectEqualStrings("D:\\CustomWindows\\System32\\tar.exe", resolved);
+
+        _ = environ_map.orderedRemove("SystemRoot");
+        const fallback = try systemTarBinary(&environ_map, allocator);
+        try std.testing.expectEqualStrings("C:\\Windows\\System32\\tar.exe", fallback);
+    } else {
+        const resolved = try systemTarBinary(&environ_map, allocator);
+        try std.testing.expectEqualStrings("tar", resolved);
+    }
 }
 
 test "temporary toolchain archives keep the archive extension last" {

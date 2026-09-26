@@ -1396,7 +1396,8 @@ fn createBundleTar(ctx: *const Context, bundle_root: []const u8, tar_path: []con
     try env_map.put("COPYFILE_DISABLE", "1");
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
-    try appendBundleTarArgs(ctx.allocator, &argv, builtin.os.tag, tar_path, parent, name);
+    const tar_binary = try toolchain_store.systemTarBinary(ctx.environ_map, ctx.allocator);
+    try appendBundleTarArgs(ctx.allocator, &argv, builtin.os.tag, tar_binary, tar_path, parent, name);
     try runReleaseCommand(
         ctx,
         argv.items,
@@ -1409,11 +1410,12 @@ fn appendBundleTarArgs(
     allocator: std.mem.Allocator,
     argv: *std.ArrayList([]const u8),
     os_tag: std.Target.Os.Tag,
+    tar_binary: []const u8,
     tar_path: []const u8,
     parent: []const u8,
     name: []const u8,
 ) !void {
-    try argv.append(allocator, "tar");
+    try argv.append(allocator, tar_binary);
     // COPYFILE_DISABLE prevents AppleDouble sidecars, while --no-xattrs also
     // prevents binary macOS extended attributes from entering PAX records.
     if (os_tag == .macos) try argv.append(allocator, "--no-xattrs");
@@ -1428,6 +1430,7 @@ test "bundle tar requests extended attribute exclusion only on macOS" {
         std.testing.allocator,
         &argv,
         .macos,
+        "tar",
         "/tmp/bundle.tar",
         "/tmp",
         "Example.app",
@@ -1451,6 +1454,7 @@ test "bundle tar requests extended attribute exclusion only on macOS" {
         std.testing.allocator,
         &argv,
         .linux,
+        "tar",
         "/tmp/bundle.tar",
         "/tmp",
         "example",
@@ -1473,12 +1477,13 @@ test "bundle tar requests extended attribute exclusion only on macOS" {
         std.testing.allocator,
         &argv,
         .windows,
+        "C:\\Windows\\System32\\tar.exe",
         "C:\\bundle.tar",
         "C:\\",
         "example",
     );
     const windows_expected = [_][]const u8{
-        "tar",
+        "C:\\Windows\\System32\\tar.exe",
         "-cf",
         "C:\\bundle.tar",
         "-C",
@@ -2582,7 +2587,8 @@ fn createLinuxInstaller(ctx: *const Context, config: CommandContext, state: Rele
     defer env_map.deinit();
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     try env_map.put("COPYFILE_DISABLE", "1");
-    try runReleaseCommand(ctx, &.{ "tar", "-czf", archive_path, "-C", staging, "." }, ctx.project_root, &env_map);
+    const tar_binary = try toolchain_store.systemTarBinary(ctx.environ_map, ctx.allocator);
+    try runReleaseCommand(ctx, &.{ tar_binary, "-czf", archive_path, "-C", staging, "." }, ctx.project_root, &env_map);
     return archive_path;
 }
 
