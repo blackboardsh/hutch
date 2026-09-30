@@ -3387,7 +3387,7 @@ fn executableFileName(comptime basename: []const u8) []const u8 {
 
 fn zigTargetName() []const u8 {
     return switch (builtin.os.tag) {
-        .windows => "x86_64-windows",
+        .windows => if (builtin.cpu.arch == .aarch64) "aarch64-windows-gnu" else "x86_64-windows-gnu",
         .linux => switch (builtin.cpu.arch) {
             // Linux main processes dynamically load Electrobun's glibc-based
             // core. An unspecified ABI lets Zig select a static libc, which
@@ -3663,8 +3663,7 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
 
 fn rustTargetName() []const u8 {
     return switch (builtin.os.tag) {
-        // Electrobun's Windows runtime and Rust devkit currently ship x64.
-        .windows => "x86_64-pc-windows-msvc",
+        .windows => if (builtin.cpu.arch == .aarch64) "aarch64-pc-windows-msvc" else "x86_64-pc-windows-msvc",
         .linux => switch (builtin.cpu.arch) {
             .aarch64 => "aarch64-unknown-linux-gnu",
             else => "x86_64-unknown-linux-gnu",
@@ -4318,9 +4317,9 @@ fn configureGoBuildEnvironment(
         .linux => {},
         .windows => {
             const zig = zig_binary orelse return error.WindowsCgoCompilerNotFound;
-            const cc = try quotedGoCompilerCommand(allocator, zig, "cc");
+            const cc = try quotedGoCompilerCommand(allocator, zig, if (target.arch == .arm64) "cc -target aarch64-windows-gnu" else "cc -target x86_64-windows-gnu");
             defer allocator.free(cc);
-            const cxx = try quotedGoCompilerCommand(allocator, zig, "c++");
+            const cxx = try quotedGoCompilerCommand(allocator, zig, if (target.arch == .arm64) "c++ -target aarch64-windows-gnu" else "c++ -target x86_64-windows-gnu");
             defer allocator.free(cxx);
             try environment.put("CC", cc);
             try environment.put("CXX", cxx);
@@ -4527,17 +4526,34 @@ test "Go v2 Windows cgo compiler command quotes cached Zig paths" {
     try std.testing.expectEqualStrings("v1", environment.get("GOAMD64").?);
     try std.testing.expectEqualStrings("C:\\Dash Cache\\go", environment.get("GOROOT").?);
     try std.testing.expectEqualStrings(
-        "\"C:\\Dash Cache\\zig\\zig.exe\" cc",
+        "\"C:\\Dash Cache\\zig\\zig.exe\" cc -target x86_64-windows-gnu",
         environment.get("CC").?,
     );
     try std.testing.expectEqualStrings(
-        "\"C:\\Dash Cache\\zig\\zig.exe\" c++",
+        "\"C:\\Dash Cache\\zig\\zig.exe\" c++ -target x86_64-windows-gnu",
         environment.get("CXX").?,
     );
     try std.testing.expectError(
         error.InvalidGoCompilerPath,
         quotedGoCompilerCommand(std.testing.allocator, "C:\\bad\"path\\zig.exe", "cc"),
     );
+}
+
+test "Go v2 Windows ARM64 uses the target architecture with an emulated Zig compiler" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try configureGoBuildEnvironment(
+        std.testing.allocator,
+        &environment,
+        .{ .os = .windows, .arch = .arm64 },
+        null,
+        "C:\\tools\\zig.exe",
+    );
+    try std.testing.expectEqualStrings("arm64", environment.get("GOARCH").?);
+    try std.testing.expectEqualStrings("v8.0", environment.get("GOARM64").?);
+    try std.testing.expect(environment.get("GOAMD64") == null);
+    try std.testing.expectEqualStrings("\"C:\\tools\\zig.exe\" cc -target aarch64-windows-gnu", environment.get("CC").?);
+    try std.testing.expectEqualStrings("\"C:\\tools\\zig.exe\" c++ -target aarch64-windows-gnu", environment.get("CXX").?);
 }
 
 test "Go v2 requires the project module to replace the selected SDK" {
@@ -4642,6 +4658,10 @@ test "Go v2 project validation requires owned modules and a package directory" {
 }
 
 fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) {
+        ctx.writeStderr("hutch electrobun: Odin main processes are not supported on Windows ARM64\n", .{});
+        return error.OdinWindowsArm64Unsupported;
+    }
     const leased_odin_toolchain = try resolveBuildToolchain(ctx, config.root, platform_paths, .odin);
     defer leased_odin_toolchain.close(ctx.io);
     const odin_toolchain = leased_odin_toolchain.resolution;

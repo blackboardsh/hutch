@@ -319,7 +319,7 @@ fn toolchainPlatformKey() []const u8 {
     return switch (builtin.os.tag) {
         .macos => if (builtin.cpu.arch == .aarch64) "macos-arm64" else "macos-x64",
         .linux => if (builtin.cpu.arch == .aarch64) "linux-arm64" else "linux-x64",
-        else => "windows-x64",
+        else => if (builtin.cpu.arch == .aarch64) "windows-arm64" else "windows-x64",
     };
 }
 

@@ -870,7 +870,7 @@ pub fn platformKey() ![]const u8 {
             .x86_64 => "linux-x64",
             else => error.UnsupportedElectrobunPlatform,
         },
-        .windows => "windows-x64",
+        .windows => if (builtin.cpu.arch == .aarch64) "windows-arm64" else "windows-x64",
         else => error.UnsupportedElectrobunPlatform,
     };
 }
@@ -894,7 +894,6 @@ fn releasePlatformName() []const u8 {
 }
 
 fn releaseArchName() []const u8 {
-    if (builtin.os.tag == .windows) return "x64";
     return switch (builtin.cpu.arch) {
         .aarch64 => "arm64",
         else => "x64",

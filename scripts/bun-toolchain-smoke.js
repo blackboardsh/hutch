@@ -29,6 +29,7 @@ const platformKey = {
   "linux-x64": "linux-x64",
   "linux-arm64": "linux-arm64",
   "win32-x64": "windows-x64",
+  "win32-arm64": "windows-arm64",
 }[`${process.platform}-${process.arch}`];
 assert(platformKey, `unsupported bun toolchain smoke platform: ${process.platform}-${process.arch}`);
 

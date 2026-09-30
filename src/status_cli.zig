@@ -29,6 +29,7 @@ const platform_keys = [_][]const u8{
     "linux-x64",
     "linux-arm64",
     "windows-x64",
+    "windows-arm64",
 };
 
 pub fn run(

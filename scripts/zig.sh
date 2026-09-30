@@ -11,4 +11,23 @@ if [[ ! -x "$ZIG_BIN" ]]; then
 fi
 
 cd "$HUTCH_ROOT"
+# The Windows host compiler is x64 even for native ARM64 builds. Follow the
+# Node host architecture unless the caller supplied an explicit Zig target.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [[ "${1:-}" == "build" ]]; then
+      has_target=false
+      for arg in "$@"; do
+        if [[ "$arg" == -Dtarget=* ]]; then has_target=true; fi
+      done
+      if [[ "$has_target" == false ]]; then
+        case "$(node -p 'process.arch')" in
+          arm64) set -- "$@" -Dtarget=aarch64-windows-msvc ;;
+          x64) set -- "$@" -Dtarget=x86_64-windows-msvc ;;
+          *) echo "hutch: unsupported Windows target architecture" >&2; exit 1 ;;
+        esac
+      fi
+    fi
+    ;;
+esac
 exec "$ZIG_BIN" "$@"

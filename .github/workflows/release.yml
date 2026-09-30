@@ -1,6 +1,8 @@
 name: Build and publish Hutch
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -29,10 +31,13 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
 
-      - name: Validate release contract and tag
+      - name: Validate release contracts
         run: |
-          node --test scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
-          node scripts/validate-release-tag.js
+          node --test scripts/windows-binary-architecture.test.mjs scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/validate-release-tag.js
 
   build:
     name: Build ${{ matrix.platform }}
@@ -59,6 +64,10 @@ jobs:
             runner: windows-2025
             os: windows
             target: x86_64-windows-msvc
+          - platform: windows-arm64
+            runner: windows-11-arm
+            os: windows
+            target: aarch64-windows-msvc
 
     steps:
       - name: Check out Hutch
@@ -111,7 +120,7 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline
+          & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }} -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Hutch release build failed" }
 
       - name: Run Hutch tests
@@ -140,7 +149,7 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          & .\vendors\zig\zig.exe build test
+          & .\vendors\zig\zig.exe build test -Dtarget=${{ matrix.target }}
           if ($LASTEXITCODE -ne 0) { throw "Hutch Zig tests failed" }
           node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
@@ -200,6 +209,7 @@ jobs:
   publish:
     name: Publish complete release matrix to R2
     needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:

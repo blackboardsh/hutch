@@ -1955,6 +1955,7 @@ fn validatePlatform(value: []const u8) !void {
         "linux-arm64",
         "linux-x64",
         "windows-x64",
+        "windows-arm64",
     }) |platform| {
         if (std.mem.eql(u8, value, platform)) return;
     }

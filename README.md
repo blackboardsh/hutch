@@ -431,7 +431,10 @@ Run `hutch push:canary` to propose the next `canary.N` release, or
 editing the proposed semantic version before they commit, tag, and atomically
 push `main` and the release tag.
 
-The GitHub Actions matrix builds macOS ARM64, Linux x64/ARM64, and Windows x64.
+The GitHub Actions matrix builds macOS ARM64, Linux x64/ARM64, and Windows x64/ARM64.
+Windows ARM64 uses the x64 Zig compiler under emulation and runs the resulting
+ARM64 binaries and tests natively. Odin main-process builds are unavailable on
+Windows ARM64.
 It uploads one archive per revision and platform:
 
 ```text
@@ -445,8 +448,8 @@ hutch/install.ps1
 
 Archives contain only `bin/hutch`, `bin/hutch-engine`, and release metadata. The
 mutable remote channel manifest is written after every immutable archive and
-manifest. Every published object remains under the `hutch/` bucket prefix. Tags
-are the only workflow trigger.
+manifest. Every published object remains under the `hutch/` bucket prefix.
+Pull requests and manual runs validate the full matrix; only version tags publish.
 
 The GitHub repository requires `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, and
 `R2_SECRET_ACCESS_KEY` Actions secrets. Those credentials must have object-write

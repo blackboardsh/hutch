@@ -979,7 +979,6 @@ fn targetOs() []const u8 {
 }
 
 fn targetArch() []const u8 {
-    if (builtin.os.tag == .windows) return "x64";
     return switch (builtin.cpu.arch) {
         .aarch64 => "arm64",
         else => "x64",

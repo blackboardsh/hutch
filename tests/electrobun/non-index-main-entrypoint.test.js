@@ -126,7 +126,7 @@ function toolchainPlatformKey() {
   if (process.platform === "linux") {
     return process.arch === "arm64" ? "linux-arm64" : "linux-x64";
   }
-  return "windows-x64";
+  return process.arch === "arm64" ? "windows-arm64" : "windows-x64";
 }
 
 // Pre-installs the fixture bun into a Hutch home's toolchain store the way a

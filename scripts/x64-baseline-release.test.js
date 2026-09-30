@@ -28,7 +28,9 @@ test("every Hutch release build explicitly targets the baseline CPU", () => {
 
   const windowsCommand = releaseCommands.find((command) => command.includes("zig.exe"));
   assert.ok(windowsCommand);
-  assert.match(windowsCommand, /-Dtarget=x86_64-windows-msvc/);
+  assert.match(windowsCommand, /-Dtarget=\$\{\{ matrix\.target \}\}/);
+  assert.match(releaseWorkflow, /platform: windows-x64\s+runner: windows-2025\s+os: windows\s+target: x86_64-windows-msvc/);
+  assert.match(releaseWorkflow, /platform: windows-arm64\s+runner: windows-11-arm\s+os: windows\s+target: aarch64-windows-msvc/);
 });
 
 test("Linux Hutch releases target the Electrobun glibc baseline", () => {
