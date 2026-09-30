@@ -45,6 +45,14 @@ zsh, bash, fish, or POSIX shell profile and prints the command that activates it
 in the current terminal. Pass `--no-modify-path` to only print that command.
 `stable` is accepted as an installer channel alias for `production`.
 
+Windows ARM64 is initially available on the canary channel. The PowerShell
+installer detects the native CPU even from an emulated x64 shell. Existing
+x64 launchers keep selecting x64 releases; rerun the installer with
+`-Channel canary` to install the native `hutch-canary.exe`. Its paired ARM64
+Cottontail supports JavaScriptCore's Baseline, DFG, FTL, and WebAssembly JITs.
+After updating an x64 canary on ARM64 hardware, Hutch prints the native
+installer command. Automatic architecture migration is not enabled yet.
+
 ## Project Pins
 
 The first line of `hutch.config.ts` can pin

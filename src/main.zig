@@ -20,6 +20,7 @@ const status_cli = @import("status_cli.zig");
 const store_locks = @import("store_locks.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const version_selector = @import("version_selector.zig");
+const windows_architecture = @import("windows_architecture.zig");
 
 const version = @import("version.zig").version;
 const hutch_version = @import("version.zig");
@@ -1679,6 +1680,12 @@ fn runReleaseCommand(
         const channel_name = updated_channel.?;
         try writeReleaseUpdateSuccess(stdout, product, resolution, channel_name);
         notePragmaPin(init, allocator, product, channel_name, resolution.version, stderr) catch {};
+        if (product == .hutch) try windows_architecture.writeMigrationNotice(
+            stderr,
+            windows_architecture.isX64OnArm64(),
+            channel_name,
+            resolution.version,
+        );
     }
     return 0;
 }
@@ -1944,6 +1951,12 @@ fn maybePromptForUpdates(
             try stderr.print(
                 "hutch: updated {s} to {s}; it will be used by the next command.\n",
                 .{ product.name(), resolution.version },
+            );
+            try windows_architecture.writeMigrationNotice(
+                stderr,
+                windows_architecture.isX64OnArm64(),
+                channel,
+                resolution.version,
             );
         } else if (std.ascii.eqlIgnoreCase(response, "s") or
             std.ascii.eqlIgnoreCase(response, "skip"))

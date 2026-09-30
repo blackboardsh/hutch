@@ -64,6 +64,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const windows_architecture_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windows_architecture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = windows_arm64,
+        }),
+    });
     // `hutch status` reads the whole store layout, so it is rooted as its own
     // test binary: tests in a file that is only imported by the engine root
     // are not part of the engine test artifact.
@@ -191,6 +199,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_patch_tests.step);
     test_step.dependOn(&run_launcher_tests.step);
     test_step.dependOn(&run_windows_icon_tests.step);
+    test_step.dependOn(&b.addRunArtifact(windows_architecture_tests).step);
     test_step.dependOn(&run_status_tests.step);
     test_step.dependOn(&run_electrobun_tests.step);
     test_step.dependOn(&run_electrobun_template_tests.step);
