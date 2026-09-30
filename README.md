@@ -51,6 +51,8 @@ x64 launchers keep selecting x64 releases; rerun the installer with
 `-Channel canary` to install the native `hutch-canary.exe`. Its paired ARM64
 Cottontail currently uses an interpreter without JIT or WebAssembly, so
 JavaScript-heavy build scripts can run more slowly than under x64 emulation.
+After updating an x64 canary on ARM64 hardware, Hutch prints the native
+installer command. Automatic architecture migration is not enabled yet.
 
 ## Project Pins
 
