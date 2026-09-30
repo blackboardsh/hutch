@@ -19,7 +19,28 @@ if ($Version -and $Build) {
   throw "Hutch installer: -Version and -Build are mutually exclusive"
 }
 
-$platform = "windows-x64"
+# IsWow64Process2 reports the real CPU even from an emulated x64 PowerShell.
+if (-not ("HutchNativeArchitecture" -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HutchNativeArchitecture {
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+}
+'@
+}
+[UInt16]$processMachine = 0
+[UInt16]$nativeMachine = 0
+if (-not [HutchNativeArchitecture]::IsWow64Process2([IntPtr]::new(-1), [ref]$processMachine, [ref]$nativeMachine)) {
+  throw "Hutch installer: could not detect native Windows architecture"
+}
+$platform = switch ($nativeMachine) {
+  0xAA64 { "windows-arm64" }
+  0x8664 { "windows-x64" }
+  default { throw "Hutch installer: unsupported Windows machine type $nativeMachine" }
+}
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("hutch-install-" + [guid]::NewGuid())
 $stageRoot = $null
 New-Item -ItemType Directory -Force -Path $temporary | Out-Null

@@ -26,6 +26,7 @@ const platform = {
   "linux-x64": "linux-x64",
   "linux-arm64": "linux-arm64",
   "win32-x64": "windows-x64",
+  "win32-arm64": "windows-arm64",
 }[`${process.platform}-${process.arch}`];
 assert(platform, `unsupported installer smoke platform: ${process.platform}-${process.arch}`);
 
@@ -272,6 +273,7 @@ try {
       hutchHome,
       "-ArtifactsBaseUrl",
       baseUrl,
+      "-NoModifyPath",
     ]);
     assertActiveInstall(hutchHome, channel);
     const commandName = channel === "canary" ? "hutch-canary.exe" : "hutch.exe";
@@ -298,6 +300,7 @@ try {
       stableAliasHome,
       "-ArtifactsBaseUrl",
       baseUrl,
+      "-NoModifyPath",
     ]);
   } else {
     mkdirSync(shellHome, { recursive: true });

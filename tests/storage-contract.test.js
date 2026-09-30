@@ -32,6 +32,7 @@ const platform = {
   "linux-arm64": "linux-arm64",
   "linux-x64": "linux-x64",
   "win32-x64": "windows-x64",
+  "win32-arm64": "windows-arm64",
 }[`${process.platform}-${process.arch}`];
 
 assert(platform, `unsupported Hutch storage-contract platform: ${process.platform}-${process.arch}`);

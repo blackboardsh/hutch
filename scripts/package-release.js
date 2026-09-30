@@ -15,6 +15,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { releaseChannel } from "./release-contract.js";
+import { validateWindowsReleaseArchitecture } from "./windows-binary-architecture.mjs";
 
 const hutchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repositoryRoot = hutchRoot;
@@ -40,6 +41,7 @@ function platformKey() {
     "linux-x64": "linux-x64",
     "linux-arm64": "linux-arm64",
     "win32-x64": "windows-x64",
+    "win32-arm64": "windows-arm64",
   }[key] ?? fail(`unsupported release platform: ${key}`);
 }
 
@@ -83,6 +85,9 @@ rmSync(packageRoot, { recursive: true, force: true });
 mkdirSync(binRoot, { recursive: true });
 copyFileSync(builtLauncher, join(binRoot, launcherName));
 copyFileSync(builtEngine, join(binRoot, engineName));
+if (process.platform === "win32") {
+  validateWindowsReleaseArchitecture(binRoot, process.arch);
+}
 if (process.platform !== "win32") {
   chmodSync(join(binRoot, launcherName), 0o755);
   chmodSync(join(binRoot, engineName), 0o755);

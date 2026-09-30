@@ -35,6 +35,8 @@ vendor_zig() {
   local arch os
   arch="$(host_arch)"
   os="$(host_os)"
+  # The x64 Zig host compiler works under Windows ARM64 emulation.
+  if [[ "$os" == "windows" ]]; then arch="x86_64"; fi
 
   local zig_dir="$HUTCH_ROOT/vendors/zig"
   local zig_bin="$zig_dir/$(zig_binary_name "$os")"

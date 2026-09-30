@@ -17,6 +17,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Zig 0.16's optimized, libc-free ARM64 Windows startup crashes while
+    // initializing its allocator. Use the C runtime, as the engine does.
+    const windows_arm64 = target.result.os.tag == .windows and target.result.cpu.arch == .aarch64;
+    launcher.root_module.link_libc = windows_arm64;
     const engine = b.addExecutable(.{
         .name = "hutch-engine",
         .root_module = b.createModule(.{
@@ -52,6 +56,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    launcher_tests.root_module.link_libc = windows_arm64;
     const windows_icon_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/windows_icon.zig"),
@@ -163,6 +168,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    runtime_command_fixture.root_module.link_libc = windows_arm64;
     const runtime_command_regression = b.addExecutable(.{
         .name = "hutch-runtime-command-regression",
         .root_module = b.createModule(.{
@@ -171,6 +177,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    runtime_command_regression.root_module.link_libc = windows_arm64;
     const run_runtime_command_regression = b.addRunArtifact(runtime_command_regression);
     run_runtime_command_regression.addArtifactArg(launcher);
     run_runtime_command_regression.addArtifactArg(engine);

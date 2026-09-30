@@ -497,7 +497,7 @@ fn archiveFor(allocator: std.mem.Allocator, kind: Kind, version: []const u8) !Ar
             .{
                 version,
                 if (builtin.os.tag == .macos) "darwin" else if (builtin.os.tag == .windows) "windows" else "linux",
-                if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows) "arm64" else "amd64",
+                if (builtin.cpu.arch == .aarch64) "arm64" else "amd64",
                 if (builtin.os.tag == .windows) "zip" else "tar.gz",
             },
         ),
@@ -526,7 +526,7 @@ fn bunArchiveName(allocator: std.mem.Allocator) ![]const u8 {
     // Windows uses the baseline build: the binary ships inside end-user app
     // bundles, and the non-baseline build requires AVX2.
     if (builtin.os.tag == .windows) {
-        return allocator.dupe(u8, "bun-windows-x64-baseline.zip");
+        return allocator.dupe(u8, if (builtin.cpu.arch == .aarch64) "bun-windows-aarch64.zip" else "bun-windows-x64-baseline.zip");
     }
     const os = switch (builtin.os.tag) {
         .macos => "darwin",
@@ -544,6 +544,8 @@ fn zigArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8
         .windows => "windows",
         else => return error.UnsupportedToolchainPlatform,
     };
+    // Use the x64 Zig host compiler on Windows ARM64 until Zig's native
+    // Windows ARM64 host build is reliable. Build targets remain explicit.
     const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
         "aarch64"
     else
@@ -566,6 +568,7 @@ fn zigLegacyArchiveNaming(version: []const u8) bool {
 }
 
 fn odinArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) return error.OdinWindowsArm64Unsupported;
     const os = switch (builtin.os.tag) {
         .macos => "macos",
         .linux => "linux",
@@ -587,7 +590,7 @@ fn rustHostTriple() []const u8 {
     return switch (builtin.os.tag) {
         .macos => if (builtin.cpu.arch == .aarch64) "aarch64-apple-darwin" else "x86_64-apple-darwin",
         .linux => if (builtin.cpu.arch == .aarch64) "aarch64-unknown-linux-gnu" else "x86_64-unknown-linux-gnu",
-        .windows => "x86_64-pc-windows-msvc",
+        .windows => if (builtin.cpu.arch == .aarch64) "aarch64-pc-windows-msvc" else "x86_64-pc-windows-msvc",
         else => "unsupported",
     };
 }
@@ -806,7 +809,7 @@ fn platformKey() ![]const u8 {
     return switch (builtin.os.tag) {
         .macos => if (builtin.cpu.arch == .aarch64) "macos-arm64" else "macos-x64",
         .linux => if (builtin.cpu.arch == .aarch64) "linux-arm64" else "linux-x64",
-        .windows => "windows-x64",
+        .windows => if (builtin.cpu.arch == .aarch64) "windows-arm64" else "windows-x64",
         else => error.UnsupportedToolchainPlatform,
     };
 }
@@ -852,7 +855,7 @@ test "bun archives resolve from upstream oven-sh releases" {
     ));
     try std.testing.expect(std.mem.endsWith(u8, archive.filename, ".zip"));
     if (builtin.os.tag == .windows) {
-        try std.testing.expectEqualStrings("bun-windows-x64-baseline.zip", archive.filename);
+        try std.testing.expectEqualStrings(if (builtin.cpu.arch == .aarch64) "bun-windows-aarch64.zip" else "bun-windows-x64-baseline.zip", archive.filename);
     } else {
         try std.testing.expect(std.mem.indexOf(u8, archive.filename, "baseline") == null);
     }
@@ -1150,6 +1153,10 @@ test "dated Odin pins never select an ambiguous system compiler" {
 }
 
 test "toolchain archive URLs follow upstream release naming" {
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) {
+        try std.testing.expectError(error.OdinWindowsArm64Unsupported, archiveFor(std.testing.allocator, .odin, "dev-2026-07a"));
+        return;
+    }
     const archive = try archiveFor(std.testing.allocator, .odin, "dev-2026-07a");
     defer std.testing.allocator.free(archive.url);
     defer std.testing.allocator.free(archive.filename);

@@ -27,9 +27,9 @@ export function hostContract() {
   if (process.platform === "win32") {
     return {
       os: "win",
-      arch: "x64",
-      key: "windows-x64",
-      asset: "win-x64",
+      arch: process.arch === "arm64" ? "arm64" : "x64",
+      key: `windows-${process.arch === "arm64" ? "arm64" : "x64"}`,
+      asset: `win-${process.arch === "arm64" ? "arm64" : "x64"}`,
       core: "ElectrobunCore.dll",
       native: "libNativeWrapper.dll",
       nativeCef: "libNativeWrapper.dll",
