@@ -57,6 +57,13 @@ try {
   }
 
   $manifest = Invoke-RestMethod -Uri $manifestUrl
+  # The shared installer also serves older releases, including production
+  # while native ARM64 is available only on canary. Preserve x64 emulation
+  # when the requested release has no ARM64 entry at all.
+  if ($platform -eq "windows-arm64" -and $null -eq $manifest.platforms.'windows-arm64' -and $null -ne $manifest.platforms.'windows-x64') {
+    $platform = "windows-x64"
+    Write-Host "Hutch installer: this release has no Windows ARM64 build; using x64 emulation."
+  }
   $artifact = $manifest.platforms.$platform.archive
   if (!$manifest.version -or !$manifest.revision -or !$artifact.url -or !$artifact.sha256 -or !$artifact.size) {
     throw "Hutch installer: release manifest is incomplete for $platform"
