@@ -151,7 +151,7 @@ jobs:
         run: |
           & .\vendors\zig\zig.exe build test -Dtarget=${{ matrix.target }}
           if ($LASTEXITCODE -ne 0) { throw "Hutch Zig tests failed" }
-          node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js
+          node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/windows-installer-architecture.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
           node scripts/local-stack.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }
