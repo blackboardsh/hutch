@@ -157,6 +157,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }
           node --test --test-concurrency=1 tests/storage-contract.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch storage contract tests failed" }
+          # Exercise concurrent downloads with the actual optimized release
+          # engine: Debug Zig unit tests do not catch ARM64 TLS codegen bugs.
+          node tests/package-manager/package-manager-cache-concurrency.cjs zig-out/bin/hutch-engine.exe
+          if ($LASTEXITCODE -ne 0) { throw "Hutch release package installer failed" }
 
       - name: Smoke test Hutch release executables
         if: matrix.os != 'windows'

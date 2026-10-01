@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         .default_target = .{ .cpu_model = .baseline },
     });
     const optimize = b.standardOptimizeOption(.{});
+    const windows_arm64 = target.result.os.tag == .windows and target.result.cpu.arch == .aarch64;
+    // Zig 0.16's stripped ARM64 Windows output misaddresses thread-local
+    // storage in SmpAllocator and crashes package-download workers. Keep
+    // optimized code with debug information; PDBs are not release payloads.
+    const strip: ?bool = if (windows_arm64) false else null;
 
     const launcher = b.addExecutable(.{
         .name = "hutch",
@@ -15,11 +20,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/launcher.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     // Zig 0.16's optimized, libc-free ARM64 Windows startup crashes while
     // initializing its allocator. Use the C runtime, as the engine does.
-    const windows_arm64 = target.result.os.tag == .windows and target.result.cpu.arch == .aarch64;
     launcher.root_module.link_libc = windows_arm64;
     const engine = b.addExecutable(.{
         .name = "hutch-engine",
@@ -27,6 +32,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     engine.root_module.link_libc = true;
