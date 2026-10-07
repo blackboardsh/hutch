@@ -19,6 +19,7 @@ node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/storage-contract.test.js"
 node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/electrobun/build-lifecycle-lock.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/native-zig-cache.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/decorator-bundle.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/init-scaffold.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/javascript-sdk-subpaths.test.js" \

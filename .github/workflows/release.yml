@@ -131,6 +131,7 @@ jobs:
           node scripts/local-stack.test.js
           node --test --test-concurrency=1 tests/storage-contract.test.js
           node --test --test-concurrency=1 \
+            tests/electrobun/native-zig-cache.test.js \
             tests/electrobun/decorator-bundle.test.js \
             tests/electrobun/init-scaffold.test.js \
             tests/electrobun/javascript-sdk-subpaths.test.js \

@@ -3607,6 +3607,22 @@ test "Rust toolchain overrides are exact semantic versions" {
     }
 }
 
+fn openProjectZigCache(ctx: *const Context) !struct { directory: std.Io.Dir, path: []const u8 } {
+    var state = try project_state.open(ctx.io, ctx.project_root, .create, .{});
+    defer state.close(ctx.io);
+    var caches = try project_state.openChild(ctx.io, state, "cache", .create, .{});
+    defer caches.close(ctx.io);
+    var zig = try project_state.openChild(ctx.io, caches, "zig", .create, .{});
+    defer zig.close(ctx.io);
+    const target = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() });
+    const directory = try project_state.openChild(ctx.io, zig, target, .create, .{});
+    errdefer directory.close(ctx.io);
+    return .{
+        .directory = directory,
+        .path = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".hutch", "cache", "zig", target }),
+    };
+}
+
 fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
     const build_script_path = try requireProjectZigBuildFile(ctx);
 
@@ -3622,7 +3638,11 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
     const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
     try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const install_prefix = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "install" });
-    const cache_dir = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "cache" });
+    // runBuildUnlocked intentionally recreates build_root. Compiler caches
+    // belong to project state so incremental builds survive that cleanup;
+    // install output stays in the clean build tree and is always regenerated.
+    const cache = try openProjectZigCache(ctx);
+    defer cache.directory.close(ctx.io);
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(ctx.allocator);
@@ -3632,7 +3652,7 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
         zig_binary,
         build_script_path,
         install_prefix,
-        cache_dir,
+        cache.path,
         zig_sdk_path,
         config.build_env,
     );
