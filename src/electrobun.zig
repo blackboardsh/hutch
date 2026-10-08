@@ -1419,10 +1419,14 @@ fn appendBundleTarArgs(
     // COPYFILE_DISABLE prevents AppleDouble sidecars, while --no-xattrs also
     // prevents binary macOS extended attributes from entering PAX records.
     if (os_tag == .macos) try argv.append(allocator, "--no-xattrs");
+    // GNU tar defaults to GNU long-name records, which installed Electrobun
+    // updaters cannot extract. USTAR stores split directory prefixes instead;
+    // GNU tar fails packaging if a path cannot be represented safely.
+    if (os_tag == .linux) try argv.append(allocator, "--format=ustar");
     try argv.appendSlice(allocator, &.{ "-cf", tar_path, "-C", parent, name });
 }
 
-test "bundle tar requests extended attribute exclusion only on macOS" {
+test "bundle tar uses USTAR on Linux and excludes extended attributes on macOS" {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(std.testing.allocator);
 
@@ -1461,6 +1465,7 @@ test "bundle tar requests extended attribute exclusion only on macOS" {
     );
     const linux_expected = [_][]const u8{
         "tar",
+        "--format=ustar",
         "-cf",
         "/tmp/bundle.tar",
         "-C",
@@ -1494,6 +1499,91 @@ test "bundle tar requests extended attribute exclusion only on macOS" {
     for (windows_expected, argv.items) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "Linux bundle tar preserves long paths without unsupported extension records" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const long_path = "Dash-canary/Resources/platform-apps/dash.tsserver/resources/node_modules/typescript/lib/" ++
+        "some-very-long-language-service-declaration-file-name.d.ts";
+    try std.testing.expect(long_path.len > 100);
+    try tmp.dir.createDirPath(io, std.fs.path.dirname(long_path).?);
+    try tmp.dir.writeFile(io, .{ .sub_path = long_path, .data = "long path contents\n" });
+    try tmp.dir.createDirPath(io, "Dash-canary/bin");
+    {
+        const launcher = try tmp.dir.createFile(io, "Dash-canary/bin/launcher", .{
+            .permissions = .executable_file,
+        });
+        defer launcher.close(io);
+        try launcher.writeStreamingAll(io, "#!/bin/sh\nexit 0\n");
+    }
+    try tmp.dir.symLink(io, "launcher", "Dash-canary/bin/launch-link", .{});
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    const tar_path = try std.fs.path.join(allocator, &.{ root, "bundle.tar" });
+    // Exercise the Linux command on both GNU tar (Linux CI) and BSD tar
+    // (local macOS testing), independently of either tool's default format.
+    try appendBundleTarArgs(allocator, &argv, .linux, "/usr/bin/tar", tar_path, root, "Dash-canary");
+    var env_map = std.process.Environ.Map.init(allocator);
+    try env_map.put("COPYFILE_DISABLE", "1");
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+    });
+    try std.testing.expectEqual(@as(u8, 0), termExitCode(result.term));
+    const archive = try tmp.dir.readFileAlloc(io, "bundle.tar", allocator, .limited(1024 * 1024));
+    var offset: usize = 0;
+    var found_prefix = false;
+    // Inspect raw headers: std.tar's iterator accepts GNU extensions and
+    // would hide a regression that the installed extractor cannot tolerate.
+    while (offset + 512 <= archive.len) {
+        const header = archive[offset..][0..512];
+        if (std.mem.allEqual(u8, header, 0)) break;
+        try std.testing.expectEqualStrings("ustar", header[257..262]);
+        try std.testing.expect(header[156] == '0' or header[156] == 0 or
+            header[156] == '2' or header[156] == '5');
+        if (header[345] != 0) found_prefix = true;
+        const size = try std.fmt.parseInt(usize, std.mem.trim(u8, header[124..136], " \x00"), 8);
+        offset += 512 + std.mem.alignForward(usize, size, 512);
+    }
+    try std.testing.expect(found_prefix);
+    try tmp.dir.createDirPath(io, "extracted");
+    var extracted = try tmp.dir.openDir(io, "extracted", .{});
+    defer extracted.close(io);
+    var reader: std.Io.Reader = .fixed(archive);
+    try std.tar.extract(io, extracted, &reader, .{});
+    try std.testing.expectEqualStrings("long path contents\n", try extracted.readFileAlloc(
+        io,
+        long_path,
+        allocator,
+        .limited(1024),
+    ));
+    var link_buffer: [100]u8 = undefined;
+    const link_len = try extracted.readLink(io, "Dash-canary/bin/launch-link", &link_buffer);
+    try std.testing.expectEqualStrings("launcher", link_buffer[0..link_len]);
+    const launcher = try extracted.openFile(io, "Dash-canary/bin/launcher", .{});
+    defer launcher.close(io);
+    try std.testing.expect((try launcher.stat(io)).permissions.toMode() & 0o111 != 0);
+
+    // Linux's GNU tar must stop release creation for a filename that cannot
+    // fit USTAR instead of publishing truncated names or GNU extensions.
+    // BSD tar's error exit behavior differs; production macOS keeps its own
+    // format and is not subject to the Linux USTAR option.
+    if (builtin.os.tag != .linux) return;
+    const too_long = "Dash-canary/" ++ "x" ** 101;
+    try tmp.dir.writeFile(io, .{ .sub_path = too_long, .data = "cannot represent" });
+    const rejected = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+    });
+    try std.testing.expect(termExitCode(rejected.term) != 0);
 }
 
 fn compressTar(
