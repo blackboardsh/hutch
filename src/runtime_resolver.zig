@@ -154,3 +154,16 @@ test "runtime resolver binary names match the host" {
         try std.testing.expectEqualStrings("cottontail", cottontailBinaryName());
     }
 }
+
+// Runtime selection is independent of the Cottontail version pragma used by
+// internal build tooling. Existing explicit runtime overrides remain supported.
+pub fn useCottontailScripts(environment: *const std.process.Environ.Map) !bool {
+    if (environment.get("HUTCH_RUNTIME")) |runtime| {
+        if (std.mem.eql(u8, runtime, "bun")) return false;
+        if (std.mem.eql(u8, runtime, "cottontail")) return true;
+        return error.InvalidHutchRuntime;
+    }
+    return environment.get("DASH_COTTONTAIL") != null or
+        environment.get("COTTONTAIL_BINARY") != null or
+        environmentFlagEnabled(environment, "DASH_USE_LOCAL_COTTONTAIL");
+}

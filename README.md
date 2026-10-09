@@ -7,9 +7,12 @@ installation has two parts:
 - `hutch-engine`, the versioned engine that owns scripts, builds, toolchains, and
   Electrobun orchestration.
 
+Bun is the default JavaScript/TypeScript script and test runner. Cottontail is
+experimental and opt-in via `HUTCH_RUNTIME=cottontail`.
+
 Cottontail is released and stored independently, but every Hutch release names
 the Cottontail version it was built and tested with. An unpinned project uses
-that pair for build-time JavaScript execution; an explicit Cottontail pin wins.
+that pair for internal configuration and bundling helpers; an explicit Cottontail pin wins.
 JavaScript dependencies install through Hutch's minimal built-in npm-compatible
 resolver by default, or through an explicitly selected external package manager.
 
@@ -483,7 +486,7 @@ for the release workflow.
 - `hutch reset`
 
 Scripts resolve exclusively from the nearest `hutch.config.ts`. A string is
-command text parsed and executed by the selected Cottontail release's Bun.$
+command text parsed and executed by the selected runtime's Bun.$
 shell. A non-empty array is exact argv. Invocation arguments are appended as
 separately escaped Bun.$ interpolations for strings and exact argv entries for
 arrays:
@@ -512,8 +515,11 @@ outer orchestrator, which could otherwise deliver a terminal interrupt twice.
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
 emulate npm lifecycle variables when running these tasks. Invoke a local binary
 explicitly with `hutch pm exec`, or select and call an external package manager.
-Hutch invokes the selected Cottontail release for JavaScript execution, runtime
-compatibility APIs, and compiler-backed build paths.
+Hutch defaults to Bun for JavaScript/TypeScript scripts and tests. Internal
+config loading and Electrobun bundling still use the paired Cottontail.
+Set `HUTCH_RUNTIME=cottontail` to use the experimental script runner, or
+`HUTCH_RUNTIME=bun` to select Bun even with local Cottontail overrides.
+A Cottontail version pragma alone does not select the script runner.
 
 `hutch run --if-configured <script-name>` uses the same config-only lookup but
 exits successfully when the task is absent. It is intended for generic setup

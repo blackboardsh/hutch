@@ -6,8 +6,8 @@ const release_store = @import("release_store.zig");
 
 const max_archive_bytes = 1536 * 1024 * 1024;
 
-// Hutch's own Bun default for generic packageManager: "bun" projects, where
-// no Electrobun devkit exists to supply toolchains.bun.defaultVersion.
+// Hutch's pinned script runtime, also used by generic packageManager: "bun"
+// projects. Electrobun package-manager selection can use its devkit's Bun pin.
 pub const default_bun_version = "1.4.0";
 
 pub const Kind = enum {

@@ -14,7 +14,7 @@ const defaultConfig = {
   build: {
     buildFolder: "build",
     artifactFolder: "artifacts",
-    mainProcess: "cottontail",
+    mainProcess: "bun",
     useAsar: false,
     main: {
       entrypoint: "src/bun/index.ts",
@@ -115,6 +115,13 @@ function mergeConfig(base, override) {
         : value;
   }
   return result;
+}
+
+// A legacy Cottontail-only block must not silently lose its entrypoint/options
+// when the implicit runtime changes to Bun.
+if (loadedConfig.build?.mainProcess == null && !loadedConfig.build?.bun &&
+    (loadedConfig.build?.cottontail || loadedConfig.build?.main)) {
+  throw new Error('Bun is now the default main process. Move application settings to build.bun, or explicitly set build.mainProcess: "cottontail" for the experimental runtime.');
 }
 
 const merged = mergeConfig(defaultConfig, loadedConfig);

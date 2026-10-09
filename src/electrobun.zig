@@ -12,6 +12,7 @@ const release_store = @import("release_store.zig");
 const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const windows_icon = @import("windows_icon.zig");
+const runtime_resolver = @import("runtime_resolver.zig");
 const hutch_release = @import("version.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
@@ -344,7 +345,7 @@ fn printHelp(writer: anytype) !void {
         \\  - update rewrites the nearest parent hutch.config.ts to the latest stable exact version, then runs sync.
         \\  - prepare reuses an existing valid projection for a floating direct-Hutch project; sync advances it to the active channel.
         \\  - esbuild is vendored automatically on first use as a native binary.
-        \\  - hook scripts are transpiled and executed by Cottontail through Hutch.
+        \\  - hook scripts default to Bun; HUTCH_RUNTIME=cottontail opts into experimental Cottontail.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
         \\  - init requires network access; release metadata and template archives are never retained.
         \\  - DASH_RELEASE_OFFLINE prevents all Hutch-managed network access for installed projects.
@@ -5650,8 +5651,12 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
         }
     }
 
+    const use_cottontail = try runtime_resolver.useCottontailScripts(ctx.environ_map);
+    const bun = if (use_cottontail) null else try toolchain_store.resolveVersion(ctx.init, ctx.allocator, .bun, toolchain_store.default_bun_version);
+    defer if (bun) |runtime| runtime.close(ctx.io);
+    const runtime_binary = if (bun) |runtime| runtime.resolution.binary else try resolveCottontailBinary(ctx);
     var child = try std.process.spawn(ctx.io, .{
-        .argv = &[_][]const u8{ try resolveCottontailBinary(ctx), hook_wrapper },
+        .argv = &[_][]const u8{ runtime_binary, hook_wrapper },
         .cwd = .{ .path = ctx.project_root },
         .environ_map = &env_map,
         .stdin = .inherit,
@@ -6522,8 +6527,8 @@ fn artifactOutputRoot(ctx: *const Context, root: std.json.Value) ![]const u8 {
 }
 
 fn getMainProcess(root: std.json.Value) !MainProcess {
-    const build = getObjectField(root, "build") orelse return .cottontail;
-    const configured = build.get("mainProcess") orelse return .cottontail;
+    const build = getObjectField(root, "build") orelse return .bun;
+    const configured = build.get("mainProcess") orelse return .bun;
     if (configured != .string) return error.InvalidMainProcess;
     return std.meta.stringToEnum(MainProcess, configured.string) orelse
         error.UnsupportedMainProcess;
@@ -8520,7 +8525,7 @@ fn termExitCode(term: std.process.Child.Term) u8 {
     };
 }
 
-test "Electrobun accepts every supported main process and defaults to Cottontail" {
+test "Electrobun accepts every supported main process and defaults to Bun" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -8546,7 +8551,7 @@ test "Electrobun accepts every supported main process and defaults to Cottontail
         "{}",
         .{},
     );
-    try std.testing.expectEqual(MainProcess.cottontail, try getMainProcess(default_config));
+    try std.testing.expectEqual(MainProcess.bun, try getMainProcess(default_config));
 }
 
 test "Electrobun rejects unknown and non-string main processes" {

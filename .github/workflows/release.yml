@@ -129,7 +129,7 @@ jobs:
           ./vendors/zig/zig build test
           node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/verify-macos-deployment-target.test.js
           node scripts/local-stack.test.js
-          node --test --test-concurrency=1 tests/storage-contract.test.js
+          node --test --test-concurrency=1 tests/storage-contract.test.js tests/bun-script-runner.test.mjs tests/electrobun/default-runtime.test.js
           node --test --test-concurrency=1 \
             tests/electrobun/native-zig-cache.test.js \
             tests/electrobun/decorator-bundle.test.js \
@@ -156,7 +156,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
           node scripts/local-stack.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }
-          node --test --test-concurrency=1 tests/storage-contract.test.js
+          node --test --test-concurrency=1 tests/storage-contract.test.js tests/bun-script-runner.test.mjs tests/electrobun/default-runtime.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch storage contract tests failed" }
           # Exercise concurrent downloads with the actual optimized release
           # engine: Debug Zig unit tests do not catch ARM64 TLS codegen bugs.

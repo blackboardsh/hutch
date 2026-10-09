@@ -49,7 +49,7 @@ const help_text_template =
     \\
     \\Config:
     \\  Scripts are resolved only from hutch.config.ts.
-    \\  String scripts run through the selected Cottontail Bun.$ shell.
+    \\  Scripts and tests default to Bun; HUTCH_RUNTIME=cottontail selects the experimental runtime.
     \\  Array scripts run as exact non-empty argv string arrays.
     \\  packageManager selects npm, bun, pnpm, yarn, or an explicit executable;
     \\  without a selection, Hutch's built-in npm-compatible resolver installs
@@ -57,7 +57,7 @@ const help_text_template =
     \\  ignoring any foreign lockfile, and never runs lifecycle scripts.
     \\  Its `pm exec` runs only project-local node_modules/.bin commands.
     \\  Scripts invoke dependency managers and other external tools explicitly.
-    \\  Test files and options are forwarded to the selected Cottontail runtime.
+    \\  String scripts use Bun.$; test files and options use the selected runtime.
     \\
 ;
 
@@ -165,6 +165,9 @@ fn isInstallerBootstrapInvocation(args: []const [:0]const u8) bool {
 // invocations must behave like the runtime's own CLI instead of Hutch's
 // workspace orchestrator.
 fn isBunCliFacade(environment: *const std.process.Environ.Map) bool {
+    if (environment.get("HUTCH_RUNTIME")) |runtime| {
+        if (std.mem.eql(u8, runtime, "bun")) return false;
+    }
     return environment.get("DASH_COTTONTAIL") != null or
         environment.get("COTTONTAIL_BINARY") != null;
 }
@@ -312,6 +315,9 @@ fn runCottontailCommand(
     cottontail_path: []const u8,
     command_args: []const []const u8,
 ) !u8 {
+    if (!try useCottontailScripts(init.environ_map)) {
+        return runBunCommand(init, allocator, command_args);
+    }
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
 
@@ -393,10 +399,10 @@ fn makeConfigLoaderSource(
             "const __hutchClearPrivateArgv = () => {\n" ++
             "  process.argv.splice(1);\n" ++
             "  if (Array.isArray(Bun.argv) && Bun.argv !== process.argv) Bun.argv.splice(1);\n" ++
-            "  if (Array.isArray(cottontail.argv)) cottontail.argv.splice(1);\n" ++
-            "  if (Array.isArray(cottontail.args)) cottontail.args.splice(0);\n" ++
+            "  if (Array.isArray(globalThis.cottontail?.argv)) cottontail.argv.splice(1);\n" ++
+            "  if (Array.isArray(globalThis.cottontail?.args)) cottontail.args.splice(0);\n" ++
             "  if (Array.isArray(process.execArgv)) process.execArgv.splice(0);\n" ++
-            "  if (Array.isArray(cottontail.execArgv)) cottontail.execArgv.splice(0);\n" ++
+            "  if (Array.isArray(globalThis.cottontail?.execArgv)) cottontail.execArgv.splice(0);\n" ++
             "};\n" ++
             "__hutchClearPrivateArgv();\n" ++
             "const configModule = await import(",
@@ -1260,10 +1266,10 @@ const hutch_shell_wrapper_source =
     \\const clearPrivateArgv = () => {
     \\  process.argv.splice(1);
     \\  if (Array.isArray(Bun.argv) && Bun.argv !== process.argv) Bun.argv.splice(1);
-    \\  if (Array.isArray(cottontail.argv)) cottontail.argv.splice(1);
-    \\  if (Array.isArray(cottontail.args)) cottontail.args.splice(0);
+    \\  if (Array.isArray(globalThis.cottontail?.argv)) cottontail.argv.splice(1);
+    \\  if (Array.isArray(globalThis.cottontail?.args)) cottontail.args.splice(0);
     \\  if (Array.isArray(process.execArgv)) process.execArgv.splice(0);
-    \\  if (Array.isArray(cottontail.execArgv)) cottontail.execArgv.splice(0);
+    \\  if (Array.isArray(globalThis.cottontail?.execArgv)) cottontail.execArgv.splice(0);
     \\};
     \\clearPrivateArgv();
     \\globalThis.__cottontailLoadDotenv?.();
@@ -1284,7 +1290,7 @@ const hutch_shell_wrapper_source =
     \\}
     \\strings.raw = strings;
     \\const task = Bun.$(strings, ...args).nothrow();
-    \\task.options[Symbol.for("cottontail.internal.hutchShellTask")] = {
+    \\if (globalThis.cottontail) task.options[Symbol.for("cottontail.internal.hutchShellTask")] = {
     \\  input: () => Bun.stdin.stream(),
     \\  passthrough: true,
     \\};
@@ -1374,14 +1380,14 @@ fn runCottontailShellScript(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{
-        cottontail_path,
-        "--hutch-shell-file",
-        wrapper_path,
-        "--hutch-private-root",
-        task_dir.path,
-        script,
-    });
+    const use_cottontail = try useCottontailScripts(init.environ_map);
+    const bun = if (use_cottontail) null else try toolchain_store.resolveVersion(init, allocator, .bun, toolchain_store.default_bun_version);
+    defer if (bun) |runtime| runtime.close(init.io);
+    if (use_cottontail) {
+        try argv.appendSlice(allocator, &.{ cottontail_path, "--hutch-shell-file", wrapper_path, "--hutch-private-root", task_dir.path, script });
+    } else {
+        try argv.appendSlice(allocator, &.{ bun.?.resolution.binary, wrapper_path, script });
+    }
     for (script_args) |arg| try argv.append(allocator, arg);
 
     var env = try configuredScriptEnvironment(
@@ -2114,12 +2120,50 @@ fn prepareForwardedRuntimeAutoInstall(
     }
 }
 
+const useCottontailScripts = runtime_resolver.useCottontailScripts;
+
+fn runBunCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+) !u8 {
+    const bun = try toolchain_store.resolveVersion(init, allocator, .bun, toolchain_store.default_bun_version);
+    defer bun.close(init.io);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, bun.resolution.binary);
+    try argv.appendSlice(allocator, command_args);
+    if (comptime builtin.os.tag != .windows) {
+        if (bun.lease) |lease| try lease.makeInheritable(init.io);
+        try process_replace.replace(allocator, bun.resolution.binary, argv.items, init.environ_map);
+        unreachable;
+    }
+    return runProcess(init, argv.items);
+}
+
+test "scripts default to Bun and support explicit experimental Cottontail" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try std.testing.expect(!try useCottontailScripts(&environment));
+    try environment.put("COTTONTAIL_BINARY", "/explicit/cottontail");
+    try std.testing.expect(try useCottontailScripts(&environment));
+    try environment.put("HUTCH_RUNTIME", "bun");
+    try std.testing.expect(!try useCottontailScripts(&environment));
+    try environment.put("HUTCH_RUNTIME", "cottontail");
+    try std.testing.expect(try useCottontailScripts(&environment));
+    try environment.put("HUTCH_RUNTIME", "unknown");
+    try std.testing.expectError(error.InvalidHutchRuntime, useCottontailScripts(&environment));
+}
+
 fn forwardToCottontail(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     command_args: []const [:0]const u8,
     stderr: *std.Io.Writer,
 ) !u8 {
+    if (!try useCottontailScripts(init.environ_map)) {
+        return runBunCommand(init, allocator, command_args);
+    }
     if (!try prepareForwardedRuntimeAutoInstall(init, command_args, stderr)) return 1;
     const cottontail = resolveCottontail(init, allocator, command_args) catch |err| {
         try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
@@ -2987,7 +3031,7 @@ test "help text describes hutch config scripts" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "dash.config.ts") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "package.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "argv string arrays") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Cottontail Bun.$ shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "String scripts use Bun.$") != null);
 }
 
 test "Electrobun package manager version precedence is explicit default projection channel" {
