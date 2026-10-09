@@ -1,4 +1,4 @@
-pub const version = "0.28.0-canary.5";
+pub const version = "0.28.0-canary.6";
 
 /// The Cottontail release this Hutch release was built and tested with.
 /// Internal config/bundling helpers and explicitly selected experimental
