@@ -11,8 +11,8 @@ if [[ ! -x "$ZIG_BIN" ]]; then
 fi
 
 cd "$HUTCH_ROOT"
-# The Windows host compiler is x64 even for native ARM64 builds. Follow the
-# Node host architecture unless the caller supplied an explicit Zig target.
+# Compiler architecture can differ when an older Zig pin uses emulation. Follow
+# the Node host architecture unless the caller supplied an explicit Zig target.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     if [[ "${1:-}" == "build" ]]; then
