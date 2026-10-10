@@ -11,7 +11,6 @@ pub const lifecycle_script_names = [_][]const u8{
     "postprepare",
 };
 
-
 const std = @import("std");
 const PackageName = @import("support/util/package_name.zig");
 const Semver = @import("support/semver/root.zig");
@@ -614,7 +613,7 @@ test "package aliases and logical lock keys cannot escape node_modules" {
     try std.testing.expect(!packageNameIsSafe("scope\\outside"));
     try std.testing.expect(!packageNameIsSafe("has space"));
     try std.testing.expect(!packageNameIsSafe("has:colon"));
-    try std.testing.expect(!packageNameIsSafe("a" ** 215));
+    try std.testing.expect(!packageNameIsSafe(&@as([215]u8, @splat('a'))));
     try std.testing.expect(!packageKeyIsSafe("parent/../../outside"));
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

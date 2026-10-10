@@ -1930,8 +1930,8 @@ fn validateSegment(value: []const u8) !void {
 }
 
 fn validateToolchainKind(value: []const u8) !void {
-    inline for (@typeInfo(toolchain_store.Kind).@"enum".fields) |field| {
-        if (std.mem.eql(u8, value, field.name)) return;
+    inline for (@typeInfo(toolchain_store.Kind).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, value, name)) return;
     }
     return error.InvalidManagedObjectPath;
 }

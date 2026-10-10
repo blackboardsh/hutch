@@ -1,6 +1,6 @@
 --- a/vendors/zig/lib/std/Io/net/HostName.zig
 +++ b/vendors/zig/lib/std/Io/net/HostName.zig
-@@ -273,0 +274,10 @@
+@@ -300,0 +301,10 @@ pub const ConnectError = LookupError || IpAddress.ConnectError;
 +// Keep hostname connection fan-out bounded. Apart from limiting resource use,
 +// this makes the time to report an all-address failure deterministic even when
 +// DNS returns a large answer set containing blackholed addresses.
@@ -11,27 +11,25 @@
 +    .clock = .awake,
 +} };
 +
-@@ -283 +293,5 @@
+@@ -310 +320,3 @@ pub fn connect(
 -    var connect_many = io.async(connectMany, .{ host_name, io, port, &connect_many_queue, options });
-+    // `Io.async` may run eagerly when its pool is saturated. That would hide a
-+    // successful result until every loser finishes, recreating the hang this
-+    // race is intended to avoid.
++    // Real concurrency prevents the async pool from eagerly waiting for every loser.
 +    var connect_many = io.concurrent(connectMany, .{ host_name, io, port, &connect_many_queue, options }) catch
 +        return error.SystemResources;
-@@ -323,2 +337,3 @@
+@@ -350,2 +362,3 @@ pub fn connect(
 -/// Asynchronously establishes a connection to all IP addresses associated with
 -/// a host name, adding them to a results queue upon completion.
 +/// Asynchronously establishes connections to at most 32 IP addresses associated
 +/// with a host name, using at most four concurrent attempts and adding results
 +/// to a queue upon completion.
-@@ -343,6 +357,0 @@
+@@ -370,6 +382,0 @@ pub fn connectMany(
 -    var lookup_future = io.async(lookup, .{ host_name, io, &lookup_queue, .{
 -        .port = port,
 -        .canonical_name_buffer = &canonical_name_buffer,
 -    } });
 -    defer lookup_future.cancel(io) catch {};
 -
-@@ -350,0 +360,7 @@
+@@ -377,0 +385,7 @@ pub fn connectMany(
 +    var attempts_remaining: std.atomic.Value(usize) = .init(max_connect_attempts);
 +    // A real concurrency assignment is required for each worker; Group.async's
 +    // eager fallback would turn the address race back into a serial loop.
@@ -39,7 +37,7 @@
 +        group.concurrent(io, connectWorker, .{ io, &lookup_queue, results, &attempts_remaining, options }) catch
 +            return error.SystemResources;
 +    }
-@@ -352,8 +368,8 @@
+@@ -379,8 +393,8 @@ pub fn connectMany(
 -    while (lookup_queue.getOne(io)) |dns_result| switch (dns_result) {
 -        .address => |address| group.async(io, enqueueConnection, .{ address, io, results, options }),
 -        .canonical_name => continue,
@@ -56,22 +54,22 @@
 +        error.Canceled => {
 +            group.cancel(io);
 +            return err;
-@@ -361 +377,4 @@
+@@ -388 +402,4 @@ pub fn connectMany(
 -    }
 +        else => lookup_error = err,
 +    };
 +    try group.await(io);
 +    if (lookup_error) |err| return err;
-@@ -363,2 +382,2 @@
+@@ -390,2 +407,2 @@ pub fn connectMany(
 -fn enqueueConnection(
 -    address: IpAddress,
 +
 +fn connectWorker(
-@@ -365,0 +385 @@
+@@ -392,0 +410 @@ fn enqueueConnection(
 +    lookup_queue: *Io.Queue(LookupResult),
-@@ -366,0 +387 @@
+@@ -393,0 +412 @@ fn enqueueConnection(
 +    attempts_remaining: *std.atomic.Value(usize),
-@@ -369,3 +390,10 @@
+@@ -396,3 +415,10 @@ fn enqueueConnection(
 -    const result = address.connect(io, options) catch |err| switch (err) {
 -        error.Canceled => |e| return e,
 -        else => |e| e, // other errors go in the result queue
@@ -85,7 +83,7 @@
 +            .none => if (native_os == .windows) .none else default_connect_timeout,
 +            else => options.timeout,
 +        },
-@@ -373,2 +401,18 @@
+@@ -400,2 +426,18 @@ fn enqueueConnection(
 -    errdefer if (result) |s| s.close(io) else |_| {};
 -    queue.putOne(io, result) catch |err| switch (err) {
 +
@@ -106,7 +104,7 @@
 +            };
 +        },
 +    } else |err| switch (err) {
-@@ -376,2 +420,14 @@
+@@ -403,2 +445,14 @@ fn enqueueConnection(
 -        error.Closed => unreachable, // `queue` must not be closed
 -    };
 +        error.Closed => return,
@@ -125,16 +123,14 @@
 +    return false;
 --- a/vendors/zig/lib/std/Io/Threaded.zig
 +++ b/vendors/zig/lib/std/Io/Threaded.zig
-@@ -12077 +12076,0 @@
+@@ -12410 +12409,0 @@ fn netConnectIpPosix(
 -    if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
-@@ -12079 +12077,0 @@
+@@ -12412 +12410,0 @@ fn netConnectIpPosix(
 -    _ = t;
-@@ -12085 +12083 @@
+@@ -12418 +12416 @@ fn netConnectIpPosix(
 -    try posixConnect(socket_fd, &storage.any, addr_len);
 +    try posixConnectTimeout(t, socket_fd, &storage.any, addr_len, options.timeout);
-@@ -12087,0 +12086,144 @@
-+}
-+
+@@ -12422,0 +12421,144 @@ fn netConnectIpPosix(
 +fn setSocketNonBlockingPosix(socket_fd: posix.socket_t, enabled: bool) !void {
 +    var flags: usize = flags: {
 +        const syscall: Syscall = try .start();
@@ -263,7 +259,7 @@
 +        else => |err| return error_syscall.unexpectedErrno(err),
 +    };
 +
-+    return switch (@as(posix.E, @enumFromInt(socket_error))) {
++    return switch (@as(posix.E, @fromBackingInt(@intCast(socket_error)))) {
 +        .SUCCESS => setSocketNonBlockingPosix(socket_fd, false),
 +        .ADDRNOTAVAIL => error.AddressUnavailable,
 +        .AFNOSUPPORT => error.AddressFamilyUnsupported,
@@ -277,3 +273,5 @@
 +        .NETDOWN => error.NetworkDown,
 +        else => error.Unexpected,
 +    };
++}
++

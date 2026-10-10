@@ -235,10 +235,11 @@ const FileDetails = struct {
     }
 
     fn nullifyEmptyStrings(self: *FileDetails) void {
-        inline for (std.meta.fields(FileDetails)) |field| {
-            if (field.type == ?[]const u8) {
-                const value = @field(self, field.name);
-                if (value != null and value.?.len == 0) @field(self, field.name) = null;
+        const info = @typeInfo(FileDetails).@"struct";
+        inline for (info.field_names, info.field_types) |name, field_type| {
+            if (field_type == ?[]const u8) {
+                const value = @field(self, name);
+                if (value != null and value.?.len == 0) @field(self, name) = null;
             }
         }
     }
@@ -385,7 +386,7 @@ const Parser = struct {
             .insertion, .deletion, .context => {
                 if (self.current_hunk == null)
                     return error.hunk_lines_encountered_before_hunk_header;
-                const part_type: PatchMutationPart.PartType = @enumFromInt(@intFromEnum(line_type));
+                const part_type: PatchMutationPart.PartType = @fromBackingInt(@intCast(@backingInt(line_type)));
                 if (self.current_part != null and self.current_part.?.type != part_type) {
                     try self.current_hunk.?.parts.append(self.allocator, self.current_part.?);
                     self.current_part = null;

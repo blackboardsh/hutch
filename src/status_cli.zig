@@ -1408,7 +1408,7 @@ test "the disk walk sums nested files without following symlinks out of the stor
     });
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ outside, "huge" }),
-        .data = "x" ** 4096,
+        .data = &@as([4096]u8, @splat('x')),
     });
     // A bin launcher symlink must be counted, never traversed.
     try std.Io.Dir.cwd().symLink(

@@ -1578,7 +1578,7 @@ test "Linux bundle tar preserves long paths without unsupported extension record
     // BSD tar's error exit behavior differs; production macOS keeps its own
     // format and is not subject to the Linux USTAR option.
     if (builtin.os.tag != .linux) return;
-    const too_long = "Dash-canary/" ++ "x" ** 101;
+    const too_long = "Dash-canary/" ++ @as([101]u8, @splat('x'));
     try tmp.dir.writeFile(io, .{ .sub_path = too_long, .data = "cannot represent" });
     const rejected = try std.process.run(allocator, io, .{
         .argv = argv.items,
@@ -1807,7 +1807,7 @@ fn fetchOptionalBytes(ctx: *const Context, url: []const u8, max_bytes: usize) !?
         .response_writer = &output.writer,
         .keep_alive = builtin.os.tag != .windows,
     });
-    const status: u16 = @intFromEnum(result.status);
+    const status: u16 = @backingInt(result.status);
     if (status == 404) return null;
     if (status < 200 or status >= 300) return error.ReleaseDownloadFailed;
     if (output.written().len > max_bytes) return error.ReleaseDownloadTooLarge;
@@ -9172,7 +9172,7 @@ test "release bundle hashes are deterministic and content sensitive" {
         const mode_root = try std.fs.path.join(allocator, &.{ absolute_root, "mode-bundle" });
         const non_executable_hash = try hashBundle(&ctx, mode_root, &semantic_fields);
         const mode_file = try tmp.dir.openFile(io, "mode-bundle/tool", .{ .mode = .read_write });
-        try mode_file.setPermissions(io, @enumFromInt(0o755));
+        try mode_file.setPermissions(io, @fromBackingInt(@intCast(0o755)));
         mode_file.close(io);
         const executable_hash = try hashBundle(&ctx, mode_root, &semantic_fields);
         try std.testing.expect(!std.mem.eql(u8, non_executable_hash, executable_hash));

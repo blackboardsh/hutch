@@ -16,7 +16,7 @@ pub fn cachedNPMPackageFolderPrintBasename(
     if (version.tag.hasPre()) {
         if (version.tag.hasBuild()) {
             if (patch_hash) |hash| {
-                return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}-{x}+{X}{s}_patch_hash={x}", .{
+                return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}-{x}+{X}{s}_patch_hash={x}", .{
                     name,
                     version.major,
                     version.minor,
@@ -25,9 +25,9 @@ pub fn cachedNPMPackageFolderPrintBasename(
                     version.tag.build.hash,
                     cache_suffix,
                     hash,
-                }) catch unreachable;
+                }, 0) catch unreachable;
             }
-            return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}-{x}+{X}{s}", .{
+            return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}-{x}+{X}{s}", .{
                 name,
                 version.major,
                 version.minor,
@@ -35,11 +35,11 @@ pub fn cachedNPMPackageFolderPrintBasename(
                 version.tag.pre.hash,
                 version.tag.build.hash,
                 cache_suffix,
-            }) catch unreachable;
+            }, 0) catch unreachable;
         }
 
         if (patch_hash) |hash| {
-            return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}-{x}{s}_patch_hash={x}", .{
+            return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}-{x}{s}_patch_hash={x}", .{
                 name,
                 version.major,
                 version.minor,
@@ -47,21 +47,21 @@ pub fn cachedNPMPackageFolderPrintBasename(
                 version.tag.pre.hash,
                 cache_suffix,
                 hash,
-            }) catch unreachable;
+            }, 0) catch unreachable;
         }
-        return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}-{x}{s}", .{
+        return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}-{x}{s}", .{
             name,
             version.major,
             version.minor,
             version.patch,
             version.tag.pre.hash,
             cache_suffix,
-        }) catch unreachable;
+        }, 0) catch unreachable;
     }
 
     if (version.tag.hasBuild()) {
         if (patch_hash) |hash| {
-            return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}+{X}{s}_patch_hash={x}", .{
+            return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}+{X}{s}_patch_hash={x}", .{
                 name,
                 version.major,
                 version.minor,
@@ -69,35 +69,35 @@ pub fn cachedNPMPackageFolderPrintBasename(
                 version.tag.build.hash,
                 cache_suffix,
                 hash,
-            }) catch unreachable;
+            }, 0) catch unreachable;
         }
-        return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}+{X}{s}", .{
+        return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}+{X}{s}", .{
             name,
             version.major,
             version.minor,
             version.patch,
             version.tag.build.hash,
             cache_suffix,
-        }) catch unreachable;
+        }, 0) catch unreachable;
     }
 
     if (patch_hash) |hash| {
-        return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}{s}_patch_hash={x}", .{
+        return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}{s}_patch_hash={x}", .{
             name,
             version.major,
             version.minor,
             version.patch,
             cache_suffix,
             hash,
-        }) catch unreachable;
+        }, 0) catch unreachable;
     }
-    return std.fmt.bufPrintZ(buffer, "{s}@{d}.{d}.{d}{s}", .{
+    return std.mem.printSentinel(buffer, "{s}@{d}.{d}.{d}{s}", .{
         name,
         version.major,
         version.minor,
         version.patch,
         cache_suffix,
-    }) catch unreachable;
+    }, 0) catch unreachable;
 }
 
 const TestTag = struct {

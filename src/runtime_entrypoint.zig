@@ -43,19 +43,19 @@ fn resolveDepth(
         requested[requested.len - 1] == '\\';
 
     if (!trailing_separator) {
-        if (pathIsFile(io, requested)) return try allocator.dupeZ(u8, requested);
+        if (pathIsFile(io, requested)) return try allocator.dupeSentinel(u8, requested, 0);
 
         const extension = std.fs.path.extension(requested);
         if (extension.len > 0) {
             const stem = requested[0 .. requested.len - extension.len];
             for (fallbackExtensions(requested)) |replacement| {
                 const candidate = try std.mem.concat(allocator, u8, &.{ stem, replacement });
-                if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+                if (pathIsFile(io, candidate)) return try allocator.dupeSentinel(u8, candidate, 0);
             }
         } else {
             for (extensions) |candidate_extension| {
                 const candidate = try std.mem.concat(allocator, u8, &.{ requested, candidate_extension });
-                if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+                if (pathIsFile(io, candidate)) return try allocator.dupeSentinel(u8, candidate, 0);
             }
         }
     }
@@ -92,7 +92,7 @@ fn resolveDepth(
     for (extensions) |candidate_extension| {
         const basename = try std.mem.concat(allocator, u8, &.{ "index", candidate_extension });
         const candidate = try std.fs.path.join(allocator, &.{ requested, basename });
-        if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+        if (pathIsFile(io, candidate)) return try allocator.dupeSentinel(u8, candidate, 0);
     }
     return null;
 }

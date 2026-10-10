@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Opens a file without following its final path component and prepares the
-/// returned handle for reading. Zig 0.16 opens Windows no-follow handles for
-/// asynchronous I/O but does not reflect that in File.flags.
+/// Opens a file without following its final path component. Preserve the I/O
+/// backend's flags: Zig 0.17 opens Windows no-follow handles synchronously, so
+/// the former 0.16 nonblocking override would wait for nonexistent async I/O.
 pub fn openForRead(
     directory: std.Io.Dir,
     io: std.Io,
@@ -12,9 +12,7 @@ pub fn openForRead(
 ) std.Io.File.OpenError!std.Io.File {
     var no_follow_options = options;
     no_follow_options.follow_symlinks = false;
-    var file = try directory.openFile(io, path, no_follow_options);
-    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
-    return file;
+    return directory.openFile(io, path, no_follow_options);
 }
 
 test "no-follow file handles can be read positionally" {
@@ -30,7 +28,18 @@ test "no-follow file handles can be read positionally" {
     });
     defer file.close(std.testing.io);
     if (comptime builtin.os.tag == .windows) {
-        try std.testing.expect(file.flags.nonblocking);
+        const windows = std.os.windows;
+        var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+        var information: windows.FILE.MODE.INFORMATION = undefined;
+        try std.testing.expectEqual(windows.NTSTATUS.SUCCESS, windows.ntdll.NtQueryInformationFile(
+            file.handle,
+            &io_status_block,
+            &information,
+            @sizeOf(windows.FILE.MODE.INFORMATION),
+            .Mode,
+        ));
+        const asynchronous = information.Mode.IO == .ASYNCHRONOUS;
+        try std.testing.expectEqual(asynchronous, file.flags.nonblocking);
     }
 
     var buffer: [16]u8 = undefined;

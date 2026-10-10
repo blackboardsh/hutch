@@ -8,19 +8,19 @@ import path from "node:path";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const hutchRoot = path.resolve(path.dirname(scriptPath), "..");
-const zigVersion = "0.16.0";
-const patchPath = path.join(hutchRoot, "patches", "zig-0.16.0-hostname-connect.patch");
+const zigVersion = "0.17.0";
+const patchPath = path.join(hutchRoot, "patches", "zig-0.17.0-hostname-connect.patch");
 
 export const knownFiles = Object.freeze([
   Object.freeze({
     path: "vendors/zig/lib/std/Io/net/HostName.zig",
-    pristineSha256: "ec7ba989492b0f0e227faf468b7f8ade808ba51c34ccddf971959e289d58c27a",
-    patchedSha256: "f481a322a39e131951f55f526fe879ac3f999a7101bb86db82ce47c5bcd6fff4",
+    pristineSha256: "af3c45a3357afa0746744d73e891e456cf63c47db38507e8cc0a319698979275",
+    patchedSha256: "a4ac2caa2169bb203c89e525f9b0c2f90e2d3803a40d81555c4926291170337f",
   }),
   Object.freeze({
     path: "vendors/zig/lib/std/Io/Threaded.zig",
-    pristineSha256: "eb7bbb4ddf590ec3d0d2a1ee5c3845ef4984d9e440965a3e7c920cd0c906df94",
-    patchedSha256: "c4c97fbd8ba658fd9f68a978d519d15bbe9f7d02d8f6a2809652e8696581505e",
+    pristineSha256: "1a770001e309f24c8c58a9fdb3c095994c454cbfa9dba9d4f1dede2f134eeac7",
+    patchedSha256: "1c87690c305e6b31808a9d6fab851a7ba8c3ca2cef2c9967a19cceba4acfc919",
   }),
 ]);
 

@@ -21,7 +21,7 @@ pub const lifecycle_stage_names = [_][]const u8{
 };
 
 pub const LifecycleScripts = struct {
-    commands: [lifecycle_stage_names.len]?[]const u8 = .{null} ** lifecycle_stage_names.len,
+    commands: [lifecycle_stage_names.len]?[]const u8 = @splat(null),
     total: usize = 0,
 };
 

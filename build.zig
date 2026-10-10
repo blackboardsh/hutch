@@ -9,9 +9,8 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
     const windows_arm64 = target.result.os.tag == .windows and target.result.cpu.arch == .aarch64;
-    // Zig 0.16's stripped ARM64 Windows output misaddresses thread-local
-    // storage in SmpAllocator and crashes package-download workers. Keep
-    // optimized code with debug information; PDBs are not release payloads.
+    // Retain the Zig 0.16 ARM64 TLS workaround through 0.17 canary validation:
+    // optimized code keeps debug information; PDBs are not release payloads.
     const strip: ?bool = if (windows_arm64) false else null;
 
     const launcher = b.addExecutable(.{
@@ -41,9 +40,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(launcher);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Build and run Hutch");
     run_step.dependOn(&run_cmd.step);
@@ -166,6 +163,16 @@ pub fn build(b: *std.Build) void {
     });
     hostname_connect_regression_tests.root_module.link_libc = true;
 
+    const zig_stdlib_regression_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zig_stdlib_regression.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .link_libc = true,
+        }),
+    });
+
     const run_engine_tests = b.addRunArtifact(engine_tests);
     const run_launcher_tests = b.addRunArtifact(launcher_tests);
     const run_windows_icon_tests = b.addRunArtifact(windows_icon_tests);
@@ -193,9 +200,9 @@ pub fn build(b: *std.Build) void {
     });
     runtime_command_regression.root_module.link_libc = windows_arm64;
     const run_runtime_command_regression = b.addRunArtifact(runtime_command_regression);
-    run_runtime_command_regression.addArtifactArg(launcher);
-    run_runtime_command_regression.addArtifactArg(engine);
-    run_runtime_command_regression.addArtifactArg(runtime_command_fixture);
+    run_runtime_command_regression.addArtifactArg2(launcher, .{ .make_absolute = true });
+    run_runtime_command_regression.addArtifactArg2(engine, .{ .make_absolute = true });
+    run_runtime_command_regression.addArtifactArg2(runtime_command_fixture, .{ .make_absolute = true });
     const runtime_command_test_step = b.step("test:commands", "Test real launcher and engine command routing");
     runtime_command_test_step.dependOn(&run_runtime_command_regression.step);
 
@@ -210,5 +217,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_electrobun_tests.step);
     test_step.dependOn(&run_electrobun_template_tests.step);
     test_step.dependOn(&run_hostname_connect_regression_tests.step);
+    test_step.dependOn(&b.addRunArtifact(zig_stdlib_regression_tests).step);
     test_step.dependOn(&run_runtime_command_regression.step);
 }

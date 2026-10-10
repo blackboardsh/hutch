@@ -1399,10 +1399,11 @@ test "zig archive naming flips at 0.14.1" {
     try std.testing.expect(zigLegacyArchiveNaming("0.14.0"));
     try std.testing.expect(!zigLegacyArchiveNaming("0.14.1"));
     try std.testing.expect(!zigLegacyArchiveNaming("0.16.0"));
+    try std.testing.expect(!zigLegacyArchiveNaming("0.17.0"));
 
     const legacy = try zigArchiveName(std.testing.allocator, "0.13.0");
     defer std.testing.allocator.free(legacy);
-    const modern = try zigArchiveName(std.testing.allocator, "0.16.0");
+    const modern = try zigArchiveName(std.testing.allocator, "0.17.0");
     defer std.testing.allocator.free(modern);
     const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
         "aarch64"
@@ -1410,7 +1411,7 @@ test "zig archive naming flips at 0.14.1" {
         "x86_64";
     try std.testing.expect(std.mem.startsWith(u8, legacy, "zig-") and
         std.mem.indexOf(u8, legacy, arch) != null);
-    try std.testing.expect(std.mem.indexOf(u8, modern, "-0.16.0.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, modern, "-0.17.0.") != null);
     // Modern names lead with the arch segment.
     var prefix_buf: [32]u8 = undefined;
     const modern_prefix = try std.fmt.bufPrint(&prefix_buf, "zig-{s}-", .{arch});

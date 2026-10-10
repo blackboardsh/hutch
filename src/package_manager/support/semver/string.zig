@@ -11,7 +11,7 @@ pub const String = extern struct {
     pub const max_inline_len: usize = 8;
     pub const empty: String = .{};
 
-    bytes: [max_inline_len]u8 = .{0} ** max_inline_len,
+    bytes: [max_inline_len]u8 = @splat(0),
 
     pub fn from(comptime value: []const u8) String {
         comptime {
@@ -151,10 +151,10 @@ pub const String = extern struct {
     }
 
     fn initExternal(buffer: string, value: string) String {
-        return @bitCast((@as(u64, @as(
+        return .{ .bytes = @bitCast((@as(u64, @as(
             max_addressable_space,
-            @truncate(@as(u64, @bitCast(Pointer.init(buffer, value)))),
-        ))) | (@as(u64, 1) << 63));
+            @truncate(@as(u64, @bitCast(std.mem.toBytes(Pointer.init(buffer, value))))),
+        ))) | (@as(u64, 1) << 63)) };
     }
 
     pub fn initInline(value: string) String {
@@ -238,7 +238,8 @@ pub const String = extern struct {
     };
 
     pub inline fn ptr(self: String) Pointer {
-        return @bitCast(@as(u64, @as(u63, @truncate(@as(u64, @bitCast(self))))));
+        const bytes: [max_inline_len]u8 = @bitCast(@as(u64, @as(u63, @truncate(@as(u64, @bitCast(self.bytes))))));
+        return std.mem.bytesToValue(Pointer, &bytes);
     }
 
     /// Must receive a pointer because inline values are sliced from their own storage.

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HUTCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ZIG_VERSION="0.16.0"
+ZIG_VERSION="0.17.0"
 
 host_arch() {
   case "$(uname -m)" in

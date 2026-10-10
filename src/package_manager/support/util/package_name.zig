@@ -66,8 +66,8 @@ test "npm package-name validation matches Bun compatibility rules" {
 }
 
 test "npm package names enforce Bun's 214-byte limit" {
-    const at_limit = "a" ** 214;
-    const over_limit = "a" ** 215;
+    const at_limit = &@as([214]u8, @splat('a'));
+    const over_limit = &@as([215]u8, @splat('a'));
     try std.testing.expect(isNPMPackageName(at_limit));
     try std.testing.expect(!isNPMPackageName(over_limit));
     try std.testing.expect(isNPMPackageNameIgnoreLength(over_limit));

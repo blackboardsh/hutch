@@ -13,7 +13,7 @@ import {
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const hutchRoot = path.resolve(scriptsDir, "..");
-const patchName = "zig-0.16.0-hostname-connect.patch";
+const patchName = "zig-0.17.0-hostname-connect.patch";
 
 async function makePatchedFixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "hutch-zig-connect-patch-"));
@@ -21,7 +21,7 @@ async function makePatchedFixture(t) {
 
   await mkdir(path.join(root, "vendors", "zig"), { recursive: true });
   await mkdir(path.join(root, "patches"), { recursive: true });
-  await writeFile(path.join(root, "vendors", "zig", ".zig-version"), "0.16.0\n");
+  await writeFile(path.join(root, "vendors", "zig", ".zig-version"), "0.17.0\n");
   await copyFile(path.join(hutchRoot, "patches", patchName), path.join(root, "patches", patchName));
   for (const file of knownFiles) {
     const destination = path.join(root, file.path);
@@ -100,7 +100,7 @@ test("setup always verifies the patch after vendoring", async () => {
 });
 
 test("release workflow Zig cache key includes every patch input", async () => {
-  const hashFiles = /hashFiles\('scripts\/setup\.sh', 'scripts\/patch-zig-hostname-connect\.js', 'patches\/zig-0\.16\.0-hostname-connect\.patch'\)/g;
+  const hashFiles = /hashFiles\('scripts\/setup\.sh', 'scripts\/patch-zig-hostname-connect\.js', 'patches\/zig-0\.17\.0-hostname-connect\.patch'\)/g;
   const releaseWorkflow = await readFile(path.join(hutchRoot, ".github", "workflows", "release.yml"), "utf8");
   assert.equal(releaseWorkflow.match(hashFiles)?.length, 1);
 });

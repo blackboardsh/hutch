@@ -157,18 +157,18 @@ pub fn prepare(
         "--save-text-lockfile",
         "--cwd",
     });
-    try args.append(allocator, try allocator.dupeZ(u8, staging_root));
+    try args.append(allocator, try allocator.dupeSentinel(u8, staging_root, 0));
     if (bunfig_path) |path| {
         try args.appendSlice(allocator, &.{
             "--config",
-            try allocator.dupeZ(u8, path),
+            try allocator.dupeSentinel(u8, path, 0),
         });
     }
     if (mode == .force) try args.append(allocator, "--force");
     for (missing.items) |request| {
         try args.append(
             allocator,
-            try allocator.dupeZ(u8, request.install_specifier),
+            try allocator.dupeSentinel(u8, request.install_specifier, 0),
         );
     }
 
@@ -632,9 +632,10 @@ fn registryHostname(
     const url = try registryUrl(init, allocator, bunfig_path, package_name) orelse
         return null;
     const uri = std.Uri.parse(url) catch return null;
-    const host = uri.getHostAlloc(allocator) catch return null;
-    if (std.mem.eql(u8, host.bytes, "registry.npmjs.org")) return null;
-    return host.bytes;
+    const host = uri.host orelse return null;
+    const bytes = host.toRawMaybeAlloc(allocator) catch return null;
+    if (std.mem.eql(u8, bytes, "registry.npmjs.org")) return null;
+    return bytes;
 }
 
 fn exposeInstalledPackage(
@@ -723,7 +724,8 @@ fn nodeModulesPresentNear(
     }
 }
 
-fn packageIsInstalled(    io: std.Io,
+fn packageIsInstalled(
+    io: std.Io,
     allocator: std.mem.Allocator,
     start_dir: []const u8,
     package_name: []const u8,

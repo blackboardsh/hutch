@@ -239,8 +239,8 @@ const InteractiveTerminalMode = if (builtin.os.tag == .windows) struct {
         raw.lflag.ECHO = false;
         raw.lflag.ISIG = false;
         raw.lflag.IEXTEN = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
         std.posix.tcsetattr(0, .NOW, raw) catch return .{};
         return .{ .saved = saved, .is_tty = true };
     }
@@ -376,9 +376,11 @@ fn httpOriginsEqual(left: std.Uri, right: std.Uri) !bool {
     if (effectiveHttpPort(left) != effectiveHttpPort(right)) return false;
     var left_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     var right_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const left_host = try left.getHost(&left_buffer);
-    const right_host = try right.getHost(&right_buffer);
-    return left_host.eql(right_host);
+    // Origins include IP literals as well as DNS names. HostName.fromUri now
+    // validates DNS labels, so compare decoded URI components directly here.
+    const left_host = left.host orelse return error.UriMissingHost;
+    const right_host = right.host orelse return error.UriMissingHost;
+    return std.ascii.eqlIgnoreCase(try left_host.toRaw(&left_buffer), try right_host.toRaw(&right_buffer));
 }
 
 /// Zig's FetchOptions.extra_headers survive automatic redirects. Drive GET
@@ -525,7 +527,7 @@ const RegistryManifestFetch = struct {
                 if (attempt == fetch_state.max_retry_count) return err;
                 continue;
             };
-            const status: u16 = @intFromEnum(result.status);
+            const status: u16 = @backingInt(result.status);
             if (status >= 200 and status < 300) {
                 if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
                 fetch_state.bytes = try output.toOwnedSlice();
@@ -605,7 +607,7 @@ const RegistryArchiveFetch = struct {
             max_tarball_bytes,
             builtin.os.tag != .windows,
         );
-        const status: u16 = @intFromEnum(result.status);
+        const status: u16 = @backingInt(result.status);
         if (status < 200 or status >= 300) return error.RegistryArchiveRequestFailed;
         if (output.written().len > max_tarball_bytes) return error.ResponseTooLarge;
         if (fetch_state.verify_integrity) try verifyIntegrity(output.written(), fetch_state.integrity);
@@ -2716,7 +2718,7 @@ const Manager = struct {
             },
         );
         if (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) |source| {
-            if (std.mem.eql(u8, source, security_scanner_runtime)) return manager.allocator.dupeZ(u8, path);
+            if (std.mem.eql(u8, source, security_scanner_runtime)) return manager.allocator.dupeSentinel(u8, path, 0);
             return error.InvalidSecurityScannerRuntime;
         }
 
@@ -2736,7 +2738,7 @@ const Manager = struct {
                 return error.InvalidSecurityScannerRuntime;
             if (!std.mem.eql(u8, source, security_scanner_runtime)) return error.InvalidSecurityScannerRuntime;
         };
-        return manager.allocator.dupeZ(u8, path);
+        return manager.allocator.dupeSentinel(u8, path, 0);
     }
 
     fn writeSecurityResolution(
@@ -3126,10 +3128,10 @@ const Manager = struct {
         const result_path = try manager.securityTempFile("result.json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, result_path) catch {};
         const scanner_args = [_][:0]const u8{
-            try manager.allocator.dupeZ(u8, scanner),
-            try manager.allocator.dupeZ(u8, manager.root_dir),
-            try manager.allocator.dupeZ(u8, payload_path),
-            try manager.allocator.dupeZ(u8, result_path),
+            try manager.allocator.dupeSentinel(u8, scanner, 0),
+            try manager.allocator.dupeSentinel(u8, manager.root_dir, 0),
+            try manager.allocator.dupeSentinel(u8, payload_path, 0),
+            try manager.allocator.dupeSentinel(u8, result_path, 0),
         };
         const runtime_path = try manager.securityScannerRuntimePath();
         const scanner_exit_code = Host.runRuntime(
@@ -10575,7 +10577,7 @@ const Manager = struct {
                 }
                 continue;
             };
-            const status: u16 = @intFromEnum(result.status);
+            const status: u16 = @backingInt(result.status);
             if (status >= 200 and status < 300) {
                 if (output.written().len > limit) return error.ResponseTooLarge;
                 return try output.toOwnedSlice();
@@ -10623,7 +10625,7 @@ const Manager = struct {
                 }
                 continue;
             };
-            const status: u16 = @intFromEnum(result.status);
+            const status: u16 = @backingInt(result.status);
             if (status >= 200 and status < 300) {
                 if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
                 return try output.toOwnedSlice();
@@ -11063,9 +11065,9 @@ const Manager = struct {
                 "#!/bin/sh\nexec {s} {s} \"$@\"\n",
                 .{ quoted_executable, quoted_target },
             );
-            const executable_permissions: std.Io.File.Permissions = @enumFromInt(
-                @intFromEnum(stat.permissions) | 0o111,
-            );
+            const executable_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(
+                @backingInt(stat.permissions) | 0o111,
+            ));
             try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
                 .sub_path = destination,
                 .data = command,
@@ -11139,7 +11141,7 @@ const Manager = struct {
                 .flags = .{ .permissions = stat.permissions },
             });
         }
-        const executable_permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(stat.permissions) | 0o111);
+        const executable_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(@backingInt(stat.permissions) | 0o111));
         try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, target, executable_permissions, .{});
     }
 
@@ -12088,7 +12090,7 @@ const Manager = struct {
         var output: std.Io.Writer.Allocating = .init(manager.allocator);
         const writer = &output.writer;
         try writer.print("{{\n  \"lockfileVersion\": 1,\n  \"configVersion\": {d},\n  \"workspaces\": {{\n    \"\": ", .{
-            @intFromEnum(manager.lockfile_config_version),
+            @backingInt(manager.lockfile_config_version),
         });
         try manager.writeWorkspaceInfo(writer, root, true, "");
         try writer.writeByte(',');
@@ -13414,7 +13416,7 @@ fn parseIntegrity(value: []const u8) !ParsedIntegrity {
             error.UnsupportedIntegrityAlgorithm => continue,
             else => return err,
         };
-        if (selected == null or @intFromEnum(parsed.algorithm) > @intFromEnum(selected.?.algorithm)) {
+        if (selected == null or @backingInt(parsed.algorithm) > @backingInt(selected.?.algorithm)) {
             selected = parsed;
         }
     }
@@ -14521,6 +14523,15 @@ test "redirect credentials are retained only for the exact HTTP origin" {
     try std.testing.expect(!try httpOriginsEqual(https, other_port));
     try std.testing.expect(!try httpOriginsEqual(https, subdomain));
     try std.testing.expect(!try httpOriginsEqual(https, downgraded));
+    try std.testing.expect(try httpOriginsEqual(
+        try std.Uri.parse("https://[::1]/path"),
+        try std.Uri.parse("https://[::1]:443/other"),
+    ));
+    try std.testing.expect(!try httpOriginsEqual(
+        try std.Uri.parse("https://[::1]/path"),
+        try std.Uri.parse("https://[::2]/other"),
+    ));
+    try std.testing.expect(try httpOriginsEqual(https, try std.Uri.parse("https://registry%2eexample/other")));
 }
 
 test "Windows bin command replacement rejects a preseeded symlink" {

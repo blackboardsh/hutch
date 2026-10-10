@@ -11,10 +11,10 @@ pub fn replace(
         return error.ProcessReplacementUnsupported;
     }
 
-    const executable_z = try allocator.dupeZ(u8, executable);
+    const executable_z = try allocator.dupeSentinel(u8, executable, 0);
     const argv_z = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |argument, index| {
-        argv_z[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        argv_z[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
     }
     const environment_block = try environment.createPosixBlock(allocator, .{});
 
