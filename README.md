@@ -443,9 +443,10 @@ editing the proposed semantic version before they commit, tag, and atomically
 push `main` and the release tag.
 
 The GitHub Actions matrix builds macOS ARM64, Linux x64/ARM64, and Windows x64/ARM64.
-Windows ARM64 uses the x64 Zig compiler under emulation and runs the resulting
-ARM64 binaries and tests natively. Odin main-process builds are unavailable on
-Windows ARM64.
+Windows ARM64 uses the native ARM64 Zig 0.17 compiler and runs the resulting
+ARM64 binaries and tests natively. Projects pinned to older Zig versions retain
+their x64 compiler fallback. Odin main-process builds are unavailable on Windows
+ARM64.
 It uploads one archive per revision and platform:
 
 ```text

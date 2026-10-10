@@ -125,9 +125,10 @@ jobs:
 
       - name: Run Hutch tests
         if: matrix.os != 'windows'
+        timeout-minutes: 20
         run: |
-          ./vendors/zig/zig build test
-          node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/verify-macos-deployment-target.test.js
+          ./vendors/zig/zig build test --test-timeout 120s --summary all
+          node --test scripts/zig-host-architecture.test.js scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/verify-macos-deployment-target.test.js
           node scripts/local-stack.test.js
           node --test --test-concurrency=1 tests/storage-contract.test.js tests/bun-script-runner.test.mjs tests/electrobun/default-runtime.test.js
           node --test --test-concurrency=1 \
@@ -149,10 +150,11 @@ jobs:
       - name: Run Hutch tests
         if: matrix.os == 'windows'
         shell: pwsh
+        timeout-minutes: 20
         run: |
-          & .\vendors\zig\zig.exe build test -Dtarget=${{ matrix.target }}
+          & .\vendors\zig\zig.exe build test -Dtarget=${{ matrix.target }} --test-timeout 120s --summary all
           if ($LASTEXITCODE -ne 0) { throw "Hutch Zig tests failed" }
-          node --test scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/windows-installer-architecture.test.js
+          node --test scripts/zig-host-architecture.test.js scripts/stdio-redirection.test.js scripts/r2-settings.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/windows-installer-architecture.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch release tests failed" }
           node scripts/local-stack.test.js
           if ($LASTEXITCODE -ne 0) { throw "Hutch local stack tests failed" }

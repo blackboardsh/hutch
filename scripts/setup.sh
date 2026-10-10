@@ -7,6 +7,16 @@ HUTCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ZIG_VERSION="0.17.0"
 
 host_arch() {
+  # Git Bash can itself be x64 on an ARM64 Windows host. Windows preserves
+  # the native architecture in PROCESSOR_ARCHITEW6432 for emulated processes.
+  case "$(uname -s)" in
+    MINGW*ARM64*|MSYS*ARM64*|CYGWIN*ARM64*) printf 'aarch64'; return ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-}}" in
+        ARM64|arm64) printf 'aarch64'; return ;;
+        AMD64|amd64) printf 'x86_64'; return ;;
+      esac ;;
+  esac
   case "$(uname -m)" in
     arm64|aarch64) printf 'aarch64' ;;
     x86_64|amd64) printf 'x86_64' ;;
@@ -35,14 +45,14 @@ vendor_zig() {
   local arch os
   arch="$(host_arch)"
   os="$(host_os)"
-  # The x64 Zig host compiler works under Windows ARM64 emulation.
-  if [[ "$os" == "windows" ]]; then arch="x86_64"; fi
 
   local zig_dir="$HUTCH_ROOT/vendors/zig"
   local zig_bin="$zig_dir/$(zig_binary_name "$os")"
   local stamp="$zig_dir/.zig-version"
+  local platform_stamp="$zig_dir/.zig-platform"
+  local platform="$os-$arch"
 
-  if [[ -x "$zig_bin" && -f "$stamp" && "$(tr -d '[:space:]' < "$stamp")" == "$ZIG_VERSION" ]]; then
+  if [[ -x "$zig_bin" && -f "$stamp" && "$(tr -d '[:space:]' < "$stamp")" == "$ZIG_VERSION" && -f "$platform_stamp" && "$(tr -d '[:space:]' < "$platform_stamp")" == "$platform" ]]; then
     echo "OK Zig $ZIG_VERSION already vendored"
     return
   fi
@@ -75,8 +85,11 @@ vendor_zig() {
 
   chmod 755 "$zig_bin"
   printf '%s\n' "$ZIG_VERSION" > "$stamp"
+  printf '%s\n' "$platform" > "$platform_stamp"
   echo "OK Zig $ZIG_VERSION vendored"
 }
 
-vendor_zig
-node "$SCRIPT_DIR/patch-zig-hostname-connect.js"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  vendor_zig
+  node "$SCRIPT_DIR/patch-zig-hostname-connect.js"
+fi

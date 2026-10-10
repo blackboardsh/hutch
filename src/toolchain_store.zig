@@ -544,12 +544,7 @@ fn zigArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8
         .windows => "windows",
         else => return error.UnsupportedToolchainPlatform,
     };
-    // Use the x64 Zig host compiler on Windows ARM64 until Zig's native
-    // Windows ARM64 host build is reliable. Build targets remain explicit.
-    const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
-        "aarch64"
-    else
-        "x86_64";
+    const arch = zigHostArch(version, builtin.os.tag, builtin.cpu.arch);
     const ext = if (builtin.os.tag == .windows) "zip" else "tar.xz";
     // ziglang.org flipped archive naming from zig-<os>-<arch>-<version> to
     // zig-<arch>-<os>-<version> starting with 0.14.1 (verified: 0.14.0 only
@@ -565,6 +560,16 @@ fn zigLegacyArchiveNaming(version: []const u8) bool {
     const parsed = std.SemanticVersion.parse(version) catch return false;
     const flip = std.SemanticVersion{ .major = 0, .minor = 14, .patch = 1 };
     return parsed.order(flip) == .lt;
+}
+
+fn zigHostArch(version: []const u8, os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) []const u8 {
+    if (arch != .aarch64) return "x86_64";
+    if (os != .windows) return "aarch64";
+    // Native Windows ARM64 compiler distributions are available from 0.17.
+    // Keep older project/editor pins on their existing x64 distribution.
+    const parsed = std.SemanticVersion.parse(version) catch return "x86_64";
+    const first_native = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
+    return if (parsed.order(first_native) == .lt) "x86_64" else "aarch64";
 }
 
 fn odinArchiveName(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -688,6 +693,21 @@ fn executableMatchesVersion(
     defer allocator.free(result.stderr);
     if (termExitCode(result.term) != 0) return false;
     const output = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (kind == .zig and builtin.os.tag == .windows and builtin.cpu.arch == .aarch64 and
+        std.mem.eql(u8, zigHostArch(version, .windows, .aarch64), "aarch64"))
+    {
+        if (!std.mem.eql(u8, output, version)) return false;
+        // Validate both PATH compilers and previously cached x64 installs.
+        // Version alone cannot distinguish the two official distributions.
+        const info = std.process.run(allocator, io, .{
+            .argv = &.{ executable, "env" },
+            .create_no_window = true,
+        }) catch return false;
+        defer allocator.free(info.stdout);
+        defer allocator.free(info.stderr);
+        if (termExitCode(info.term) != 0) return false;
+        return zigEnvIsNativeWindowsArm64(info.stdout);
+    }
     return switch (kind) {
         .zig, .bun => std.mem.eql(u8, output, version),
         .rust => std.mem.startsWith(u8, output, try std.fmt.allocPrint(allocator, "rustc {s} ", .{version})),
@@ -700,6 +720,17 @@ fn executableMatchesVersion(
             break :blk std.mem.indexOf(u8, output, prefix) != null;
         },
     };
+}
+
+fn zigEnvIsNativeWindowsArm64(output: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, ".target = ")) {
+            return std.mem.startsWith(u8, trimmed, ".target = \"aarch64-windows.");
+        }
+    }
+    return false;
 }
 
 fn systemExecutableMatchesVersion(
@@ -1405,12 +1436,10 @@ test "zig archive naming flips at 0.14.1" {
     defer std.testing.allocator.free(legacy);
     const modern = try zigArchiveName(std.testing.allocator, "0.17.0");
     defer std.testing.allocator.free(modern);
-    const arch = if (builtin.cpu.arch == .aarch64 and builtin.os.tag != .windows)
-        "aarch64"
-    else
-        "x86_64";
+    const legacy_arch = zigHostArch("0.13.0", builtin.os.tag, builtin.cpu.arch);
+    const arch = zigHostArch("0.17.0", builtin.os.tag, builtin.cpu.arch);
     try std.testing.expect(std.mem.startsWith(u8, legacy, "zig-") and
-        std.mem.indexOf(u8, legacy, arch) != null);
+        std.mem.indexOf(u8, legacy, legacy_arch) != null);
     try std.testing.expect(std.mem.indexOf(u8, modern, "-0.17.0.") != null);
     // Modern names lead with the arch segment.
     var prefix_buf: [32]u8 = undefined;
@@ -1418,6 +1447,23 @@ test "zig archive naming flips at 0.14.1" {
     try std.testing.expect(std.mem.startsWith(u8, modern, modern_prefix));
     try std.testing.expect(!std.mem.startsWith(u8, legacy, modern_prefix) or
         builtin.os.tag == .windows);
+}
+
+test "Zig Windows ARM64 host selection preserves older pins" {
+    try std.testing.expectEqualStrings("x86_64", zigHostArch("0.13.0", .windows, .aarch64));
+    try std.testing.expectEqualStrings("x86_64", zigHostArch("0.16.0", .windows, .aarch64));
+    try std.testing.expectEqualStrings("x86_64", zigHostArch("0.17.0-dev.1", .windows, .aarch64));
+    try std.testing.expectEqualStrings("aarch64", zigHostArch("0.17.0", .windows, .aarch64));
+    try std.testing.expectEqualStrings("aarch64", zigHostArch("0.18.0", .windows, .aarch64));
+    try std.testing.expectEqualStrings("x86_64", zigHostArch("0.17.0", .windows, .x86_64));
+    try std.testing.expectEqualStrings("aarch64", zigHostArch("0.16.0", .linux, .aarch64));
+    try std.testing.expectEqualStrings("aarch64", zigHostArch("0.16.0", .macos, .aarch64));
+}
+
+test "Zig environment rejects cached or PATH x64 compilers on Windows ARM64" {
+    try std.testing.expect(zigEnvIsNativeWindowsArm64(".{\n    .target = \"aarch64-windows.win11_br...win11_br-gnu\",\n}\n"));
+    try std.testing.expect(!zigEnvIsNativeWindowsArm64(".{\n    .target = \"x86_64-windows.win11_br...win11_br-gnu\",\n}\n"));
+    try std.testing.expect(!zigEnvIsNativeWindowsArm64(".zig_exe = \"aarch64-windows.exe\",\n"));
 }
 
 test "toolchain versions resolve to isolated toolchain roots without downloading" {
