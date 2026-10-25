@@ -1,6 +1,6 @@
 {
   "name": "@blackboard/hutch",
-  "version": "0.28.2-canary.10",
+  "version": "0.28.2",
   "private": true,
   "license": "MIT",
   "repository": "github:blackboardsh/hutch",
