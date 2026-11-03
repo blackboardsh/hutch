@@ -171,9 +171,15 @@ const LocalCottontailProvenance = struct {
 const ReleaseState = struct {
     bundle: AppBundlePaths,
     hash: []const u8,
+    tar_integrity: ReleaseTarIntegrity,
     compressed_tar_path: []const u8,
     patch_path: ?[]const u8,
     flatpak_payload_path: ?[]const u8,
+};
+
+const ReleaseTarIntegrity = struct {
+    sha256: [64]u8,
+    size: u64,
 };
 
 const FlatpakManifestOptions = struct {
@@ -1142,6 +1148,9 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
         try std.mem.concat(ctx.allocator, u8, &.{ app_file_name, ".tar" });
     const tar_path = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, tar_name });
     try createBundleTar(ctx, bundle.bundle_root, tar_path);
+    // This is the exact signed/stapled archive used by bsdiff, including its
+    // headers and padding. It differs from the semantic bundle version hash.
+    const tar_integrity = try releaseTarIntegrity(ctx.io, tar_path);
 
     const patch_path = try generateDeltaPatch(ctx, config, platform_paths, tar_path);
     const compressed_tar_path = try std.mem.concat(ctx.allocator, u8, &.{ tar_path, ".zst" });
@@ -1153,10 +1162,27 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
     return .{
         .bundle = bundle,
         .hash = hash,
+        .tar_integrity = tar_integrity,
         .compressed_tar_path = compressed_tar_path,
         .patch_path = patch_path,
         .flatpak_payload_path = flatpak_payload_path,
     };
+}
+
+fn releaseTarIntegrity(io: std.Io, path: []const u8) !ReleaseTarIntegrity {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.InvalidReleaseArchive;
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var size: u64 = 0;
+    while (true) {
+        const count = try file.readPositionalAll(io, &buffer, size);
+        if (count == 0) break;
+        digest.update(buffer[0..count]);
+        size = try std.math.add(u64, size, count);
+    }
+    return .{ .sha256 = std.fmt.bytesToHex(digest.finalResult(), .lower), .size = size };
 }
 
 fn artifactAppFileName(ctx: *const Context, config: CommandContext) ![]const u8 {
@@ -3220,23 +3246,32 @@ fn writeReleaseArtifacts(
         "-",
         std.fs.path.basename(state.compressed_tar_path),
     });
-    const update_json = try releaseUpdateJson(
-        ctx,
-        try getAppIdentifier(ctx, config.root),
-        buildEnvironmentName(config.build_env),
-        try getAppVersion(ctx, config.root),
-        state.hash,
-        osName(),
-        archName(),
-        compressed_artifact_name,
-    );
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = try std.fs.path.join(
-            ctx.allocator,
-            &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-update.json" }) },
-        ),
-        .data = update_json,
-    });
+    // Released native clients reject unknown manifest fields. Preserve their
+    // exact schema and offer exact tar integrity at an independently negotiated
+    // URL for streaming updaters; both manifests describe the same artifacts.
+    for ([_]struct { suffix: []const u8, integrity: ?ReleaseTarIntegrity }{
+        .{ .suffix = "-update.json", .integrity = null },
+        .{ .suffix = "-update-v2.json", .integrity = state.tar_integrity },
+    }) |manifest| {
+        const update_json = try releaseUpdateJson(
+            ctx,
+            try getAppIdentifier(ctx, config.root),
+            buildEnvironmentName(config.build_env),
+            try getAppVersion(ctx, config.root),
+            state.hash,
+            osName(),
+            archName(),
+            compressed_artifact_name,
+            manifest.integrity,
+        );
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{
+            .sub_path = try std.fs.path.join(
+                ctx.allocator,
+                &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, manifest.suffix }) },
+            ),
+            .data = update_json,
+        });
+    }
 
     const candidates = [_]?[]const u8{
         state.compressed_tar_path,
@@ -3268,9 +3303,16 @@ fn releaseUpdateJson(
     platform: []const u8,
     arch: []const u8,
     artifact_name: []const u8,
+    tar_integrity: ?ReleaseTarIntegrity,
 ) ![]const u8 {
     var artifact: std.json.ObjectMap = .empty;
     try artifact.put(ctx.allocator, "file", .{ .string = artifact_name });
+    if (tar_integrity) |integrity| {
+        try artifact.put(ctx.allocator, "tarSha256", .{ .string = try ctx.allocator.dupe(u8, &integrity.sha256) });
+        try artifact.put(ctx.allocator, "tarSize", .{
+            .integer = std.math.cast(i64, integrity.size) orelse return error.InvalidReleaseArchiveSize,
+        });
+    }
 
     var update: std.json.ObjectMap = .empty;
     try update.put(ctx.allocator, "schemaVersion", .{ .integer = 1 });
@@ -9711,7 +9753,37 @@ test "release bundle hashes are deterministic and content sensitive" {
     }
 }
 
-test "release update metadata carries identity and the conventional artifact name" {
+test "release tar integrity covers exact archive bytes across streaming boundaries" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "release.tar" });
+    defer std.testing.allocator.free(path);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "release.tar", .data = "abc" });
+    const known = try releaseTarIntegrity(io, path);
+    try std.testing.expectEqual(@as(u64, 3), known.size);
+    try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", &known.sha256);
+
+    // Archive headers, signing data, and trailing padding must all contribute,
+    // even when the source spans multiple reads and ends in a short read.
+    var bytes: [128 * 1024 + 17]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 37);
+    try tmp.dir.writeFile(io, .{ .sub_path = "release.tar", .data = &bytes });
+    const original = try releaseTarIntegrity(io, path);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &expected, .{});
+    try std.testing.expectEqual(@as(u64, bytes.len), original.size);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(expected, .lower), &original.sha256);
+
+    bytes[bytes.len - 1] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "release.tar", .data = &bytes });
+    const changed = try releaseTarIntegrity(io, path);
+    try std.testing.expectEqual(original.size, changed.size);
+    try std.testing.expect(!std.mem.eql(u8, &original.sha256, &changed.sha256));
+}
+
+test "release update metadata negotiates exact tar integrity without changing legacy schema" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -9737,6 +9809,7 @@ test "release update metadata carries identity and the conventional artifact nam
         "win",
         "x64",
         "canary-win-x64-Example-canary.tar.zst",
+        .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
     );
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
     const update = parsed.object;
@@ -9753,10 +9826,40 @@ test "release update metadata carries identity and the conventional artifact nam
         "canary-win-x64-Example-canary.tar.zst",
         artifact.get("file").?.string,
     );
-    try std.testing.expectEqual(@as(usize, 1), artifact.count());
+    try std.testing.expectEqualStrings(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        artifact.get("tarSha256").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 3), artifact.get("tarSize").?.integer);
+    try std.testing.expectEqual(@as(usize, 3), artifact.count());
     try std.testing.expect(artifact.get("size") == null);
     try std.testing.expect(artifact.get("sha256") == null);
     try std.testing.expect(update.get("patch") == null);
+    const previous = previousReleasePatchSource(
+        parsed,
+        "com.example.update",
+        "canary",
+        "win",
+        "x64",
+        "canary-win-x64-Example-canary.tar.zst",
+    ).?;
+    try std.testing.expectEqualStrings("abc123", previous.hash);
+
+    const legacy_json = try releaseUpdateJson(
+        &ctx,
+        "com.example.update",
+        "canary",
+        "2.0.0",
+        "abc123",
+        "win",
+        "x64",
+        "canary-win-x64-Example-canary.tar.zst",
+        null,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"schemaVersion\":1,\"identifier\":\"com.example.update\",\"channel\":\"canary\",\"version\":\"2.0.0\",\"hash\":\"abc123\",\"platform\":\"win\",\"arch\":\"x64\",\"artifact\":{\"file\":\"canary-win-x64-Example-canary.tar.zst\"}}",
+        legacy_json,
+    );
 }
 
 test "release version metadata keeps display and artifact names distinct" {
@@ -9869,6 +9972,7 @@ test "stable releases use one updater prefix and unprefixed-channel installers" 
     try writeReleaseArtifacts(&ctx, config, .{
         .bundle = unused_bundle,
         .hash = "newhash",
+        .tar_integrity = .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
         .compressed_tar_path = compressed_path,
         .patch_path = patch_path,
         .flatpak_payload_path = null,
@@ -9879,6 +9983,7 @@ test "stable releases use one updater prefix and unprefixed-channel installers" 
     const installer_prefix = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ osName(), archName() });
     for ([_][]const u8{
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update-v2.json" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ installer_prefix, "-MigrationApp-Setup.zip" }),
@@ -9897,7 +10002,25 @@ test "stable releases use one updater prefix and unprefixed-channel installers" 
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         stable_update.object.get("artifact").?.object.get("file").?.string,
     );
+    try std.testing.expectEqual(@as(usize, 1), stable_update.object.get("artifact").?.object.count());
     try std.testing.expect(stable_update.object.get("patch") == null);
+
+    const streaming_update_path = try std.fs.path.join(
+        allocator,
+        &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update-v2.json" }) },
+    );
+    const streaming_bytes = try std.Io.Dir.cwd().readFileAlloc(io, streaming_update_path, allocator, .limited(64 * 1024));
+    const streaming_update = try std.json.parseFromSliceLeaky(std.json.Value, allocator, streaming_bytes, .{});
+    try std.testing.expectEqualStrings("newhash", streaming_update.object.get("hash").?.string);
+    try std.testing.expectEqualStrings(
+        stable_update.object.get("artifact").?.object.get("file").?.string,
+        streaming_update.object.get("artifact").?.object.get("file").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        streaming_update.object.get("artifact").?.object.get("tarSha256").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 3), streaming_update.object.get("artifact").?.object.get("tarSize").?.integer);
 
     const removed_prefix = try std.fmt.allocPrint(allocator, "production-{s}-{s}", .{ osName(), archName() });
     for ([_][]const u8{
