@@ -136,63 +136,126 @@ export function signingHeaders({
   };
 }
 
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function requestR2(config, request, {
+  fetchImpl = globalThis.fetch,
+  sleepImpl = sleep,
+  log = console.log,
+  timeoutMs = 30_000,
+} = {}) {
+  const method = request.method ?? "PUT";
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const signed = signingHeaders({ ...config, ...request, method });
+      const response = await fetchImpl(signed.url, {
+        method,
+        headers: signed.headers,
+        ...(method === "PUT" ? { body: request.body } : {}),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      // Reading the body belongs to the attempt too: a dropped GET body is
+      // unknown content, never evidence that an immutable object matches.
+      const body = method === "HEAD" ? Buffer.alloc(0) : Buffer.from(await response.arrayBuffer());
+      if (response.status === 429 || response.status >= 500) {
+        const error = new Error(`R2 ${method} failed for ${request.key}: ${response.status} ${body.toString("utf8")}`);
+        error.retryable = true;
+        throw error;
+      }
+      return { status: response.status, ok: response.ok, body };
+    } catch (error) {
+      const transient = error.retryable || error instanceof TypeError ||
+        error.name === "AbortError" || error.name === "TimeoutError";
+      if (!transient || attempt === 4) throw error;
+      log(`retrying R2 ${method} ${request.key} (${attempt + 1}/4): ${error.message}`);
+      await sleepImpl(500 * 2 ** (attempt - 1));
+    }
+  }
+}
+
+export async function getObject(config, key, options = {}) {
+  const { dryRunMode = dryRun, log = console.log } = options;
+  if (dryRunMode) {
+    log(`dry-run GET ${key}`);
+    return null;
+  }
+  const response = await requestR2(config, { key, method: "GET" }, options);
+  if (response.status === 404) return null;
+  if (response.ok) return response.body;
+  throw new Error(`R2 read failed for ${key}: ${response.status} ${response.body.toString("utf8")}`);
+}
+
+export async function objectMatches(config, object, options = {}) {
+  const body = await getObject(config, object.key, options);
+  return body !== null && body.equals(object.body);
+}
+
+export async function existingPublishedAt(config, keys, options = {}) {
+  let publishedAt;
+  for (const key of keys) {
+    const body = await getObject(config, key, options);
+    if (body === null) continue;
+    const value = JSON.parse(body.toString("utf8")).publishedAt;
+    if (typeof value !== "string" || !Number.isFinite(Date.parse(value)) ||
+        new Date(value).toISOString() !== value) {
+      throw new Error(`R2 immutable manifest has invalid publishedAt: ${key}`);
+    }
+    if (publishedAt !== undefined && publishedAt !== value) {
+      throw new Error("R2 immutable manifests disagree on publishedAt");
+    }
+    publishedAt = value;
+  }
+  // This timestamp only makes a resumed plan deterministic. The complete
+  // regenerated manifest bytes must still pass immutable preflight below.
+  return publishedAt;
+}
+
 export async function objectExists(
   config,
   key,
-  {
-    dryRunMode = dryRun,
-    fetchImpl = globalThis.fetch,
-    log = console.log,
-  } = {},
+  options = {},
 ) {
+  const { dryRunMode = dryRun, log = console.log } = options;
   if (dryRunMode) {
     log(`dry-run HEAD ${key}`);
     return false;
   }
-  const request = signingHeaders({ ...config, key, method: "HEAD" });
-  const response = await fetchImpl(request.url, {
-    method: "HEAD",
-    headers: request.headers,
-  });
+  const response = await requestR2(config, { key, method: "HEAD" }, options);
   if (response.status === 404) return false;
   if (response.ok) return true;
   throw new Error(
-    `R2 preflight failed for ${key}: ${response.status} ${await response.text()}`,
+    `R2 preflight failed for ${key}: ${response.status} ${response.body.toString("utf8")}`,
   );
 }
 
 export async function putObject(
   config,
   object,
-  {
-    dryRunMode = dryRun,
-    fetchImpl = globalThis.fetch,
-    ifAbsent = false,
-    log = console.log,
-  } = {},
+  options = {},
 ) {
+  const { dryRunMode = dryRun, ifAbsent = false, log = console.log } = options;
   if (dryRunMode) {
     log(`dry-run PUT ${object.key} (${object.body.length} bytes)`);
     return;
   }
-  const request = signingHeaders({
-    ...config,
+  const response = await requestR2(config, {
     ...object,
     ifNoneMatch: ifAbsent ? "*" : undefined,
-  });
-  const response = await fetchImpl(request.url, {
-    method: "PUT",
-    headers: request.headers,
-    body: object.body,
-  });
+  }, options);
   if (!response.ok) {
     if (ifAbsent && (response.status === 409 || response.status === 412)) {
+      // A prior PUT can have succeeded even when its response was lost.
+      // Accept the race only after reading and verifying the exact bytes.
+      if (await objectMatches(config, object, options)) {
+        log(`verified existing ${object.key}`);
+        return;
+      }
       throw new Error(
         `R2 immutable object already exists; refusing to overwrite ${object.key}`,
       );
     }
     throw new Error(
-      `R2 upload failed for ${object.key}: ${response.status} ${await response.text()}`,
+      `R2 upload failed for ${object.key}: ${response.status} ${response.body.toString("utf8")}`,
     );
   }
   log(`uploaded ${object.key}`);
@@ -202,19 +265,24 @@ export async function publishObjectPlan({
   immutableObjects,
   mutableObjects,
   objectExistsFn,
+  objectMatchesFn,
   putObjectFn,
 }) {
-  const existing = [];
+  const existing = new Set();
+  const conflicts = [];
   for (const object of immutableObjects) {
-    if (await objectExistsFn(object)) existing.push(object.key);
+    if (!await objectExistsFn(object)) continue;
+    if (objectMatchesFn && await objectMatchesFn(object)) existing.add(object.key);
+    else conflicts.push(object.key);
   }
-  if (existing.length > 0) {
+  if (conflicts.length > 0) {
     throw new Error(
-      `R2 immutable release objects already exist; refusing to overwrite: ${existing.join(", ")}`,
+      `R2 immutable release objects already exist with unverified or different content; refusing to overwrite: ${conflicts.join(", ")}`,
     );
   }
 
   for (const object of immutableObjects) {
+    if (existing.has(object.key)) continue;
     await putObjectFn(object, { ifAbsent: true });
   }
   for (const object of mutableObjects) {
@@ -277,7 +345,16 @@ export async function main() {
     setting("R2_PUBLIC_BASE_URL") ?? "https://artifacts.invalid"
   ).replace(/\/+$/, "");
   const artifacts = RELEASE_PLATFORMS.map(readArtifact);
-  const publishedAt = new Date().toISOString();
+  const config = {
+    accountId: setting("R2_ACCOUNT_ID") ?? "dry-run-account",
+    accessKeyId: setting("R2_ACCESS_KEY_ID") ?? "dry-run-access-key",
+    secretAccessKey: setting("R2_SECRET_ACCESS_KEY") ?? "dry-run-secret",
+    bucket,
+  };
+  const publishedAt = await existingPublishedAt(config, [
+    buildManifestKey(product, revision),
+    releaseManifestKey(product, version),
+  ]) ?? new Date().toISOString();
   const manifestOptions = {
     product,
     version,
@@ -285,12 +362,6 @@ export async function main() {
     publishedAt,
     publicBaseUrl,
     artifacts,
-  };
-  const config = {
-    accountId: setting("R2_ACCOUNT_ID") ?? "dry-run-account",
-    accessKeyId: setting("R2_ACCESS_KEY_ID") ?? "dry-run-access-key",
-    secretAccessKey: setting("R2_SECRET_ACCESS_KEY") ?? "dry-run-secret",
-    bucket,
   };
   const immutableCacheControl = "public, max-age=31536000, immutable";
   const mutableCacheControl = "no-cache, no-store, must-revalidate";
@@ -346,6 +417,7 @@ export async function main() {
     immutableObjects,
     mutableObjects,
     objectExistsFn: (object) => objectExists(config, object.key),
+    objectMatchesFn: (object) => objectMatches(config, object),
     putObjectFn: (object, options) => putObject(config, object, options),
   });
 
