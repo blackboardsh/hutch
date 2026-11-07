@@ -24,6 +24,9 @@ node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/electrobun/decorator-bundle.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/init-scaffold.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/javascript-sdk-subpaths.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/managed-build-config.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/managed-deploy.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/managed-native.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/non-index-main-entrypoint.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/published-platform-artifact.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/tsconfig-path-alias-bundle.test.js" \

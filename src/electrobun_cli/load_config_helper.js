@@ -126,6 +126,13 @@ if (loadedConfig.build?.mainProcess == null && !loadedConfig.build?.bun &&
 
 const merged = mergeConfig(defaultConfig, loadedConfig);
 
+// For managed hosting an explicit baseUrl selects a custom origin. The legacy
+// static-host default is not an explicit origin and must not become one merely
+// because the config passed through the build's default-merging step.
+if (isPlainObject(merged.release?.managed) && loadedConfig.release?.baseUrl === undefined) {
+  delete merged.release.baseUrl;
+}
+
 if (!merged.build.main && merged.build.bun) merged.build.main = { ...merged.build.bun };
 if (!merged.build.bun && merged.build.main) merged.build.bun = { ...merged.build.main };
 

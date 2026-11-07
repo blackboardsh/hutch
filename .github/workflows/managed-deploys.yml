@@ -1,0 +1,88 @@
+name: Managed Electrobun deploys
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/managed-deploys.yml'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'package.json'
+      - 'src/**'
+      - 'tests/electrobun/**'
+      - 'scripts/setup.sh'
+      - 'scripts/patch-zig-*.js'
+      - 'patches/**'
+      - 'scripts/test-managed-deploys.mjs'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/managed-deploys.yml'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'package.json'
+      - 'src/**'
+      - 'tests/electrobun/**'
+      - 'scripts/setup.sh'
+      - 'scripts/patch-zig-*.js'
+      - 'patches/**'
+      - 'scripts/test-managed-deploys.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-deploys-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  managed-deploys:
+    name: Managed deploys (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-gnu.2.35
+          - runner: macos-26
+            target: aarch64-macos.14.0
+          - runner: windows-2025
+            target: x86_64-windows-msvc
+    env:
+      HUTCH_NO_UPDATE_CHECK: '1'
+      HUTCH_MANAGED_TEST_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.22.1'
+          package-manager-cache: false
+      - name: Restore vendored Zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendors/zig
+          key: hutch-managed-zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup.sh', 'scripts/patch-zig-hostname-connect.js', 'patches/zig-0.17.0-hostname-connect.patch', 'scripts/patch-zig-tls.js', 'src/zig_tls_patch.json') }}
+      - name: Set up Zig and build current Hutch
+        shell: bash
+        run: |
+          bash scripts/setup.sh
+          zig=./vendors/zig/zig
+          if [[ "$RUNNER_OS" == Windows ]]; then zig="$zig.exe"; fi
+          "$zig" build -Doptimize=ReleaseSmall -Dcpu=baseline -Dtarget="$HUTCH_MANAGED_TEST_TARGET"
+      - name: Test native uploads, publication, and managed/static update contracts
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/test-managed-deploys.mjs 2>&1 | tee managed-deploys.log
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: managed-deploys-${{ runner.os }}-${{ runner.arch }}
+          path: managed-deploys.log
+          if-no-files-found: ignore
+          retention-days: 7

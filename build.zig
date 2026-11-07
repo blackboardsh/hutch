@@ -224,6 +224,22 @@ pub fn build(b: *std.Build) void {
     runtime_command_test_step.dependOn(&run_runtime_command_regression.step);
 
     const test_step = b.step("test", "Run tests");
+    const electrobun_config_test_step = b.step("test:electrobun-config", "Test Electrobun build metadata and managed/static update compatibility");
+    electrobun_config_test_step.dependOn(&run_electrobun_tests.step);
+    const managed_test_step = b.step("test:managed-deploys", "Test native release inventory and bounded upload requests");
+    for ([_][]const u8{ "src/electrobun_managed_inventory.zig", "src/electrobun_managed_timeout.zig" }) |source| {
+        const managed_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        const run_managed_tests = b.addRunArtifact(managed_tests);
+        managed_test_step.dependOn(&run_managed_tests.step);
+        test_step.dependOn(&run_managed_tests.step);
+    }
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_cache_tests.step);
     test_step.dependOn(&run_patch_tests.step);

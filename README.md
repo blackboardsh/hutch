@@ -258,6 +258,21 @@ bash scripts/setup.sh
 ./zig-out/bin/hutch --version
 ```
 
+Run the managed deployment checks against those local executables:
+
+```sh
+node scripts/test-managed-deploys.mjs
+```
+
+This runs native upload/publish HTTP tests, the JavaScript helper tests, and
+Zig inventory, timeout, configuration, and static-host compatibility tests.
+It fails if the local launcher, engine, or Zig is missing, and uses an isolated
+Hutch store. `HUTCH_BINARY`, `HUTCH_ENGINE_BINARY`, and `ZIG_BINARY` can select
+other local builds. No Cloudflare credentials or JavaScript app runner are
+needed. CI runs this suite on macOS, Linux, and Windows and before release
+publication. The installed-app lifecycle against the real local Cloud Worker,
+R2, D1, and Insights queue is maintained in the sibling `dash-cloud` repository.
+
 `scripts/setup.sh` only installs the pinned Zig toolchain. To run JavaScript
 against a sibling Cottontail checkout:
 
@@ -378,6 +393,137 @@ produces a self-extracting installer tarball.
 Set `release.baseUrl` to the published artifact root to generate a delta from
 the previous release, or set `release.generatePatch` to false to skip it.
 
+### Electrobun Managed Deploys
+
+Set the app ID from your Dash dashboard in `electrobun.config.ts`:
+
+```ts
+release: {
+  managed: { appId: "your-app-id" },
+},
+insights: { appId: "your-app-id" },
+```
+
+The service URL is automatic. Managed builds use one stable folder at
+`/v1/electrobun/apps/<appId>/updates/` for the ordinary
+`<channel>-<os>-<arch>-update.json`, `<channel>-<os>-<arch>-<fromHash>.patch`,
+and full-archive filenames. Hutch reads the previous release from that folder
+when generating a patch. The Worker serves that published artifact folder
+through D1 routing; app update requests contain no release ID. Artifact bytes
+remain grouped in R2 at
+`accounts/<account>/apps/<app>/releases/<channel>/<version>/<filename>`.
+Release metadata, publication state, and upload bookkeeping live in D1; the
+version folder contains only the generated artifact files. Registered prerelease
+installs can receive a selected prerelease from the same flat URLs.
+A shared, persisted Electrobun installation ID identifies the
+install for managed updates and Insights; Insights remains independently opt-in.
+Applications can show `app.getInstallationId()` in About, Help, or settings so
+developers and early adopters can enroll an installation in the prerelease group.
+Omit `release.managed` to keep using any static artifact host through
+`release.baseUrl`, with the existing artifact layout and updater behavior.
+Insights is independent of the updater.
+Future externally distributed builds can set `release.updateAuthority` to
+`"external"` or `"none"` to disable direct update downloads while retaining Insights.
+
+A custom domain is optional. After registering and verifying its hostname in
+Dash, set it alongside the managed app ID:
+
+```ts
+release: {
+  managed: { appId: "your-app-id" },
+  baseUrl: "https://updates.example.com",
+},
+insights: { appId: "your-app-id" },
+```
+
+Managed update filenames are requested directly beneath that origin. Insights
+for the same app defaults to its `/insights` endpoint; an explicit Insights
+`apiUrl` remains an override. Insights collection is still off unless enabled.
+DNS CNAME records identify hostnames, not URL folders: Dash must bind the custom
+hostname to this app and configure TLS before it can serve requests. Upload and
+publish continue using the control API; the custom download hostname does not
+receive deployment credentials.
+
+Keep the base app name and identifier in `app`. Hutch names canary bundles
+automatically and appends `.canary` to managed canary identifiers, so stable and
+canary installs can coexist. The dashboard uses that same convention; there is
+no separate canary identity to configure. Existing static-hosted applications
+retain their configured identifiers.
+
+After building, provide an app-scoped API key through `ELECTROBUN_API_KEY` (or
+`--api-key`) and stage the existing artifact directory:
+
+```sh
+hutch electrobun build --env=canary
+hutch electrobun upload --dry-run
+hutch electrobun upload
+```
+
+Upload discovers the channel, version, and platforms from the artifact names and
+update manifests. Hutch's Zig core validates the manifests, hashes files, and
+uploads 8 MiB parts directly to R2 using short-lived, checksum-bound signed URLs.
+The API authorizes and completes uploads; artifact bytes do not pass through it.
+Retry the same command to resume an interrupted upload. Each runner
+uploads its generated artifacts; the service accumulates the platforms as they
+arrive. No platform list or upload environment is required.
+
+The generated `<channel>-<platform>-<arch>-update.json` carries the archive name
+and tar integrity metadata. Upload validates those integrity fields together when
+present, and also accepts older `update.json` files without those optional fields.
+
+Upload and publish require only the Hutch binary. They do not run JavaScript,
+install packages, or evaluate `electrobun.config.ts`. A managed build saves public
+defaults (`appId`, `apiUrl`, and `artifactFolder`) in `.hutch/managed-deploy.json`
+and includes `managed-deploy.json` in its artifact folder. No credentials are
+written to these files. When copying artifacts to another runner, retain that
+file and select the copied folder with `--artifacts=<folder>`. Explicit `--app`
+or `ELECTROBUN_APP_ID` can supply the app ID when no build metadata is available.
+
+Release IDs are `<channel>-<version>`, so a canary build of app version
+`1.2.3` stages into `canary-1.2.3` on every runner. If a folder contains both
+canary and stable artifacts, upload stages each channel into its own release.
+An optional `--release=<id>` must match the inferred channel and version; it
+cannot create an alternate release for the same version. Canary and stable may
+use the same version because their artifact folders remain separate.
+
+Upload never publishes. In CI, make a separate publish job depend on all build
+and upload jobs succeeding. That job reads the accumulated release from the
+server, verifies its files, and publishes it without needing local artifacts:
+
+```sh
+hutch electrobun publish --app=your-app-id --release=canary-1.2.3 --audience=prerelease --dry-run
+hutch electrobun publish --app=your-app-id --release=canary-1.2.3 --audience=prerelease
+# When ready, publish the same uploaded files to public:
+hutch electrobun publish --app=your-app-id --release=canary-1.2.3 --audience=public
+```
+
+The publish dry run inspects the release and prints the intended audience without
+changing routing. `--audience=prerelease` publishes to installation IDs enrolled
+in the app's prerelease group in Dash. `--audience=public` publishes to all installs
+and is the default when the flag is omitted. Membership in the prerelease group
+persists after public publication. Publishing a public release also leaves an
+independently selected later prerelease in place. You can review files and
+publish to either audience from the dashboard. The service checks the uploaded
+files; CI's job dependencies determine when every
+intended runner has finished. Canary and stable are the supported channels; dev
+builds do not create release artifacts. The final publish job needs the Hutch
+binary and API key, with no local artifacts, project checkout, or build sidecar.
+
+Publication changes D1 routing selections without copying or renaming artifacts.
+Uploaded files remain in their channel/version folder. D1 maps ordinary
+hash-named patch requests to retained release folders, including older published
+patches needed to follow a chain. Prerelease patches are selected only for
+registered prerelease installs. Hutch's build-time patch generation always fetches
+the public release. A release's files become read-only once published to either
+audience; a different build needs a new
+version. This managed-hosting rule does not change the existing hash-based
+update behavior for static hosts.
+
+`hutch electrobun deploy` remains an alias for upload. Use `--artifacts` for a
+different directory, `--app` to override the configured app, or `--api-url` to
+select staging. App-scoped API keys authorize uploads and publication. Keep them
+in CI secrets or the shell environment, never in bundled app configuration.
+
 Linux can also emit an opt-in Flatpak MVP without invoking Flatpak tooling:
 
 ```ts
@@ -478,7 +624,7 @@ for the release workflow.
 - `hutch install [args...]`
 - `hutch pm exec [--] <command> [args...]`
 - `hutch build [args...]`
-- `hutch electrobun <init|update|config|prepare|sync|build|run|dev> [args...]`
+- `hutch electrobun <init|update|config|prepare|sync|build|upload|publish|run|dev> [args...]`
 - `hutch upgrade [selector]`
 - `hutch self <path|version|update|pin> [selector] [--recursive]`
 - `hutch cottontail <path|version|pin> [selector] [--recursive]`

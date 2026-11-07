@@ -263,6 +263,13 @@ pub fn run(
 
     const command = args[0];
 
+    if (std.mem.eql(u8, command, "upload") or std.mem.eql(u8, command, "deploy") or std.mem.eql(u8, command, "publish")) {
+        return runManagedCommand(&ctx, command, args[1..]) catch |err| {
+            ctx.writeStderr("hutch electrobun {s}: {s}\n", .{ command, @errorName(err) });
+            return 1;
+        };
+    }
+
     if (std.mem.eql(u8, command, "config")) {
         const config = try loadConfigAfterProductDevkit(&ctx, try parseBuildEnvironment(args[1..]));
         pruneAutomaticOnce(&ctx);
@@ -348,11 +355,16 @@ fn printHelp(writer: anytype) !void {
         \\  hutch electrobun sync [--env=dev|canary|stable]
         \\  hutch electrobun prepare [--env=dev|canary|stable]
         \\  hutch electrobun build [--env=dev|canary|stable]
+        \\  hutch electrobun upload [--release=<id>] [--app=<id>] [--artifacts=<dir>] [--dry-run]
+        \\  hutch electrobun publish --release=<channel-version> [--audience=prerelease|public] [--app=<id>] [--dry-run]
         \\  hutch electrobun run [--env=dev|canary|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
         \\  - update rewrites the nearest parent hutch.config.ts to the latest stable exact version, then runs sync.
+        \\  - upload discovers release artifacts and stages them in Electrobun Managed Deploys; deploy is an alias.
+        \\  - publish validates accumulated uploads; --audience=prerelease selects registered prerelease installs, public publishes to all installs (default).
+        \\  - upload and publish use native Hutch, ELECTROBUN_API_KEY or --api-key, and public app defaults saved during build.
         \\  - prepare reuses an existing valid projection for a floating direct-Hutch project; sync advances it to the active channel.
         \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts default to Bun; HUTCH_RUNTIME=cottontail opts into experimental Cottontail.
@@ -366,6 +378,10 @@ fn printHelp(writer: anytype) !void {
         \\  - CLI options override ELECTROBUN_INSPECT, which overrides runtime.mainProcessInspector; --no-inspect disables both.
         \\
     );
+}
+
+fn runManagedCommand(ctx: *const Context, command: []const u8, args: []const [:0]const u8) !u8 {
+    return @import("electrobun_managed.zig").run(ctx.init, command, args);
 }
 
 fn isHelpFlag(arg: []const u8) bool {
@@ -1118,11 +1134,11 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
     const bundle = try appBundlePaths(ctx, config);
     const app_file_name = try artifactAppFileName(ctx, config);
     const semantic_fields = [_][]const u8{
-        try getAppIdentifier(ctx, config.root),
+        try getAppIdentifier(ctx, config),
         try getAppName(ctx, config.root),
         try getAppVersion(ctx, config.root),
         buildEnvironmentName(config.build_env),
-        releaseBaseUrl(config.root),
+        try releaseBaseUrl(ctx, config.root),
         osName(),
         archName(),
         app_file_name,
@@ -1221,7 +1237,105 @@ fn installerPlatformPrefix(ctx: *const Context, config: CommandContext) ![]const
     return releasePlatformPrefix(ctx, config);
 }
 
-fn releaseBaseUrl(root: std.json.Value) []const u8 {
+fn managedApiBaseUrl(ctx: *const Context, settings: std.json.ObjectMap) ![]const u8 {
+    const raw = getStringFieldFromObject(settings, "apiUrl") orelse "https://api.electrobun.dev";
+    const base = std.mem.trimEnd(u8, raw, "/");
+    const uri = std.Uri.parse(base) catch return error.InvalidManagedApiUrl;
+    const host = uri.host orelse return error.InvalidManagedApiUrl;
+    const host_name = try std.ascii.allocLowerString(ctx.allocator, switch (host) {
+        .raw, .percent_encoded => |value| value,
+    });
+    if (host_name.len == 0) return error.InvalidManagedApiUrl;
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const local = std.mem.eql(u8, host_name, "localhost") or std.mem.eql(u8, host_name, "127.0.0.1") or std.mem.eql(u8, host_name, "[::1]");
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or
+        (!secure and !(local and std.ascii.eqlIgnoreCase(uri.scheme, "http")))) return error.InvalidManagedApiUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (path.len != 0 and !std.mem.eql(u8, path, "/v1/electrobun")) return error.InvalidManagedApiUrl;
+    const scheme: []const u8 = if (secure) "https" else "http";
+    if (uri.port) |port| {
+        if (port != @as(u16, if (secure) 443 else 80))
+            return std.fmt.allocPrint(ctx.allocator, "{s}://{s}:{d}/v1/electrobun", .{ scheme, host_name, port });
+    }
+    return std.fmt.allocPrint(ctx.allocator, "{s}://{s}/v1/electrobun", .{ scheme, host_name });
+}
+
+fn managedAppId(settings: std.json.ObjectMap) ![]const u8 {
+    const app_id = getStringFieldFromObject(settings, "appId") orelse return error.InvalidManagedAppId;
+    if (app_id.len == 0 or app_id.len > 128 or !std.ascii.isAlphanumeric(app_id[0])) return error.InvalidManagedAppId;
+    for (app_id) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidManagedAppId;
+    return app_id;
+}
+
+fn releaseManagedConfig(root: std.json.Value) ?std.json.ObjectMap {
+    const release = getObjectField(root, "release") orelse return null;
+    return getObjectFieldFromObject(release, "managed");
+}
+
+fn releaseUpdateAuthority(root: std.json.Value) ![]const u8 {
+    const release = getObjectField(root, "release") orelse return "direct";
+    const authority = getStringFieldFromObject(release, "updateAuthority") orelse "direct";
+    for ([_][]const u8{ "direct", "external", "none" }) |valid| {
+        if (std.mem.eql(u8, authority, valid)) return authority;
+    }
+    return error.InvalidUpdateAuthority;
+}
+
+fn managedPublicMetadata(ctx: *const Context, settings: std.json.ObjectMap) !std.json.Value {
+    var result: std.json.ObjectMap = .empty;
+    try result.put(ctx.allocator, "appId", .{ .string = try managedAppId(settings) });
+    try result.put(ctx.allocator, "apiUrl", .{ .string = try managedApiBaseUrl(ctx, settings) });
+    return .{ .object = result };
+}
+
+/// A managed release may use a verified custom origin for installed-app traffic.
+/// The deployment API remains independent, so upload credentials never follow it.
+fn managedCustomBaseUrl(ctx: *const Context, root: std.json.Value) !?[]const u8 {
+    if (releaseManagedConfig(root) == null) return null;
+    const release = getObjectField(root, "release").?;
+    const value = release.get("baseUrl") orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidManagedBaseUrl;
+    const uri = std.Uri.parse(value.string) catch return error.InvalidManagedBaseUrl;
+    const host = uri.host orelse return error.InvalidManagedBaseUrl;
+    const host_name = try std.ascii.allocLowerString(ctx.allocator, switch (host) {
+        .raw, .percent_encoded => |name| name,
+    });
+    if (host_name.len == 0) return error.InvalidManagedBaseUrl;
+    const local = std.mem.eql(u8, host_name, "localhost") or std.mem.eql(u8, host_name, "127.0.0.1") or std.mem.eql(u8, host_name, "[::1]");
+    if (!local) for (host_name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '.') return error.InvalidManagedBaseUrl;
+    };
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or
+        (!secure and !(local and std.ascii.eqlIgnoreCase(uri.scheme, "http")))) return error.InvalidManagedBaseUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |part| part,
+    };
+    if (path.len != 0 and !std.mem.eql(u8, path, "/")) return error.InvalidManagedBaseUrl;
+    const scheme: []const u8 = if (secure) "https" else "http";
+    if (uri.port) |port| {
+        if (secure and port != 443) return error.InvalidManagedBaseUrl;
+        if (port != @as(u16, if (secure) 443 else 80))
+            return try std.fmt.allocPrint(ctx.allocator, "{s}://{s}:{d}", .{ scheme, host_name, port });
+    }
+    return try std.fmt.allocPrint(ctx.allocator, "{s}://{s}", .{ scheme, host_name });
+}
+
+fn managedVersionMetadata(ctx: *const Context, root: std.json.Value) !std.json.Value {
+    var metadata = try managedPublicMetadata(ctx, releaseManagedConfig(root).?);
+    if (try managedCustomBaseUrl(ctx, root)) |base| try metadata.object.put(ctx.allocator, "baseUrl", .{ .string = base });
+    return metadata;
+}
+
+fn releaseBaseUrl(ctx: *const Context, root: std.json.Value) ![]const u8 {
+    if (!std.mem.eql(u8, try releaseUpdateAuthority(root), "direct")) return "";
+    if (releaseManagedConfig(root)) |managed| {
+        const app_id = try managedAppId(managed);
+        if (try managedCustomBaseUrl(ctx, root)) |base| return base;
+        return std.fmt.allocPrint(ctx.allocator, "{s}/apps/{s}/updates", .{ try managedApiBaseUrl(ctx, managed), app_id });
+    }
     const release = getObjectField(root, "release") orelse return "";
     return getStringFieldFromObject(release, "baseUrl") orelse "";
 }
@@ -1230,6 +1344,192 @@ fn releaseGeneratesPatch(root: std.json.Value) bool {
     const release = getObjectField(root, "release") orelse return true;
     const value = release.get("generatePatch") orelse return true;
     return value != .bool or value.bool;
+}
+
+test "managed release metadata keeps Insights independent from update authority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = "",
+    };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"build":{"mainProcess":"zig"},"release":{"managed":{"appId":"app_123","apiUrl":"https://api.example.test/v1/electrobun/","apiKey":"must-not-be-bundled"}},"insights":{"appId":"insights_123","apiUrl":"https://insights.example.test","apiKey":"must-not-be-bundled"}}
+    , .{});
+    try std.testing.expectEqualStrings("https://api.example.test/v1/electrobun/apps/app_123/updates", try releaseBaseUrl(&ctx, root));
+    const managed = try managedPublicMetadata(&ctx, releaseManagedConfig(root).?);
+    try std.testing.expect(managed.object.get("apiKey") == null);
+    try std.testing.expectEqualStrings("https://api.example.test/v1/electrobun", getStringField(managed, "apiUrl").?);
+
+    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .dev };
+    const json = try bundledRuntimeMetadataJson(&ctx, config, .{ .electrobun_version = "2.0.0", .bun_runtime_version = "1.3.0" });
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+    try std.testing.expectEqualStrings("direct", getStringField(metadata, "updateAuthority").?);
+    const insights = metadata.object.get("insights").?;
+    try std.testing.expectEqualStrings("insights_123", getStringField(insights, "appId").?);
+    try std.testing.expect(insights.object.get("enabled") == null);
+    try std.testing.expect(insights.object.get("apiKey") == null);
+
+    const external = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"build":{"mainProcess":"zig"},"release":{"baseUrl":"https://static.example.test","updateAuthority":"external"},"insights":{"appId":"insights_123","enabled":true}}
+    , .{});
+    try std.testing.expectEqualStrings("", try releaseBaseUrl(&ctx, external));
+    const external_json = try bundledRuntimeMetadataJson(&ctx, .{ .raw_json = "", .root = external, .build_env = .stable }, .{ .electrobun_version = "2.0.0", .bun_runtime_version = "1.3.0" });
+    const external_metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, external_json, .{});
+    try std.testing.expectEqualStrings("external", getStringField(external_metadata, "updateAuthority").?);
+    try std.testing.expect(external_metadata.object.get("insights").?.object.get("enabled").?.bool);
+    const static = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"release":{"baseUrl":"https://static.example.test/"}}
+    , .{});
+    try std.testing.expectEqualStrings("https://static.example.test/", try releaseBaseUrl(&ctx, static));
+}
+
+test "managed apps derive canary install identities while static identities remain unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const project_root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"app":{"name":"Example App","identifier":"dev.example.app","version":"1.2.3"},"build":{},"release":{"managed":{"appId":"app_123"}}}
+    , .{});
+    const canary = CommandContext{ .raw_json = "", .root = root, .build_env = .canary };
+    const stable = CommandContext{ .raw_json = "", .root = root, .build_env = .stable };
+    try std.testing.expectEqualStrings("dev.example.app", try getAppIdentifier(&ctx, stable));
+    try std.testing.expectEqualStrings("ExampleApp-canary", try artifactAppFileName(&ctx, canary));
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun/apps/app_123/updates", try releaseBaseUrl(&ctx, root));
+
+    const bundle = try appBundlePaths(&ctx, canary);
+    try std.Io.Dir.cwd().createDirPath(io, bundle.resources_dir);
+    try writeVersionMetadata(&ctx, canary, bundle, "buildhash");
+    const metadata_bytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ bundle.resources_dir, "version.json" }), allocator, .limited(64 * 1024));
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, metadata_bytes, .{});
+    try std.testing.expectEqualStrings("dev.example.app.canary", getStringField(metadata, "identifier").?);
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun/apps/app_123/updates", getStringField(metadata, "baseUrl").?);
+    try std.testing.expect(metadata.object.get("releaseId") == null);
+    const extractor = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try extractorMetadataJson(&ctx, canary, "buildhash"), .{});
+    try std.testing.expectEqualStrings("dev.example.app.canary", getStringField(extractor, "identifier").?);
+    try std.testing.expect(std.mem.find(u8, try infoPlistContents(&ctx, canary), "<string>dev.example.app.canary</string>") != null);
+
+    const static_root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"app":{"name":"Example App","identifier":"dev.example.legacy","version":"1.2.3"},"release":{"baseUrl":"https://static.example.test"}}
+    , .{});
+    try std.testing.expectEqualStrings("dev.example.legacy", try getAppIdentifier(&ctx, .{ .raw_json = "", .root = static_root, .build_env = .canary }));
+    // A base identifier that happens to end in .canary is still a base identity.
+    root.object.getPtr("app").?.object.getPtr("identifier").?.* = .{ .string = "dev.example.canary" };
+    try std.testing.expectEqualStrings("dev.example.canary.canary", try getAppIdentifier(&ctx, canary));
+}
+
+test "managed custom origins keep installed traffic separate from deployment credentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{ .init = undefined, .io = std.testing.io, .allocator = allocator, .environ_map = &environment, .self_exe_path = "", .cottontail_home = "", .cottontail_binary = "", .project_root = "" };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"build":{"mainProcess":"zig"},"release":{"managed":{"appId":"app_123"},"baseUrl":"https://Updates.Example.test:443/"},"insights":{"appId":"app_123"}}
+    , .{});
+    try std.testing.expectEqualStrings("https://updates.example.test", try releaseBaseUrl(&ctx, root));
+    const version = try managedVersionMetadata(&ctx, root);
+    try std.testing.expectEqualStrings("app_123", getStringField(version, "appId").?);
+    try std.testing.expectEqualStrings("https://updates.example.test", getStringField(version, "baseUrl").?);
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun", getStringField(version, "apiUrl").?);
+    const defaults = try managedPublicMetadata(&ctx, releaseManagedConfig(root).?);
+    try std.testing.expect(defaults.object.get("baseUrl") == null);
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun", getStringField(defaults, "apiUrl").?);
+    const config = CommandContext{ .raw_json = "", .root = root, .build_env = .stable };
+    const provenance = BundledRuntimeProvenance{ .electrobun_version = "2.0.0", .bun_runtime_version = "1.3.0" };
+    const build = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try bundledRuntimeMetadataJson(&ctx, config, provenance), .{});
+    try std.testing.expectEqualStrings("https://updates.example.test", getStringField(build.object.get("insights").?, "apiUrl").?);
+    try std.testing.expect(build.object.get("insights").?.object.get("enabled") == null);
+
+    try root.object.getPtr("insights").?.object.put(allocator, "apiUrl", .{ .string = "https://analytics.example.test" });
+    const overridden = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try bundledRuntimeMetadataJson(&ctx, config, provenance), .{});
+    try std.testing.expectEqualStrings("https://analytics.example.test/v1/electrobun", getStringField(overridden.object.get("insights").?, "apiUrl").?);
+    _ = root.object.getPtr("insights").?.object.swapRemove("apiUrl");
+    try root.object.getPtr("insights").?.object.put(allocator, "appId", .{ .string = "different_app" });
+    const separate = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try bundledRuntimeMetadataJson(&ctx, config, provenance), .{});
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun", getStringField(separate.object.get("insights").?, "apiUrl").?);
+    // A self-hosted artifact URL must never become an Insights endpoint.
+    _ = root.object.getPtr("release").?.object.swapRemove("managed");
+    const self_hosted = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try bundledRuntimeMetadataJson(&ctx, config, provenance), .{});
+    try std.testing.expectEqualStrings("https://api.electrobun.dev/v1/electrobun", getStringField(self_hosted.object.get("insights").?, "apiUrl").?);
+    try std.testing.expectEqualStrings("https://Updates.Example.test:443/", try releaseBaseUrl(&ctx, root));
+}
+
+test "managed custom origins reject folder paths and ambiguous URLs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{ .init = undefined, .io = std.testing.io, .allocator = allocator, .environ_map = &environment, .self_exe_path = "", .cottontail_home = "", .cottontail_binary = "", .project_root = "" };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"release":{"managed":{"appId":"app_123"},"baseUrl":"https://updates.example.test"}}
+    , .{});
+    for ([_][]const u8{ "", "http://updates.example.test", "https://key@updates.example.test", "https://updates.example.test?token=secret", "https://updates.example.test?", "https://updates.example.test#fragment", "https://updates.example.test#", "https://updates.example.test/folder", "https://updates.example.test//", "https://updates.example.test:8443", "https://updates.example.test/%2f", "https://updates.example.test%2fother" }) |base| {
+        try root.object.getPtr("release").?.object.put(allocator, "baseUrl", .{ .string = base });
+        try std.testing.expectError(error.InvalidManagedBaseUrl, releaseBaseUrl(&ctx, root));
+    }
+    try root.object.getPtr("release").?.object.put(allocator, "baseUrl", .{ .string = "http://127.0.0.1:8765/" });
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765", try releaseBaseUrl(&ctx, root));
+    try root.object.getPtr("release").?.object.getPtr("managed").?.object.put(allocator, "appId", .{ .string = "../other-app" });
+    try std.testing.expectError(error.InvalidManagedAppId, releaseBaseUrl(&ctx, root));
+}
+
+test "managed release configuration rejects credential URLs and invalid app identifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = "",
+    };
+    for ([_][]const u8{
+        "https://key@api.example.test",
+        "https://api.example.test?key=secret",
+        "http://api.example.test",
+        "https://api.example.test/arbitrary/path",
+    }) |url| {
+        var settings: std.json.ObjectMap = .empty;
+        try settings.put(allocator, "apiUrl", .{ .string = url });
+        try std.testing.expectError(error.InvalidManagedApiUrl, managedApiBaseUrl(&ctx, settings));
+    }
+    var settings: std.json.ObjectMap = .empty;
+    try settings.put(allocator, "appId", .{ .string = "../other-app" });
+    try std.testing.expectError(error.InvalidManagedAppId, managedAppId(settings));
 }
 
 fn platformConfigBool(root: std.json.Value, field: []const u8, default: bool) bool {
@@ -1380,14 +1680,16 @@ fn writeVersionMetadata(
     try object.put(ctx.allocator, "version", .{ .string = try getAppVersion(ctx, config.root) });
     try object.put(ctx.allocator, "hash", .{ .string = hash });
     try object.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
-    try object.put(ctx.allocator, "baseUrl", .{ .string = releaseBaseUrl(config.root) });
+    try object.put(ctx.allocator, "baseUrl", .{ .string = try releaseBaseUrl(ctx, config.root) });
+    try object.put(ctx.allocator, "updateAuthority", .{ .string = try releaseUpdateAuthority(config.root) });
+    if (releaseManagedConfig(config.root) != null) try object.put(ctx.allocator, "managed", try managedVersionMetadata(ctx, config.root));
     try object.put(ctx.allocator, "name", .{ .string = try artifactAppFileName(ctx, config) });
     // `name` is the channel-qualified filesystem artifact name retained for
     // updater compatibility. Native update integration needs the developer's
     // original display name so shortcuts and uninstall UI do not inherit that
     // sanitized filename during a v1-layout migration.
     try object.put(ctx.allocator, "displayName", .{ .string = try getAppName(ctx, config.root) });
-    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config.root) });
+    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config) });
     const json = try std.json.Stringify.valueAlloc(
         ctx.allocator,
         std.json.Value{ .object = object },
@@ -1406,7 +1708,7 @@ fn writeExtractorMetadata(
     output_path: []const u8,
 ) !void {
     var object: std.json.ObjectMap = .empty;
-    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config.root) });
+    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config) });
     try object.put(ctx.allocator, "name", .{ .string = try getAppName(ctx, config.root) });
     try object.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
     try object.put(ctx.allocator, "hash", .{ .string = hash });
@@ -1734,7 +2036,7 @@ fn generateDeltaPatch(
         ctx.writeStdout("delta patch generation disabled\n", .{});
         return null;
     }
-    const base_url = std.mem.trimEnd(u8, releaseBaseUrl(config.root), "/");
+    const base_url = std.mem.trimEnd(u8, try releaseBaseUrl(ctx, config.root), "/");
     if (base_url.len == 0) {
         ctx.writeStdout("no release.baseUrl configured; skipping delta patch\n", .{});
         return null;
@@ -1751,6 +2053,8 @@ fn generateDeltaPatch(
     ctx.io.random(&cache_random);
     const cache_buster = std.fmt.bytesToHex(cache_random, .lower);
     const update_file = try std.fmt.allocPrint(ctx.allocator, "{s}-update.json", .{prefix});
+    // Managed hosting exposes the same flat artifact folder as a static host.
+    // Both the canonical manifest and its archive use this one configured base.
     const update_url = try cacheBustedReleaseUrl(ctx.allocator, base_url, update_file, &cache_buster);
     const update_bytes = fetchOptionalBytes(ctx, update_url, 1024 * 1024) catch |err| {
         ctx.writeStderr("hutch electrobun: could not fetch previous update metadata ({s}); skipping delta patch\n", .{@errorName(err)});
@@ -1765,7 +2069,7 @@ fn generateDeltaPatch(
     };
     const previous_source = previousReleasePatchSource(
         previous,
-        try getAppIdentifier(ctx, config.root),
+        try getAppIdentifier(ctx, config),
         buildEnvironmentName(config.build_env),
         osName(),
         archName(),
@@ -3120,7 +3424,7 @@ fn writeFlatpakOutput(
     staged_payload_path: []const u8,
     options: FlatpakOutputOptions,
 ) !void {
-    const app_id = try getAppIdentifier(ctx, config.root);
+    const app_id = try getAppIdentifier(ctx, config);
     try validateSafeOutputSegment(app_id);
     const channel = buildEnvironmentName(config.build_env);
     const architecture = try flatpakArchitectureName();
@@ -3195,7 +3499,7 @@ fn writeFlatpakOutput(
 
 fn extractorMetadataJson(ctx: *const Context, config: CommandContext, hash: []const u8) ![]const u8 {
     var object: std.json.ObjectMap = .empty;
-    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config.root) });
+    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config) });
     try object.put(ctx.allocator, "name", .{ .string = try getAppName(ctx, config.root) });
     try object.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
     try object.put(ctx.allocator, "hash", .{ .string = hash });
@@ -3249,7 +3553,7 @@ fn writeReleaseArtifacts(
     // Keep release discovery and exact archive integrity in one manifest.
     const update_json = try releaseUpdateJson(
         ctx,
-        try getAppIdentifier(ctx, config.root),
+        try getAppIdentifier(ctx, config),
         buildEnvironmentName(config.build_env),
         try getAppVersion(ctx, config.root),
         state.hash,
@@ -3284,6 +3588,31 @@ fn writeReleaseArtifacts(
         );
         try copyPathWithin(ctx, artifact_root, source, destination);
         std.Io.Dir.cwd().deleteFile(ctx.io, source) catch {};
+    }
+    // Upload/publish are native commands and never evaluate this TypeScript
+    // configuration. Persist only public build defaults for those later steps.
+    if (releaseManagedConfig(config.root)) |managed| {
+        var metadata = try managedPublicMetadata(ctx, managed);
+        const configured_folder = if (getObjectField(config.root, "build")) |build|
+            getStringFieldFromObject(build, "artifactFolder") orelse "artifacts"
+        else
+            "artifacts";
+        try metadata.object.put(ctx.allocator, "artifactFolder", .{ .string = configured_folder });
+        const data = try std.json.Stringify.valueAlloc(ctx.allocator, metadata, .{ .whitespace = .indent_2 });
+        const hutch_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".hutch" });
+        try std.Io.Dir.cwd().createDirPath(ctx.io, hutch_dir);
+        for ([_][]const u8{ hutch_dir, artifact_root }) |folder| {
+            try std.Io.Dir.cwd().writeFile(ctx.io, .{
+                .sub_path = try std.fs.path.join(ctx.allocator, &.{ folder, "managed-deploy.json" }),
+                .data = data,
+            });
+        }
+    } else {
+        const stale_defaults = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".hutch", "managed-deploy.json" });
+        std.Io.Dir.cwd().deleteFile(ctx.io, stale_defaults) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
     }
 }
 
@@ -3820,7 +4149,7 @@ fn runCottontailApp(ctx: *const Context, config: CommandContext) !void {
 
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     try env_map.put("COTTONTAIL_ELECTROBUN_NAME", try getAppName(ctx, config.root));
-    try env_map.put("COTTONTAIL_ELECTROBUN_IDENTIFIER", try getAppIdentifier(ctx, config.root));
+    try env_map.put("COTTONTAIL_ELECTROBUN_IDENTIFIER", try getAppIdentifier(ctx, config));
     try env_map.put("COTTONTAIL_ELECTROBUN_CHANNEL", buildEnvironmentName(config.build_env));
 
     const platform_paths = try getPlatformPaths(ctx, config.root);
@@ -6058,7 +6387,7 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
     try env_map.put("ELECTROBUN_BUILD_DIR", try buildOutputRoot(ctx, config));
     try env_map.put("ELECTROBUN_APP_NAME", try getAppName(ctx, config.root));
     try env_map.put("ELECTROBUN_APP_VERSION", try getAppVersion(ctx, config.root));
-    try env_map.put("ELECTROBUN_APP_IDENTIFIER", try getAppIdentifier(ctx, config.root));
+    try env_map.put("ELECTROBUN_APP_IDENTIFIER", try getAppIdentifier(ctx, config));
     try env_map.put("ELECTROBUN_ARTIFACT_DIR", try artifactOutputRoot(ctx, config.root));
     if (extra_env) |map| {
         var it = map.iterator();
@@ -6768,7 +7097,7 @@ fn validateOutputConfiguration(ctx: *const Context, config: CommandContext) !voi
         }
     }
     if (flatpakEnabled(config.root)) {
-        try validateSafeOutputSegment(try getAppIdentifier(ctx, config.root));
+        try validateSafeOutputSegment(try getAppIdentifier(ctx, config));
         try validateSafeRelativeOutputPath(flatpakConfigString(config.root, "outputPath", "flatpak"));
     }
 }
@@ -6973,9 +7302,16 @@ fn getAppName(_: *const Context, root: std.json.Value) ![]const u8 {
     return getStringFieldFromObject(app, "name") orelse error.InvalidConfig;
 }
 
-fn getAppIdentifier(_: *const Context, root: std.json.Value) ![]const u8 {
-    const app = getObjectField(root, "app") orelse return error.InvalidConfig;
-    return getStringFieldFromObject(app, "identifier") orelse error.InvalidConfig;
+fn getAppIdentifier(ctx: *const Context, config: CommandContext) ![]const u8 {
+    const app = getObjectField(config.root, "app") orelse return error.InvalidConfig;
+    const identifier = getStringFieldFromObject(app, "identifier") orelse return error.InvalidConfig;
+    // Managed apps configure one base identity. Canary installs coexist with
+    // stable installs, and the service validates this same derived identity.
+    // Existing static-host apps retain their configured updater identity.
+    if (config.build_env == .canary and releaseManagedConfig(config.root) != null) {
+        return std.mem.concat(ctx.allocator, u8, &.{ identifier, ".canary" });
+    }
+    return identifier;
 }
 
 fn getAppVersion(_: *const Context, root: std.json.Value) ![]const u8 {
@@ -8044,7 +8380,7 @@ fn infoPlistContents(ctx: *const Context, config: CommandContext) ![]const u8 {
         ctx.allocator,
         4,
         "CFBundleIdentifier",
-        try getAppIdentifier(ctx, config.root),
+        try getAppIdentifier(ctx, config),
     );
     try appendPlistStringEntry(
         &output,
@@ -8087,9 +8423,9 @@ fn infoPlistContents(ctx: *const Context, config: CommandContext) ![]const u8 {
         &output,
         ctx.allocator,
         app,
-        try getAppIdentifier(ctx, config.root),
+        try getAppIdentifier(ctx, config),
     );
-    try appendDocumentTypes(ctx, &output, app, try getAppIdentifier(ctx, config.root));
+    try appendDocumentTypes(ctx, &output, app, try getAppIdentifier(ctx, config));
 
     try output.appendSlice(ctx.allocator, "</dict>\n</plist>\n");
     return output.toOwnedSlice(ctx.allocator);
@@ -8764,6 +9100,24 @@ fn bundledRuntimeMetadataJson(
     );
     try metadata.put(ctx.allocator, "availableRenderers", .{ .array = available_renderers });
     try metadata.put(ctx.allocator, "buildEnvironment", .{ .string = buildEnvironmentName(config.build_env) });
+    try metadata.put(ctx.allocator, "updateAuthority", .{ .string = try releaseUpdateAuthority(config.root) });
+    if (getObjectField(config.root, "insights")) |settings| {
+        var insights = try managedPublicMetadata(ctx, settings);
+        // The same app's Insights requests may use its custom managed origin.
+        // An explicit endpoint or unrelated Insights app keeps its own routing.
+        if (settings.get("apiUrl") == null) {
+            if (releaseManagedConfig(config.root)) |managed| {
+                if (std.mem.eql(u8, try managedAppId(settings), try managedAppId(managed))) {
+                    if (try managedCustomBaseUrl(ctx, config.root)) |base| try insights.object.put(ctx.allocator, "apiUrl", .{ .string = base });
+                }
+            }
+        }
+        if (settings.get("enabled")) |enabled| {
+            if (enabled != .bool) return error.InvalidInsightsConfig;
+            try insights.object.put(ctx.allocator, "enabled", enabled);
+        }
+        try metadata.put(ctx.allocator, "insights", insights);
+    }
     try metadata.put(ctx.allocator, "runtime", runtime_value);
     try appendWindowsAutoGrantPermissions(ctx.allocator, &metadata, config.root, builtin.os.tag == .windows);
 
@@ -8788,7 +9142,7 @@ fn writeBundledRuntimeMetadata(
     bundle: AppBundlePaths,
     platform_paths: PlatformPaths,
 ) !void {
-    const identifier = try getAppIdentifier(ctx, config.root);
+    const identifier = try getAppIdentifier(ctx, config);
     const app_name = try appDisplayName(ctx, config);
     const version_name = try getAppVersion(ctx, config.root);
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotPrepared;
@@ -8805,11 +9159,16 @@ fn writeBundledRuntimeMetadata(
         .cottontail_runtime_version = if (local_cottontail != null) null else devkit.toolchains.cottontail,
         .cottontail_local_override = if (local_cottontail) |executable| try localCottontailProvenance(ctx, executable) else null,
     });
-    const version_json = try std.fmt.allocPrint(
-        ctx.allocator,
-        "{{\"version\":\"{s}\",\"hash\":\"dev\",\"channel\":\"{s}\",\"name\":\"{s}\",\"identifier\":\"{s}\",\"baseUrl\":\"\"}}",
-        .{ version_name, buildEnvironmentName(config.build_env), app_name, identifier },
-    );
+    var version_metadata: std.json.ObjectMap = .empty;
+    try version_metadata.put(ctx.allocator, "version", .{ .string = version_name });
+    try version_metadata.put(ctx.allocator, "hash", .{ .string = "dev" });
+    try version_metadata.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
+    try version_metadata.put(ctx.allocator, "name", .{ .string = app_name });
+    try version_metadata.put(ctx.allocator, "identifier", .{ .string = identifier });
+    try version_metadata.put(ctx.allocator, "baseUrl", .{ .string = "" });
+    try version_metadata.put(ctx.allocator, "updateAuthority", .{ .string = try releaseUpdateAuthority(config.root) });
+    if (releaseManagedConfig(config.root)) |managed| try version_metadata.put(ctx.allocator, "managed", try managedPublicMetadata(ctx, managed));
+    const version_json = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = version_metadata }, .{});
 
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "build.json" }),
@@ -9435,6 +9794,128 @@ test "previous release fetch URLs bypass mutable caches without changing filenam
     );
 }
 
+test "managed custom and self-hosted patch generation fetch ordinary files from one flat folder" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const Server = struct {
+        listener: std.Io.net.Server,
+        responses: []const Response,
+        received: std.atomic.Value(usize) = .init(0),
+        const Response = struct { path: []const u8, body: []const u8, location: ?[]const u8 = null };
+
+        fn serve(self: *@This()) !void {
+            const server_io = std.testing.io;
+            for (self.responses) |response| {
+                const connection = try self.listener.accept(server_io);
+                defer connection.close(server_io);
+                var input_buffer: [4096]u8 = undefined;
+                var reader = connection.reader(server_io, &input_buffer);
+                var parts = std.mem.splitScalar(u8, try reader.interface.takeDelimiterInclusive('\n'), ' ');
+                try std.testing.expectEqualStrings("GET", parts.next().?);
+                const target = parts.next().?;
+                const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+                try std.testing.expectEqualStrings(response.path, path);
+                if (!std.mem.startsWith(u8, path, "/redirected/")) {
+                    try std.testing.expect(std.mem.find(u8, target, "?cache=") != null);
+                }
+                while (true) {
+                    const header = try reader.interface.takeDelimiterInclusive('\n');
+                    if (std.mem.eql(u8, header, "\r\n")) break;
+                    try std.testing.expect(!std.ascii.startsWithIgnoreCase(header, "authorization:"));
+                    try std.testing.expect(!std.ascii.startsWithIgnoreCase(header, "cookie:"));
+                    // Build runners always generate patches from the public
+                    // release, even if this machine tests candidate installs.
+                    try std.testing.expect(!std.ascii.startsWithIgnoreCase(header, "x-electrobun-installation-id:"));
+                }
+                _ = self.received.fetchAdd(1, .release);
+                var output_buffer: [4096]u8 = undefined;
+                var writer = connection.writer(server_io, &output_buffer);
+                try writer.interface.print("HTTP/1.1 {d} Response\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ @as(u16, if (response.location == null) 200 else 302), response.body.len });
+                if (response.location) |location| try writer.interface.print("Location: {s}\r\n", .{location});
+                try writer.interface.writeAll("\r\n");
+                try writer.interface.writeAll(response.body);
+                try writer.interface.flush();
+            }
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const project_root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .cottontail_home = "",
+        .cottontail_binary = "",
+        .project_root = project_root,
+    };
+    var tools = std.mem.zeroes(PlatformPaths);
+    // The network contract is the subject of this test. Stop after fetching
+    // the previous archive instead of requiring platform compression tools.
+    tools.bsdiff = "/usr/bin/false";
+    tools.zig_zstd = "/usr/bin/false";
+    const Hosting = enum { self_hosted, managed_default, managed_custom };
+    for ([_]Hosting{ .self_hosted, .managed_default, .managed_custom }) |hosting| {
+        const managed = hosting != .self_hosted;
+        for ([_]BuildEnvironment{ .stable, .canary }) |channel| {
+            const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+            var server: Server = .{ .listener = try address.listen(io, .{}), .responses = &.{} };
+            defer server.listener.deinit(io);
+            const origin = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listener.socket.address.getPort()});
+            const folder = switch (hosting) {
+                .managed_default => "/v1/electrobun/apps/app_test/updates",
+                .managed_custom => "",
+                .self_hosted => "/my-existing-bucket-folder",
+            };
+            const expected_base = try std.mem.concat(allocator, u8, &.{ origin, folder });
+            const configuration = if (managed)
+                try std.fmt.allocPrint(allocator, "{{\"app\":{{\"name\":\"Example\",\"identifier\":\"dev.example.app\",\"version\":\"2.0.0\"}},\"release\":{{\"managed\":{{\"appId\":\"app_test\",\"apiUrl\":\"{s}\"}}}}}}", .{origin})
+            else
+                try std.fmt.allocPrint(allocator, "{{\"app\":{{\"name\":\"Example\",\"identifier\":\"dev.example.app\",\"version\":\"2.0.0\"}},\"release\":{{\"baseUrl\":\"{s}/\"}}}}", .{expected_base});
+            const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, configuration, .{});
+            if (hosting == .managed_custom) try root.object.getPtr("release").?.object.put(allocator, "baseUrl", .{ .string = origin });
+            const config = CommandContext{ .raw_json = configuration, .root = root, .build_env = channel };
+            const app_file = try artifactAppFileName(&ctx, config);
+            const tar_name = try std.mem.concat(allocator, u8, &.{ app_file, if (builtin.os.tag == .macos) ".app.tar" else ".tar" });
+            const current_tar = try std.fs.path.join(allocator, &.{ project_root, tar_name });
+            const prefix = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ buildEnvironmentName(channel), osName(), archName() });
+            const archive_file = try std.mem.concat(allocator, u8, &.{ prefix, "-", tar_name, ".zst" });
+            // A managed response is a plain canonical manifest, without an
+            // envelope, release ID, or download base. Older static metadata
+            // still works, including the existing manifest redirect behavior.
+            const manifest = if (managed)
+                try releaseUpdateJson(&ctx, try getAppIdentifier(&ctx, config), buildEnvironmentName(channel), "1.0.0", "oldhash", osName(), archName(), archive_file, null)
+            else
+                try std.json.Stringify.valueAlloc(allocator, .{ .version = "1.0.0", .hash = "oldhash", .platform = osName(), .arch = archName() }, .{});
+            const metadata_path = try std.mem.concat(allocator, u8, &.{ folder, "/", prefix, "-update.json" });
+            const archive_path = try std.mem.concat(allocator, u8, &.{ folder, "/", archive_file });
+            var responses: [3]Server.Response = undefined;
+            if (managed) {
+                responses[0] = .{ .path = metadata_path, .body = manifest };
+                responses[1] = .{ .path = archive_path, .body = "previous archive" };
+                server.responses = responses[0..2];
+            } else {
+                responses[0] = .{ .path = metadata_path, .body = "", .location = try std.mem.concat(allocator, u8, &.{ origin, "/redirected/manifest.json" }) };
+                responses[1] = .{ .path = "/redirected/manifest.json", .body = manifest };
+                responses[2] = .{ .path = archive_path, .body = "previous archive" };
+                server.responses = &responses;
+            }
+            var serving = try io.concurrent(Server.serve, .{&server});
+            defer serving.cancel(io) catch {};
+            try std.testing.expectEqual(@as(?[]const u8, null), try generateDeltaPatch(&ctx, config, tools, current_tar));
+            try std.testing.expectEqual(server.responses.len, server.received.load(.acquire));
+            try serving.await(io);
+        }
+    }
+}
+
 test "previous release patch source accepts legacy metadata and validates modern identity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9912,6 +10393,9 @@ test "release version metadata keeps display and artifact names distinct" {
         "Migration App",
         parsed.object.get("displayName").?.string,
     );
+    try std.testing.expectEqualStrings("https://updates.example.test", parsed.object.get("baseUrl").?.string);
+    try std.testing.expect(parsed.object.get("managed") == null);
+    try std.testing.expect(parsed.object.get("releaseId") == null);
 }
 
 test "release artifacts use one integrity manifest and channel-specific installers" {
@@ -9922,6 +10406,25 @@ test "release artifacts use one integrity manifest and channel-specific installe
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const Flat = struct {
+        fn expect(root_path: []const u8, names: []const []const u8) !void {
+            var directory = try std.Io.Dir.openDirAbsolute(std.testing.io, root_path, .{ .iterate = true });
+            defer directory.close(std.testing.io);
+            var iterator = directory.iterate();
+            var count: usize = 0;
+            while (try iterator.next(std.testing.io)) |entry| {
+                try std.testing.expectEqual(std.Io.File.Kind.file, entry.kind);
+                var found = false;
+                for (names) |name| if (std.mem.eql(u8, name, entry.name)) {
+                    found = true;
+                    break;
+                };
+                try std.testing.expect(found);
+                count += 1;
+            }
+            try std.testing.expectEqual(names.len, count);
+        }
+    };
     const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     const compressed_path = try std.fs.path.join(allocator, &.{ absolute_root, "MigrationApp.tar.zst" });
@@ -9980,14 +10483,13 @@ test "release artifacts use one integrity manifest and channel-specific installe
     }, installer_path);
 
     const installer_prefix = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ osName(), archName() });
-    for ([_][]const u8{
+    const stable_files = [_][]const u8{
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ installer_prefix, "-MigrationApp-Setup.zip" }),
-    }) |name| {
-        try std.testing.expect(pathExists(io, try std.fs.path.join(allocator, &.{ artifact_root, name })));
-    }
+    };
+    try Flat.expect(artifact_root, &stable_files);
     try std.testing.expect(!pathExists(io, stale_stable_manifest));
 
     const stable_update_path = try std.fs.path.join(
@@ -10074,6 +10576,42 @@ test "release artifacts use one integrity manifest and channel-specific installe
     );
     try std.testing.expectEqual(@as(i64, 3), canary_artifact.get("tarSize").?.integer);
     try std.testing.expectEqual(@as(usize, 3), canary_artifact.count());
+
+    const canary_files = [_][]const u8{
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary.tar.zst" }),
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-oldhash.patch" }),
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary-Setup.zip" }),
+    };
+    try Flat.expect(artifact_root, &canary_files);
+
+    // Managed hosting changes only the delivery base and public deployment
+    // defaults. It must never introduce release folders or rename artifacts.
+    var managed_root = root;
+    const managed_release = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"managed":{"appId":"app_fixture"}}
+    , .{});
+    try managed_root.object.put(allocator, "release", managed_release);
+    for ([_]BuildEnvironment{ .stable, .canary }) |channel| {
+        const is_canary = channel == .canary;
+        const managed_config = CommandContext{ .raw_json = "", .root = managed_root, .build_env = channel };
+        // Packaging moves these build outputs into artifacts; each subsequent
+        // build supplies a fresh set before the folder is recreated.
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = if (is_canary) canary_compressed_path else compressed_path, .data = "managed archive" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = if (is_canary) canary_installer_path else installer_path, .data = "managed installer" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patch_path, .data = "managed patch" });
+        try writeReleaseArtifacts(&ctx, managed_config, .{
+            .bundle = unused_bundle,
+            .hash = "managedhash",
+            .tar_integrity = .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
+            .compressed_tar_path = if (is_canary) canary_compressed_path else compressed_path,
+            .patch_path = patch_path,
+            .flatpak_payload_path = null,
+        }, if (is_canary) canary_installer_path else installer_path);
+        const files = if (is_canary) &canary_files else &stable_files;
+        const managed_files = files.* ++ [_][]const u8{"managed-deploy.json"};
+        try Flat.expect(artifact_root, &managed_files);
+    }
 }
 
 test "release metadata and macOS plist preserve public app configuration" {

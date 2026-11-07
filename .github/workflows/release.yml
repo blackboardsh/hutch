@@ -132,6 +132,12 @@ jobs:
           & .\vendors\zig\zig.exe build -Doptimize=ReleaseSmall -Dtarget=${{ matrix.target }} -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Hutch release build failed" }
 
+      - name: Run managed deploy contracts against current Hutch
+        run: node scripts/test-managed-deploys.mjs
+        timeout-minutes: 15
+        env:
+          HUTCH_MANAGED_TEST_TARGET: ${{ matrix.target }}
+
       - name: Run Hutch tests
         if: matrix.os != 'windows'
         timeout-minutes: 20

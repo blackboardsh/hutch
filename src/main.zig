@@ -32,7 +32,7 @@ const help_text_template =
     \\Usage:
     \\  hutch <entrypoint.js|entrypoint.ts> [args...]
     \\  hutch <script-name> [args...]
-    \\  hutch electrobun <init|update|config|sync|prepare|build|run|dev> [args...]
+    \\  hutch electrobun <init|update|config|sync|prepare|build|upload|publish|run|dev> [args...]
     \\  hutch install [package-manager-options...]
     \\  hutch pm [package-manager-arguments...]
     \\  hutch run [--if-configured] [script-name] [args...]
@@ -2903,6 +2903,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, selected_command, "electrobun")) {
+        if (args.len > 2 and @import("electrobun_managed.zig").isCommand(args[2])) {
+            const exit_code = try @import("electrobun_managed.zig").run(init, args[2], args[3..]);
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
         const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
             try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
             try stderr.flush();
