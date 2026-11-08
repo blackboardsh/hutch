@@ -108,6 +108,9 @@ fn inventoryChannel(io: std.Io, allocator: Allocator, directory: std.Io.Dir, fol
     for (names) |filename| {
         if (!safeFileName(filename) or !supportedArtifactSuffix(filename)) continue;
         const target = artifactTarget(filename, channel, targets.items) orelse continue;
+        if (std.mem.endsWith(u8, filename, "-checksum.json")) {
+            try validateChecksum(io, allocator, directory, filename, manifests[targetIndex(target).?].?);
+        }
         try checkRegularPath(io, directory, filename);
         const file = try directory.openFile(io, filename, .{ .follow_symlinks = false });
         defer file.close(io);
@@ -163,6 +166,30 @@ fn readManifest(io: std.Io, allocator: Allocator, directory: std.Io.Dir, filenam
         tar_size = size.integer;
     }
     return .{ .name = name, .version = try allocator.dupe(u8, version), .identifier = try allocator.dupe(u8, identifier), .hash = try allocator.dupe(u8, hash), .archive = try allocator.dupe(u8, archive), .tar_sha256 = tar_sha256, .tar_size = tar_size };
+}
+
+fn validateChecksum(io: std.Io, allocator: Allocator, directory: std.Io.Dir, filename: []const u8, manifest: Manifest) !void {
+    const expected = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-checksum.json", .{ manifest.name.channel, manifest.name.target, manifest.hash });
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, filename, expected)) return error.ManagedChecksumBuildMismatch;
+    try checkRegularPath(io, directory, filename);
+    const file = try directory.openFile(io, filename, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const stat = try regularFileStat(io, directory, filename, file);
+    if (stat.size > max_manifest_bytes) return error.ManagedReleaseManifestTooLarge;
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !sameStat(stat, try file.stat(io))) return error.ManagedReleaseArtifactChanged;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.InvalidManagedChecksum;
+    defer parsed.deinit();
+    const checksum = stringField(parsed.value, "tarSha256") catch return error.InvalidManagedChecksum;
+    if (checksum.len != 64) return error.InvalidManagedChecksum;
+    for (checksum) |byte| if (!std.ascii.isHex(byte)) return error.InvalidManagedChecksum;
+    const size = parsed.value.object.get("tarSize") orelse return error.InvalidManagedChecksum;
+    if (size != .integer or size.integer <= 0 or size.integer > max_safe_integer) return error.InvalidManagedChecksum;
+    if (manifest.tar_sha256) |inline_checksum| {
+        if (!std.mem.eql(u8, checksum, inline_checksum) or size.integer != manifest.tar_size.?) return error.ManagedUpdateChecksumsDisagree;
+    }
 }
 
 fn regularFileStat(io: std.Io, directory: std.Io.Dir, filename: []const u8, file: std.Io.File) !std.Io.File.Stat {
@@ -237,7 +264,7 @@ fn safeFileName(value: []const u8) bool {
 }
 
 fn supportedArtifactSuffix(filename: []const u8) bool {
-    for ([_][]const u8{ "-update.json", "-update-v2.json", ".tar.zst", ".patch", ".dmg", ".zip", ".exe", ".tar.gz" }) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
+    for ([_][]const u8{ "-update.json", "-update-v2.json", "-checksum.json", ".tar.zst", ".patch", ".dmg", ".zip", ".exe", ".tar.gz" }) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
     return false;
 }
 
@@ -258,9 +285,9 @@ fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
 }
 
 fn fileLessThan(_: void, a: File, b: File) bool {
-    const a_manifest = std.mem.endsWith(u8, a.filename, ".json");
-    const b_manifest = std.mem.endsWith(u8, b.filename, ".json");
-    if (a_manifest != b_manifest) return !a_manifest;
+    const a_order: u8 = if (parseManifestName(a.filename) != null) 2 else if (std.mem.endsWith(u8, a.filename, "-checksum.json")) 1 else 0;
+    const b_order: u8 = if (parseManifestName(b.filename) != null) 2 else if (std.mem.endsWith(u8, b.filename, "-checksum.json")) 1 else 0;
+    if (a_order != b_order) return a_order < b_order;
     return std.mem.lessThan(u8, a.filename, b.filename);
 }
 
@@ -422,7 +449,7 @@ test "inventory validates canonical metadata and its agreement with a legacy com
     }
 }
 
-test "inventory accepts old canonical manifests without tar integrity" {
+test "inventory accepts legacy canonical manifests with an optional build bound checksum" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -436,6 +463,61 @@ test "inventory accepts old canonical manifests without tar integrity" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = legacy });
     const releases = try inventory(std.testing.io, a, try testFolder(a, tmp.dir), null, null, null);
     try std.testing.expectEqual(@as(usize, 2), releases[0].files.len);
+    const checksum_name = "canary-macos-arm64-hash1-checksum.json";
+    const checksum_json = "{\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":123}";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = checksum_name, .data = checksum_json });
+    const with_checksum = try inventory(std.testing.io, a, try testFolder(a, tmp.dir), null, null, null);
+    try std.testing.expectEqual(@as(usize, 3), with_checksum[0].files.len);
+    try std.testing.expectEqualStrings(checksum_name, with_checksum[0].files[1].filename);
+    try std.testing.expectEqualStrings(filename, with_checksum[0].files[2].filename);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(checksum_json, &digest, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), with_checksum[0].files[1].sha256);
+}
+
+test "inventory rejects checksum files for another build or invalid checksum content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(a, tmp.dir, "canary", "macos-arm64", "1.2.3", "hash1");
+    const folder = try testFolder(a, tmp.dir);
+    const checksum_json = "{\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":123}";
+    const wrong_name = "canary-macos-arm64-otherhash-checksum.json";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = wrong_name, .data = checksum_json });
+    try std.testing.expectError(error.ManagedChecksumBuildMismatch, inventory(std.testing.io, a, folder, null, null, null));
+    try tmp.dir.deleteFile(std.testing.io, wrong_name);
+    const filename = "canary-macos-arm64-hash1-checksum.json";
+    for ([_][]const u8{
+        "{",
+        "null",
+        "[]",
+        "{}",
+        "{\"tarSize\":123}",
+        "{\"tarSha256\":\"invalid\",\"tarSize\":123}",
+        "{\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+        "{\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":0}",
+        "{\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":9007199254740992}",
+    }) |invalid| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = invalid });
+        try std.testing.expectError(error.InvalidManagedChecksum, inventory(std.testing.io, a, folder, null, null, null));
+    }
+    const conflicting = try std.mem.replaceOwned(u8, a, checksum_json, "123", "124");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = conflicting });
+    try std.testing.expectError(error.ManagedUpdateChecksumsDisagree, inventory(std.testing.io, a, folder, null, null, null));
+}
+
+test "inventory rejects checksum symlinks before reading their content" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(a, tmp.dir, "canary", "macos-arm64", "1.2.3", "hash1");
+    try tmp.dir.symLink(std.testing.io, "canary-macos-arm64-update.json", "canary-macos-arm64-hash1-checksum.json", .{});
+    try std.testing.expectError(error.InvalidManagedReleaseArtifact, inventory(std.testing.io, a, try testFolder(a, tmp.dir), null, null, null));
 }
 
 test "inventory streams checksums across multiple read buffers" {

@@ -31,12 +31,13 @@ function artifacts(directory, { folder = "artifacts", channel = "canary", archiv
   const archive = Buffer.alloc(archiveSize, 0x67);
   const manifest = {
     schemaVersion: 1, identifier: "dev.electrobun.native", channel, version: "1.2.3",
-    hash: "123abc", platform: "macos", arch: "arm64", artifact: { file: archiveName, ...(integrity ? { tarSha256: "a".repeat(64), tarSize: 123 } : {}) },
+    hash: "123abc", platform: "macos", arch: "arm64", artifact: { file: archiveName, ...(integrity === true ? { tarSha256: "a".repeat(64), tarSize: 123 } : {}) },
   };
   const files = new Map([
     [archiveName, archive],
     [`${prefix}-update.json`, Buffer.from(JSON.stringify(manifest))],
   ]);
+  if (integrity === "sidecar") files.set(`${prefix}-${manifest.hash}-checksum.json`, Buffer.from(JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 })));
   for (const [filename, bytes] of files) writeFileSync(join(output, filename), bytes);
   return { output, prefix, files, manifest, archiveName };
 }
@@ -244,7 +245,7 @@ test("native upload reads public build metadata without evaluating config", nati
   assert.ok(copied.stdout.includes(copiedFiles.archiveName));
 });
 
-for (const integrity of [true, false]) test(`native upload sends signed parts directly to storage and publishes canonical update.json ${integrity ? "with" : "without"} tar integrity and no script runtime`, native, async (t) => {
+for (const integrity of [true, false, "sidecar"]) test(`native upload sends signed parts directly to storage with ${integrity === "sidecar" ? "checksum sidecar" : integrity ? "inline tar integrity" : "legacy metadata"} and no script runtime`, native, async (t) => {
   const directory = project(t);
   const files = artifacts(directory, { archiveSize: partSize + 31, integrity });
   const remote = await service(t);
@@ -260,6 +261,9 @@ for (const integrity of [true, false]) test(`native upload sends signed parts di
     assert.ok(upload.complete);
     assert.equal(upload.metadata.sha256, hash("sha256", files.files.get(upload.metadata.filename)));
   }
+  if (integrity === "sidecar") assert.deepEqual([...remote.uploads.values()].map(upload => upload.metadata.filename), [
+    files.archiveName, `${files.prefix}-${files.manifest.hash}-checksum.json`, `${files.prefix}-update.json`,
+  ], "The archive and checksum must upload before the canonical manifest");
   const publishDirectory = project(t);
   const publishArgs = ["--app=native-app", "--release=canary-1.2.3", `--api-url=${remote.api.origin}`];
   const preview = await run(publishDirectory, "publish", [...publishArgs, "--dry-run"]);
@@ -425,13 +429,32 @@ test("native upload rejects malformed or incomplete canonical tar integrity befo
   assert.deepEqual(api.errors, []);
 });
 
-test("native upload rejects manifest and archive symlinks to files outside its artifact folder", { ...native, skip: native.skip || (process.platform === "win32" && "Windows symlink creation requires privileges") }, async (t) => {
+test("native upload rejects invalid or mismatched checksum sidecars before network requests", native, async (t) => {
   const directory = project(t);
-  const files = artifacts(directory);
+  const files = artifacts(directory, { integrity: "sidecar" });
   let requests = 0;
   const api = await serve(t, async (_request, response) => { requests++; reply(response, {}); });
   const args = ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${api.origin}`];
-  for (const filename of [`${files.prefix}-update.json`, files.archiveName]) {
+  const filename = `${files.prefix}-${files.manifest.hash}-checksum.json`;
+  for (const checksum of [null, {}, { tarSha256: "invalid", tarSize: 123 }, { tarSha256: "a".repeat(64) }, { tarSha256: "a".repeat(64), tarSize: 0 }]) {
+    writeFileSync(join(files.output, filename), JSON.stringify(checksum));
+    failed(await run(directory, "upload", args));
+    assert.equal(requests, 0, "Invalid sidecar integrity must fail local preflight");
+  }
+  rmSync(join(files.output, filename));
+  writeFileSync(join(files.output, `${files.prefix}-anotherhash-checksum.json`), files.files.get(filename));
+  failed(await run(directory, "upload", args));
+  assert.equal(requests, 0, "A sidecar must belong to the manifest's exact build hash");
+  assert.deepEqual(api.errors, []);
+});
+
+test("native upload rejects manifest archive and checksum symlinks to files outside its artifact folder", { ...native, skip: native.skip || (process.platform === "win32" && "Windows symlink creation requires privileges") }, async (t) => {
+  const directory = project(t);
+  const files = artifacts(directory, { integrity: "sidecar" });
+  let requests = 0;
+  const api = await serve(t, async (_request, response) => { requests++; reply(response, {}); });
+  const args = ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${api.origin}`];
+  for (const filename of [`${files.prefix}-update.json`, files.archiveName, `${files.prefix}-${files.manifest.hash}-checksum.json`]) {
     const target = join(directory, filename);
     writeFileSync(target, files.files.get(filename));
     const path = join(files.output, filename);

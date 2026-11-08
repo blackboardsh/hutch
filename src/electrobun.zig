@@ -3550,7 +3550,9 @@ fn writeReleaseArtifacts(
         "-",
         std.fs.path.basename(state.compressed_tar_path),
     });
-    // Keep release discovery and exact archive integrity in one manifest.
+    // Shipped native updaters parse the legacy manifest strictly. Keep its
+    // shape unchanged and bind optional archive integrity to the build hash
+    // in a separate filename, without duplicating the release metadata.
     const update_json = try releaseUpdateJson(
         ctx,
         try getAppIdentifier(ctx, config),
@@ -3560,7 +3562,6 @@ fn writeReleaseArtifacts(
         osName(),
         archName(),
         compressed_artifact_name,
-        state.tar_integrity,
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(
@@ -3568,6 +3569,13 @@ fn writeReleaseArtifacts(
             &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-update.json" }) },
         ),
         .data = update_json,
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = try std.fs.path.join(
+            ctx.allocator,
+            &.{ artifact_root, try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-checksum.json", .{ prefix, state.hash }) },
+        ),
+        .data = try releaseChecksumJson(ctx, state.tar_integrity),
     });
 
     const candidates = [_]?[]const u8{
@@ -3625,16 +3633,9 @@ fn releaseUpdateJson(
     platform: []const u8,
     arch: []const u8,
     artifact_name: []const u8,
-    tar_integrity: ?ReleaseTarIntegrity,
 ) ![]const u8 {
     var artifact: std.json.ObjectMap = .empty;
     try artifact.put(ctx.allocator, "file", .{ .string = artifact_name });
-    if (tar_integrity) |integrity| {
-        try artifact.put(ctx.allocator, "tarSha256", .{ .string = try ctx.allocator.dupe(u8, &integrity.sha256) });
-        try artifact.put(ctx.allocator, "tarSize", .{
-            .integer = std.math.cast(i64, integrity.size) orelse return error.InvalidReleaseArchiveSize,
-        });
-    }
 
     var update: std.json.ObjectMap = .empty;
     try update.put(ctx.allocator, "schemaVersion", .{ .integer = 1 });
@@ -3650,6 +3651,13 @@ fn releaseUpdateJson(
         std.json.Value{ .object = update },
         .{},
     );
+}
+
+fn releaseChecksumJson(ctx: *const Context, integrity: ReleaseTarIntegrity) ![]const u8 {
+    return std.json.Stringify.valueAlloc(ctx.allocator, .{
+        .tarSha256 = @as([]const u8, &integrity.sha256),
+        .tarSize = std.math.cast(i64, integrity.size) orelse return error.InvalidReleaseArchiveSize,
+    }, .{});
 }
 
 fn runBuiltApp(
@@ -9891,7 +9899,7 @@ test "managed custom and self-hosted patch generation fetch ordinary files from 
             // envelope, release ID, or download base. Older static metadata
             // still works, including the existing manifest redirect behavior.
             const manifest = if (managed)
-                try releaseUpdateJson(&ctx, try getAppIdentifier(&ctx, config), buildEnvironmentName(channel), "1.0.0", "oldhash", osName(), archName(), archive_file, null)
+                try releaseUpdateJson(&ctx, try getAppIdentifier(&ctx, config), buildEnvironmentName(channel), "1.0.0", "oldhash", osName(), archName(), archive_file)
             else
                 try std.json.Stringify.valueAlloc(allocator, .{ .version = "1.0.0", .hash = "oldhash", .platform = osName(), .arch = archName() }, .{});
             const metadata_path = try std.mem.concat(allocator, u8, &.{ folder, "/", prefix, "-update.json" });
@@ -10257,7 +10265,7 @@ test "release tar integrity covers exact archive bytes across streaming boundari
     try std.testing.expect(!std.mem.eql(u8, &original.sha256, &changed.sha256));
 }
 
-test "release update metadata includes exact tar integrity and supports legacy patch sources" {
+test "release update metadata remains readable by strict legacy clients with separate checksum metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -10283,32 +10291,32 @@ test "release update metadata includes exact tar integrity and supports legacy p
         "win",
         "x64",
         "canary-win-x64-Example-canary.tar.zst",
-        .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
     );
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
-    const update = parsed.object;
-    try std.testing.expectEqual(@as(i64, 1), update.get("schemaVersion").?.integer);
-    try std.testing.expectEqualStrings("com.example.update", update.get("identifier").?.string);
-    try std.testing.expectEqualStrings("canary", update.get("channel").?.string);
-    try std.testing.expectEqualStrings("2.0.0", update.get("version").?.string);
-    try std.testing.expectEqualStrings("abc123", update.get("hash").?.string);
-    try std.testing.expectEqualStrings("win", update.get("platform").?.string);
-    try std.testing.expectEqualStrings("x64", update.get("arch").?.string);
+    // This is the strict manifest shape shipped by native Dash 0.0.115.
+    // Reading the producer's JSON through it catches additional fields at any
+    // level, which otherwise prevent installed clients from downloading a fix.
+    const LegacyManifest = struct {
+        schemaVersion: u32,
+        identifier: []const u8,
+        channel: []const u8,
+        version: []const u8,
+        hash: []const u8,
+        platform: enum { macos, linux, win },
+        arch: enum { x64, arm64 },
+        artifact: struct { file: []const u8 },
+    };
+    const legacy = try std.json.parseFromSlice(LegacyManifest, allocator, json, .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u32, 1), legacy.value.schemaVersion);
+    try std.testing.expectEqualStrings("com.example.update", legacy.value.identifier);
+    try std.testing.expectEqualStrings("canary", legacy.value.channel);
+    try std.testing.expectEqualStrings("2.0.0", legacy.value.version);
+    try std.testing.expectEqualStrings("abc123", legacy.value.hash);
+    try std.testing.expectEqual(.win, legacy.value.platform);
+    try std.testing.expectEqual(.x64, legacy.value.arch);
+    try std.testing.expectEqualStrings("canary-win-x64-Example-canary.tar.zst", legacy.value.artifact.file);
 
-    const artifact = update.get("artifact").?.object;
-    try std.testing.expectEqualStrings(
-        "canary-win-x64-Example-canary.tar.zst",
-        artifact.get("file").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        artifact.get("tarSha256").?.string,
-    );
-    try std.testing.expectEqual(@as(i64, 3), artifact.get("tarSize").?.integer);
-    try std.testing.expectEqual(@as(usize, 3), artifact.count());
-    try std.testing.expect(artifact.get("size") == null);
-    try std.testing.expect(artifact.get("sha256") == null);
-    try std.testing.expect(update.get("patch") == null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
     const previous = previousReleasePatchSource(
         parsed,
         "com.example.update",
@@ -10319,21 +10327,21 @@ test "release update metadata includes exact tar integrity and supports legacy p
     ).?;
     try std.testing.expectEqualStrings("abc123", previous.hash);
 
-    const legacy_json = try releaseUpdateJson(
-        &ctx,
-        "com.example.update",
-        "canary",
-        "2.0.0",
-        "abc123",
-        "win",
-        "x64",
-        "canary-win-x64-Example-canary.tar.zst",
-        null,
-    );
+    const checksum_json = try releaseChecksumJson(&ctx, .{
+        .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*,
+        .size = 3,
+    });
+    const checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, checksum_json, .{});
+    try std.testing.expectEqual(@as(usize, 2), checksum.object.count());
     try std.testing.expectEqualStrings(
-        "{\"schemaVersion\":1,\"identifier\":\"com.example.update\",\"channel\":\"canary\",\"version\":\"2.0.0\",\"hash\":\"abc123\",\"platform\":\"win\",\"arch\":\"x64\",\"artifact\":{\"file\":\"canary-win-x64-Example-canary.tar.zst\"}}",
-        legacy_json,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        checksum.object.get("tarSha256").?.string,
     );
+    try std.testing.expectEqual(@as(i64, 3), checksum.object.get("tarSize").?.integer);
+    try std.testing.expectError(error.InvalidReleaseArchiveSize, releaseChecksumJson(&ctx, .{
+        .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*,
+        .size = std.math.maxInt(u64),
+    }));
 }
 
 test "release version metadata keeps display and artifact names distinct" {
@@ -10398,7 +10406,7 @@ test "release version metadata keeps display and artifact names distinct" {
     try std.testing.expect(parsed.object.get("releaseId") == null);
 }
 
-test "release artifacts use one integrity manifest and channel-specific installers" {
+test "release artifacts use a legacy manifest hash-bound checksum and channel-specific installers" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10485,6 +10493,7 @@ test "release artifacts use one integrity manifest and channel-specific installe
     const installer_prefix = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ osName(), archName() });
     const stable_files = [_][]const u8{
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-newhash-checksum.json" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ installer_prefix, "-MigrationApp-Setup.zip" }),
@@ -10503,14 +10512,18 @@ test "release artifacts use one integrity manifest and channel-specific installe
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         stable_update.object.get("artifact").?.object.get("file").?.string,
     );
-    try std.testing.expectEqual(@as(usize, 3), stable_update.object.get("artifact").?.object.count());
+    try std.testing.expectEqual(@as(usize, 1), stable_update.object.get("artifact").?.object.count());
     try std.testing.expect(stable_update.object.get("patch") == null);
     try std.testing.expectEqualStrings("newhash", stable_update.object.get("hash").?.string);
+    const stable_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, stable_files[1] });
+    const stable_checksum_bytes = try std.Io.Dir.cwd().readFileAlloc(io, stable_checksum_path, allocator, .limited(64 * 1024));
+    const stable_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, stable_checksum_bytes, .{});
+    try std.testing.expectEqual(@as(usize, 2), stable_checksum.object.count());
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        stable_update.object.get("artifact").?.object.get("tarSha256").?.string,
+        stable_checksum.object.get("tarSha256").?.string,
     );
-    try std.testing.expectEqual(@as(i64, 3), stable_update.object.get("artifact").?.object.get("tarSize").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), stable_checksum.object.get("tarSize").?.integer);
 
     const removed_prefix = try std.fmt.allocPrint(allocator, "production-{s}-{s}", .{ osName(), archName() });
     for ([_][]const u8{
@@ -10547,6 +10560,7 @@ test "release artifacts use one integrity manifest and channel-specific installe
     }, canary_installer_path);
     for ([_][]const u8{
         "-update.json",
+        "-canaryhash-checksum.json",
         "-MigrationApp-canary.tar.zst",
         "-oldhash.patch",
         "-MigrationApp-canary-Setup.zip",
@@ -10570,15 +10584,20 @@ test "release artifacts use one integrity manifest and channel-specific installe
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary.tar.zst" }),
         canary_artifact.get("file").?.string,
     );
+    try std.testing.expectEqual(@as(usize, 1), canary_artifact.count());
+    const canary_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-canaryhash-checksum.json" }) });
+    const canary_checksum_bytes = try std.Io.Dir.cwd().readFileAlloc(io, canary_checksum_path, allocator, .limited(64 * 1024));
+    const canary_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, canary_checksum_bytes, .{});
+    try std.testing.expectEqual(@as(usize, 2), canary_checksum.object.count());
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        canary_artifact.get("tarSha256").?.string,
+        canary_checksum.object.get("tarSha256").?.string,
     );
-    try std.testing.expectEqual(@as(i64, 3), canary_artifact.get("tarSize").?.integer);
-    try std.testing.expectEqual(@as(usize, 3), canary_artifact.count());
+    try std.testing.expectEqual(@as(i64, 3), canary_checksum.object.get("tarSize").?.integer);
 
     const canary_files = [_][]const u8{
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-update.json" }),
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-canaryhash-checksum.json" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary-Setup.zip" }),
@@ -10609,7 +10628,8 @@ test "release artifacts use one integrity manifest and channel-specific installe
             .flatpak_payload_path = null,
         }, if (is_canary) canary_installer_path else installer_path);
         const files = if (is_canary) &canary_files else &stable_files;
-        const managed_files = files.* ++ [_][]const u8{"managed-deploy.json"};
+        var managed_files = files.* ++ [_][]const u8{"managed-deploy.json"};
+        managed_files[1] = try std.fmt.allocPrint(allocator, "{s}-managedhash-checksum.json", .{if (is_canary) canary_installer_prefix else stable_prefix});
         try Flat.expect(artifact_root, &managed_files);
     }
 }

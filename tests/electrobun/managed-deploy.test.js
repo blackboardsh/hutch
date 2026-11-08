@@ -178,8 +178,41 @@ test("managed deploy inventories existing Hutch artifacts with compressed-object
   assert.ok(inventory.files.some((file) => file.filename === patchName));
 });
 
+test("managed inventory uploads a build checksum before the legacy canonical manifest", (t) => {
+  const f = fixture(t);
+  f.manifest.hash = "zzzhash";
+  f.manifest.artifact = { file: f.archiveName };
+  writeFileSync(join(f.directory, `${f.prefix}-update.json`), JSON.stringify(f.manifest));
+  assert.equal(inventoryArtifacts(options(f.directory)).files.length, 2, "Old builds without checksums still upload");
+  const filename = `${f.prefix}-${f.manifest.hash}-checksum.json`;
+  const bytes = JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 });
+  writeFileSync(join(f.directory, filename), bytes);
+  const inventory = inventoryArtifacts(options(f.directory));
+  assert.deepEqual(inventory.files.map(file => file.filename), [f.archiveName, filename, `${f.prefix}-update.json`]);
+  assert.equal(inventory.files[1].sha256, digest(bytes));
+  assert.equal(inventory.files[1].target, "macos-arm64");
+});
+
+test("managed inventory rejects checksum identity and content mismatches", (t) => {
+  for (const [name, body] of [
+    ["otherhash", { tarSha256: "a".repeat(64), tarSize: 123 }],
+    ["n61b2c3", null],
+    ["n61b2c3", { tarSha256: "invalid", tarSize: 123 }],
+    ["n61b2c3", { tarSha256: ["a".repeat(64)], tarSize: 123 }],
+    ["n61b2c3", { tarSha256: "a".repeat(64) }],
+    ["n61b2c3", { tarSha256: "a".repeat(64), tarSize: 0 }],
+    ["n61b2c3", { tarSha256: "a".repeat(64), tarSize: Number.MAX_SAFE_INTEGER + 1 }],
+    ["n61b2c3", { tarSha256: "b".repeat(64), tarSize: 123 }],
+  ]) {
+    const f = fixture(t);
+    writeFileSync(join(f.directory, `${f.prefix}-${name}-checksum.json`), JSON.stringify(body));
+    assert.throws(() => inventoryArtifacts(options(f.directory)), /[Cc]hecksum/);
+  }
+});
+
 test("managed deploy rejects absent archives, traversal and mismatched manifests", async (t) => {
   for (const mutate of [
+    (f) => writeFileSync(join(f.directory, `${f.prefix}-update.json`), JSON.stringify({ ...f.manifest, artifact: { ...f.manifest.artifact, tarSha256: ["a".repeat(64)] } })),
     (f) => rmSync(join(f.directory, f.archiveName)),
     (f) => writeFileSync(join(f.directory, `${f.prefix}-update.json`), JSON.stringify({ ...f.manifest, channel: "stable" })),
     (f) => writeFileSync(join(f.directory, `${f.prefix}-update-v2.json`), JSON.stringify({ ...f.manifest, hash: "differenthash" })),

@@ -126,7 +126,7 @@ export function inventoryArtifacts(options) {
       throw new Error(`Invalid Electrobun update manifest: ${filename}`);
     }
     if (!manifest.artifact.file.startsWith(`${options.channel}-${target}-`) || !manifest.artifact.file.endsWith(".tar.zst")) throw new Error(`Manifest artifact must name this target's .tar.zst archive: ${filename}`);
-    if ((match[3] || manifest.artifact.tarSha256 !== undefined || manifest.artifact.tarSize !== undefined) && (!/^[a-f0-9]{64}$/i.test(manifest.artifact.tarSha256 ?? "") || !Number.isSafeInteger(manifest.artifact.tarSize) || manifest.artifact.tarSize <= 0)) throw new Error(`Invalid update manifest tar integrity: ${filename}`);
+    if ((match[3] || manifest.artifact.tarSha256 !== undefined || manifest.artifact.tarSize !== undefined) && (typeof manifest.artifact.tarSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(manifest.artifact.tarSha256) || !Number.isSafeInteger(manifest.artifact.tarSize) || manifest.artifact.tarSize <= 0)) throw new Error(`Invalid update manifest tar integrity: ${filename}`);
     if ((version !== undefined && version !== manifest.version) || (identifier !== undefined && identifier !== manifest.identifier)) throw new Error("All artifacts in a release must have the same application identifier and version");
     version = manifest.version;
     identifier = manifest.identifier;
@@ -145,13 +145,23 @@ export function inventoryArtifacts(options) {
   for (const filename of names) {
     const target = targets.find((item) => filename.startsWith(`${options.channel}-${item}-`) || (options.channel === "stable" && filename.startsWith(`${item}-`)));
     if (!target) continue;
-    if (!isFileName(filename) || !/(?:-update(?:-v2)?\.json|\.tar\.zst|\.patch|\.dmg|\.zip|\.exe|\.tar\.gz)$/.test(filename)) continue;
+    if (!isFileName(filename) || !/(?:-update(?:-v2)?\.json|-checksum\.json|\.tar\.zst|\.patch|\.dmg|\.zip|\.exe|\.tar\.gz)$/.test(filename)) continue;
     const path = join(options.artifacts, filename);
     const stat = fileDetails(path);
+    if (filename.endsWith("-checksum.json")) {
+      const manifest = manifests.get(target);
+      if (filename !== `${options.channel}-${target}-${manifest.hash}-checksum.json`) throw new Error(`Checksum file does not match the build hash for ${target}: ${filename}`);
+      if (stat.size > 64 * 1024) throw new Error(`Update checksum is too large: ${filename}`);
+      let checksum;
+      try { checksum = JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error(`Invalid update checksum: ${filename}`); }
+      if (typeof checksum?.tarSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(checksum.tarSha256) || !Number.isSafeInteger(checksum.tarSize) || checksum.tarSize <= 0) throw new Error(`Invalid update checksum: ${filename}`);
+      if (manifest.artifact.tarSha256 !== undefined && (manifest.artifact.tarSha256 !== checksum.tarSha256 || manifest.artifact.tarSize !== checksum.tarSize)) throw new Error(`Update checksums disagree for ${target}`);
+    }
     files.push({filename, target, path, size: stat.size, sha256: hashFile(path, stat), mtimeMs: stat.mtimeMs, ino: stat.ino});
   }
-  // Finish archives before uploading manifests, so dashboard checks become ready last.
-  files.sort((a, b) => Number(a.filename.endsWith(".json")) - Number(b.filename.endsWith(".json")) || a.filename.localeCompare(b.filename));
+  // Finish archives and their checksums before manifests make dashboard checks ready.
+  const uploadOrder = (filename) => /-update(?:-v2)?\.json$/.test(filename) ? 2 : filename.endsWith("-checksum.json") ? 1 : 0;
+  files.sort((a, b) => uploadOrder(a.filename) - uploadOrder(b.filename) || a.filename.localeCompare(b.filename));
   return {version, identifier, targets, files, channel: options.channel};
 }
 

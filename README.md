@@ -366,8 +366,9 @@ edits are visible immediately.
 
 `hutch electrobun build --env=dev` creates a runnable inner application bundle.
 Canary and stable builds also create the self-extracting outer wrapper,
-compressed full-update archive, optional delta patch, platform installer, and
-`<channel>-<os>-<arch>-update.json` in the configured artifact folder:
+compressed full-update archive, optional delta patch, platform installer,
+`<channel>-<os>-<arch>-update.json`, and
+`<channel>-<os>-<arch>-<hash>-checksum.json` in the configured artifact folder:
 
 ```sh
 hutch electrobun build --env=canary
@@ -381,8 +382,8 @@ transition to a 2.0 release. Keep the app name, identifier, and existing update
 base URL unchanged for that bridge release.
 
 Updater protocol files use `stable-<os>-<arch>-` or
-`canary-<os>-<arch>-`: the update JSON, compressed archive, and conventional
-`<fromHash>.patch`. Hutch generates one patch from the previously published
+`canary-<os>-<arch>-`: the update JSON, checksum sidecar, compressed archive, and
+conventional `<fromHash>.patch`. Hutch generates one patch from the previously published
 bundle; retain older hash-named patch files so clients can follow the chain.
 
 Stable app names are unsuffixed. Stable installers use `<os>-<arch>-...`
@@ -467,9 +468,13 @@ Retry the same command to resume an interrupted upload. Each runner
 uploads its generated artifacts; the service accumulates the platforms as they
 arrive. No platform list or upload environment is required.
 
-The generated `<channel>-<platform>-<arch>-update.json` carries the archive name
-and tar integrity metadata. Upload validates those integrity fields together when
-present, and also accepts older `update.json` files without those optional fields.
+The generated `<channel>-<platform>-<arch>-update.json` keeps its legacy shape,
+including only the archive `file` inside `artifact`, so installed clients that
+reject unknown fields can still update. Exact tar integrity lives separately in
+`<channel>-<platform>-<arch>-<hash>-checksum.json`, containing only `tarSha256` and
+`tarSize`. Upload validates a sidecar against its target and manifest hash. Older
+builds without sidecars remain supported, as do the optional inline integrity
+fields emitted by earlier Hutch builds.
 
 Upload and publish require only the Hutch binary. They do not run JavaScript,
 install packages, or evaluate `electrobun.config.ts`. A managed build saves public
