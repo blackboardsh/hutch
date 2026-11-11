@@ -234,12 +234,11 @@ selected external package manager.
 hutch upgrade
 ```
 
-Cottontail is paired with the Hutch release: an unpinned project runs the
-Cottontail version this launcher was built and tested with, and
-`hutch upgrade` advances both together (`hutch self update` is the explicit
-long form). There is no separate `hutch cottontail update`; a project that
-needs a different Cottontail pins one with the pragma or
-`hutch cottontail pin`.
+When Cottontail is explicitly selected, an unpinned project uses the version
+tested with that Hutch release. `hutch upgrade` advances this optional runtime's
+default pin along with Hutch (`hutch self update` is the explicit long form).
+There is no separate `hutch cottontail update`; a project that needs a different
+Cottontail version pins one with the pragma or `hutch cottontail pin`.
 
 Interactive use checks for newer remote-channel releases at most every six
 hours. Each check fetches current metadata rather than reading a persistent
