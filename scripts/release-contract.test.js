@@ -86,10 +86,12 @@ test("release jobs build Hutch before integration tests", () => {
     "utf8",
   );
   const build = workflow.indexOf("name: Build Hutch release executables");
+  const managedTests = workflow.indexOf("node scripts/test-managed-deploys.mjs");
   const tests = workflow.indexOf("name: Run Hutch tests");
 
   assert.ok(build >= 0 && tests >= 0, "build and test steps exist");
   assert.ok(build < tests, "Hutch executables are available to integration tests");
+  assert.ok(build < managedTests && managedTests < tests, "managed deploy contracts run against the built Hutch in the release matrix");
   const serializedTests = /node --test --test-concurrency=1 \\\r?\n/;
   assert.match(workflow, serializedTests);
   assert.match(workflow.replace(/\r?\n/g, "\r\n"), serializedTests);
@@ -109,6 +111,7 @@ test("publishing waits for the complete platform matrix", () => {
     "utf8",
   );
   assert.match(workflow, /publish:\s+name: Publish complete release matrix to R2\s+needs: build/);
+  assert.match(workflow, /publish:\s+name: Publish complete release matrix to R2\s+needs: build\s+if: github\.event_name == 'push' && startsWith\(github\.ref, 'refs\/tags\/v'\)/);
   assert.match(workflow, /merge-multiple: true/);
   assert.match(workflow, /node scripts\/upload-release-r2\.js --all/);
 });

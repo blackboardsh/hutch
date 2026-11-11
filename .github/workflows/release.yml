@@ -9,8 +9,20 @@ on:
         type: boolean
         default: true
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - '.github/workflows/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'package.json'
+      - 'hutch.config.ts'
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'patches/**'
 
 permissions:
   contents: read
@@ -133,7 +145,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Hutch release build failed" }
 
       - name: Run managed deploy contracts against current Hutch
-        run: node scripts/test-managed-deploys.mjs
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/test-managed-deploys.mjs 2>&1 | tee managed-deploys.log
         timeout-minutes: 15
         env:
           HUTCH_MANAGED_TEST_TARGET: ${{ matrix.target }}
@@ -258,6 +273,15 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Retain managed deploy test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: managed-deploys-${{ matrix.platform }}
+          path: managed-deploys.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   publish:
     name: Publish complete release matrix to R2
