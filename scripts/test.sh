@@ -17,7 +17,11 @@ node --test \
   "$SCRIPT_DIR/verify-linux-glibc.test.js" \
   "$SCRIPT_DIR/verify-macos-deployment-target.test.js"
 node --test --test-concurrency=1 \
-  "$SCRIPT_DIR/../tests/storage-contract.test.js"
+  "$SCRIPT_DIR/../tests/storage-contract.test.js" \
+  "$SCRIPT_DIR/../tests/bun-script-runner.test.mjs" \
+  "$SCRIPT_DIR/../tests/package-manager-selected-runtime.test.mjs" \
+  "$SCRIPT_DIR/../tests/electrobun/default-runtime.test.js" \
+  "$SCRIPT_DIR/../tests/electrobun/helper-runtime.test.js"
 node --test --test-concurrency=1 \
   "$SCRIPT_DIR/../tests/electrobun/build-lifecycle-lock.test.js" \
   "$SCRIPT_DIR/../tests/electrobun/native-zig-cache.test.js" \

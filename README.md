@@ -7,12 +7,14 @@ installation has two parts:
 - `hutch-engine`, the versioned engine that owns scripts, builds, toolchains, and
   Electrobun orchestration.
 
-Bun is the default JavaScript/TypeScript script and test runner. Cottontail is
-experimental and opt-in via `HUTCH_RUNTIME=cottontail`.
+Bun is the default runtime for configuration, JavaScript/TypeScript scripts and
+tests, and Electrobun's JavaScript build helpers. Cottontail is experimental
+and opt-in via `HUTCH_RUNTIME=cottontail`.
 
-Cottontail is released and stored independently, but every Hutch release names
-the Cottontail version it was built and tested with. An unpinned project uses
-that pair for internal configuration and bundling helpers; an explicit Cottontail pin wins.
+Cottontail is released and stored independently. Every Hutch release records
+a tested Cottontail version for projects that opt in; an explicit Cottontail
+pin selects a different version. A Cottontail pin alone does not enable it,
+and default Bun workflows do not download Cottontail.
 JavaScript dependencies install through Hutch's minimal built-in npm-compatible
 resolver by default, or through an explicitly selected external package manager.
 
@@ -74,9 +76,9 @@ config field; omitted fields continue to use the invocation channel.
 Malformed pragmas and unavailable releases are hard errors. A project pin never
 replaces the global production or canary selection.
 
-Without a pragma, the CLI floats on the active channel and Cottontail runs the
-release paired with that CLI — the build-time runtime only; the Cottontail
-bundled into an app is pinned by the Electrobun release's devkit manifest,
+Without a pragma, the CLI floats on the active channel. When Cottontail is
+explicitly selected, it uses the release paired with that CLI. The Cottontail
+bundled into an experimental Cottontail app is pinned by the Electrobun release's devkit manifest,
 exactly like the bundled Bun. A wrapping distribution (the `electrobun` npm
 package) may supply its paired CLI and Electrobun versions through
 `HUTCH_DEFAULT_CLI` and `HUTCH_DEFAULT_ELECTROBUN`; those are defaults,
@@ -667,11 +669,11 @@ outer orchestrator, which could otherwise deliver a terminal interrupt twice.
 Hutch does not inspect `package.json`, add `node_modules/.bin` to `PATH`, or
 emulate npm lifecycle variables when running these tasks. Invoke a local binary
 explicitly with `hutch pm exec`, or select and call an external package manager.
-Hutch defaults to Bun for JavaScript/TypeScript scripts and tests. Internal
-config loading and Electrobun bundling still use the paired Cottontail.
-Set `HUTCH_RUNTIME=cottontail` to use the experimental script runner, or
-`HUTCH_RUNTIME=bun` to select Bun even with local Cottontail overrides.
-A Cottontail version pragma alone does not select the script runner.
+Hutch defaults to Bun for `hutch.config.ts`, `electrobun.config.ts`,
+JavaScript/TypeScript scripts and tests, hooks, and JavaScript bundling helpers.
+Set `HUTCH_RUNTIME=cottontail` to opt into the experimental runtime for those
+operations, or `HUTCH_RUNTIME=bun` to select Bun even with local Cottontail
+overrides. A Cottontail version pragma alone does not select the runtime.
 
 `hutch run --if-configured <script-name>` uses the same config-only lookup but
 exits successfully when the task is absent. It is intended for generic setup

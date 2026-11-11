@@ -22,17 +22,18 @@ pub fn cliExecutableForInit(
     return cliExecutable(init.io, allocator);
 }
 
-pub fn runtimeExecutable(
+pub const Runtime = runtime_resolver.Selected;
+
+pub fn resolveRuntime(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-) ![]const u8 {
+) !Runtime {
     const no_args: [0][:0]const u8 = .{};
-    const resolution = try runtime_resolver.resolveCottontail(
+    return runtime_resolver.resolveSelected(
         init,
         allocator,
         no_args[0..],
     );
-    return resolution.executable;
 }
 
 pub fn scanDependencies(
@@ -63,10 +64,11 @@ pub fn runRuntime(
     script_args: []const [:0]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
-    const runtime = try runtimeExecutable(init, allocator);
+    const runtime = try resolveRuntime(init, allocator);
+    defer runtime.close(init.io);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ runtime, script_path });
+    try argv.appendSlice(allocator, &.{ runtime.executable, script_path });
     for (script_args) |arg| try argv.append(allocator, arg);
 
     var child = try std.process.spawn(init.io, .{
@@ -89,7 +91,8 @@ pub fn runRuntimeService(
     input: []const u8,
     extra_args: []const []const u8,
 ) ![]u8 {
-    const runtime = try runtimeExecutable(init, allocator);
+    const runtime = try resolveRuntime(init, allocator);
+    defer runtime.close(init.io);
     const temporary_root = temporaryDirectory(init.environ_map);
     const service_directory = try std.fs.path.join(allocator, &.{
         temporary_root,
@@ -114,7 +117,7 @@ pub fn runRuntimeService(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
-        runtime,
+        runtime.executable,
         service,
         operation,
         input_path,
@@ -172,7 +175,7 @@ fn reportRuntimeServiceFailure(
     var file_writer = std.Io.File.stderr().writerStreaming(io, &buffer);
     const writer = &file_writer.interface;
     writer.print(
-        "hutch: Cottontail service '{s} {s}' failed\n",
+        "hutch: runtime service '{s} {s}' failed\n",
         .{ service, operation },
     ) catch return;
     if (child_stderr.len > 0) writer.writeAll(child_stderr) catch return;

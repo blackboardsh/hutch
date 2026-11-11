@@ -13,6 +13,7 @@ const terminal_ui = @import("terminal_ui.zig");
 const toolchain_store = @import("toolchain_store.zig");
 const windows_icon = @import("windows_icon.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
+const config_runtime = @import("config_runtime.zig");
 const hutch_release = @import("version.zig");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
@@ -72,8 +73,9 @@ const Context = struct {
     allocator: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
     self_exe_path: []const u8,
-    cottontail_home: []const u8,
-    cottontail_binary: []const u8,
+    cottontail_home: []const u8 = "",
+    cottontail_binary: []const u8 = "",
+    helper_runtime: ?runtime_resolver.Selected = null,
     project_root: []const u8,
     electrobun_version: ?[]const u8 = null,
     build_lock_key: ?[]const u8 = null,
@@ -213,8 +215,7 @@ pub fn forceLink() void {}
 pub fn run(
     init: std.process.Init,
     args: []const [:0]const u8,
-    cottontail_binary: []const u8,
-    cottontail_home: []const u8,
+    helper_runtime: runtime_resolver.Selected,
     electrobun_version: ?[]const u8,
 ) !u8 {
     var stdout_buffer: [1024]u8 = undefined;
@@ -251,8 +252,9 @@ pub fn run(
         .allocator = init.arena.allocator(),
         .environ_map = init.environ_map,
         .self_exe_path = self_exe_path,
-        .cottontail_home = cottontail_home,
-        .cottontail_binary = cottontail_binary,
+        .cottontail_home = if (helper_runtime.kind == .cottontail) helper_runtime.root orelse "" else "",
+        .cottontail_binary = if (helper_runtime.kind == .cottontail) helper_runtime.executable else "",
+        .helper_runtime = helper_runtime,
         .project_root = project_root,
         .electrobun_version = electrobun_version,
         .managed_root_leases = &managed_root_leases,
@@ -366,8 +368,7 @@ fn printHelp(writer: anytype) !void {
         \\  - publish validates accumulated uploads; --audience=prerelease selects registered prerelease installs, public publishes to all installs (default).
         \\  - upload and publish use native Hutch, ELECTROBUN_API_KEY or --api-key, and public app defaults saved during build.
         \\  - prepare reuses an existing valid projection for a floating direct-Hutch project; sync advances it to the active channel.
-        \\  - esbuild is vendored automatically on first use as a native binary.
-        \\  - hook scripts default to Bun; HUTCH_RUNTIME=cottontail opts into experimental Cottontail.
+        \\  - configs, hooks, and bundling default to Bun; HUTCH_RUNTIME=cottontail opts into experimental Cottontail.
         \\  - init downloads the latest stable Electrobun templates; pass --beta for the latest beta templates.
         \\  - init requires network access; release metadata and template archives are never retained.
         \\  - DASH_RELEASE_OFFLINE prevents all Hutch-managed network access for installed projects.
@@ -605,6 +606,8 @@ fn pathExists(io: std.Io, absolute_path: []const u8) bool {
 }
 
 fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext {
+    const runtime = try resolveHelperRuntime(ctx);
+    defer runtime.close(ctx.io);
     const tmp_dir = try ensureCliTempDir(ctx);
     const config_source_path = findConfigPath(ctx);
     const empty_config_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "electrobun-config.empty.mjs" });
@@ -628,11 +631,6 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
         config_module_literal,
     );
 
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = wrapper_path,
-        .data = helper_source,
-    });
-
     var env_map = std.process.Environ.Map.init(ctx.allocator);
     defer env_map.deinit();
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
@@ -641,10 +639,48 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
     try env_map.put("ELECTROBUN_ARCH", archName());
 
     const env_arg = try std.fmt.allocPrint(ctx.allocator, "--env={s}", .{buildEnvironmentName(build_env)});
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(ctx.allocator);
+    var child_environment = if (runtime.kind == .bun)
+        try config_runtime.environment(ctx.allocator, &env_map)
+    else
+        try env_map.clone(ctx.allocator);
+    defer child_environment.deinit();
+
+    const source = if (runtime.kind == .bun) source: {
+        const bunfig_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "electrobun-config.bunfig.toml" });
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bunfig_path, .data = "" });
+        try arguments.appendSlice(ctx.allocator, try config_runtime.bunArguments(ctx.allocator, runtime.executable, wrapper_path, bunfig_path));
+        const restore_environment = try config_runtime.restorationSource(ctx.allocator, &env_map);
+        // Restore the caller's environment after Bun startup, before the
+        // dynamic config import. Expose only the public config argv.
+        break :source try std.fmt.allocPrint(
+            ctx.allocator,
+            "process.argv = [process.argv[0], {s}, {s}];\n" ++
+                "if (Array.isArray(process.execArgv)) process.execArgv.splice(0);\n{s}{s}",
+            .{ config_module_literal, try jsonStringLiteral(ctx, env_arg), restore_environment, helper_source },
+        );
+    } else source: {
+        try arguments.appendSlice(ctx.allocator, &.{ runtime.executable, wrapper_path });
+        break :source helper_source;
+    };
+    try arguments.append(ctx.allocator, env_arg);
+    {
+        const loader_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else @fromBackingInt(@intCast(0o600));
+        const loader_file = try std.Io.Dir.cwd().createFile(ctx.io, wrapper_path, .{ .truncate = true, .permissions = loader_permissions });
+        defer loader_file.close(ctx.io);
+        if (comptime builtin.os.tag != .windows) {
+            // Reused loader files must also become private before restored runtime
+            // options from the caller's environment are written into them.
+            try loader_file.setPermissions(ctx.io, loader_permissions);
+        }
+        try loader_file.writeStreamingAll(ctx.io, source);
+    }
+
     const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = &[_][]const u8{ try resolveCottontailBinary(ctx), wrapper_path, env_arg },
+        .argv = arguments.items,
         .cwd = .{ .path = tmp_dir },
-        .environ_map = &env_map,
+        .environ_map = &child_environment,
         .create_no_window = true,
     });
     defer ctx.allocator.free(result.stdout);
@@ -729,6 +765,8 @@ fn projectedDevkitMatchesProductVersion(ctx: *const Context) bool {
 }
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
+    const helper_runtime = try resolveHelperRuntime(ctx);
+    defer helper_runtime.close(ctx.io);
     const main_process = try getMainProcess(config.root);
     const local_cottontail = if (main_process == .cottontail)
         try configuredBundledCottontailOverride(ctx, config.build_env)
@@ -742,10 +780,11 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
     // Release resolution acquires the managed-store graph internally. Resolve
     // a devkit-pinned app-runtime Cottontail before taking the graph lock used
     // to publish the complete project dependency snapshot, and retain its
-    // object lease across that gap. The paired build-time Cottontail remains a
+    // object lease across that gap. The selected helper runtime remains a
     // separate dependency below. Explicit local-runtime builds do not resolve
     // or register the published app runtime they will not bundle.
     var bundled_cottontail: ?BundledCottontail = null;
+    var pinned_cottontail = false;
     if (main_process == .cottontail and local_cottontail == null) {
         const pinned_cottontail_version = blk: {
             const product_graph = try managed_store.acquireUsageLock(ctx.init, ctx.allocator);
@@ -756,6 +795,10 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         };
         if (pinned_cottontail_version) |pinned| {
             bundled_cottontail = try resolvePinnedBundledCottontailBinary(ctx, pinned);
+            pinned_cottontail = true;
+        } else {
+            const runtime = try resolveCottontailRuntime(ctx);
+            bundled_cottontail = .{ .executable = runtime.executable, .lease = runtime.lease };
         }
     }
     defer if (bundled_cottontail) |bundled| {
@@ -789,12 +832,20 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         .hutch,
         ctx.self_exe_path,
     )) |object| try objects.append(ctx.allocator, object);
-    if (try managed_store.managedReleaseObject(
-        ctx.init,
-        ctx.allocator,
-        .cottontail,
-        ctx.cottontail_home,
-    )) |object| try appendManagedObjectIfDistinct(ctx.allocator, &objects, object);
+    switch (helper_runtime.kind) {
+        .bun => if (try managed_store.managedToolchainObject(ctx.init, ctx.allocator, .bun, .{
+            .binary = helper_runtime.executable,
+            .root = helper_runtime.root,
+            .version = helper_runtime.version orelse return error.MissingBunRuntimeVersion,
+            .system = helper_runtime.local,
+        })) |object| try appendManagedObjectIfDistinct(ctx.allocator, &objects, object),
+        .cottontail => if (try managed_store.managedReleaseObject(
+            ctx.init,
+            ctx.allocator,
+            .cottontail,
+            helper_runtime.root orelse helper_runtime.executable,
+        )) |object| try appendManagedObjectIfDistinct(ctx.allocator, &objects, object),
+    }
     switch (main_process) {
         .zig => try appendManagedToolchain(ctx, &objects, .zig, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .zig)),
         .rust => try appendManagedToolchain(ctx, &objects, .rust, try resolveBuildToolchainUnderGraph(ctx, config.root, platform_paths, .rust)),
@@ -814,13 +865,17 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             }
         },
         .cottontail => if (bundled_cottontail) |bundled| {
-            const object = (try managed_store.managedReleaseObject(
+            const object = try managed_store.managedReleaseObject(
                 ctx.init,
                 ctx.allocator,
                 .cottontail,
                 bundled.executable,
-            )) orelse return error.BundledCottontailManagedObjectMissing;
-            try appendManagedObjectIfDistinct(ctx.allocator, &objects, object);
+            );
+            if (object) |managed| {
+                try appendManagedObjectIfDistinct(ctx.allocator, &objects, managed);
+            } else if (pinned_cottontail) {
+                return error.BundledCottontailManagedObjectMissing;
+            }
         },
     }
     try managed_store.registerPreparedProject(ctx.init, ctx.allocator, ctx.project_root, objects.items);
@@ -4163,10 +4218,11 @@ fn runCottontailApp(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx, config.root);
     try env_map.put("COTTONTAIL_ELECTROBUN_DIST", platform_paths.shared_dist_dir);
 
-    const cottontail_binary = try resolveCottontailBinary(ctx);
+    const runtime = try resolveCottontailRuntime(ctx);
+    defer runtime.close(ctx.io);
 
     var child = try std.process.spawn(ctx.io, .{
-        .argv = &[_][]const u8{ cottontail_binary, main_script },
+        .argv = &[_][]const u8{ runtime.executable, main_script },
         .cwd = .{ .path = app_dir },
         .environ_map = &env_map,
         .stdin = .inherit,
@@ -6404,12 +6460,10 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
         }
     }
 
-    const use_cottontail = try runtime_resolver.useCottontailScripts(ctx.environ_map);
-    const bun = if (use_cottontail) null else try toolchain_store.resolveVersion(ctx.init, ctx.allocator, .bun, toolchain_store.default_bun_version);
-    defer if (bun) |runtime| runtime.close(ctx.io);
-    const runtime_binary = if (bun) |runtime| runtime.resolution.binary else try resolveCottontailBinary(ctx);
+    const runtime = try resolveHelperRuntime(ctx);
+    defer runtime.close(ctx.io);
     var child = try std.process.spawn(ctx.io, .{
-        .argv = &[_][]const u8{ runtime_binary, hook_wrapper },
+        .argv = &[_][]const u8{ runtime.executable, hook_wrapper },
         .cwd = .{ .path = ctx.project_root },
         .environ_map = &env_map,
         .stdin = .inherit,
@@ -6461,7 +6515,7 @@ fn buildMainEntrypoint(
         try addExternalStrings(ctx, &spec, &.{ "bun", "bun:ffi" });
     }
     try addElectrobunImportAliases(ctx, platform_paths, &spec, main_process, getObjectFieldFromObject(build, "carrot") != null);
-    try runCottontailBuild(ctx, .{ .object = spec });
+    try runJavaScriptBuild(ctx, .{ .object = spec });
 }
 
 fn buildViews(ctx: *const Context, root: std.json.Value, platform_paths: PlatformPaths, app_dir: []const u8) !void {
@@ -6492,7 +6546,7 @@ fn buildViews(ctx: *const Context, root: std.json.Value, platform_paths: Platfor
 
         try appendSharedEsbuildOptions(ctx, &spec, view_value.object, .view);
         try addElectrobunImportAliases(ctx, platform_paths, &spec, null, getObjectFieldFromObject(build, "carrot") != null);
-        try runCottontailBuild(ctx, .{ .object = spec });
+        try runJavaScriptBuild(ctx, .{ .object = spec });
     }
 }
 
@@ -6597,9 +6651,8 @@ fn addElectrobunImportAliases(
         }
     }
 
-    // Cottontail's Bun.build resolves its Bun and Node compatibility modules
-    // from the runtime blob embedded in the binary. Only Electrobun SDK imports
-    // need filesystem aliases here.
+    // Both supported build runtimes resolve their own Bun/Node built-ins.
+    // Only Electrobun SDK imports need filesystem aliases here.
     _ = main_process;
 
     if (getValueFieldFromObject(spec.*, "alias")) |existing_alias| {
@@ -6729,21 +6782,36 @@ fn optionalEnvProjectPath(ctx: *const Context, name: []const u8) !?[]const u8 {
     return try absoluteProjectPath(ctx, value);
 }
 
-fn runCottontailBuild(ctx: *const Context, build_spec: std.json.Value) !void {
+// A selected process runtime is borrowed from the command dispatcher. Tests
+// and standalone contexts may resolve one locally; only that local resolution
+// owns a lease which this call must close.
+fn resolveHelperRuntime(ctx: *const Context) !runtime_resolver.Selected {
+    if (ctx.helper_runtime) |selected| {
+        var borrowed = selected;
+        borrowed.lease = null;
+        return borrowed;
+    }
+    return runtime_resolver.resolveSelected(ctx.init, ctx.allocator, &.{});
+}
+
+fn runJavaScriptBuild(ctx: *const Context, build_spec: std.json.Value) !void {
     if (build_spec != .object) {
         return error.InvalidBuildSpec;
     }
 
     const tmp_dir = try ensureCliTempDir(ctx);
-    const helper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "cottontail-build-helper.mjs" });
-    const spec_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "cottontail-build-spec.json" });
+    const helper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "javascript-build-helper.mjs" });
+    const spec_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "javascript-build-spec.json" });
     const spec_json = try std.json.Stringify.valueAlloc(ctx.allocator, build_spec, .{});
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = helper_path, .data = build_helper_template });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = spec_path, .data = spec_json });
 
+    const runtime = try resolveHelperRuntime(ctx);
+    defer runtime.close(ctx.io);
     const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = &[_][]const u8{ try resolveCottontailBinary(ctx), helper_path, spec_path },
+        .argv = &[_][]const u8{ runtime.executable, helper_path, spec_path },
         .cwd = .{ .path = ctx.project_root },
+        .environ_map = ctx.environ_map,
         .create_no_window = true,
     });
     defer ctx.allocator.free(result.stdout);
@@ -6752,7 +6820,7 @@ fn runCottontailBuild(ctx: *const Context, build_spec: std.json.Value) !void {
     if (termExitCode(result.term) != 0) {
         if (result.stdout.len > 0) ctx.writeStdout("{s}", .{result.stdout});
         if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
-        return error.CottontailBuildFailed;
+        return error.JavaScriptBuildFailed;
     }
 }
 
@@ -7787,11 +7855,11 @@ const BundledCottontail = struct {
 // The bundled Cottontail is an app runtime component: the Electrobun
 // release's devkit manifest pins its exact version, the same way the
 // bundled Bun is pinned, so the shipped runtime never varies with the
-// build machine's tooling. The build-time Cottontail (ctx.cottontail_binary,
-// selected by the pragma or the launcher's paired default) only executes
-// configs, scripts, and the build pipeline. Devkits published before the
-// manifest pin existed bundle the build-time binary their releases were
-// tested with. HUTCH_ELECTROBUN_COTTONTAIL_BINARY explicitly selects a local
+// build machine's tooling. Configs, scripts, and bundling use Bun by default;
+// HUTCH_RUNTIME=cottontail selects Cottontail for those helpers independently.
+// Devkits published before the manifest pin existed retain the paired
+// Cottontail fallback when the app explicitly selects that main process.
+// HUTCH_ELECTROBUN_COTTONTAIL_BINARY explicitly selects a local
 // app runtime in dev builds. DASH_USE_LOCAL_COTTONTAIL is the compatibility
 // alias that selects the build-time binary with the same validation and
 // provenance; DASH_COTTONTAIL alone does not override the app runtime.
@@ -7805,7 +7873,8 @@ fn resolveBundledCottontailBinary(
     }
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const pinned = devkit.toolchains.cottontail orelse {
-        return .{ .executable = try resolveCottontailBinary(ctx) };
+        const runtime = try resolveCottontailRuntime(ctx);
+        return .{ .executable = runtime.executable, .lease = runtime.lease };
     };
     return resolvePinnedBundledCottontailBinary(ctx, pinned);
 }
@@ -7829,7 +7898,9 @@ fn configuredBundledCottontailOverride(ctx: *const Context, build_env: BuildEnvi
         ctx.writeStderr("hutch electrobun: {s} is only allowed with --env=dev\n", .{if (explicit_binary != null) bundled_cottontail_override_variable else "DASH_USE_LOCAL_COTTONTAIL"});
         return error.LocalCottontailOverrideRequiresDev;
     }
-    const configured = explicit_binary orelse try resolveCottontailBinary(ctx);
+    const legacy_runtime = if (explicit_binary == null) try resolveCottontailRuntime(ctx) else null;
+    defer if (legacy_runtime) |runtime| runtime.close(ctx.io);
+    const configured = explicit_binary orelse legacy_runtime.?.executable;
     if (configured.len == 0 or !std.fs.path.isAbsolute(configured)) return error.InvalidLocalCottontailRuntime;
     try requireLocalCottontailFile(ctx, configured);
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, configured, ctx.allocator);
@@ -7971,9 +8042,18 @@ fn resolvePinnedBundledCottontailBinary(
     };
 }
 
-fn resolveCottontailBinary(ctx: *const Context) ![]const u8 {
-    if (!pathExists(ctx.io, ctx.cottontail_binary)) return error.CottontailNotFound;
-    return ctx.cottontail_binary;
+// This path is only for explicitly selected Cottontail app runtimes. A Bun
+// helper runtime does not provision Cottontail merely to load configuration.
+fn resolveCottontailRuntime(ctx: *const Context) !runtime_resolver.Resolution {
+    if (ctx.cottontail_binary.len != 0) {
+        if (!pathExists(ctx.io, ctx.cottontail_binary)) return error.CottontailNotFound;
+        return .{
+            .root = ctx.cottontail_home,
+            .executable = ctx.cottontail_binary,
+            .local = true,
+        };
+    }
+    return runtime_resolver.resolveCottontail(ctx.init, ctx.allocator, &.{});
 }
 
 fn writeLocalCottontailTestComponents(dir: std.Io.Dir, io: std.Io) !void {

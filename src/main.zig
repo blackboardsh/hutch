@@ -16,6 +16,7 @@ const release_store = @import("release_store.zig");
 const reset_cli = @import("reset_cli.zig");
 const runtime_autoinstall = @import("runtime_autoinstall.zig");
 const runtime_resolver = @import("runtime_resolver.zig");
+const config_runtime = @import("config_runtime.zig");
 const status_cli = @import("status_cli.zig");
 const store_locks = @import("store_locks.zig");
 const toolchain_store = @import("toolchain_store.zig");
@@ -49,7 +50,7 @@ const help_text_template =
     \\
     \\Config:
     \\  Scripts are resolved only from hutch.config.ts.
-    \\  Scripts and tests default to Bun; HUTCH_RUNTIME=cottontail selects the experimental runtime.
+    \\  Configs, scripts and tests default to Bun; HUTCH_RUNTIME=cottontail selects the experimental runtime.
     \\  Array scripts run as exact non-empty argv string arrays.
     \\  packageManager selects npm, bun, pnpm, yarn, or an explicit executable;
     \\  without a selection, Hutch's built-in npm-compatible resolver installs
@@ -76,7 +77,7 @@ const package_manager_help_text =
 ;
 
 const upgrade_help_text =
-    \\Upgrade Hutch and its paired Cottontail release.
+    \\Upgrade Hutch to the selected release.
     \\
     \\Usage:
     \\  hutch upgrade [production|stable|canary|latest|<semver>|build:<revision>]
@@ -263,6 +264,28 @@ fn resolveCottontail(
     return resolution;
 }
 
+fn resolveRuntime(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    command_args: []const [:0]const u8,
+) !runtime_resolver.Selected {
+    const selected = try runtime_resolver.resolveSelected(init, allocator, command_args);
+    if (selected.kind == .cottontail) {
+        registerRuntimeProjectReleases(init, allocator, .{
+            .root = selected.root.?,
+            .executable = selected.executable,
+            .version = selected.version,
+            .revision = selected.revision,
+            .local = selected.local,
+            .lease = selected.lease,
+        }) catch {};
+        if (command_args.len == 0 or !std.mem.eql(u8, command_args[0], "electrobun")) {
+            managed_store.pruneAutomatic(init, allocator);
+        }
+    }
+    return selected;
+}
+
 fn registerRuntimeProjectReleases(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -389,6 +412,7 @@ fn makeConfigLoaderSource(
     allocator: std.mem.Allocator,
     config_path: []const u8,
     result_path: []const u8,
+    restore_environment: []const u8,
 ) ![]const u8 {
     var source: std.ArrayList(u8) = .empty;
     errdefer source.deinit(allocator);
@@ -404,9 +428,10 @@ fn makeConfigLoaderSource(
             "  if (Array.isArray(process.execArgv)) process.execArgv.splice(0);\n" ++
             "  if (Array.isArray(globalThis.cottontail?.execArgv)) cottontail.execArgv.splice(0);\n" ++
             "};\n" ++
-            "__hutchClearPrivateArgv();\n" ++
-            "const configModule = await import(",
+            "__hutchClearPrivateArgv();\n",
     );
+    try source.appendSlice(allocator, restore_environment);
+    try source.appendSlice(allocator, "const configModule = await import(");
     try appendJsStringLiteral(allocator, &source, config_path);
     try source.appendSlice(allocator,
         \\);
@@ -915,11 +940,11 @@ fn selectElectrobunProjectVersion(
 fn resolveElectrobunProjectVersion(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
+    runtime: runtime_resolver.Selected,
     subcommand: []const u8,
     stderr: anytype,
 ) ![]const u8 {
-    const config_root = if (loadHutchConfig(init, allocator, cottontail_path)) |hutch_config|
+    const config_root = if (loadHutchConfig(init, allocator, runtime)) |hutch_config|
         hutch_config.root
     else |err| switch (err) {
         error.HutchConfigNotFound => std.json.Value{ .object = .empty },
@@ -997,7 +1022,7 @@ fn resolveElectrobunProjectVersion(
 fn updateElectrobunProjectVersion(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
+    runtime: runtime_resolver.Selected,
     stdout: anytype,
     stderr: anytype,
 ) !?[]const u8 {
@@ -1007,7 +1032,7 @@ fn updateElectrobunProjectVersion(
         );
         return null;
     };
-    const config = loadHutchConfig(init, allocator, cottontail_path) catch |err| {
+    const config = loadHutchConfig(init, allocator, runtime) catch |err| {
         try stderr.print(
             "hutch electrobun update: failed to load {s}: {s}\n",
             .{ config_path, @errorName(err) },
@@ -1139,7 +1164,7 @@ fn projectedElectrobunVersionFromMetadata(
 fn loadHutchConfig(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
+    runtime: runtime_resolver.Selected,
 ) !Config {
     const config_path = try findHutchConfig(init, allocator);
     var tmp_dir = try createPrivateTempDirectory(init, allocator, "hutch-config-loader-");
@@ -1147,18 +1172,28 @@ fn loadHutchConfig(
     defer if (tmp_dir_live) tmp_dir.deinit(init.io);
     const loader_path = try pathJoin(allocator, &.{ tmp_dir.path, "load.mjs" });
     const result_path = try pathJoin(allocator, &.{ tmp_dir.path, "config.json" });
-    const loader_source = try makeConfigLoaderSource(allocator, config_path, result_path);
+    const restore_environment = if (runtime.kind == .bun)
+        try config_runtime.restorationSource(allocator, init.environ_map)
+    else
+        "";
+    const loader_source = try makeConfigLoaderSource(allocator, config_path, result_path, restore_environment);
     try writePrivateFileAtomic(init.io, tmp_dir.dir, "load.mjs", loader_source);
     try writePrivateFileAtomic(init.io, tmp_dir.dir, hutch_private_bunfig_name, "");
 
+    var loader_environment = if (runtime.kind == .bun)
+        try config_runtime.environment(allocator, init.environ_map)
+    else
+        try init.environ_map.clone(allocator);
+    defer loader_environment.deinit();
+    const bunfig_path = try pathJoin(allocator, &.{ tmp_dir.path, hutch_private_bunfig_name });
+    const argv = if (runtime.kind == .bun)
+        try config_runtime.bunArguments(allocator, runtime.executable, loader_path, bunfig_path)
+    else
+        &[_][]const u8{ runtime.executable, "--hutch-config-file", loader_path, "--hutch-private-root", tmp_dir.path };
+
     const execution = try std.process.run(allocator, init.io, .{
-        .argv = &[_][]const u8{
-            cottontail_path,
-            "--hutch-config-file",
-            loader_path,
-            "--hutch-private-root",
-            tmp_dir.path,
-        },
+        .argv = argv,
+        .environ_map = &loader_environment,
         .create_no_window = true,
     });
     defer allocator.free(execution.stdout);
@@ -1366,10 +1401,10 @@ fn createShellTaskDirectory(
     return task_dir;
 }
 
-fn runCottontailShellScript(
+fn runShellScript(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
+    runtime: runtime_resolver.Selected,
     script: []const u8,
     script_args: []const [:0]const u8,
 ) !u8 {
@@ -1380,13 +1415,10 @@ fn runCottontailShellScript(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    const use_cottontail = try useCottontailScripts(init.environ_map);
-    const bun = if (use_cottontail) null else try toolchain_store.resolveVersion(init, allocator, .bun, toolchain_store.default_bun_version);
-    defer if (bun) |runtime| runtime.close(init.io);
-    if (use_cottontail) {
-        try argv.appendSlice(allocator, &.{ cottontail_path, "--hutch-shell-file", wrapper_path, "--hutch-private-root", task_dir.path, script });
+    if (runtime.kind == .cottontail) {
+        try argv.appendSlice(allocator, &.{ runtime.executable, "--hutch-shell-file", wrapper_path, "--hutch-private-root", task_dir.path, script });
     } else {
-        try argv.appendSlice(allocator, &.{ bun.?.resolution.binary, wrapper_path, script });
+        try argv.appendSlice(allocator, &.{ runtime.executable, wrapper_path, script });
     }
     for (script_args) |arg| try argv.append(allocator, arg);
 
@@ -1520,12 +1552,12 @@ fn printScripts(writer: anytype, config: Config) !bool {
 fn runConfiguredScriptIfExists(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    cottontail_path: []const u8,
+    runtime: runtime_resolver.Selected,
     script_name: []const u8,
     script_args: []const [:0]const u8,
     stderr: anytype,
 ) !?u8 {
-    const config = loadHutchConfig(init, allocator, cottontail_path) catch |err| switch (err) {
+    const config = loadHutchConfig(init, allocator, runtime) catch |err| switch (err) {
         error.HutchConfigNotFound => return null,
         else => return err,
     };
@@ -1533,10 +1565,10 @@ fn runConfiguredScriptIfExists(
     const script = getObjectField(scripts, script_name) orelse return null;
 
     return switch (script) {
-        .string => |command| try runCottontailShellScript(
+        .string => |command| try runShellScript(
             init,
             allocator,
-            cottontail_path,
+            runtime,
             command,
             script_args,
         ),
@@ -1613,7 +1645,7 @@ fn runReleaseCommand(
     if (product == .cottontail and std.mem.eql(u8, operation, "update")) {
         try stderr.print(
             "hutch cottontail: Cottontail is paired with the Hutch release " ++
-                "({s} for this launcher); 'hutch upgrade' advances both together. " ++
+                "({s} for this launcher); 'hutch upgrade' updates this optional runtime's default pin. " ++
                 "Pin a different version with the // @hutch pragma or 'hutch cottontail pin'.\n",
             .{hutch_version.paired_cottontail_version},
         );
@@ -1916,7 +1948,7 @@ fn maybePromptForUpdates(
     var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &reader_buffer);
 
     // Cottontail is paired with the Hutch release, so only Hutch itself has
-    // a floating channel worth prompting about; updating it moves the pair.
+    // a floating channel worth prompting about; updating it moves the runtime pin.
     for ([_]release_store.Product{.hutch}) |product| {
         const available = release_store.checkForUpdate(
             init,
@@ -2186,14 +2218,15 @@ fn runNamedConfigScript(
     stderr: *std.Io.Writer,
 ) !?u8 {
     const no_args: [0][:0]const u8 = .{};
-    const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
-        try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+    const runtime = resolveRuntime(init, allocator, &no_args) catch |err| {
+        try stderr.print("hutch: could not resolve script runtime: {s}\n", .{@errorName(err)});
         return 1;
     };
+    defer runtime.close(init.io);
     return runConfiguredScriptIfExists(
         init,
         allocator,
-        cottontail.executable,
+        runtime,
         name,
         script_args,
         stderr,
@@ -2218,14 +2251,15 @@ fn resolvePackageManager(
 ) !?PackageManagerResolution {
     if (findHutchConfig(init, allocator)) |config_path| {
         const no_args: [0][:0]const u8 = .{};
-        const cottontail = resolveCottontail(init, allocator, &no_args) catch |err| {
+        const runtime = resolveRuntime(init, allocator, &no_args) catch |err| {
             try stderr.print(
-                "hutch: could not resolve Cottontail to load hutch.config.ts: {s}\n",
+                "hutch: could not resolve config runtime for hutch.config.ts: {s}\n",
                 .{@errorName(err)},
             );
             return null;
         };
-        const config = loadHutchConfig(init, allocator, cottontail.executable) catch |err| {
+        defer runtime.close(init.io);
+        const config = loadHutchConfig(init, allocator, runtime) catch |err| {
             try stderr.print("hutch: failed to load hutch.config.ts: {s}\n", .{@errorName(err)});
             return null;
         };
@@ -2749,7 +2783,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // `hutch upgrade` is the preferred spelling of `hutch self update`: it
-    // advances the global Hutch release and its paired Cottontail together.
+    // advances the global Hutch release and its optional Cottontail runtime pin.
     // Bare `update` stays unclaimed so it can someday mean "update my
     // dependencies", matching npm/bun muscle memory.
     if (std.mem.eql(u8, selected_command, "upgrade")) {
@@ -2830,14 +2864,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, selected_command, "run")) {
-        const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+        const runtime = resolveRuntime(init, allocator, args[1..]) catch |err| {
+            try stderr.print("hutch: could not resolve script runtime: {s}\n", .{@errorName(err)});
             try stderr.flush();
             std.process.exit(1);
         };
+        defer runtime.close(init.io);
 
         if (args.len <= 2) {
-            const config = loadHutchConfig(init, allocator, cottontail.executable) catch |err| switch (err) {
+            const config = loadHutchConfig(init, allocator, runtime) catch |err| switch (err) {
                 error.HutchConfigNotFound => null,
                 else => {
                     try stderr.writeAll("hutch: failed to load hutch.config.ts\n");
@@ -2865,7 +2900,7 @@ pub fn main(init: std.process.Init) !void {
             const exit_code = try runCottontailCommand(
                 init,
                 allocator,
-                cottontail.executable,
+                runtime.executable,
                 args[1..],
             );
             if (exit_code != 0) std.process.exit(exit_code);
@@ -2874,7 +2909,7 @@ pub fn main(init: std.process.Init) !void {
         if (try runConfiguredScriptIfExists(
             init,
             allocator,
-            cottontail.executable,
+            runtime,
             requested,
             args[requested_index + 1 ..],
             stderr,
@@ -2895,7 +2930,7 @@ pub fn main(init: std.process.Init) !void {
         const exit_code = try runCottontailCommand(
             init,
             allocator,
-            cottontail.executable,
+            runtime.executable,
             args[1..],
         );
         if (exit_code != 0) std.process.exit(exit_code);
@@ -2908,11 +2943,12 @@ pub fn main(init: std.process.Init) !void {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
-        const cottontail = resolveCottontail(init, allocator, args[1..]) catch |err| {
-            try stderr.print("hutch: could not resolve Cottontail: {s}\n", .{@errorName(err)});
+        const runtime = resolveRuntime(init, allocator, args[1..]) catch |err| {
+            try stderr.print("hutch: could not resolve build runtime: {s}\n", .{@errorName(err)});
             try stderr.flush();
             std.process.exit(1);
         };
+        defer runtime.close(init.io);
         if (args.len > 2 and std.mem.eql(u8, args[2], "update")) {
             if (args.len != 3) {
                 try stderr.writeAll("hutch electrobun update: this command does not accept arguments\n");
@@ -2922,7 +2958,7 @@ pub fn main(init: std.process.Init) !void {
             const updated_version = (try updateElectrobunProjectVersion(
                 init,
                 allocator,
-                cottontail.executable,
+                runtime,
                 stdout,
                 stderr,
             )) orelse {
@@ -2935,8 +2971,7 @@ pub fn main(init: std.process.Init) !void {
             const exit_code = try electrobun.run(
                 init,
                 &sync_args,
-                cottontail.executable,
-                cottontail.root,
+                runtime,
                 updated_version,
             );
             if (exit_code != 0) std.process.exit(exit_code);
@@ -2950,14 +2985,13 @@ pub fn main(init: std.process.Init) !void {
                 std.mem.eql(u8, args[2], "run") or
                 std.mem.eql(u8, args[2], "dev"));
         const electrobun_version: ?[]const u8 = if (requires_project_version)
-            try resolveElectrobunProjectVersion(init, allocator, cottontail.executable, args[2], stderr)
+            try resolveElectrobunProjectVersion(init, allocator, runtime, args[2], stderr)
         else
             null;
         const exit_code = electrobun.run(
             init,
             args[2..],
-            cottontail.executable,
-            cottontail.root,
+            runtime,
             electrobun_version,
         ) catch |err| switch (err) {
             error.InvalidMainProcess,

@@ -11043,7 +11043,9 @@ const Manager = struct {
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
         if (builtin.os.tag == .windows) {
             const command_path = windows_command_path.?;
-            const executable = try Host.runtimeExecutable(manager.init_data, manager.allocator);
+            // Resolve the runtime when the bin runs so selection and its store
+            // lease reflect that invocation. Installing a bin needs no runtime.
+            const executable = try Host.cliExecutableForInit(manager.init_data, manager.allocator);
             const command = try std.fmt.allocPrint(manager.allocator, "@\"{s}\" \"{s}\" %*\r\n", .{ executable, target });
             try replaceWindowsBinCommand(manager.init_data.io, command_path, command);
             if (manager.node_linker == .isolated) {

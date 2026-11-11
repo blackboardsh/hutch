@@ -1,4 +1,4 @@
-import * as loadedConfigModule from __MODULE_NAME__;
+const loadedConfigModule = await import(__MODULE_NAME__);
 
 const loadedConfig = loadedConfigModule.default ?? loadedConfigModule ?? {};
 

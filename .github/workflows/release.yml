@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       runtime_tests:
-        description: Run integration tests against the published paired Cottontail release
+        description: Run Bun and explicit Cottontail runtime integration tests
         type: boolean
         default: true
   push:
@@ -149,11 +149,11 @@ jobs:
           node scripts/local-stack.test.js
           node --test --test-concurrency=1 tests/storage-contract.test.js tests/electrobun/default-runtime.test.js
 
-      - name: Run paired runtime integration tests
+      - name: Run JavaScript runtime integration tests
         if: matrix.os != 'windows' && (github.event_name != 'workflow_dispatch' || inputs.runtime_tests)
         timeout-minutes: 20
         run: |
-          node --test scripts/stdio-redirection.test.js tests/bun-script-runner.test.mjs
+          node --test --test-concurrency=1 scripts/stdio-redirection.test.js tests/bun-script-runner.test.mjs tests/package-manager-selected-runtime.test.mjs tests/electrobun/helper-runtime.test.js
           node --test --test-concurrency=1 \
             tests/electrobun/build-lifecycle-lock.test.js \
             tests/electrobun/native-zig-cache.test.js \
@@ -193,13 +193,13 @@ jobs:
           node tests/package-manager/package-manager-cache-concurrency.cjs zig-out/bin/hutch-engine.exe
           if ($LASTEXITCODE -ne 0) { throw "Hutch release package installer failed" }
 
-      - name: Run paired runtime integration tests
+      - name: Run JavaScript runtime integration tests
         if: matrix.os == 'windows' && (github.event_name != 'workflow_dispatch' || inputs.runtime_tests)
         shell: pwsh
         timeout-minutes: 20
         run: |
-          node --test scripts/stdio-redirection.test.js tests/bun-script-runner.test.mjs
-          if ($LASTEXITCODE -ne 0) { throw "Hutch paired runtime tests failed" }
+          node --test --test-concurrency=1 scripts/stdio-redirection.test.js tests/bun-script-runner.test.mjs tests/package-manager-selected-runtime.test.mjs tests/electrobun/helper-runtime.test.js
+          if ($LASTEXITCODE -ne 0) { throw "Hutch runtime integration tests failed" }
 
       - name: Smoke test Hutch release executables
         if: matrix.os != 'windows'

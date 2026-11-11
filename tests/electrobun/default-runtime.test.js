@@ -4,7 +4,7 @@ import { runInNewContext } from "node:vm";
 import test from "node:test";
 
 const helper = readFileSync(new URL("../../src/electrobun_cli/load_config_helper.js", import.meta.url), "utf8")
-  .replace("import * as loadedConfigModule from __MODULE_NAME__;", "");
+  .replace("const loadedConfigModule = await import(__MODULE_NAME__);", "");
 function load(config) {
   let result;
   runInNewContext(helper, { loadedConfigModule: { default: config }, console: {

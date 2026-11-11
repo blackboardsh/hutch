@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import test from 'node:test';
@@ -34,6 +34,135 @@ export default { scripts: { identity: 'hutch identity.ts', argv: ['hutch', 'iden
   const experimental = run(['identity.ts'], {HUTCH_RUNTIME:'cottontail'});
   assert.equal(experimental.status, 0, experimental.stderr);
   assert.equal(typeof JSON.parse(experimental.stdout.trim()).cottontail, 'string');
+ } finally { rmSync(root, {recursive:true,force:true}); }
+});
+
+test('configuration and configured commands use Bun without a Cottontail installation, with explicit runtime overrides preserved', {timeout: 300_000}, () => {
+ const root = mkdtempSync(join(tmpdir(), 'hutch-bun-config-'));
+ const project = join(root, 'project');
+ const home = join(root, 'empty-managed-home');
+ const bin = join(root, 'bun-bin');
+ const hostileTemp = join(root, 'hostile-temp');
+ const observation = join(root, 'config-observation.json');
+ const base = {...process.env, HUTCH_ENGINE_BINARY:engine, HUTCH_LAUNCHER_PATH:launcher, HUTCH_NO_UPDATE_CHECK:'1', CI:'1'};
+ for (const key of ['HUTCH_RUNTIME', 'COTTONTAIL_BINARY', 'DASH_COTTONTAIL', 'DASH_USE_LOCAL_COTTONTAIL', 'DASH_LOCAL_COTTONTAIL_ROOT', 'COTTONTAIL_ROOT', 'DASH_COTTONTAIL_SELECTOR', 'DASH_RELEASE_OFFLINE']) delete base[key];
+ const run = (binary, args, environment) => {
+  const result = spawnSync(binary, args, {cwd:project,env:environment,encoding:'utf8',timeout:180_000});
+  assert.ifError(result.error);
+  return result;
+ };
+ const success = result => {
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return result.stdout.trim();
+ };
+ try {
+  for (const directory of [project, bin, hostileTemp]) mkdirSync(directory);
+  // Bootstrap only Bun using the engine's ordinary direct-runtime path. The
+  // actual config assertions below run offline with a new managed home.
+  const installedBun = success(run(engine, ['-p', 'process.execPath'], {...base,HUTCH_RUNTIME:'bun'}));
+  const bun = join(bin, 'bun' + suffix);
+  copyFileSync(installedBun, bun);
+  chmodSync(bun, 0o755);
+  const expectedBun = success(run(bun, ['--version'], base));
+  const pathKey = Object.keys(base).find(key => key.toLowerCase() === 'path') ?? 'PATH';
+  const environment = {
+   ...base, HUTCH_HOME:home, DASH_RELEASE_OFFLINE:'1',
+   [pathKey]:[bin,base[pathKey] ?? ''].join(delimiter),
+   HUTCH_CONFIG_OBSERVATION:observation, HUTCH_CONFIG_ENV_VALUE:'inherited project environment',
+   TMPDIR:hostileTemp,TEMP:hostileTemp,TMP:hostileTemp,
+  };
+  delete environment.HUTCH_CONFIG_DOTENV_CANARY;
+  delete environment.BUN_OPTIONS;
+  delete environment.NODE_OPTIONS;
+  writeFileSync(join(project, 'identity.ts'), 'console.log(JSON.stringify({bun:process.versions.bun,cottontail:process.versions.cottontail,args:process.argv.slice(2)}));\n');
+  writeFileSync(join(project, 'hutch.config.ts'), `// @hutch cottontail=${cottontailVersion}
+import { writeFileSync } from 'node:fs';
+const observation: Record<string, unknown> = {
+ bun:process.versions.bun,cottontail:process.versions.cottontail,
+ argv:process.argv,execArgv:process.execArgv,cwd:process.cwd(),
+ value:process.env.HUTCH_CONFIG_ENV_VALUE,dotenv:process.env.HUTCH_CONFIG_DOTENV_CANARY,
+ bunOptions:process.env.BUN_OPTIONS,nodeOptions:process.env.NODE_OPTIONS,
+};
+writeFileSync(process.env.HUTCH_CONFIG_OBSERVATION!, JSON.stringify(observation));
+console.log('config console output');
+export default { packageManager:'bun', scripts: {
+ identity:'hutch identity.ts', argv:['hutch','identity.ts'], fail:'exit 23',
+} };
+`);
+  const configIdentity = (expected, inheritedOptions = {}) => {
+   const value = JSON.parse(readFileSync(observation, 'utf8'));
+   if (expected === 'bun') {
+    assert.equal(value.bun, expectedBun, 'the config itself must execute in the selected Bun');
+    assert.equal(value.cottontail, undefined);
+   } else assert.equal(typeof value.cottontail, 'string', 'explicit Cottontail must evaluate the config');
+   assert.equal(value.argv.length, 1, 'private loader path/flags must not appear in config process.argv');
+   assert.deepEqual(value.execArgv, [], 'private loader flags must not appear in config process.execArgv');
+   assert.equal(realpathSync.native(value.cwd), realpathSync.native(project));
+   assert.equal(value.value, 'inherited project environment');
+   assert.equal(value.dotenv, undefined, 'private config evaluation must not load ambient dotenv');
+   assert.equal(value.bunOptions, inheritedOptions.BUN_OPTIONS, 'the config still observes the original BUN_OPTIONS');
+   assert.equal(value.nodeOptions, inheritedOptions.NODE_OPTIONS, 'the config still observes the original NODE_OPTIONS');
+  };
+  // Config discovery must ignore both project preloads and a hostile ancestor
+  // of its temporary loader, while still allowing normal config console output.
+  for (const directory of [project, hostileTemp]) {
+   writeFileSync(join(directory, 'bunfig.toml'), 'preload = ["./must-not-run.mjs"]\n');
+   writeFileSync(join(directory, '.env'), 'HUTCH_CONFIG_DOTENV_CANARY=must-not-load\n');
+  }
+  const hostileOptions = {BUN_OPTIONS:'--preload=./must-not-run.mjs',NODE_OPTIONS:'--require=./must-not-run.cjs'};
+  const privateConfigEnvironment = {...environment,...hostileOptions};
+  for (const binary of [engine, launcher]) {
+   const listed = success(run(binary, ['run'], privateConfigEnvironment));
+   assert.ok(listed.startsWith('config console output\n'), listed);
+   assert.match(listed, /identity/);
+   configIdentity('bun', hostileOptions);
+   assert.equal(success(run(binary, ['run','--if-configured','missing'], privateConfigEnvironment)), 'config console output');
+   configIdentity('bun', hostileOptions);
+  }
+  for (const directory of [project, hostileTemp]) {
+   rmSync(join(directory, 'bunfig.toml'));
+   rmSync(join(directory, '.env'));
+  }
+  for (const binary of [engine, launcher]) {
+   for (const args of [['identity'], ['run','identity'], ['argv']]) {
+    const output = success(run(binary, [...args,'two words','$literal'], environment));
+    assert.ok(output.startsWith('config console output\n'), output);
+    const runtime = JSON.parse(output.split(/\r?\n/).at(-1));
+    assert.equal(runtime.bun, expectedBun);
+    assert.equal(runtime.cottontail, undefined);
+    assert.deepEqual(runtime.args, ['two words','$literal']);
+    configIdentity('bun');
+   }
+   assert.equal(success(run(binary, ['pm','--version'], environment)), `config console output\n${expectedBun}`);
+   configIdentity('bun');
+  }
+  // An explicit Bun choice wins even over a deliberately unusable local
+  // Cottontail executable. Neither this nor the Cottontail pragma provisions it.
+  const forcedBun = {...environment,HUTCH_RUNTIME:'bun',COTTONTAIL_BINARY:join(root,'missing-cottontail' + suffix)};
+  success(run(launcher, ['run'], forcedBun));
+  configIdentity('bun');
+  assert.equal(existsSync(join(home, 'releases', 'cottontail')), false, 'default config workflows must not install Cottontail');
+
+  // Opt-in coverage uses a real Cottontail, resolved only after every offline
+  // default-path assertion has passed. The local override stays offline.
+  const cottontail = success(run(engine, ['cottontail','path'], base));
+  for (const override of [{HUTCH_RUNTIME:'cottontail'}, {COTTONTAIL_BINARY:cottontail}]) {
+   const selected = {...environment,...override};
+   if (override.HUTCH_RUNTIME) {
+    delete selected.HUTCH_HOME;
+    delete selected.DASH_RELEASE_OFFLINE;
+    if (base.HUTCH_HOME) selected.HUTCH_HOME = base.HUTCH_HOME;
+   }
+   const output = success(run(launcher, ['identity'], selected));
+   assert.equal(typeof JSON.parse(output.split(/\r?\n/).at(-1)).cottontail, 'string');
+   configIdentity('cottontail');
+  }
+  if (process.platform !== 'win32') {
+   writeFileSync(join(project, 'hutch.config.ts'), "process.kill(process.pid, 'SIGTERM'); await new Promise(() => {});\n");
+   const interrupted = run(engine, ['run'], environment);
+   assert.equal(interrupted.signal, 'SIGTERM');
+   assert.deepEqual(readdirSync(hostileTemp), [], 'a signalled config process must not leave a private loader directory');
+  }
  } finally { rmSync(root, {recursive:true,force:true}); }
 });
 

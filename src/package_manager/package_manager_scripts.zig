@@ -279,11 +279,13 @@ fn runLifecycleStage(
     }
     var windows_source: std.ArrayList(u8) = .empty;
     defer windows_source.deinit(allocator);
+    const runtime: ?Host.Runtime = if (builtin.os.tag == .windows) try Host.resolveRuntime(init, allocator) else null;
+    defer if (runtime) |selected| selected.close(init.io);
     var windows_argv: [3][]const u8 = undefined;
     const shell_args: []const []const u8 = if (builtin.os.tag == .windows) shell: {
         try appendBunShellSource(allocator, &windows_source, command);
         windows_argv = .{
-            try Host.runtimeExecutable(init, allocator),
+            runtime.?.executable,
             "-e",
             windows_source.items,
         };
@@ -418,11 +420,13 @@ fn runCommandStage(
     const command = try replaceBunCommand(allocator, init.io, script);
     var windows_source: std.ArrayList(u8) = .empty;
     defer windows_source.deinit(allocator);
+    const runtime: ?Host.Runtime = if (builtin.os.tag == .windows) try Host.resolveRuntime(init, allocator) else null;
+    defer if (runtime) |selected| selected.close(init.io);
     var windows_argv: [3][]const u8 = undefined;
     const shell_args: []const []const u8 = if (builtin.os.tag == .windows) shell: {
         try appendBunShellSource(allocator, &windows_source, command);
         windows_argv = .{
-            try Host.runtimeExecutable(init, allocator),
+            runtime.?.executable,
             "-e",
             windows_source.items,
         };
