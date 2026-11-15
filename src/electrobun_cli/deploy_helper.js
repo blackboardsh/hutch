@@ -146,14 +146,23 @@ export function inventoryArtifacts(options) {
     const target = targets.find((item) => filename.startsWith(`${options.channel}-${item}-`) || (options.channel === "stable" && filename.startsWith(`${item}-`)));
     if (!target) continue;
     if (!isFileName(filename) || !/(?:-update(?:-v2)?\.json|-checksum\.json|\.tar\.zst|\.patch|\.dmg|\.zip|\.exe|\.tar\.gz)$/.test(filename)) continue;
+    const checksumName = `${options.channel}-${target}-checksum.json`;
+    if (filename.startsWith(`${options.channel}-${target}-`) && filename.endsWith("-checksum.json") && filename !== checksumName && names.includes(checksumName)) {
+      // A fixed sidecar replaces the legacy hash-named inventory. Old files may
+      // remain in a reused artifact folder, but must not be uploaded again.
+      const legacyHash = filename.slice(`${options.channel}-${target}-`.length, -"-checksum.json".length);
+      if (/^[a-z0-9]+$/i.test(legacyHash)) continue;
+    }
     const path = join(options.artifacts, filename);
     const stat = fileDetails(path);
     if (filename.endsWith("-checksum.json")) {
       const manifest = manifests.get(target);
-      if (filename !== `${options.channel}-${target}-${manifest.hash}-checksum.json`) throw new Error(`Checksum file does not match the build hash for ${target}: ${filename}`);
+      const canonical = filename === checksumName;
+      if (!canonical && filename !== `${options.channel}-${target}-${manifest.hash}-checksum.json`) throw new Error(`Checksum file does not match the build hash for ${target}: ${filename}`);
       if (stat.size > 64 * 1024) throw new Error(`Update checksum is too large: ${filename}`);
       let checksum;
       try { checksum = JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error(`Invalid update checksum: ${filename}`); }
+      if ((canonical || checksum?.hash !== undefined) && checksum?.hash !== manifest.hash) throw new Error(`Checksum file does not match the build hash for ${target}: ${filename}`);
       if (typeof checksum?.tarSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(checksum.tarSha256) || !Number.isSafeInteger(checksum.tarSize) || checksum.tarSize <= 0) throw new Error(`Invalid update checksum: ${filename}`);
       if (manifest.artifact.tarSha256 !== undefined && (manifest.artifact.tarSha256 !== checksum.tarSha256 || manifest.artifact.tarSize !== checksum.tarSize)) throw new Error(`Update checksums disagree for ${target}`);
     }

@@ -37,9 +37,13 @@ function artifacts(directory, { folder = "artifacts", channel = "canary", archiv
     [archiveName, archive],
     [`${prefix}-update.json`, Buffer.from(JSON.stringify(manifest))],
   ]);
-  if (integrity === "sidecar") files.set(`${prefix}-${manifest.hash}-checksum.json`, Buffer.from(JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 })));
+  const checksumName = integrity === "canonical" ? `${prefix}-checksum.json`
+    : integrity === "sidecar" ? `${prefix}-${manifest.hash}-checksum.json` : null;
+  if (checksumName) files.set(checksumName, Buffer.from(JSON.stringify({
+    ...(integrity === "canonical" ? { hash: manifest.hash } : {}), tarSha256: "a".repeat(64), tarSize: 123,
+  })));
   for (const [filename, bytes] of files) writeFileSync(join(output, filename), bytes);
-  return { output, prefix, files, manifest, archiveName };
+  return { output, prefix, files, manifest, archiveName, checksumName };
 }
 
 function run(directory, command, args = [], overrides = {}) {
@@ -245,7 +249,7 @@ test("native upload reads public build metadata without evaluating config", nati
   assert.ok(copied.stdout.includes(copiedFiles.archiveName));
 });
 
-for (const integrity of [true, false, "sidecar"]) test(`native upload sends signed parts directly to storage with ${integrity === "sidecar" ? "checksum sidecar" : integrity ? "inline tar integrity" : "legacy metadata"} and no script runtime`, native, async (t) => {
+for (const integrity of [true, false, "sidecar", "canonical"]) test(`native upload sends signed parts directly to storage with ${integrity === "canonical" ? "fixed checksum" : integrity === "sidecar" ? "legacy checksum sidecar" : integrity ? "inline tar integrity" : "legacy metadata"} and no script runtime`, native, async (t) => {
   const directory = project(t);
   const files = artifacts(directory, { archiveSize: partSize + 31, integrity });
   const remote = await service(t);
@@ -261,8 +265,8 @@ for (const integrity of [true, false, "sidecar"]) test(`native upload sends sign
     assert.ok(upload.complete);
     assert.equal(upload.metadata.sha256, hash("sha256", files.files.get(upload.metadata.filename)));
   }
-  if (integrity === "sidecar") assert.deepEqual([...remote.uploads.values()].map(upload => upload.metadata.filename), [
-    files.archiveName, `${files.prefix}-${files.manifest.hash}-checksum.json`, `${files.prefix}-update.json`,
+  if (files.checksumName) assert.deepEqual([...remote.uploads.values()].map(upload => upload.metadata.filename), [
+    files.archiveName, files.checksumName, `${files.prefix}-update.json`,
   ], "The archive and checksum must upload before the canonical manifest");
   const publishDirectory = project(t);
   const publishArgs = ["--app=native-app", "--release=canary-1.2.3", `--api-url=${remote.api.origin}`];
@@ -277,6 +281,23 @@ for (const integrity of [true, false, "sidecar"]) test(`native upload sends sign
   assert.deepEqual(remote.requests.find((request) => request.path.endsWith("/publish")).payload, { audience: "public" });
   assert.equal(remote.releases.get("canary-1.2.3").status, "published");
   assert.deepEqual(remote.api.errors, []);
+});
+
+test("native upload selects the fixed checksum and omits obsolete hash-named sidecars", native, async (t) => {
+  const directory = project(t);
+  const files = artifacts(directory, { integrity: "canonical" });
+  for (const build of ["oldhash", files.manifest.hash]) {
+    writeFileSync(join(files.output, `${files.prefix}-${build}-checksum.json`), "obsolete checksum contents");
+  }
+  const remote = await service(t);
+  succeeded(await run(directory, "upload", ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${remote.api.origin}`]));
+  assert.deepEqual([...remote.uploads.values()].map(upload => upload.metadata.filename), [
+    files.archiveName, files.checksumName, `${files.prefix}-update.json`,
+  ]);
+  const checksum = [...remote.uploads.values()].find(upload => upload.metadata.filename === files.checksumName);
+  assert.equal(JSON.parse(checksum.parts.get(1).bytes.toString()).hash, files.manifest.hash);
+  assert.deepEqual(remote.api.errors, []);
+  assert.deepEqual(remote.storage.errors, []);
 });
 
 test("native publish exposes a release to prerelease installs before publishing to public", native, async (t) => {
@@ -429,18 +450,30 @@ test("native upload rejects malformed or incomplete canonical tar integrity befo
   assert.deepEqual(api.errors, []);
 });
 
-test("native upload rejects invalid or mismatched checksum sidecars before network requests", native, async (t) => {
+for (const integrity of ["sidecar", "canonical"]) test(`native upload rejects invalid or mismatched ${integrity} checksums before network requests`, native, async (t) => {
   const directory = project(t);
-  const files = artifacts(directory, { integrity: "sidecar" });
+  const files = artifacts(directory, { integrity });
   let requests = 0;
   const api = await serve(t, async (_request, response) => { requests++; reply(response, {}); });
   const args = ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${api.origin}`];
-  const filename = `${files.prefix}-${files.manifest.hash}-checksum.json`;
-  for (const checksum of [null, {}, { tarSha256: "invalid", tarSize: 123 }, { tarSha256: "a".repeat(64) }, { tarSha256: "a".repeat(64), tarSize: 0 }]) {
+  const filename = files.checksumName;
+  if (integrity === "canonical") {
+    writeFileSync(join(files.output, `${files.prefix}-${files.manifest.hash}-checksum.json`), JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 }));
+  }
+  for (const checksum of [null, {},
+    { hash: files.manifest.hash, tarSha256: "invalid", tarSize: 123 },
+    { hash: files.manifest.hash, tarSha256: "a".repeat(64) },
+    { hash: files.manifest.hash, tarSha256: "a".repeat(64), tarSize: 0 },
+    ...["wronghash", null, 123, [files.manifest.hash]].map(hash => ({ hash, tarSha256: "a".repeat(64), tarSize: 123 })),
+    ...(integrity === "canonical" ? [{ tarSha256: "a".repeat(64), tarSize: 123 }] : []),
+  ]) {
     writeFileSync(join(files.output, filename), JSON.stringify(checksum));
     failed(await run(directory, "upload", args));
-    assert.equal(requests, 0, "Invalid sidecar integrity must fail local preflight");
+    assert.equal(requests, 0, "Invalid sidecar integrity or build identity must fail local preflight without a legacy fallback");
   }
+  writeFileSync(join(files.output, filename), "{");
+  failed(await run(directory, "upload", args));
+  assert.equal(requests, 0, "Malformed sidecar JSON must fail local preflight");
   rmSync(join(files.output, filename));
   writeFileSync(join(files.output, `${files.prefix}-anotherhash-checksum.json`), files.files.get(filename));
   failed(await run(directory, "upload", args));
@@ -448,13 +481,24 @@ test("native upload rejects invalid or mismatched checksum sidecars before netwo
   assert.deepEqual(api.errors, []);
 });
 
-test("native upload rejects manifest archive and checksum symlinks to files outside its artifact folder", { ...native, skip: native.skip || (process.platform === "win32" && "Windows symlink creation requires privileges") }, async (t) => {
+test("native upload does not hide malformed checksum filenames behind a valid fixed checksum", native, async (t) => {
   const directory = project(t);
-  const files = artifacts(directory, { integrity: "sidecar" });
+  const files = artifacts(directory, { integrity: "canonical" });
+  let requests = 0;
+  const api = await serve(t, async (_request, response) => { requests++; reply(response, {}); });
+  writeFileSync(join(files.output, `${files.prefix}-invalid.hash-checksum.json`), files.files.get(files.checksumName));
+  failed(await run(directory, "upload", ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${api.origin}`]));
+  assert.equal(requests, 0);
+  assert.deepEqual(api.errors, []);
+});
+
+for (const integrity of ["sidecar", "canonical"]) test(`native upload rejects manifest archive and ${integrity} checksum symlinks to files outside its artifact folder`, { ...native, skip: native.skip || (process.platform === "win32" && "Windows symlink creation requires privileges") }, async (t) => {
+  const directory = project(t);
+  const files = artifacts(directory, { integrity });
   let requests = 0;
   const api = await serve(t, async (_request, response) => { requests++; reply(response, {}); });
   const args = ["--app=native-app", `--artifacts=${files.output}`, `--api-url=${api.origin}`];
-  for (const filename of [`${files.prefix}-update.json`, files.archiveName, `${files.prefix}-${files.manifest.hash}-checksum.json`]) {
+  for (const filename of [`${files.prefix}-update.json`, files.archiveName, files.checksumName]) {
     const target = join(directory, filename);
     writeFileSync(target, files.files.get(filename));
     const path = join(files.output, filename);

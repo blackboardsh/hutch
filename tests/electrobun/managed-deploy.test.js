@@ -178,19 +178,67 @@ test("managed deploy inventories existing Hutch artifacts with compressed-object
   assert.ok(inventory.files.some((file) => file.filename === patchName));
 });
 
-test("managed inventory uploads a build checksum before the legacy canonical manifest", (t) => {
+test("managed inventory uploads a fixed checksum before the legacy canonical manifest", (t) => {
   const f = fixture(t);
   f.manifest.hash = "zzzhash";
   f.manifest.artifact = { file: f.archiveName };
   writeFileSync(join(f.directory, `${f.prefix}-update.json`), JSON.stringify(f.manifest));
   assert.equal(inventoryArtifacts(options(f.directory)).files.length, 2, "Old builds without checksums still upload");
-  const filename = `${f.prefix}-${f.manifest.hash}-checksum.json`;
-  const bytes = JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 });
+  const filename = `${f.prefix}-checksum.json`;
+  const bytes = JSON.stringify({ hash: f.manifest.hash, tarSha256: "a".repeat(64), tarSize: 123 });
   writeFileSync(join(f.directory, filename), bytes);
   const inventory = inventoryArtifacts(options(f.directory));
   assert.deepEqual(inventory.files.map(file => file.filename), [f.archiveName, filename, `${f.prefix}-update.json`]);
   assert.equal(inventory.files[1].sha256, digest(bytes));
   assert.equal(inventory.files[1].target, "macos-arm64");
+});
+
+test("managed inventory accepts legacy checksum filenames and validates an optional body hash", (t) => {
+  for (const hash of [undefined, "n61b2c3"]) {
+    const f = fixture(t);
+    const filename = `${f.prefix}-${f.manifest.hash}-checksum.json`;
+    writeFileSync(join(f.directory, filename), JSON.stringify({ hash, tarSha256: "a".repeat(64), tarSize: 123 }));
+    assert.ok(inventoryArtifacts(options(f.directory)).files.some(file => file.filename === filename));
+  }
+  for (const hash of ["different", null, 123, ["n61b2c3"]]) {
+    const f = fixture(t);
+    writeFileSync(join(f.directory, `${f.prefix}-${f.manifest.hash}-checksum.json`), JSON.stringify({ hash, tarSha256: "a".repeat(64), tarSize: 123 }));
+    assert.throws(() => inventoryArtifacts(options(f.directory)), /[Cc]hecksum/);
+  }
+});
+
+test("fixed checksums take precedence over retained legacy files across repeated builds", (t) => {
+  const f = fixture(t);
+  const filename = `${f.prefix}-checksum.json`;
+  writeFileSync(join(f.directory, `${f.prefix}-oldhash-checksum.json`), "obsolete checksum contents");
+  writeFileSync(join(f.directory, `${f.prefix}-${f.manifest.hash}-checksum.json`), "obsolete checksum contents");
+  for (const hash of [f.manifest.hash, "rebuilthash"]) {
+    f.manifest.hash = hash;
+    writeFileSync(join(f.directory, `${f.prefix}-update.json`), JSON.stringify(f.manifest));
+    writeFileSync(join(f.directory, filename), JSON.stringify({ hash, tarSha256: "a".repeat(64), tarSize: 123 }));
+    const inventory = inventoryArtifacts(options(f.directory));
+    assert.deepEqual(inventory.files.map(file => file.filename), [f.archiveName, filename, `${f.prefix}-update.json`]);
+    assert.equal(JSON.parse(readFileSync(inventory.files[1].path, "utf8")).hash, hash);
+  }
+});
+
+test("fixed checksums require a matching body hash and never fall back to legacy data", (t) => {
+  for (const hash of [undefined, "different", null, 123, ["n61b2c3"]]) {
+    const f = fixture(t);
+    writeFileSync(join(f.directory, `${f.prefix}-${f.manifest.hash}-checksum.json`), JSON.stringify({ tarSha256: "a".repeat(64), tarSize: 123 }));
+    writeFileSync(join(f.directory, `${f.prefix}-checksum.json`), JSON.stringify({ hash, tarSha256: "a".repeat(64), tarSize: 123 }));
+    assert.throws(() => inventoryArtifacts(options(f.directory)), /[Cc]hecksum/);
+  }
+});
+
+test("managed inventory rejects a fixed checksum symlink", {
+  skip: process.platform === "win32" && "Windows symlink creation requires privileges",
+}, (t) => {
+  const f = fixture(t);
+  const external = join(f.directory, "private-checksum.txt");
+  writeFileSync(external, JSON.stringify({ hash: f.manifest.hash, tarSha256: "a".repeat(64), tarSize: 123 }));
+  symlinkSync(external, join(f.directory, `${f.prefix}-checksum.json`));
+  assert.throws(() => inventoryArtifacts(options(f.directory)), /regular files/);
 });
 
 test("managed inventory rejects checksum identity and content mismatches", (t) => {
@@ -204,9 +252,12 @@ test("managed inventory rejects checksum identity and content mismatches", (t) =
     ["n61b2c3", { tarSha256: "a".repeat(64), tarSize: Number.MAX_SAFE_INTEGER + 1 }],
     ["n61b2c3", { tarSha256: "b".repeat(64), tarSize: 123 }],
   ]) {
-    const f = fixture(t);
-    writeFileSync(join(f.directory, `${f.prefix}-${name}-checksum.json`), JSON.stringify(body));
-    assert.throws(() => inventoryArtifacts(options(f.directory)), /[Cc]hecksum/);
+    for (const canonical of [false, true]) {
+      const f = fixture(t);
+      const filename = canonical ? `${f.prefix}-checksum.json` : `${f.prefix}-${name}-checksum.json`;
+      writeFileSync(join(f.directory, filename), JSON.stringify(canonical && body ? { hash: name, ...body } : body));
+      assert.throws(() => inventoryArtifacts(options(f.directory)), /[Cc]hecksum/);
+    }
   }
 });
 

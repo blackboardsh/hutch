@@ -109,7 +109,13 @@ fn inventoryChannel(io: std.Io, allocator: Allocator, directory: std.Io.Dir, fol
         if (!safeFileName(filename) or !supportedArtifactSuffix(filename)) continue;
         const target = artifactTarget(filename, channel, targets.items) orelse continue;
         if (std.mem.endsWith(u8, filename, "-checksum.json")) {
-            try validateChecksum(io, allocator, directory, filename, manifests[targetIndex(target).?].?);
+            const manifest = manifests[targetIndex(target).?].?;
+            const canonical = try std.fmt.allocPrint(allocator, "{s}-{s}-checksum.json", .{ channel, target });
+            defer allocator.free(canonical);
+            // A rebuilt artifact folder can still contain sidecars produced by
+            // an older Hutch. The fixed file is authoritative for this target.
+            if (contains(names, canonical) and legacyChecksumName(filename, canonical)) continue;
+            try validateChecksum(io, allocator, directory, filename, manifest);
         }
         try checkRegularPath(io, directory, filename);
         const file = try directory.openFile(io, filename, .{ .follow_symlinks = false });
@@ -168,10 +174,21 @@ fn readManifest(io: std.Io, allocator: Allocator, directory: std.Io.Dir, filenam
     return .{ .name = name, .version = try allocator.dupe(u8, version), .identifier = try allocator.dupe(u8, identifier), .hash = try allocator.dupe(u8, hash), .archive = try allocator.dupe(u8, archive), .tar_sha256 = tar_sha256, .tar_size = tar_size };
 }
 
+fn legacyChecksumName(filename: []const u8, canonical: []const u8) bool {
+    const prefix = canonical[0 .. canonical.len - "checksum.json".len];
+    const suffix = "-checksum.json";
+    if (!std.mem.startsWith(u8, filename, prefix) or !std.mem.endsWith(u8, filename, suffix) or filename.len <= prefix.len + suffix.len) return false;
+    for (filename[prefix.len .. filename.len - suffix.len]) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
+    return true;
+}
+
 fn validateChecksum(io: std.Io, allocator: Allocator, directory: std.Io.Dir, filename: []const u8, manifest: Manifest) !void {
+    const canonical = try std.fmt.allocPrint(allocator, "{s}-{s}-checksum.json", .{ manifest.name.channel, manifest.name.target });
+    defer allocator.free(canonical);
+    const fixed = std.mem.eql(u8, filename, canonical);
     const expected = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-checksum.json", .{ manifest.name.channel, manifest.name.target, manifest.hash });
     defer allocator.free(expected);
-    if (!std.mem.eql(u8, filename, expected)) return error.ManagedChecksumBuildMismatch;
+    if (!fixed and !std.mem.eql(u8, filename, expected)) return error.ManagedChecksumBuildMismatch;
     try checkRegularPath(io, directory, filename);
     const file = try directory.openFile(io, filename, .{ .follow_symlinks = false });
     defer file.close(io);
@@ -182,6 +199,11 @@ fn validateChecksum(io: std.Io, allocator: Allocator, directory: std.Io.Dir, fil
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !sameStat(stat, try file.stat(io))) return error.ManagedReleaseArtifactChanged;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.InvalidManagedChecksum;
     defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidManagedChecksum;
+    if (fixed or parsed.value.object.contains("hash")) {
+        const hash = stringField(parsed.value, "hash") catch return error.InvalidManagedChecksum;
+        if (!std.mem.eql(u8, hash, manifest.hash)) return error.ManagedChecksumBuildMismatch;
+    }
     const checksum = stringField(parsed.value, "tarSha256") catch return error.InvalidManagedChecksum;
     if (checksum.len != 64) return error.InvalidManagedChecksum;
     for (checksum) |byte| if (!std.ascii.isHex(byte)) return error.InvalidManagedChecksum;
@@ -516,8 +538,58 @@ test "inventory rejects checksum symlinks before reading their content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try fixture(a, tmp.dir, "canary", "macos-arm64", "1.2.3", "hash1");
-    try tmp.dir.symLink(std.testing.io, "canary-macos-arm64-update.json", "canary-macos-arm64-hash1-checksum.json", .{});
-    try std.testing.expectError(error.InvalidManagedReleaseArtifact, inventory(std.testing.io, a, try testFolder(a, tmp.dir), null, null, null));
+    for ([_][]const u8{ "canary-macos-arm64-hash1-checksum.json", "canary-macos-arm64-checksum.json" }) |name| {
+        try tmp.dir.symLink(std.testing.io, "canary-macos-arm64-update.json", name, .{});
+        try std.testing.expectError(error.InvalidManagedReleaseArtifact, inventory(std.testing.io, a, try testFolder(a, tmp.dir), null, null, null));
+        try tmp.dir.deleteFile(std.testing.io, name);
+    }
+}
+
+test "inventory selects one fixed checksum and ignores obsolete hash named sidecars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(a, tmp.dir, "canary", "macos-arm64", "1.2.3", "hash1");
+    const folder = try testFolder(a, tmp.dir);
+    const filename = "canary-macos-arm64-checksum.json";
+    const json = "{\"hash\":\"hash1\",\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":123}";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = json });
+    // Both old and current hash-named files are obsolete once fixed metadata is
+    // supplied. Neither stale integrity nor malformed bytes enter the upload.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "canary-macos-arm64-oldhash-checksum.json", .data = "stale checksum" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "canary-macos-arm64-hash1-checksum.json", .data = "not JSON" });
+    const releases = try inventory(std.testing.io, a, folder, null, null, null);
+    try std.testing.expectEqual(@as(usize, 3), releases[0].files.len);
+    try std.testing.expectEqualStrings(filename, releases[0].files[1].filename);
+    const wrong_hash = try std.mem.replaceOwned(u8, a, json, "hash1", "hash2");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = wrong_hash });
+    try std.testing.expectError(error.ManagedChecksumBuildMismatch, inventory(std.testing.io, a, folder, null, null, null));
+    for ([_][]const u8{ "", "null", "123", "{}" }) |value| {
+        const invalid = if (value.len == 0)
+            try std.mem.replaceOwned(u8, a, json, "\"hash\":\"hash1\",", "")
+        else
+            try std.mem.replaceOwned(u8, a, json, "\"hash1\"", value);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = invalid });
+        try std.testing.expectError(error.InvalidManagedChecksum, inventory(std.testing.io, a, folder, null, null, null));
+    }
+}
+
+test "inventory verifies optional legacy checksum body hash when present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(a, tmp.dir, "stable", "linux-x64", "1.2.3", "hash1");
+    const folder = try testFolder(a, tmp.dir);
+    const filename = "stable-linux-x64-hash1-checksum.json";
+    const json = "{\"hash\":\"hash1\",\"tarSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tarSize\":123}";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = json });
+    try std.testing.expectEqual(@as(usize, 3), (try inventory(std.testing.io, a, folder, null, null, null))[0].files.len);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = try std.mem.replaceOwned(u8, a, json, "hash1", "hash2") });
+    try std.testing.expectError(error.ManagedChecksumBuildMismatch, inventory(std.testing.io, a, folder, null, null, null));
 }
 
 test "inventory streams checksums across multiple read buffers" {

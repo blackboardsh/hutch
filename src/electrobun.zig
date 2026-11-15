@@ -3607,7 +3607,7 @@ fn writeReleaseArtifacts(
     });
     // Shipped native updaters parse the legacy manifest strictly. Keep its
     // shape unchanged and bind optional archive integrity to the build hash
-    // in a separate filename, without duplicating the release metadata.
+    // in one replaceable checksum file, without duplicating release metadata.
     const update_json = try releaseUpdateJson(
         ctx,
         try getAppIdentifier(ctx, config),
@@ -3628,9 +3628,9 @@ fn writeReleaseArtifacts(
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = try std.fs.path.join(
             ctx.allocator,
-            &.{ artifact_root, try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-checksum.json", .{ prefix, state.hash }) },
+            &.{ artifact_root, try std.mem.concat(ctx.allocator, u8, &.{ prefix, "-checksum.json" }) },
         ),
-        .data = try releaseChecksumJson(ctx, state.tar_integrity),
+        .data = try releaseChecksumJson(ctx, state.hash, state.tar_integrity),
     });
 
     const candidates = [_]?[]const u8{
@@ -3708,8 +3708,9 @@ fn releaseUpdateJson(
     );
 }
 
-fn releaseChecksumJson(ctx: *const Context, integrity: ReleaseTarIntegrity) ![]const u8 {
+fn releaseChecksumJson(ctx: *const Context, hash: []const u8, integrity: ReleaseTarIntegrity) ![]const u8 {
     return std.json.Stringify.valueAlloc(ctx.allocator, .{
+        .hash = hash,
         .tarSha256 = @as([]const u8, &integrity.sha256),
         .tarSize = std.math.cast(i64, integrity.size) orelse return error.InvalidReleaseArchiveSize,
     }, .{});
@@ -10407,18 +10408,19 @@ test "release update metadata remains readable by strict legacy clients with sep
     ).?;
     try std.testing.expectEqualStrings("abc123", previous.hash);
 
-    const checksum_json = try releaseChecksumJson(&ctx, .{
+    const checksum_json = try releaseChecksumJson(&ctx, "abc123", .{
         .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*,
         .size = 3,
     });
     const checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, checksum_json, .{});
-    try std.testing.expectEqual(@as(usize, 2), checksum.object.count());
+    try std.testing.expectEqual(@as(usize, 3), checksum.object.count());
+    try std.testing.expectEqualStrings("abc123", checksum.object.get("hash").?.string);
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         checksum.object.get("tarSha256").?.string,
     );
     try std.testing.expectEqual(@as(i64, 3), checksum.object.get("tarSize").?.integer);
-    try std.testing.expectError(error.InvalidReleaseArchiveSize, releaseChecksumJson(&ctx, .{
+    try std.testing.expectError(error.InvalidReleaseArchiveSize, releaseChecksumJson(&ctx, "abc123", .{
         .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*,
         .size = std.math.maxInt(u64),
     }));
@@ -10486,7 +10488,7 @@ test "release version metadata keeps display and artifact names distinct" {
     try std.testing.expect(parsed.object.get("releaseId") == null);
 }
 
-test "release artifacts use a legacy manifest hash-bound checksum and channel-specific installers" {
+test "release artifacts use a legacy manifest replaceable checksum and channel-specific installers" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10573,7 +10575,7 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
     const installer_prefix = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ osName(), archName() });
     const stable_files = [_][]const u8{
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-update.json" }),
-        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-newhash-checksum.json" }),
+        try std.mem.concat(allocator, u8, &.{ stable_prefix, "-checksum.json" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-MigrationApp.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ stable_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ installer_prefix, "-MigrationApp-Setup.zip" }),
@@ -10598,7 +10600,8 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
     const stable_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, stable_files[1] });
     const stable_checksum_bytes = try std.Io.Dir.cwd().readFileAlloc(io, stable_checksum_path, allocator, .limited(64 * 1024));
     const stable_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, stable_checksum_bytes, .{});
-    try std.testing.expectEqual(@as(usize, 2), stable_checksum.object.count());
+    try std.testing.expectEqual(@as(usize, 3), stable_checksum.object.count());
+    try std.testing.expectEqualStrings("newhash", stable_checksum.object.get("hash").?.string);
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         stable_checksum.object.get("tarSha256").?.string,
@@ -10640,7 +10643,7 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
     }, canary_installer_path);
     for ([_][]const u8{
         "-update.json",
-        "-canaryhash-checksum.json",
+        "-checksum.json",
         "-MigrationApp-canary.tar.zst",
         "-oldhash.patch",
         "-MigrationApp-canary-Setup.zip",
@@ -10665,10 +10668,11 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
         canary_artifact.get("file").?.string,
     );
     try std.testing.expectEqual(@as(usize, 1), canary_artifact.count());
-    const canary_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-canaryhash-checksum.json" }) });
+    const canary_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-checksum.json" }) });
     const canary_checksum_bytes = try std.Io.Dir.cwd().readFileAlloc(io, canary_checksum_path, allocator, .limited(64 * 1024));
     const canary_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, canary_checksum_bytes, .{});
-    try std.testing.expectEqual(@as(usize, 2), canary_checksum.object.count());
+    try std.testing.expectEqual(@as(usize, 3), canary_checksum.object.count());
+    try std.testing.expectEqualStrings("canaryhash", canary_checksum.object.get("hash").?.string);
     try std.testing.expectEqualStrings(
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         canary_checksum.object.get("tarSha256").?.string,
@@ -10677,12 +10681,33 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
 
     const canary_files = [_][]const u8{
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-update.json" }),
-        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-canaryhash-checksum.json" }),
+        try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-checksum.json" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary.tar.zst" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-oldhash.patch" }),
         try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary-Setup.zip" }),
     };
     try Flat.expect(artifact_root, &canary_files);
+
+    // Re-running an unchanged release version replaces its fixed metadata,
+    // including when the produced build hash changes. No checksum history is
+    // added beside the flat installer/archive/patch files.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = canary_compressed_path, .data = "rebuilt archive" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = canary_installer_path, .data = "rebuilt installer" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patch_path, .data = "rebuilt patch" });
+    const stale_checksum_path = try std.fs.path.join(allocator, &.{ artifact_root, try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-canaryhash-checksum.json" }) });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_checksum_path, .data = "old hash-named checksum" });
+    try writeReleaseArtifacts(&ctx, canary_config, .{
+        .bundle = unused_bundle,
+        .hash = "rebuilthash",
+        .tar_integrity = .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
+        .compressed_tar_path = canary_compressed_path,
+        .patch_path = patch_path,
+        .flatpak_payload_path = null,
+    }, canary_installer_path);
+    try Flat.expect(artifact_root, &canary_files);
+    const rebuilt_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try std.Io.Dir.cwd().readFileAlloc(io, canary_checksum_path, allocator, .limited(64 * 1024)), .{});
+    try std.testing.expectEqualStrings("rebuilthash", rebuilt_checksum.object.get("hash").?.string);
+    try std.testing.expect(!pathExists(io, stale_checksum_path));
 
     // Managed hosting changes only the delivery base and public deployment
     // defaults. It must never introduce release folders or rename artifacts.
@@ -10708,9 +10733,10 @@ test "release artifacts use a legacy manifest hash-bound checksum and channel-sp
             .flatpak_payload_path = null,
         }, if (is_canary) canary_installer_path else installer_path);
         const files = if (is_canary) &canary_files else &stable_files;
-        var managed_files = files.* ++ [_][]const u8{"managed-deploy.json"};
-        managed_files[1] = try std.fmt.allocPrint(allocator, "{s}-managedhash-checksum.json", .{if (is_canary) canary_installer_prefix else stable_prefix});
+        const managed_files = files.* ++ [_][]const u8{"managed-deploy.json"};
         try Flat.expect(artifact_root, &managed_files);
+        const managed_checksum = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ artifact_root, managed_files[1] }), allocator, .limited(64 * 1024)), .{});
+        try std.testing.expectEqualStrings("managedhash", managed_checksum.object.get("hash").?.string);
     }
 }
 
