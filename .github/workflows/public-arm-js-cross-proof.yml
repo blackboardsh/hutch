@@ -30,10 +30,8 @@ jobs:
           - platform: windows
             runner: windows-11-arm
     env:
-      HUTCH_HOME: ${{ runner.temp }}/public-arm-cross-store
       HUTCH_ACTIVE_CHANNEL: canary
       HUTCH_NO_UPDATE_CHECK: '1'
-      CROSS_PROOF_ROOT: ${{ runner.temp }}/public-arm-cross-apps
       CROSS_PROOF_HUTCH_VERSION: 0.31.0-canary.2
       CROSS_PROOF_ELECTROBUN_VERSION: 2.0.7-beta.24
 
@@ -47,6 +45,9 @@ jobs:
           node-version: '24.22.1'
           architecture: arm64
           package-manager-cache: false
+
+      - name: Prepare isolated runner paths
+        run: node -e "const fs=require('node:fs'),p=require('node:path');fs.appendFileSync(process.env.GITHUB_ENV,'HUTCH_HOME='+p.join(process.env.RUNNER_TEMP,'public-arm-cross-store')+'\nCROSS_PROOF_ROOT='+p.join(process.env.RUNNER_TEMP,'public-arm-cross-apps')+'\n');"
 
       - name: Install exact published native Hutch on Linux
         if: matrix.platform == 'linux'
