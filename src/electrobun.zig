@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ElectrobunTarget = @import("electrobun_target.zig").Target;
 const file_locks = @import("file_locks.zig");
 const managed_store = @import("managed_store.zig");
 const store_locks = @import("store_locks.zig");
@@ -78,6 +79,7 @@ const Context = struct {
     helper_runtime: ?runtime_resolver.Selected = null,
     project_root: []const u8,
     electrobun_version: ?[]const u8 = null,
+    target: ElectrobunTarget = .{},
     build_lock_key: ?[]const u8 = null,
     managed_root_leases: ?*std.ArrayList(ManagedRootLease) = null,
     cached_managed_devkit: ?*?electrobun_devkit.Resolution = null,
@@ -153,6 +155,17 @@ const PlatformPaths = struct {
     bsdiff: []const u8,
     bspatch: []const u8,
     zig_zstd: []const u8,
+    host_devkit: ?electrobun_devkit.Resolution = null,
+    build_bsdiff: ?[]const u8 = null,
+    build_zig_zstd: ?[]const u8 = null,
+
+    fn bsdiffTool(self: PlatformPaths) []const u8 {
+        return self.build_bsdiff orelse self.bsdiff;
+    }
+
+    fn zstdTool(self: PlatformPaths) []const u8 {
+        return self.build_zig_zstd orelse self.zig_zstd;
+    }
 };
 
 const BundledRuntimeProvenance = struct {
@@ -257,6 +270,7 @@ pub fn run(
         .helper_runtime = helper_runtime,
         .project_root = project_root,
         .electrobun_version = electrobun_version,
+        .target = try parseBuildTarget(args[1..]),
         .managed_root_leases = &managed_root_leases,
         .cached_managed_devkit = &cached_managed_devkit,
         .automatic_prune_completed = &automatic_prune_completed,
@@ -264,6 +278,10 @@ pub fn run(
     defer cleanupCliTempDir(&ctx);
 
     const command = args[0];
+    if (!ctx.target.isNative() and (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "dev") or std.mem.eql(u8, command, "init"))) {
+        ctx.writeStderr("hutch electrobun: --arch only selects a build target; run/dev/init require the native architecture\n", .{});
+        return error.CrossArchitectureExecutionUnsupported;
+    }
 
     if (std.mem.eql(u8, command, "upload") or std.mem.eql(u8, command, "deploy") or std.mem.eql(u8, command, "publish")) {
         return runManagedCommand(&ctx, command, args[1..]) catch |err| {
@@ -353,16 +371,18 @@ fn printHelp(writer: anytype) !void {
         \\Usage:
         \\  hutch electrobun init [project-name] [--template=name] [--beta] [--skip-install]
         \\  hutch electrobun update
-        \\  hutch electrobun config [--env=dev|canary|stable]
-        \\  hutch electrobun sync [--env=dev|canary|stable]
-        \\  hutch electrobun prepare [--env=dev|canary|stable]
-        \\  hutch electrobun build [--env=dev|canary|stable]
+        \\  hutch electrobun config [--env=dev|canary|stable] [--arch=arm64|x64]
+        \\  hutch electrobun sync [--env=dev|canary|stable] [--arch=arm64|x64]
+        \\  hutch electrobun prepare [--env=dev|canary|stable] [--arch=arm64|x64]
+        \\  hutch electrobun build [--env=dev|canary|stable] [--arch=arm64|x64]
         \\  hutch electrobun upload [--release=<id>] [--app=<id>] [--artifacts=<dir>] [--dry-run]
         \\  hutch electrobun publish --release=<channel-version> [--audience=prerelease|public] [--app=<id>] [--dry-run]
         \\  hutch electrobun run [--env=dev|canary|stable] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
+        \\  - --arch selects a same-OS target; cross-architecture app builds currently support Zig main processes.
+        \\  - Build tools always run on the host; config and hooks receive ELECTROBUN_ARCH and ELECTROBUN_HOST_ARCH.
         \\  - update rewrites the nearest parent hutch.config.ts to the latest stable exact version, then runs sync.
         \\  - upload discovers release artifacts and stages them in Electrobun Managed Deploys; deploy is an alias.
         \\  - publish validates accumulated uploads; --audience=prerelease selects registered prerelease installs, public publishes to all installs (default).
@@ -394,6 +414,47 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
         if (std.mem.eql(u8, arg, flag)) return true;
     }
     return false;
+}
+
+fn parseBuildTarget(args: []const [:0]const u8) !ElectrobunTarget {
+    var target = ElectrobunTarget.native();
+    var selected = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        const value = if (std.mem.startsWith(u8, arg, "--arch="))
+            arg["--arch=".len..]
+        else if (std.mem.eql(u8, arg, "--arch")) blk: {
+            index += 1;
+            if (index == args.len) return error.InvalidElectrobunTargetArchitecture;
+            break :blk args[index];
+        } else continue;
+        if (selected) return error.DuplicateElectrobunTargetArchitecture;
+        target = try ElectrobunTarget.parse(value);
+        selected = true;
+    }
+    return target;
+}
+
+fn validateBuildTarget(ctx: *const Context, root: std.json.Value) !void {
+    if (ctx.target.isNative()) return;
+    if (try getMainProcess(root) != .zig) {
+        ctx.writeStderr("hutch electrobun: cross-architecture builds currently require build.mainProcess=zig; other main processes need target runtime/toolchain support\n", .{});
+        return error.UnsupportedCrossArchitectureMainProcess;
+    }
+    if (flatpakEnabled(root)) {
+        ctx.writeStderr("hutch electrobun: cross-architecture Flatpak builds are not supported\n", .{});
+        return error.UnsupportedCrossArchitectureFlatpak;
+    }
+}
+
+test "cross architecture CLI selection is explicit and rejects ambiguous targets" {
+    try std.testing.expect((try parseBuildTarget(&.{})).isNative());
+    try std.testing.expectEqualStrings("x64", (try parseBuildTarget(&.{"--arch=x64"})).archName());
+    try std.testing.expectEqualStrings("arm64", (try parseBuildTarget(&.{ "--env=canary", "--arch", "arm64" })).archName());
+    try std.testing.expectError(error.InvalidElectrobunTargetArchitecture, parseBuildTarget(&.{"--arch"}));
+    try std.testing.expectError(error.InvalidElectrobunTargetArchitecture, parseBuildTarget(&.{"--arch=x86"}));
+    try std.testing.expectError(error.DuplicateElectrobunTargetArchitecture, parseBuildTarget(&.{ "--arch=x64", "--arch=arm64" }));
 }
 
 fn parseBuildEnvironment(args: []const [:0]const u8) !BuildEnvironment {
@@ -636,7 +697,8 @@ fn loadConfig(ctx: *const Context, build_env: BuildEnvironment) !CommandContext 
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     try env_map.put("ELECTROBUN_BUILD_ENV", buildEnvironmentName(build_env));
     try env_map.put("ELECTROBUN_OS", osName());
-    try env_map.put("ELECTROBUN_ARCH", archName());
+    try env_map.put("ELECTROBUN_ARCH", ctx.target.archName());
+    try env_map.put("ELECTROBUN_HOST_ARCH", archName());
 
     const env_arg = try std.fmt.allocPrint(ctx.allocator, "--env={s}", .{buildEnvironmentName(build_env)});
     var arguments: std.ArrayList([]const u8) = .empty;
@@ -761,7 +823,9 @@ fn projectedDevkitMatchesProductVersion(ctx: *const Context) bool {
     }) catch return false;
     const product = getObjectField(parsed, "product") orelse return false;
     const version = getStringFieldFromObject(product, "version") orelse return false;
-    return std.mem.eql(u8, version, expected_version);
+    const target = getObjectField(parsed, "target") orelse return false;
+    const target_arch = getStringFieldFromObject(target, "arch") orelse return false;
+    return std.mem.eql(u8, version, expected_version) and std.mem.eql(u8, target_arch, ctx.target.archName());
 }
 
 fn prepareProject(ctx: *const Context, config: CommandContext) !void {
@@ -824,6 +888,19 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
         );
         for (managed) |object| {
             if (object) |value| try objects.append(ctx.allocator, value);
+        }
+    }
+    if (platform_paths.host_devkit) |host_devkit| {
+        const managed = try managed_store.managedElectrobunObjects(
+            ctx.init,
+            ctx.allocator,
+            host_devkit.root,
+            host_devkit.version,
+            host_devkit.source_manifest_sha256,
+            false,
+        );
+        for (managed) |object| {
+            if (object) |value| try appendManagedObjectIfDistinct(ctx.allocator, &objects, value);
         }
     }
     if (try managed_store.managedReleaseObject(
@@ -1128,6 +1205,7 @@ fn projectPathsEqual(left: []const u8, right: []const u8) bool {
 }
 
 fn runBuild(ctx: *const Context, config: CommandContext) !void {
+    try validateBuildTarget(ctx, config.root);
     try validateOutputConfiguration(ctx, config);
     try validateBuildLockIsolation(ctx, config);
     const build_lock = try acquireProjectBuildLock(ctx);
@@ -1195,7 +1273,7 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
         buildEnvironmentName(config.build_env),
         try releaseBaseUrl(ctx, config.root),
         osName(),
-        archName(),
+        ctx.target.archName(),
         app_file_name,
     };
     const hash = try hashBundle(ctx, bundle.bundle_root, &semantic_fields);
@@ -1225,7 +1303,7 @@ fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
 
     const patch_path = try generateDeltaPatch(ctx, config, platform_paths, tar_path);
     const compressed_tar_path = try std.mem.concat(ctx.allocator, u8, &.{ tar_path, ".zst" });
-    try compressTar(ctx, platform_paths.zig_zstd, tar_path, compressed_tar_path);
+    try compressTar(ctx, platform_paths.zstdTool(), tar_path, compressed_tar_path);
     std.Io.Dir.cwd().deleteFile(ctx.io, tar_path) catch {};
 
     try createOuterWrapper(ctx, config, bundle, platform_paths, hash, compressed_tar_path);
@@ -1281,13 +1359,13 @@ fn releasePlatformPrefix(ctx: *const Context, config: CommandContext) ![]const u
     return std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{s}", .{
         buildEnvironmentName(config.build_env),
         osName(),
-        archName(),
+        ctx.target.archName(),
     });
 }
 
 fn installerPlatformPrefix(ctx: *const Context, config: CommandContext) ![]const u8 {
     if (config.build_env == .stable) {
-        return std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() });
+        return std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), ctx.target.archName() });
     }
     return releasePlatformPrefix(ctx, config);
 }
@@ -2096,7 +2174,7 @@ fn generateDeltaPatch(
         ctx.writeStdout("no release.baseUrl configured; skipping delta patch\n", .{});
         return null;
     }
-    if (!pathExists(ctx.io, platform_paths.bsdiff) or !pathExists(ctx.io, platform_paths.zig_zstd)) {
+    if (!pathExists(ctx.io, platform_paths.bsdiffTool()) or !pathExists(ctx.io, platform_paths.zstdTool())) {
         ctx.writeStderr("hutch electrobun: bsdiff or zig-zstd missing; skipping delta patch\n", .{});
         return null;
     }
@@ -2127,7 +2205,7 @@ fn generateDeltaPatch(
         try getAppIdentifier(ctx, config),
         buildEnvironmentName(config.build_env),
         osName(),
-        archName(),
+        ctx.target.archName(),
         expected_archive_file,
     ) orelse {
         ctx.writeStderr("hutch electrobun: previous update metadata does not match this release; skipping delta patch\n", .{});
@@ -2159,7 +2237,7 @@ fn generateDeltaPatch(
     });
     if (!try runReleaseCommandSuccess(
         ctx,
-        &.{ platform_paths.zig_zstd, "decompress", "-i", previous_zstd_path, "-o", previous_tar_path },
+        &.{ platform_paths.zstdTool(), "decompress", "-i", previous_zstd_path, "-o", previous_tar_path },
         ctx.project_root,
         null,
     )) {
@@ -2173,7 +2251,7 @@ fn generateDeltaPatch(
     );
     if (!try runReleaseCommandSuccess(
         ctx,
-        &.{ platform_paths.bsdiff, previous_tar_path, current_tar_path, patch_path, "--use-zstd" },
+        &.{ platform_paths.bsdiffTool(), previous_tar_path, current_tar_path, patch_path, "--use-zstd" },
         ctx.project_root,
         null,
     )) {
@@ -3615,7 +3693,7 @@ fn writeReleaseArtifacts(
         try getAppVersion(ctx, config.root),
         state.hash,
         osName(),
-        archName(),
+        ctx.target.archName(),
         compressed_artifact_name,
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
@@ -4423,6 +4501,7 @@ fn appendProjectZigBuildArguments(
     cache_dir: []const u8,
     zig_sdk_path: []const u8,
     build_env: BuildEnvironment,
+    target: ElectrobunTarget,
 ) !void {
     try argv.append(allocator, zig_binary);
     try argv.append(allocator, "build");
@@ -4433,7 +4512,7 @@ fn appendProjectZigBuildArguments(
     try argv.append(allocator, install_prefix);
     try argv.append(allocator, "--cache-dir");
     try argv.append(allocator, cache_dir);
-    try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{zigTargetName()}));
+    try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Dtarget={s}", .{zigTargetNameFor(builtin.os.tag, target.arch)}));
     if (builtin.os.tag == .windows or builtin.os.tag == .macos) try argv.append(allocator, "-Dcpu=baseline");
     try argv.append(allocator, if (build_env == .dev) "-Doptimize=Debug" else "-Doptimize=ReleaseSmall");
     try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Delectrobun-sdk={s}", .{zig_sdk_path}));
@@ -4495,7 +4574,7 @@ fn openProjectZigCache(ctx: *const Context) !struct { directory: std.Io.Dir, pat
     defer caches.close(ctx.io);
     var zig = try project_state.openChild(ctx.io, caches, "zig", .create, .{});
     defer zig.close(ctx.io);
-    const target = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() });
+    const target = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), ctx.target.archName() });
     const directory = try project_state.openChild(ctx.io, zig, target, .create, .{});
     errdefer directory.close(ctx.io);
     return .{
@@ -4516,7 +4595,7 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
     const zig_toolchain = leased_zig_toolchain.resolution;
     const zig_binary = zig_toolchain.binary;
 
-    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
+    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), ctx.target.archName() }) });
     try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const install_prefix = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "install" });
     // runBuildUnlocked intentionally recreates build_root. Compiler caches
@@ -4536,6 +4615,7 @@ fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_
         cache.path,
         zig_sdk_path,
         config.build_env,
+        ctx.target,
     );
 
     var env_map = std.process.Environ.Map.init(ctx.allocator);
@@ -5021,7 +5101,7 @@ fn buildGoMainExecutable(ctx: *const Context, config: CommandContext, platform_p
     const go_toolchain = leased_go_toolchain.resolution;
     const go_binary = go_toolchain.binary;
 
-    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-go-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
+    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-go-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), ctx.target.archName() }) });
     try recreateDirWithin(ctx, bundle.build_root, temp_build_dir);
 
     const go_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
@@ -5578,7 +5658,7 @@ fn buildOdinMainExecutable(ctx: *const Context, config: CommandContext, platform
     const entrypoint = try resolveMainEntrypoint(ctx, config.root, .odin);
     if (!pathExists(ctx.io, entrypoint)) return error.OdinEntrypointNotFound;
 
-    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-odin-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
+    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-odin-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), ctx.target.archName() }) });
     try createOutputDirWithin(ctx, bundle.build_root, temp_build_dir);
     const odin_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, executableFileName("main") });
     const entrypoint_dir = std.fs.path.dirname(entrypoint) orelse entrypoint;
@@ -6448,7 +6528,8 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
     try inheritCurrentEnvironmentFromContext(ctx, &env_map);
     try env_map.put("ELECTROBUN_BUILD_ENV", buildEnvironmentName(config.build_env));
     try env_map.put("ELECTROBUN_OS", osName());
-    try env_map.put("ELECTROBUN_ARCH", archName());
+    try env_map.put("ELECTROBUN_ARCH", ctx.target.archName());
+    try env_map.put("ELECTROBUN_HOST_ARCH", archName());
     try env_map.put("ELECTROBUN_BUILD_DIR", try buildOutputRoot(ctx, config));
     try env_map.put("ELECTROBUN_APP_NAME", try getAppName(ctx, config.root));
     try env_map.put("ELECTROBUN_APP_VERSION", try getAppVersion(ctx, config.root));
@@ -7337,7 +7418,7 @@ fn buildOutputRoot(ctx: *const Context, config: CommandContext) ![]const u8 {
     const prefix = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}-{s}", .{
         buildEnvironmentName(config.build_env),
         osName(),
-        archName(),
+        ctx.target.archName(),
     });
     return safeOutputJoin(ctx, build_folder_root, prefix);
 }
@@ -8165,7 +8246,14 @@ fn resolveProductPlatformPathsUnderGraph(ctx: *const Context) !PlatformPaths {
         );
         return err;
     };
-    return platformPathsFromDevkit(ctx, devkit, projection);
+    var paths = try platformPathsFromDevkit(ctx, devkit, projection);
+    if (!ctx.target.isNative()) {
+        const host_devkit = try loadHostProductDevkitUnderGraph(ctx, version);
+        paths.host_devkit = host_devkit;
+        paths.build_bsdiff = host_devkit.runtime.bsdiff;
+        paths.build_zig_zstd = host_devkit.runtime.zig_zstd;
+    }
+    return paths;
 }
 
 fn loadProductDevkitUnderGraph(
@@ -8183,18 +8271,19 @@ fn loadProductDevkitUnderGraph(
             );
             return err;
         };
-    } else electrobun_artifacts.ensureCore(ctx.init, ctx.allocator, version) catch |err| {
+    } else electrobun_artifacts.ensureCoreFor(ctx.init, ctx.allocator, version, ctx.target) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: could not install the Electrobun {s} devkit: {s}\n",
             .{ version, @errorName(err) },
         );
         return err;
     };
-    const devkit = electrobun_devkit.load(
+    const devkit = electrobun_devkit.loadFor(
         ctx.io,
         ctx.allocator,
         core_root,
         version,
+        ctx.target,
     ) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: Electrobun {s} has an invalid native devkit: {s}\n",
@@ -8204,6 +8293,21 @@ fn loadProductDevkitUnderGraph(
     };
     if (managed) try retainManagedRootLeaseUnderGraph(ctx, devkit.root);
     return devkit;
+}
+
+fn loadHostProductDevkitUnderGraph(ctx: *const Context, version: []const u8) !electrobun_devkit.Resolution {
+    var host_environment = try ctx.environ_map.clone(ctx.allocator);
+    defer host_environment.deinit();
+    _ = host_environment.swapRemove("HUTCH_ELECTROBUN_DEVKIT_ROOT");
+    if (ctx.environ_map.get("HUTCH_ELECTROBUN_HOST_DEVKIT_ROOT")) |root| {
+        try host_environment.put("HUTCH_ELECTROBUN_DEVKIT_ROOT", root);
+    }
+    var host_ctx = ctx.*;
+    host_ctx.target = .{};
+    host_ctx.environ_map = &host_environment;
+    host_ctx.init.environ_map = &host_environment;
+    host_ctx.cached_managed_devkit = null;
+    return loadProductDevkitUnderGraph(&host_ctx, version);
 }
 
 fn retainManagedRootLeaseUnderGraph(ctx: *const Context, root: []const u8) !void {
@@ -8252,10 +8356,11 @@ fn ensureRequiredPlatformArtifacts(
     const managed_root = (platform_paths.devkit orelse
         return error.ElectrobunDevkitNotResolved).root;
     suspendManagedRootLeaseUnderGraph(ctx, managed_root);
-    const platform_root = electrobun_artifacts.ensureCef(
+    const platform_root = electrobun_artifacts.ensureCefFor(
         ctx.init,
         ctx.allocator,
         version,
+        ctx.target,
     ) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: could not install CEF for Electrobun {s}: {s}\n",
@@ -9760,6 +9865,7 @@ test "Zig builds invoke the project build file with the projected SDK contract" 
         "/project/build/private/cache",
         "/project/.hutch/devkit/zig-sdk/electrobun.zig",
         .dev,
+        .{},
     );
 
     const baseline_cpu = builtin.os.tag == .windows or builtin.os.tag == .macos;
@@ -9795,6 +9901,7 @@ test "Zig builds invoke the project build file with the projected SDK contract" 
         "/cache",
         "/sdk/electrobun.zig",
         .stable,
+        .{},
     );
     try std.testing.expectEqualStrings("-Doptimize=ReleaseSmall", argv.items[optimize_index]);
 }

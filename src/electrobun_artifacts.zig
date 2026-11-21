@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Target = @import("electrobun_target.zig").Target;
 const archive_util = @import("archive.zig");
 const electrobun_devkit = @import("electrobun_devkit.zig");
 const file_locks = @import("file_locks.zig");
@@ -54,6 +55,7 @@ const Abi = struct {
 };
 
 const ArtifactSelection = struct {
+    target: Target = .{},
     version: []const u8,
     target_os: []const u8,
     target_arch: []const u8,
@@ -82,7 +84,7 @@ pub fn ensureCore(
     allocator: std.mem.Allocator,
     version: []const u8,
 ) ![]const u8 {
-    return ensure(init, allocator, version, .core);
+    return ensureCoreFor(init, allocator, version, .{});
 }
 
 pub fn ensureCef(
@@ -90,8 +92,26 @@ pub fn ensureCef(
     allocator: std.mem.Allocator,
     version: []const u8,
 ) ![]const u8 {
-    _ = try ensure(init, allocator, version, .core);
-    return ensure(init, allocator, version, .cef);
+    return ensureCefFor(init, allocator, version, .{});
+}
+
+pub fn ensureCoreFor(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    target: Target,
+) ![]const u8 {
+    return ensure(init, allocator, version, .core, target);
+}
+
+pub fn ensureCefFor(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    target: Target,
+) ![]const u8 {
+    _ = try ensure(init, allocator, version, .core, target);
+    return ensure(init, allocator, version, .cef, target);
 }
 
 fn ensure(
@@ -99,10 +119,11 @@ fn ensure(
     allocator: std.mem.Allocator,
     version: []const u8,
     kind: Kind,
+    target: Target,
 ) ![]const u8 {
     try validateVersion(version);
     const home = try release_store.hutchHome(init, allocator);
-    const platform = try platformKey();
+    const platform = try target.platformKey();
     const root = try std.fs.path.join(allocator, &.{
         home,
         release_store.releases_directory_name,
@@ -112,13 +133,14 @@ fn ensure(
     });
     const parent = std.fs.path.dirname(root) orelse return error.InvalidElectrobunInstallPath;
     try std.Io.Dir.cwd().createDirPath(init.io, parent);
-    const lock = (try lockForInstallation(
+    const lock = (try lockForInstallationFor(
         init.io,
         allocator,
         root,
         kind,
         version,
         environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE"),
+        target,
     )) orelse return root;
     defer lock.close(init.io);
 
@@ -129,6 +151,7 @@ fn ensure(
         base_url,
         version,
         platform,
+        target,
     );
     const artifact = try selection.artifact(kind);
 
@@ -164,6 +187,18 @@ fn lockForInstallation(
     version: []const u8,
     offline: bool,
 ) !?release_store.PersistentFileLock {
+    return lockForInstallationFor(io, allocator, root, kind, version, offline, .{});
+}
+
+fn lockForInstallationFor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    kind: Kind,
+    version: []const u8,
+    offline: bool,
+    build_target: Target,
+) !?release_store.PersistentFileLock {
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     try store_locks.initializePersistentFile(io, lock_path);
     var contended = false;
@@ -181,7 +216,7 @@ fn lockForInstallation(
                 .shared,
             );
             defer reader.close(io);
-            const local_status = try localInstallationStatus(io, check_arena.allocator(), root, kind, version);
+            const local_status = try localInstallationStatusFor(io, check_arena.allocator(), root, kind, version, build_target);
             if (local_status == .valid) return null;
             if (offline) {
                 return if (local_status == .invalid)
@@ -212,7 +247,7 @@ fn lockForInstallation(
         errdefer writer.close(io);
         // A peer may publish in the reader-to-writer gap. Check again before
         // downloading or replacing anything, now under the writer lock.
-        if (try localInstallationStatus(io, check_arena.allocator(), root, kind, version) == .valid) {
+        if (try localInstallationStatusFor(io, check_arena.allocator(), root, kind, version, build_target) == .valid) {
             writer.close(io);
             return null;
         }
@@ -226,6 +261,7 @@ fn resolveArtifactSelection(
     base_url: []const u8,
     version: []const u8,
     platform: []const u8,
+    build_target: Target,
 ) !ArtifactSelection {
     const url = try artifactIndexUrl(allocator, base_url, version);
     const downloaded = try fetchBoundedBytes(
@@ -234,12 +270,13 @@ fn resolveArtifactSelection(
         url,
         max_artifact_index_bytes,
     );
-    return parseArtifactIndex(
+    return parseArtifactIndexFor(
         allocator,
         downloaded,
         base_url,
         version,
         platform,
+        build_target,
     );
 }
 
@@ -249,6 +286,17 @@ fn parseArtifactIndex(
     base_url: []const u8,
     expected_version: []const u8,
     platform: []const u8,
+) !ArtifactSelection {
+    return parseArtifactIndexFor(allocator, bytes, base_url, expected_version, platform, .{});
+}
+
+fn parseArtifactIndexFor(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    base_url: []const u8,
+    expected_version: []const u8,
+    platform: []const u8,
+    build_target: Target,
 ) !ArtifactSelection {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{
         .duplicate_field_behavior = .@"error",
@@ -305,8 +353,8 @@ fn parseArtifactIndex(
     const target = try jsonObject(platform_value, "target");
     const target_os = try jsonString(target, "os");
     const target_arch = try jsonString(target, "arch");
-    if (!std.mem.eql(u8, target_os, targetOsName()) or
-        !std.mem.eql(u8, target_arch, releaseArchName()))
+    if (!std.mem.eql(u8, target_os, build_target.osName()) or
+        !std.mem.eql(u8, target_arch, build_target.archName()))
     {
         return error.ElectrobunArtifactTargetMismatch;
     }
@@ -318,13 +366,15 @@ fn parseArtifactIndex(
         base_url,
         version,
         .core,
+        build_target,
     );
     const cef = if (platform_value.object.get("cef") != null)
-        try parseArtifact(allocator, platform_value, "cef", base_url, version, .cef)
+        try parseArtifact(allocator, platform_value, "cef", base_url, version, .cef, build_target)
     else
         null;
 
     return .{
+        .target = build_target,
         .version = version,
         .target_os = target_os,
         .target_arch = target_arch,
@@ -343,10 +393,11 @@ fn parseArtifact(
     base_url: []const u8,
     version: []const u8,
     kind: Kind,
+    build_target: Target,
 ) !Artifact {
     const value = try jsonObject(platform_value, field_name);
     const url = try jsonString(value, "url");
-    const expected_url = try artifactUrl(allocator, base_url, version, kind);
+    const expected_url = try artifactUrlFor(allocator, base_url, version, kind, build_target);
     if (!std.mem.eql(u8, url, expected_url)) return error.UntrustedElectrobunArtifactUrl;
     const sha256 = try jsonString(value, "sha256");
     try validateSha256(sha256);
@@ -563,6 +614,17 @@ fn localInstallationStatus(
     kind: Kind,
     version: []const u8,
 ) !InstallationStatus {
+    return localInstallationStatusFor(io, allocator, root, kind, version, .{});
+}
+
+fn localInstallationStatusFor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    kind: Kind,
+    version: []const u8,
+    build_target: Target,
+) !InstallationStatus {
     const marker = try markerPath(allocator, root, kind);
     const value = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -577,7 +639,7 @@ fn localInstallationStatus(
     validateSha256(std.mem.trim(u8, value, " \t\r\n")) catch return .invalid;
 
     switch (kind) {
-        .core => validateLocalCoreInstallation(io, allocator, root, version) catch return .invalid,
+        .core => validateLocalCoreInstallationFor(io, allocator, root, version, build_target) catch return .invalid,
         .cef => {
             const cef = try std.fs.path.join(allocator, &.{ root, "cef" });
             validateCefPayload(io, allocator, cef) catch return .invalid;
@@ -610,6 +672,16 @@ fn validateLocalCoreInstallation(
     root: []const u8,
     version: []const u8,
 ) !void {
+    return validateLocalCoreInstallationFor(io, allocator, root, version, .{});
+}
+
+fn validateLocalCoreInstallationFor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    version: []const u8,
+    build_target: Target,
+) !void {
     const path = try std.fs.path.join(allocator, &.{ root, native_devkit_manifest_file_name });
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -630,8 +702,8 @@ fn validateLocalCoreInstallation(
         return error.ElectrobunDevkitIdentityMismatch;
     }
     const target = try jsonObject(manifest, "target");
-    if (!std.mem.eql(u8, try jsonString(target, "os"), targetOsName()) or
-        !std.mem.eql(u8, try jsonString(target, "arch"), releaseArchName()))
+    if (!std.mem.eql(u8, try jsonString(target, "os"), build_target.osName()) or
+        !std.mem.eql(u8, try jsonString(target, "arch"), build_target.archName()))
     {
         return error.ElectrobunDevkitIdentityMismatch;
     }
@@ -645,7 +717,7 @@ fn validateLocalCoreInstallation(
     {
         return error.ElectrobunDevkitIdentityMismatch;
     }
-    _ = try electrobun_devkit.load(io, allocator, root, version);
+    _ = try electrobun_devkit.loadFor(io, allocator, root, version, build_target);
 }
 
 fn validateCoreInstallation(
@@ -655,7 +727,7 @@ fn validateCoreInstallation(
     selection: ArtifactSelection,
 ) !void {
     try validateNativeDevkitIdentity(io, allocator, root, selection);
-    _ = try electrobun_devkit.load(io, allocator, root, selection.version);
+    _ = try electrobun_devkit.loadFor(io, allocator, root, selection.version, selection.target);
 }
 
 fn validateNativeDevkitIdentity(
@@ -796,10 +868,20 @@ fn artifactUrl(
     version: []const u8,
     kind: Kind,
 ) ![]const u8 {
+    return artifactUrlFor(allocator, base_url, version, kind, .{});
+}
+
+fn artifactUrlFor(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    version: []const u8,
+    kind: Kind,
+    build_target: Target,
+) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
         "{s}/v{s}/electrobun-{s}-{s}-{s}.tar.gz",
-        .{ base_url, version, kind.name(), releasePlatformName(), releaseArchName() },
+        .{ base_url, version, kind.name(), build_target.releasePlatformName(), build_target.archName() },
     );
 }
 
@@ -910,10 +992,19 @@ fn validIndexJson(
     base_url: []const u8,
     version: []const u8,
 ) ![]const u8 {
-    const platform = try platformKey();
-    const core_url = try artifactUrl(allocator, base_url, version, .core);
+    return validIndexJsonFor(allocator, base_url, version, .{});
+}
+
+fn validIndexJsonFor(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    version: []const u8,
+    build_target: Target,
+) ![]const u8 {
+    const platform = try build_target.platformKey();
+    const core_url = try artifactUrlFor(allocator, base_url, version, .core, build_target);
     defer allocator.free(core_url);
-    const cef_url = try artifactUrl(allocator, base_url, version, .cef);
+    const cef_url = try artifactUrlFor(allocator, base_url, version, .cef, build_target);
     defer allocator.free(cef_url);
     return std.fmt.allocPrint(allocator,
         \\{{
@@ -932,7 +1023,7 @@ fn validIndexJson(
         \\    }}
         \\  }}
         \\}}
-    , .{ version, platform, targetOsName(), releaseArchName(), core_url, cef_url });
+    , .{ version, platform, build_target.osName(), build_target.archName(), core_url, cef_url });
 }
 
 test "Electrobun artifact indexes select an exact verified platform asset" {
@@ -1199,9 +1290,13 @@ test "matching core markers do not hide incomplete manifest layouts" {
 }
 
 fn createTestCoreInstallation(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !void {
+    return createTestCoreInstallationFor(io, allocator, root, .{});
+}
+
+fn createTestCoreInstallationFor(io: std.Io, allocator: std.mem.Allocator, root: []const u8, build_target: Target) !void {
     try std.Io.Dir.cwd().createDirPath(io, root);
-    const with_os = try std.mem.replaceOwned(u8, allocator, test_core_manifest_template, "__OS__", targetOsName());
-    const manifest = try std.mem.replaceOwned(u8, allocator, with_os, "__ARCH__", releaseArchName());
+    const with_os = try std.mem.replaceOwned(u8, allocator, test_core_manifest_template, "__OS__", build_target.osName());
+    const manifest = try std.mem.replaceOwned(u8, allocator, with_os, "__ARCH__", build_target.archName());
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ root, native_devkit_manifest_file_name }),
         .data = manifest,
@@ -1339,4 +1434,32 @@ test "missing Electrobun core requires an exclusive installation lock" {
     defer writer.close(io);
     const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
     try std.testing.expectError(error.WouldBlock, file_locks.openNonblocking(io, std.Io.Dir.cwd(), lock_path, .read_write, .shared));
+}
+
+test "cross architecture Electrobun artifacts validate target URLs and cached manifests" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cross: Target = .{ .arch = if (builtin.cpu.arch == .aarch64) .x86_64 else .aarch64 };
+    const base_url = "https://releases.example.test";
+    const version = "2.0.0";
+    const index = try validIndexJsonFor(allocator, base_url, version, cross);
+    const platform = try cross.platformKey();
+    const selection = try parseArtifactIndexFor(allocator, index, base_url, version, platform, cross);
+    try std.testing.expectEqual(cross.arch, selection.target.arch);
+    try std.testing.expectEqualStrings(cross.archName(), selection.target_arch);
+    try std.testing.expectError(error.ElectrobunArtifactTargetMismatch, parseArtifactIndexFor(allocator, index, base_url, version, platform, .{}));
+    const wrong_url = try std.mem.replaceOwned(u8, allocator, index, try artifactUrlFor(allocator, base_url, version, .core, cross), try artifactUrl(allocator, base_url, version, .core));
+    try std.testing.expectError(error.UntrustedElectrobunArtifactUrl, parseArtifactIndexFor(allocator, wrong_url, base_url, version, platform, cross));
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    try createTestCoreInstallationFor(io, allocator, root, cross);
+    try std.testing.expectEqual(InstallationStatus.valid, try localInstallationStatusFor(io, allocator, root, .core, version, cross));
+    try std.testing.expectEqual(InstallationStatus.invalid, try localInstallationStatus(io, allocator, root, .core, version));
+    try validateCoreInstallation(io, allocator, root, selection);
+    try std.testing.expect((try lockForInstallationFor(io, allocator, root, .core, version, true, cross)) == null);
+    try std.testing.expectError(error.ElectrobunReleaseInvalid, lockForInstallation(io, allocator, root, .core, version, true));
 }

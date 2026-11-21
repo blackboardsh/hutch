@@ -2343,7 +2343,9 @@ fn loadElectrobunDevkitForPackageManager(
     allocator: std.mem.Allocator,
     electrobun_version: []const u8,
 ) !LeasedElectrobunDevkit {
-    if (init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| {
+    // Package installation executes Bun on the build host, independently of
+    // the application payload selected by electrobun --arch.
+    if (init.environ_map.get("HUTCH_ELECTROBUN_HOST_DEVKIT_ROOT") orelse init.environ_map.get("HUTCH_ELECTROBUN_DEVKIT_ROOT")) |configured| {
         if (configured.len == 0) return error.InvalidElectrobunDevkitRoot;
         const core_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, configured, allocator);
         return .{
@@ -2998,7 +3000,17 @@ pub fn main(init: std.process.Init) !void {
             error.UnsupportedMainProcess,
             error.LegacyBunVersionConfig,
             error.ElectrobunProductConfigMovedToHutch,
+            error.UnsupportedCrossArchitectureMainProcess,
+            error.UnsupportedCrossArchitectureFlatpak,
+            error.CrossArchitectureExecutionUnsupported,
             => 1,
+            error.InvalidElectrobunTargetArchitecture,
+            error.DuplicateElectrobunTargetArchitecture,
+            => blk: {
+                try stderr.writeAll("hutch electrobun: specify --arch=arm64 or --arch=x64 once\n");
+                try stderr.flush();
+                break :blk 1;
+            },
             error.InvalidBuildEnvironment => blk: {
                 try stderr.writeAll("hutch electrobun: --env must be dev, canary, or stable\n");
                 try stderr.flush();

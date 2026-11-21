@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Target = @import("electrobun_target.zig").Target;
 const release_store = @import("release_store.zig");
 
 const manifest_file_name = "native-devkit.json";
@@ -108,6 +109,7 @@ pub const SdkPaths = struct {
 };
 
 pub const Resolution = struct {
+    target: Target = .{},
     root: []const u8,
     version: []const u8,
     source_manifest_sha256: []const u8,
@@ -171,6 +173,16 @@ pub fn load(
     core_root: []const u8,
     requested_version: []const u8,
 ) !Resolution {
+    return loadFor(io, allocator, core_root, requested_version, .{});
+}
+
+pub fn loadFor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    core_root: []const u8,
+    requested_version: []const u8,
+    build_target: Target,
+) !Resolution {
     try validateExactVersion(requested_version);
     const manifest_path = try std.fs.path.join(allocator, &.{ core_root, manifest_file_name });
     const source = std.Io.Dir.cwd().readFileAlloc(
@@ -208,8 +220,8 @@ pub fn load(
     }
 
     const target = try requiredObjectField(root, "target");
-    if (!std.mem.eql(u8, try requiredString(target, "os"), targetOs()) or
-        !std.mem.eql(u8, try requiredString(target, "arch"), targetArch()))
+    if (!std.mem.eql(u8, try requiredString(target, "os"), build_target.osName()) or
+        !std.mem.eql(u8, try requiredString(target, "arch"), build_target.archName()))
     {
         return error.ElectrobunDevkitTargetMismatch;
     }
@@ -288,6 +300,7 @@ pub fn load(
 
     return .{
         .root = core_root,
+        .target = build_target,
         .version = manifest_version,
         .source_manifest_sha256 = try allocator.dupe(u8, &manifest_digest_hex),
         .toolchains = toolchain_versions,
@@ -399,7 +412,7 @@ fn projectionMarker(allocator: std.mem.Allocator, resolution: Resolution) ![]con
     return std.fmt.allocPrint(
         allocator,
         "schema=1\nelectrobun={s}\ntarget={s}-{s}\nsource-manifest-sha256={s}\n",
-        .{ resolution.version, targetOs(), targetArch(), resolution.source_manifest_sha256 },
+        .{ resolution.version, resolution.target.osName(), resolution.target.archName(), resolution.source_manifest_sha256 },
     );
 }
 
@@ -459,8 +472,8 @@ fn projectionIdentityMatches(
     if (!std.mem.eql(u8, requiredString(product, "version") catch return false, resolution.version)) return false;
 
     const target = requiredObjectField(metadata, "target") catch return false;
-    if (!std.mem.eql(u8, requiredString(target, "os") catch return false, targetOs())) return false;
-    if (!std.mem.eql(u8, requiredString(target, "arch") catch return false, targetArch())) return false;
+    if (!std.mem.eql(u8, requiredString(target, "os") catch return false, resolution.target.osName())) return false;
+    if (!std.mem.eql(u8, requiredString(target, "arch") catch return false, resolution.target.archName())) return false;
 
     const abi = requiredObjectField(metadata, "abi") catch return false;
     validateAbi(requiredObjectField(abi, "core") catch return false, "electrobun-core", supported_core_abi_version) catch return false;
@@ -573,8 +586,8 @@ fn writeProjectionMetadata(
     try product.put(allocator, "name", .{ .string = "electrobun" });
     try product.put(allocator, "version", .{ .string = resolution.version });
     var target: std.json.ObjectMap = .empty;
-    try target.put(allocator, "os", .{ .string = targetOs() });
-    try target.put(allocator, "arch", .{ .string = targetArch() });
+    try target.put(allocator, "os", .{ .string = resolution.target.osName() });
+    try target.put(allocator, "arch", .{ .string = resolution.target.archName() });
     var core_abi: std.json.ObjectMap = .empty;
     try core_abi.put(allocator, "name", .{ .string = "electrobun-core" });
     try core_abi.put(allocator, "version", .{ .integer = supported_core_abi_version });
@@ -1436,4 +1449,36 @@ test "v2 devkit paths cannot escape the cached core root" {
     try std.testing.expectError(error.InvalidElectrobunDevkitPath, validateRelativePosixPath("/absolute"));
     try std.testing.expectError(error.InvalidElectrobunDevkitPath, validateRelativePosixPath("C:/absolute"));
     try std.testing.expectError(error.InvalidElectrobunDevkitPath, validateRelativePosixPath("api\\sdk"));
+}
+
+test "cross architecture devkit loading and projection preserve the selected target" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const version = "2.0.0";
+    const cross: Target = .{ .arch = if (builtin.cpu.arch == .aarch64) .x86_64 else .aarch64 };
+    const root = try createTestDevkit(io, allocator, &tmp, version);
+    const native = try load(io, allocator, root, version);
+    const project_root = try std.fs.path.join(allocator, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(io, project_root);
+    const projection = try project(io, allocator, project_root, native, .{});
+    try std.testing.expect(try projectionIdentityMatches(io, allocator, projection.root, native));
+
+    const with_version = try std.mem.replaceOwned(u8, allocator, test_manifest_template, "__VERSION__", version);
+    const with_os = try std.mem.replaceOwned(u8, allocator, with_version, "__OS__", cross.osName());
+    const manifest = try std.mem.replaceOwned(u8, allocator, with_os, "__ARCH__", cross.archName());
+    try tmp.dir.writeFile(io, .{ .sub_path = manifest_file_name, .data = manifest });
+    try std.testing.expectError(error.ElectrobunDevkitTargetMismatch, load(io, allocator, root, version));
+    const resolution = try loadFor(io, allocator, root, version, cross);
+    try std.testing.expectEqual(cross.arch, resolution.target.arch);
+    try std.testing.expect(!try projectionIdentityMatches(io, allocator, projection.root, resolution));
+    _ = try project(io, allocator, project_root, resolution, .{});
+    try std.testing.expect(try projectionIdentityMatches(io, allocator, projection.root, resolution));
+    try std.testing.expect(!try projectionIdentityMatches(io, allocator, projection.root, native));
+    const metadata = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ projection.root, "projection.json" }), allocator, .limited(128 * 1024));
+    const parsed = try parseTestJson(allocator, metadata);
+    try std.testing.expectEqualStrings(cross.archName(), try requiredString(try requiredObjectField(try requiredObject(parsed, null), "target"), "arch"));
 }

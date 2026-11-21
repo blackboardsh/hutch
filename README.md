@@ -360,8 +360,27 @@ runtime components.
 
 For development against an unpublished local core, set
 `HUTCH_ELECTROBUN_DEVKIT_ROOT` to its absolute directory containing the exact
-version/host `native-devkit.json`. Local syncs always refresh the facade so SDK
+version/target `native-devkit.json`. Local syncs always refresh the facade so SDK
 edits are visible immediately.
+
+Zig applications can build for either architecture on the host operating system:
+
+```sh
+hutch electrobun sync --arch=x64
+hutch electrobun build --env=canary --arch=x64
+```
+
+`--arch=arm64` and `--arch=x64` are supported by `config`, `sync`, `prepare`,
+and `build`; omitting the flag selects the host architecture. Config and hooks
+receive the selected `ELECTROBUN_ARCH` and native `ELECTROBUN_HOST_ARCH`.
+Compiler caches, app output, devkit payloads, and release metadata follow the
+selected target. Hutch runs the native compiler and packaging tools while
+bundling target executables. For locally supplied cross-build devkits, use
+`HUTCH_ELECTROBUN_DEVKIT_ROOT` for the target and
+`HUTCH_ELECTROBUN_HOST_DEVKIT_ROOT` for native build tools from the same release.
+Without the latter override Hutch resolves the published native devkit.
+Cross-architecture `build` currently requires `build.mainProcess: "zig"` and
+does not support Flatpak packaging; `run` and `dev` require the native target.
 
 ## Electrobun Packaging
 

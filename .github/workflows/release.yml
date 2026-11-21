@@ -172,6 +172,7 @@ jobs:
           node --test --test-concurrency=1 \
             tests/electrobun/build-lifecycle-lock.test.js \
             tests/electrobun/native-zig-cache.test.js \
+            tests/electrobun/cross-architecture-build.test.js \
             tests/electrobun/decorator-bundle.test.js \
             tests/electrobun/init-scaffold.test.js \
             tests/electrobun/javascript-sdk-subpaths.test.js \
