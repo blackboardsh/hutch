@@ -1,0 +1,76 @@
+name: Temporary ARM cross-build proof for JavaScript apps
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/public-arm-js-cross-proof
+    paths:
+      - '.github/workflows/public-arm-js-cross-proof.yml'
+      - 'scripts/public-arm-js-cross-proof.mjs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-arm-js-cross-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cross-build:
+    name: ${{ matrix.platform }} ARM host to x64 app payloads
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04-arm
+          - platform: windows
+            runner: windows-11-arm
+    env:
+      HUTCH_HOME: ${{ runner.temp }}/public-arm-cross-store
+      HUTCH_ACTIVE_CHANNEL: canary
+      HUTCH_NO_UPDATE_CHECK: '1'
+      CROSS_PROOF_ROOT: ${{ runner.temp }}/public-arm-cross-apps
+      CROSS_PROOF_HUTCH_VERSION: 0.31.0-canary.2
+      CROSS_PROOF_ELECTROBUN_VERSION: 2.0.7-beta.24
+
+    steps:
+      - name: Check out proof scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up native ARM Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.22.1'
+          architecture: arm64
+          package-manager-cache: false
+
+      - name: Install exact published native Hutch on Linux
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          bash scripts/install.sh --version "$CROSS_PROOF_HUTCH_VERSION" --channel canary --hutch-home "$HUTCH_HOME" --no-modify-path
+          echo "HUTCH_BINARY=$HUTCH_HOME/bin/hutch-canary" >> "$GITHUB_ENV"
+
+      - name: Install exact published native Hutch on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          & ./scripts/install.ps1 -Version $env:CROSS_PROOF_HUTCH_VERSION -Channel canary -HutchHome $env:HUTCH_HOME -NoModifyPath
+          if ($LASTEXITCODE -ne 0) { throw 'Exact Hutch installation failed' }
+          Add-Content -Path $env:GITHUB_ENV -Value "HUTCH_BINARY=$env:HUTCH_HOME/bin/hutch-canary.exe" -Encoding utf8
+
+      - name: Build and inspect Bun and pinned Cottontail x64 canary apps
+        run: node scripts/public-arm-js-cross-proof.mjs
+
+      - name: Retain small architecture reports and build logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-js-cross-proof-${{ matrix.platform }}-arm64-to-x64
+          path: proof-reports/
+          if-no-files-found: warn
+          retention-days: 7
