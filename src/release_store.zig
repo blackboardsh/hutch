@@ -233,6 +233,44 @@ pub fn resolveLeased(
     selector: version_selector.Selector,
     options: Options,
 ) !LeasedResolution {
+    return resolveLeasedWithPlatform(init, allocator, product, selector, options, try platformKey(), true);
+}
+
+/// Resolves an exact app-runtime pin for either CPU on the host OS. This never
+/// consults or activates the native executable's channel selection and never
+/// executes the bundled runtime. Archive bytes and metadata are verified by
+/// the same install path used for native releases.
+pub fn resolveLeasedForPlatform(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: Product,
+    selector: version_selector.Selector,
+    options: Options,
+    platform: []const u8,
+) !LeasedResolution {
+    try validateBundledRuntimeTarget(product, selector, platform);
+    return resolveLeasedWithPlatform(init, allocator, product, selector, options, platform, false);
+}
+
+fn validateBundledRuntimeTarget(product: Product, selector: version_selector.Selector, platform: []const u8) !void {
+    if (product != .cottontail) return error.UnsupportedBundledReleaseProduct;
+    if (selector.kind != .version) return error.ExactBundledRuntimeVersionRequired;
+    if ((try version_selector.parse(selector.value)).kind != .version) return error.ExactBundledRuntimeVersionRequired;
+    try validatePlatformName(platform);
+    const native_platform = try platformKey();
+    const os_prefix_len = (std.mem.indexOfScalar(u8, native_platform, '-') orelse return error.UnsupportedReleasePlatform) + 1;
+    if (!std.mem.startsWith(u8, platform, native_platform[0..os_prefix_len])) return error.CrossOperatingSystemReleaseUnsupported;
+}
+
+fn resolveLeasedWithPlatform(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    product: Product,
+    selector: version_selector.Selector,
+    options: Options,
+    platform: []const u8,
+    native_selection: bool,
+) !LeasedResolution {
     const home = try hutchHome(init, allocator);
     const lifecycle = try store_locks.acquireGraph(init.io, allocator, home, .shared);
     defer lifecycle.close(init.io);
@@ -244,6 +282,8 @@ pub fn resolveLeased(
         product,
         selector,
         options,
+        platform,
+        native_selection,
     );
     return .{
         .resolution = resolution,
@@ -263,16 +303,21 @@ fn resolveUnderGraph(
     product: Product,
     selector: version_selector.Selector,
     options: Options,
+    platform: []const u8,
+    native_selection: bool,
 ) !Resolution {
+    const activation_channel = if (native_selection) selector.channel() else null;
     if (!options.refresh) {
-        if (try activeMatchingResolution(
-            init.io,
-            allocator,
-            home,
-            product,
-            selector,
-        )) |active| {
-            return active;
+        if (native_selection) {
+            if (try activeMatchingResolution(
+                init.io,
+                allocator,
+                home,
+                product,
+                selector,
+            )) |active| {
+                return active;
+            }
         }
         if (try installedMatchingResolution(
             init.io,
@@ -280,16 +325,16 @@ fn resolveUnderGraph(
             home,
             product,
             selector,
+            platform,
         )) |installed| {
-            if (selector.channel()) |channel| {
+            if (activation_channel) |channel| {
                 try activateChannel(init, allocator, product, channel, installed);
             }
             return installed;
         }
     }
     const base_url = try artifactsBaseUrl(init, allocator, product);
-    const artifact = try resolveArtifact(init, allocator, base_url, product, selector, options);
-    const platform = try platformKey();
+    const artifact = try resolveArtifact(init, allocator, base_url, product, selector, options, platform);
     const root = try std.fs.path.join(allocator, &.{
         home,
         releases_directory_name,
@@ -312,7 +357,7 @@ fn resolveUnderGraph(
         artifact,
         platform,
     )) |result| {
-        if (selector.channel()) |channel| {
+        if (activation_channel) |channel| {
             try activateChannel(init, allocator, product, channel, result);
         }
         return result;
@@ -327,7 +372,7 @@ fn resolveUnderGraph(
         .archive_sha256 = artifact.sha256,
         .installed = true,
     };
-    if (selector.channel()) |channel| {
+    if (activation_channel) |channel| {
         try activateChannel(init, allocator, product, channel, result);
     }
     return result;
@@ -1821,8 +1866,8 @@ fn installedMatchingResolution(
     home: []const u8,
     product: Product,
     selector: version_selector.Selector,
+    platform: []const u8,
 ) !?Resolution {
-    const platform = try platformKey();
     return switch (selector.kind) {
         .production, .canary => null,
         .version => try installedVersionResolution(
@@ -1944,6 +1989,7 @@ fn resolveArtifact(
     product: Product,
     selector: version_selector.Selector,
     options: Options,
+    platform: []const u8,
 ) !Artifact {
     const artifact_manifest_url = switch (selector.kind) {
         .production, .canary => blk: {
@@ -1991,7 +2037,7 @@ fn resolveArtifact(
         manifest_bytes,
         base_url,
         product,
-        try platformKey(),
+        platform,
     );
 
     switch (selector.kind) {
@@ -3383,4 +3429,93 @@ test "a validated installed Hutch engine holds its release object lease" {
         home,
         external,
     )) == null);
+}
+
+test "bundled runtime targets require exact Cottontail pins on the host OS" {
+    const native = try platformKey();
+    const exact = try version_selector.parse("1.2.3-canary.4");
+    try validateBundledRuntimeTarget(.cottontail, exact, native);
+    try std.testing.expectError(error.UnsupportedBundledReleaseProduct, validateBundledRuntimeTarget(.hutch, exact, native));
+    for ([_][]const u8{ "stable", "canary", "build:0123456789abcdef0123456789abcdef01234567" }) |value| {
+        try std.testing.expectError(error.ExactBundledRuntimeVersionRequired, validateBundledRuntimeTarget(.cottontail, try version_selector.parse(value), native));
+    }
+    try std.testing.expectError(error.ExactBundledRuntimeVersionRequired, validateBundledRuntimeTarget(.cottontail, .{ .kind = .version, .value = "canary" }, native));
+    try std.testing.expectError(error.UnsupportedReleasePlatform, validateBundledRuntimeTarget(.cottontail, exact, "../macos-x64"));
+    const other_os = if (builtin.os.tag == .linux) "macos-arm64" else "linux-arm64";
+    try std.testing.expectError(error.CrossOperatingSystemReleaseUnsupported, validateBundledRuntimeTarget(.cottontail, exact, other_os));
+}
+
+test "cross architecture runtime resolution selects its exact cached target without activation or execution" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const home = try std.fs.path.join(allocator, &.{ try testAbsoluteRoot(io, allocator, &tmp), "home" });
+    const native = try platformKey();
+    const os_prefix_len = (std.mem.indexOfScalar(u8, native, '-') orelse unreachable) + 1;
+    const target = try std.mem.concat(allocator, u8, &.{ native[0..os_prefix_len], if (builtin.cpu.arch == .aarch64) "x64" else "arm64" });
+    const version = "9.8.7-canary.4";
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const selector = try version_selector.parse(version);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HUTCH_HOME", home);
+    var init: std.process.Init = undefined;
+    init.io = io;
+    init.environ_map = &environment;
+
+    for ([_][]const u8{ native, target }) |platform| {
+        const release_root = try std.fs.path.join(allocator, &.{ home, releases_directory_name, "cottontail", version, revision, platform });
+        const bin = try std.fs.path.join(allocator, &.{ release_root, "bin" });
+        try std.Io.Dir.cwd().createDirPath(io, bin);
+        // Deliberately not executable: resolving a runtime for packaging must
+        // never run it, even when it selects a foreign CPU architecture.
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ bin, Product.cottontail.executableFileName() }),
+            .data = "target runtime must not execute",
+        });
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ release_root, Product.cottontail.metadataFileName() }),
+            .data = try std.fmt.allocPrint(allocator, "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"cottontail\",\"version\":\"{s}\",\"revision\":\"{s}\",\"platform\":\"{s}\"}}", .{ version, revision, platform }),
+        });
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ release_root, ".dash-installed" }),
+            .data = checksum,
+        });
+    }
+    try writeSelection(io, allocator, home, .cottontail, "canary", .{
+        .version = version,
+        .revision = revision,
+        .platform = native,
+    });
+    const selections_path = try selectionsPath(allocator, home);
+    const selections_before = try std.Io.Dir.cwd().readFileAlloc(io, selections_path, allocator, .limited(max_selections_bytes));
+    const target_root = try std.fs.path.join(allocator, &.{ home, releases_directory_name, "cottontail", version, revision, target });
+    const leased = try resolveLeasedForPlatform(init, allocator, .cottontail, selector, .{ .offline = true }, target);
+    try std.testing.expectEqualStrings(target_root, leased.resolution.root);
+    try std.testing.expectEqualStrings(checksum, leased.resolution.archive_sha256);
+    leased.close(io);
+    const mismatched_checksum: Artifact = .{
+        .version = version,
+        .revision = revision,
+        .archive_url = "https://artifacts.test/unused.tar.gz",
+        .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .size = 1,
+    };
+    try std.testing.expect((try installedArtifactResolution(io, allocator, target_root, .cottontail, mismatched_checksum, target)) == null);
+    try std.testing.expectEqualStrings(selections_before, try std.Io.Dir.cwd().readFileAlloc(io, selections_path, allocator, .limited(max_selections_bytes)));
+    const selected = (try activeResolution(io, allocator, home, .cottontail, "canary")).?;
+    try std.testing.expect(!std.mem.eql(u8, selected.root, target_root));
+
+    // Metadata for the native CPU cannot pass as the cached cross target.
+    const target_metadata = try std.fs.path.join(allocator, &.{ target_root, Product.cottontail.metadataFileName() });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = target_metadata,
+        .data = try std.fmt.allocPrint(allocator, "{{\"schema\":1,\"kind\":\"archive\",\"product\":\"cottontail\",\"version\":\"{s}\",\"revision\":\"{s}\",\"platform\":\"{s}\"}}", .{ version, revision, native }),
+    });
+    try std.testing.expectError(error.ReleaseMetadataUnavailableOffline, resolveLeasedForPlatform(init, allocator, .cottontail, selector, .{ .offline = true }, target));
+    try std.testing.expectEqualStrings(selections_before, try std.Io.Dir.cwd().readFileAlloc(io, selections_path, allocator, .limited(max_selections_bytes)));
 }

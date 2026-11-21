@@ -381,7 +381,7 @@ fn printHelp(writer: anytype) !void {
         \\  hutch electrobun dev [--env=dev|canary|stable] [--watch] [--inspect[=address]|--inspect-wait[=address]|--inspect-brk[=address]]
         \\
         \\Notes:
-        \\  - --arch selects a same-OS target; cross-architecture app builds currently support Zig main processes.
+        \\  - --arch selects a same-OS target; cross-architecture app builds support Zig, Bun, and pinned Cottontail main processes.
         \\  - Build tools always run on the host; config and hooks receive ELECTROBUN_ARCH and ELECTROBUN_HOST_ARCH.
         \\  - update rewrites the nearest parent hutch.config.ts to the latest stable exact version, then runs sync.
         \\  - upload discovers release artifacts and stages them in Electrobun Managed Deploys; deploy is an alias.
@@ -438,8 +438,9 @@ fn parseBuildTarget(args: []const [:0]const u8) !ElectrobunTarget {
 
 fn validateBuildTarget(ctx: *const Context, root: std.json.Value) !void {
     if (ctx.target.isNative()) return;
-    if (try getMainProcess(root) != .zig) {
-        ctx.writeStderr("hutch electrobun: cross-architecture builds currently require build.mainProcess=zig; other main processes need target runtime/toolchain support\n", .{});
+    const main_process = try getMainProcess(root);
+    if (main_process != .zig and main_process != .bun and main_process != .cottontail) {
+        ctx.writeStderr("hutch electrobun: cross-architecture builds currently support Zig, Bun, and pinned Cottontail main processes; other main processes need target toolchain support\n", .{});
         return error.UnsupportedCrossArchitectureMainProcess;
     }
     if (flatpakEnabled(root)) {
@@ -861,6 +862,7 @@ fn prepareProject(ctx: *const Context, config: CommandContext) !void {
             bundled_cottontail = try resolvePinnedBundledCottontailBinary(ctx, pinned);
             pinned_cottontail = true;
         } else {
+            try requireNativeCottontailFallback(ctx);
             const runtime = try resolveCottontailRuntime(ctx);
             bundled_cottontail = .{ .executable = runtime.executable, .lease = runtime.lease };
         }
@@ -4447,7 +4449,12 @@ fn resolveBuildToolchainWithMode(
     };
     const version = try configuredToolchainVersion(config_root, kind, default_version);
     return (if (managed_only)
-        (if (graph_held)
+        (if (kind == .bun)
+            (if (graph_held)
+                toolchain_store.resolveManagedBunForTargetUnderGraph(ctx.init, ctx.allocator, version, ctx.target)
+            else
+                toolchain_store.resolveManagedBunForTarget(ctx.init, ctx.allocator, version, ctx.target))
+        else if (graph_held)
             toolchain_store.resolveManagedOnlyVersionUnderGraph(ctx.init, ctx.allocator, kind, version)
         else
             toolchain_store.resolveManagedOnlyVersion(ctx.init, ctx.allocator, kind, version))
@@ -7955,10 +7962,17 @@ fn resolveBundledCottontailBinary(
     }
     const devkit = platform_paths.devkit orelse return error.ElectrobunDevkitNotResolved;
     const pinned = devkit.toolchains.cottontail orelse {
+        try requireNativeCottontailFallback(ctx);
         const runtime = try resolveCottontailRuntime(ctx);
         return .{ .executable = runtime.executable, .lease = runtime.lease };
     };
     return resolvePinnedBundledCottontailBinary(ctx, pinned);
+}
+
+fn requireNativeCottontailFallback(ctx: *const Context) !void {
+    if (ctx.target.isNative()) return;
+    ctx.writeStderr("hutch electrobun: cross-architecture Cottontail builds require an exact runtime pin in the devkit; local runtime overrides and legacy host fallbacks are not supported\n", .{});
+    return error.CrossArchitectureCottontailRequiresPin;
 }
 
 const bundled_cottontail_override_variable = "HUTCH_ELECTROBUN_COTTONTAIL_BINARY";
@@ -7973,6 +7987,7 @@ fn configuredBundledCottontailOverride(ctx: *const Context, build_env: BuildEnvi
     const explicit_binary = ctx.environ_map.get(bundled_cottontail_override_variable);
     const legacy_local_mode = environmentFlagEnabled(ctx.environ_map, "DASH_USE_LOCAL_COTTONTAIL");
     if (explicit_binary == null and !legacy_local_mode) return null;
+    try requireNativeCottontailFallback(ctx);
     // A deliberately named app-runtime override is distinct from build-time
     // COTTONTAIL_BINARY. Never let an inherited development setting alter a
     // canary/stable release, and never mutate or masquerade as a managed pin.
@@ -8105,13 +8120,13 @@ fn resolvePinnedBundledCottontailBinary(
 ) !BundledCottontail {
     const selector = version_selector.parse(pinned) catch
         return error.InvalidElectrobunToolchainVersion;
-    const release = release_store.resolveLeased(
-        ctx.init,
-        ctx.allocator,
-        .cottontail,
-        selector,
-        .{ .offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE") },
-    ) catch |err| {
+    const options = release_store.Options{
+        .offline = environmentFlagEnabled(ctx.environ_map, "DASH_RELEASE_OFFLINE"),
+    };
+    const release = (if (ctx.target.isNative())
+        release_store.resolveLeased(ctx.init, ctx.allocator, .cottontail, selector, options)
+    else
+        release_store.resolveLeasedForPlatform(ctx.init, ctx.allocator, .cottontail, selector, options, try ctx.target.platformKey())) catch |err| {
         ctx.writeStderr(
             "hutch electrobun: could not resolve the bundled Cottontail {s}: {s}\n",
             .{ pinned, @errorName(err) },

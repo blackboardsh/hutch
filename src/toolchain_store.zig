@@ -4,6 +4,7 @@ const file_locks = @import("file_locks.zig");
 const store_locks = @import("store_locks.zig");
 const release_store = @import("release_store.zig");
 const zig_tls_patch = @import("zig_tls_patch.zig");
+const ElectrobunTarget = @import("electrobun_target.zig").Target;
 
 const max_archive_bytes = 1536 * 1024 * 1024;
 
@@ -144,6 +145,190 @@ pub fn resolveManagedOnlyVersionUnderGraph(
     try validateVersion(kind, version);
     const home = try release_store.hutchHome(init, allocator);
     return resolveManagedVersionUnderGraph(init, allocator, home, kind, version);
+}
+
+/// A bundled Bun is an artifact for the selected target, not a build tool.
+/// Cross targets are authenticated from the exact upstream release checksum
+/// manifest and inspected as data. Never execute their binary on the host.
+pub fn resolveManagedBunForTarget(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    target: ElectrobunTarget,
+) !LeasedResolution {
+    if (target.isNative()) return resolveManagedOnlyVersion(init, allocator, .bun, version);
+    try validateVersion(.bun, version);
+    const home = try release_store.hutchHome(init, allocator);
+    const graph = try store_locks.acquireGraph(init.io, allocator, home, .shared);
+    defer graph.close(init.io);
+    return resolveManagedBunForTargetUnderGraph(init, allocator, version, target);
+}
+
+pub fn resolveManagedBunForTargetUnderGraph(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    target: ElectrobunTarget,
+) !LeasedResolution {
+    if (target.isNative()) return resolveManagedOnlyVersionUnderGraph(init, allocator, .bun, version);
+    try validateVersion(.bun, version);
+    const home = try release_store.hutchHome(init, allocator);
+    const platform = try target.platformKey();
+    const root = try std.fs.path.join(allocator, &.{ home, "toolchains", "bun", version, platform });
+    const binary = try installedBinaryPath(allocator, root, .bun);
+    if (try installedTargetBunState(init.io, allocator, root, version, target) == .valid) {
+        return leaseManagedResolutionUnderGraph(init.io, allocator, home, .{
+            .binary = binary,
+            .root = root,
+            .version = version,
+            .system = false,
+        });
+    }
+    const parent = std.fs.path.dirname(root) orelse return error.InvalidToolchainInstallPath;
+    try std.Io.Dir.cwd().createDirPath(init.io, parent);
+    const lock_path = try std.mem.concat(allocator, u8, &.{ root, ".lock" });
+    const lock = try release_store.acquirePersistentFileLock(init.io, lock_path);
+    var lock_open = true;
+    defer if (lock_open) lock.close(init.io);
+
+    const state = try installedTargetBunState(init.io, allocator, root, version, target);
+    if (state != .valid) {
+        if (environmentFlagEnabled(init.environ_map, "DASH_RELEASE_OFFLINE")) return offlineError(state);
+        const filename = try bunArchiveNameFor(allocator, target.arch);
+        const base = try std.fmt.allocPrint(allocator, "https://github.com/oven-sh/bun/releases/download/bun-v{s}", .{version});
+        const checksums = try release_store.fetchBytes(init, allocator, try std.mem.concat(allocator, u8, &.{ base, "/SHASUMS256.txt" }), 1024 * 1024);
+        defer allocator.free(checksums);
+        const digest = try bunArchiveChecksum(checksums, filename);
+        std.debug.print("hutch: downloading bundled Bun {s} for {s}\n", .{ version, platform });
+        const archive = try release_store.fetchBytes(init, allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, filename }), max_archive_bytes);
+        defer allocator.free(archive);
+        if (!release_store.sha256Matches(archive, digest)) return error.ToolchainArchiveChecksumMismatch;
+        try installTargetBun(init, allocator, home, root, version, target, filename, archive, digest);
+    }
+    lock.close(init.io);
+    lock_open = false;
+    return leaseManagedResolutionUnderGraph(init.io, allocator, home, .{
+        .binary = binary,
+        .root = root,
+        .version = version,
+        .system = false,
+    });
+}
+
+const target_bun_marker = ".hutch-bun-target.json";
+const TargetBunMetadata = struct {
+    schemaVersion: u8 = 1,
+    version: []const u8,
+    platform: []const u8,
+    archiveSha256: []const u8,
+    binarySha256: []const u8,
+};
+
+fn bunArchiveChecksum(checksums: []const u8, filename: []const u8) ![]const u8 {
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, checksums, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const digest = fields.next() orelse continue;
+        const name = fields.next() orelse continue;
+        const actual_name = if (std.mem.startsWith(u8, name, "*")) name[1..] else name;
+        if (!std.mem.eql(u8, actual_name, filename)) continue;
+        if (fields.next() != null or found != null or !validSha256(digest)) return error.InvalidBunChecksumManifest;
+        found = digest;
+    }
+    return found orelse error.BunArchiveChecksumMissing;
+}
+
+fn validSha256(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
+fn installedTargetBunState(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    version: []const u8,
+    target: ElectrobunTarget,
+) !InstalledState {
+    if (!pathExists(io, root)) return .missing;
+    const marker_path = try std.fs.path.join(allocator, &.{ root, target_bun_marker });
+    const metadata_bytes = std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(4096)) catch return .damaged;
+    defer allocator.free(metadata_bytes);
+    const parsed = std.json.parseFromSlice(TargetBunMetadata, allocator, metadata_bytes, .{ .duplicate_field_behavior = .@"error" }) catch return .damaged;
+    defer parsed.deinit();
+    const metadata = parsed.value;
+    if (metadata.schemaVersion != 1 or !std.mem.eql(u8, metadata.version, version) or
+        !std.mem.eql(u8, metadata.platform, try target.platformKey()) or
+        !validSha256(metadata.archiveSha256) or !validSha256(metadata.binarySha256)) return .damaged;
+    const version_path = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" });
+    const installed_version = std.Io.Dir.cwd().readFileAlloc(io, version_path, allocator, .limited(256)) catch return .damaged;
+    defer allocator.free(installed_version);
+    if (!std.mem.eql(u8, std.mem.trim(u8, installed_version, " \t\r\n"), version)) return .damaged;
+    const binary = try installedBinaryPath(allocator, root, .bun);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, binary, allocator, .limited(max_archive_bytes)) catch return .damaged;
+    defer allocator.free(bytes);
+    if (!binaryMatchesTarget(bytes, builtin.os.tag, target.arch) or
+        !release_store.sha256Matches(bytes, metadata.binarySha256)) return .damaged;
+    return .valid;
+}
+
+fn installTargetBun(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    root: []const u8,
+    version: []const u8,
+    target: ElectrobunTarget,
+    filename: []const u8,
+    archive: []const u8,
+    archive_sha256: []const u8,
+) !void {
+    const extraction = try std.mem.concat(allocator, u8, &.{ root, ".extract-tmp" });
+    const archive_path = try temporaryArchivePath(init.io, allocator, home, filename);
+    std.Io.Dir.cwd().deleteTree(init.io, extraction) catch {};
+    defer std.Io.Dir.cwd().deleteTree(init.io, extraction) catch {};
+    defer std.Io.Dir.cwd().deleteFile(init.io, archive_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(init.io, extraction);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = archive_path, .data = archive });
+    try extractArchive(init, allocator, archive_path, extraction);
+    const extracted_root = try extractedRoot(init.io, allocator, extraction);
+    const binary = try installedBinaryPath(allocator, extracted_root, .bun);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, binary, allocator, .limited(max_archive_bytes));
+    defer allocator.free(bytes);
+    if (!binaryMatchesTarget(bytes, builtin.os.tag, target.arch)) return error.BunTargetArchitectureMismatch;
+    if (builtin.os.tag != .windows) try makeExecutable(init.io, binary);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const binary_sha256 = std.fmt.bytesToHex(digest, .lower);
+    const metadata = try std.json.Stringify.valueAlloc(allocator, TargetBunMetadata{
+        .version = version,
+        .platform = try target.platformKey(),
+        .archiveSha256 = archive_sha256,
+        .binarySha256 = &binary_sha256,
+    }, .{});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ extracted_root, target_bun_marker }), .data = metadata });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = try std.fs.path.join(allocator, &.{ extracted_root, ".hutch-toolchain" }), .data = version });
+    std.Io.Dir.cwd().deleteTree(init.io, root) catch {};
+    try renameWithWindowsRetries(init.io, std.Io.Dir.cwd(), extracted_root, std.Io.Dir.cwd(), root);
+}
+
+fn binaryMatchesTarget(bytes: []const u8, os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) bool {
+    if (arch != .aarch64 and arch != .x86_64) return false;
+    return switch (os) {
+        .macos => bytes.len >= 32 and std.mem.eql(u8, bytes[0..4], &.{ 0xcf, 0xfa, 0xed, 0xfe }) and
+            std.mem.readInt(u32, bytes[4..8], .little) == @as(u32, if (arch == .aarch64) 0x0100000c else 0x01000007),
+        .linux => bytes.len >= 64 and std.mem.eql(u8, bytes[0..4], "\x7fELF") and bytes[4] == 2 and bytes[5] == 1 and
+            std.mem.readInt(u16, bytes[18..20], .little) == @as(u16, if (arch == .aarch64) 183 else 62),
+        .windows => blk: {
+            if (bytes.len < 64 or !std.mem.eql(u8, bytes[0..2], "MZ")) break :blk false;
+            const offset: usize = std.mem.readInt(u32, bytes[60..64], .little);
+            if (offset > bytes.len - 6 or !std.mem.eql(u8, bytes[offset..][0..4], "PE\x00\x00")) break :blk false;
+            break :blk std.mem.readInt(u16, bytes[offset + 4 ..][0..2], .little) == @as(u16, if (arch == .aarch64) 0xaa64 else 0x8664);
+        },
+        else => false,
+    };
 }
 
 fn systemResolution(
@@ -537,17 +722,21 @@ fn archiveFor(allocator: std.mem.Allocator, kind: Kind, version: []const u8) !Ar
 }
 
 fn bunArchiveName(allocator: std.mem.Allocator) ![]const u8 {
+    return bunArchiveNameFor(allocator, builtin.cpu.arch);
+}
+
+fn bunArchiveNameFor(allocator: std.mem.Allocator, target_arch: std.Target.Cpu.Arch) ![]const u8 {
     // Windows uses the baseline build: the binary ships inside end-user app
     // bundles, and the non-baseline build requires AVX2.
     if (builtin.os.tag == .windows) {
-        return allocator.dupe(u8, if (builtin.cpu.arch == .aarch64) "bun-windows-aarch64.zip" else "bun-windows-x64-baseline.zip");
+        return allocator.dupe(u8, if (target_arch == .aarch64) "bun-windows-aarch64.zip" else "bun-windows-x64-baseline.zip");
     }
     const os = switch (builtin.os.tag) {
         .macos => "darwin",
         .linux => "linux",
         else => return error.UnsupportedToolchainPlatform,
     };
-    const arch = if (builtin.cpu.arch == .aarch64) "aarch64" else "x64";
+    const arch = if (target_arch == .aarch64) "aarch64" else "x64";
     return std.fmt.allocPrint(allocator, "bun-{s}-{s}.zip", .{ os, arch });
 }
 
@@ -1495,4 +1684,95 @@ test "toolchain versions reject unsafe path components" {
     for ([_][]const u8{ "", ".", "..", "0.16.0/../../escape", "0.16.0\\escape" }) |version| {
         try std.testing.expectError(error.InvalidToolchainVersion, validateVersion(.zig, version));
     }
+}
+
+test "bundled Bun target checksum selection is exact and rejects ambiguity" {
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try std.testing.expectEqualStrings(digest, try bunArchiveChecksum(digest ++ "  bun-fixture.zip\n", "bun-fixture.zip"));
+    try std.testing.expectEqualStrings(digest, try bunArchiveChecksum(digest ++ " *bun-fixture.zip\r\n", "bun-fixture.zip"));
+    try std.testing.expectError(error.BunArchiveChecksumMissing, bunArchiveChecksum(digest ++ "  bun-other.zip\n", "bun-fixture.zip"));
+    try std.testing.expectError(error.InvalidBunChecksumManifest, bunArchiveChecksum("short  bun-fixture.zip\n", "bun-fixture.zip"));
+    try std.testing.expectError(error.InvalidBunChecksumManifest, bunArchiveChecksum(digest ++ "  bun-fixture.zip\n" ++ digest ++ "  bun-fixture.zip\n", "bun-fixture.zip"));
+}
+
+fn targetBunTestHeader(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) [128]u8 {
+    var bytes: [128]u8 = @splat(0);
+    switch (os) {
+        .macos => {
+            @memcpy(bytes[0..4], &[_]u8{ 0xcf, 0xfa, 0xed, 0xfe });
+            std.mem.writeInt(u32, bytes[4..8], if (arch == .aarch64) 0x0100000c else 0x01000007, .little);
+        },
+        .linux => {
+            @memcpy(bytes[0..4], "\x7fELF");
+            bytes[4] = 2;
+            bytes[5] = 1;
+            std.mem.writeInt(u16, bytes[18..20], if (arch == .aarch64) 183 else 62, .little);
+        },
+        .windows => {
+            @memcpy(bytes[0..2], "MZ");
+            std.mem.writeInt(u32, bytes[60..64], 64, .little);
+            @memcpy(bytes[64..68], "PE\x00\x00");
+            std.mem.writeInt(u16, bytes[68..70], if (arch == .aarch64) 0xaa64 else 0x8664, .little);
+        },
+        else => {},
+    }
+    return bytes;
+}
+
+test "bundled Bun target headers validate both architectures without execution" {
+    for ([_]std.Target.Os.Tag{ .macos, .linux, .windows }) |os| {
+        for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {
+            const bytes = targetBunTestHeader(os, arch);
+            try std.testing.expect(binaryMatchesTarget(&bytes, os, arch));
+            try std.testing.expect(!binaryMatchesTarget(&bytes, os, if (arch == .aarch64) .x86_64 else .aarch64));
+            try std.testing.expect(!binaryMatchesTarget(bytes[0..16], os, arch));
+        }
+    }
+    var invalid = targetBunTestHeader(.windows, .x86_64);
+    std.mem.writeInt(u32, invalid[60..64], 0xffffffff, .little);
+    try std.testing.expect(!binaryMatchesTarget(&invalid, .windows, .x86_64));
+    try std.testing.expect(!binaryMatchesTarget("#!/bin/sh\nexit 0\n", builtin.os.tag, builtin.cpu.arch));
+}
+
+test "bundled Bun target cache works offline without a runnable binary and detects corruption" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    try environment.put("HUTCH_HOME", home);
+    try environment.put("DASH_RELEASE_OFFLINE", "1");
+    const target = ElectrobunTarget{ .arch = if (builtin.cpu.arch == .aarch64) .x86_64 else .aarch64 };
+    const version = "1.4.4";
+    const root = try std.fs.path.join(allocator, &.{ home, "toolchains", "bun", version, try target.platformKey() });
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    const binary = try installedBinaryPath(allocator, root, .bun);
+    var bytes = targetBunTestHeader(builtin.os.tag, target.arch);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = binary, .data = &bytes });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const binary_sha256 = std.fmt.bytesToHex(digest, .lower);
+    const metadata = try std.json.Stringify.valueAlloc(allocator, TargetBunMetadata{
+        .version = version,
+        .platform = try target.platformKey(),
+        .archiveSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .binarySha256 = &binary_sha256,
+    }, .{});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, target_bun_marker }), .data = metadata });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, ".hutch-toolchain" }), .data = version });
+    const init = testProcessInit(&arena, &environment);
+    const resolution = try resolveManagedBunForTarget(init, allocator, version, target);
+    try std.testing.expectEqualStrings(binary, resolution.resolution.binary);
+    // A second resolution while the first lease is alive must reuse the cache,
+    // without blocking on an exclusive install lock or running the target.
+    const second = try resolveManagedBunForTarget(init, allocator, version, target);
+    second.close(io);
+    resolution.close(io);
+    bytes[127] = 1;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = binary, .data = &bytes });
+    try std.testing.expectError(error.ToolchainDamagedOffline, resolveManagedBunForTarget(init, allocator, version, target));
 }

@@ -363,7 +363,8 @@ For development against an unpublished local core, set
 version/target `native-devkit.json`. Local syncs always refresh the facade so SDK
 edits are visible immediately.
 
-Zig applications can build for either architecture on the host operating system:
+Zig, Bun, and pinned Cottontail applications can build for either architecture
+on the host operating system:
 
 ```sh
 hutch electrobun sync --arch=x64
@@ -379,8 +380,14 @@ bundling target executables. For locally supplied cross-build devkits, use
 `HUTCH_ELECTROBUN_DEVKIT_ROOT` for the target and
 `HUTCH_ELECTROBUN_HOST_DEVKIT_ROOT` for native build tools from the same release.
 Without the latter override Hutch resolves the published native devkit.
-Cross-architecture `build` currently requires `build.mainProcess: "zig"` and
-does not support Flatpak packaging; `run` and `dev` require the native target.
+Cross-architecture `build` supports Zig, Bun, and Cottontail main processes.
+Bun and Cottontail builds run the selected native JavaScript helper and ship
+the target runtime; they never execute the target runtime during packaging.
+Cottontail requires an exact runtime pin in the Electrobun devkit; legacy host
+fallbacks and local runtime overrides are supported only for native builds.
+Rust, Go, Odin, and Flatpak cross builds are not yet supported. `run` and `dev`
+require the native target. Projects that copy native dependencies must provide
+those dependencies for the selected architecture in their build hooks.
 
 ## Electrobun Packaging
 

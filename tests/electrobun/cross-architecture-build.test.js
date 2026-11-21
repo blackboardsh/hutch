@@ -26,7 +26,7 @@ function resolveCottontail(hutch, engine) {
 // these assertions do not claim to validate actual compiler or zstd output.
 // These POSIX fixtures require native Windows launchers before they can run
 // on Windows; they do not establish Windows cross-build correctness.
-test("cross architecture Zig builds package target payloads using host tools", {
+test("cross architecture Zig and JavaScript builds package target payloads using host tools", {
   timeout: 120_000,
   skip: process.platform === "win32",
 }, () => {
@@ -134,6 +134,8 @@ copyFileSync(args[args.indexOf("-i") + 1], args[args.indexOf("-o") + 1]);\n`);
     };
     delete env.COTTONTAIL_ELECTROBUN_PACKAGE;
     delete env.HUTCH_ELECTROBUN_BUILD_LOCK;
+    delete env.HUTCH_ELECTROBUN_COTTONTAIL_BINARY;
+    delete env.DASH_USE_LOCAL_COTTONTAIL;
 
     function run(args, expectedStatus = 0) {
       const result = spawnSync(hutch, ["electrobun", ...args], {
@@ -197,14 +199,135 @@ copyFileSync(args[args.indexOf("-i") + 1], args[args.indexOf("-o") + 1]);\n`);
       assert.match(unsupported.stderr, /CrossArchitectureExecutionUnsupported|run\/dev\/init require the native architecture/);
     }
     const configPath = join(project, "electrobun.config.ts");
-    writeFixtureFile(configPath, readFileSync(configPath, "utf8").replace('mainProcess: "zig"', 'mainProcess: "bun"'));
+    const zigConfig = readFileSync(configPath, "utf8");
+    writeFixtureFile(configPath, zigConfig.replace('mainProcess: "zig"', 'mainProcess: "rust"'));
     const unsupportedMain = spawnSync(hutch, ["electrobun", "build", `--arch=${arch}`], {
       cwd: project, encoding: "utf8", env, timeout: 10_000,
     });
     assert.notEqual(unsupportedMain.status, 0);
-    assert.match(unsupportedMain.stderr, /UnsupportedCrossArchitectureMainProcess|cross-architecture builds currently require build\.mainProcess=zig/);
+    assert.match(unsupportedMain.stderr, /UnsupportedCrossArchitectureMainProcess|other main processes need target toolchain support/);
     assert.equal(readFileSync(capture, "utf8").trim().split("\n").length, 2,
       "unsupported execution or runtime selection must not invoke the compiler");
+
+    // A legacy devkit's embedded Bun is a target payload. It must never be
+    // invoked to load configuration, execute hooks, or bundle JavaScript.
+    const targetBun = "#!/bin/sh\necho 'target Bun executed on build host' >&2\nexit 92\n";
+    const manifestPath = join(targetCore, "native-devkit.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    delete manifest.toolchains.bun;
+    manifest.runtimes = { bun: { version: "1.3.13" } };
+    manifest.layout.runtime.bun = "bun";
+    writeFixtureFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    writeFixtureFile(join(targetCore, "bun"), targetBun);
+    chmodSync(join(targetCore, "bun"), 0o755);
+    writeFixtureFile(join(project, "src", "bun", "index.ts"),
+      "import { devkitMarker } from 'electrobun/main';\nconsole.log('CROSS_JAVASCRIPT_MAIN', devkitMarker);\n");
+    writeFixtureFile(configPath, zigConfig.replace('mainProcess: "zig"', 'mainProcess: "bun"'));
+
+    const helperCapture = join(fixture, "host-helper.jsonl");
+    const helper = join(fixture, "helper.cjs");
+    writeFixtureFile(helper, `const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+appendFileSync(process.env.HUTCH_CROSS_HELPER_CAPTURE, JSON.stringify(args) + "\\n");
+const result = spawnSync(process.env.HUTCH_CROSS_HOST_COTTONTAIL, args, { stdio: "inherit" });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);\n`);
+    const hostHelper = join(bin, "cottontail");
+    writeFixtureFile(hostHelper, '#!/bin/sh\nexec "$HUTCH_CROSS_NODE" "$HUTCH_CROSS_HELPER" "$@"\n');
+    chmodSync(hostHelper, 0o755);
+    env.COTTONTAIL_BINARY = hostHelper;
+    env.DASH_COTTONTAIL = hostHelper;
+    env.HUTCH_CROSS_HELPER = helper;
+    env.HUTCH_CROSS_HELPER_CAPTURE = helperCapture;
+    env.HUTCH_CROSS_HOST_COTTONTAIL = cottontail;
+
+    run(["build", "--env=canary", `--arch=${arch}`]);
+    function extractRelease() {
+      rmSync(unpacked, { recursive: true, force: true });
+      writeFixtureFile(join(unpacked, "placeholder"));
+      const result = spawnSync("tar", ["-xf", archive, "-C", unpacked], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+    }
+    extractRelease();
+    const canaryBundle = join(unpacked,
+      `CrossFixture-canary${process.platform === "darwin" ? ".app" : ""}`);
+    const canaryExec = process.platform === "darwin"
+      ? join(canaryBundle, "Contents", "MacOS") : join(canaryBundle, "bin");
+    const canaryResources = process.platform === "darwin"
+      ? join(canaryBundle, "Contents", "Resources") : join(canaryBundle, "Resources");
+    assert.equal(readFileSync(join(canaryExec, "bun"), "utf8"), targetBun,
+      "the release archive must ship the embedded target Bun unchanged");
+    assert.equal(readFileSync(join(canaryExec, host.core), "utf8"), `target-core-${arch}`);
+    const bundledMain = join(canaryResources, "app", "bun", "index.js");
+    assert.match(readFileSync(bundledMain, "utf8"), /CROSS_JAVASCRIPT_MAIN/);
+    assert.match(readFileSync(bundledMain, "utf8"), /V2_DEVKIT_ALIAS/);
+    const helperCalls = readFileSync(helperCapture, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(helperCalls.filter(args => args.some(arg => arg.endsWith("javascript-build-helper.mjs"))).length, 1,
+      "JavaScript bundling must execute the native helper runtime");
+    assert.equal(readFileSync(toolCapture, "utf8").trim().split("\n").length, 2);
+    const bunUpdate = JSON.parse(readFileSync(join(project, "artifacts", `canary-${targetKey}-update.json`), "utf8"));
+    assert.equal(bunUpdate.arch, arch);
+    assert.equal(bunUpdate.platform, host.os);
+    const bunMetadata = JSON.parse(readFileSync(join(canaryResources, "build.json"), "utf8"));
+    assert.equal(bunMetadata.mainProcess, "bun");
+    assert.equal(bunMetadata.runtimeVersions.bun, "1.3.13");
+
+    // Seed both architectures at the same exact Cottontail release. Its
+    // binary and optional capabilities must all come from the target store.
+    const cottontailVersion = "9.8.7";
+    const revision = "b".repeat(40);
+    for (const selected of [host, target]) {
+      const root = join(env.HUTCH_HOME, "releases", "cottontail", cottontailVersion, revision, selected.key);
+      const executable = join(root, "bin", "cottontail");
+      writeFixtureFile(executable, `#!/bin/sh\necho '${selected.arch} app runtime executed on build host' >&2\nexit 93\n`);
+      chmodSync(executable, 0o755);
+      writeFixtureFile(join(root, "bin", "cottontail-core", "capability-namespace.jsc"), `core-${selected.arch}`);
+      writeFixtureFile(join(root, "bin", "cottontail-stdlib", "compression", "main.jsc"), `compression-${selected.arch}`);
+      writeFixtureFile(join(root, ".dash-installed"), "a".repeat(64));
+      writeFixtureFile(join(root, "cottontail-release.json"), JSON.stringify({
+        schema: 1, kind: "archive", product: "cottontail", version: cottontailVersion, revision, platform: selected.key,
+      }));
+      writeFixtureFile(`${root}.lock`, "");
+    }
+    manifest.toolchains.cottontail = { defaultVersion: cottontailVersion };
+    writeFixtureFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    writeFixtureFile(configPath, zigConfig.replace('mainProcess: "zig"',
+      'mainProcess: "cottontail", cottontail: { entrypoint: "src/bun/index.ts", capabilities: ["compression"] }'));
+    run(["build", "--env=canary", `--arch=${arch}`]);
+    extractRelease();
+    assert.equal(readFileSync(join(canaryExec, "cottontail"), "utf8"),
+      readFileSync(join(env.HUTCH_HOME, "releases", "cottontail", cottontailVersion, revision, target.key, "bin", "cottontail"), "utf8"));
+    assert.equal(readFileSync(join(canaryExec, "cottontail-core", "capability-namespace.jsc"), "utf8"), `core-${arch}`);
+    assert.equal(readFileSync(join(canaryExec, "cottontail-stdlib", "compression", "main.jsc"), "utf8"), `compression-${arch}`);
+    assert.match(readFileSync(bundledMain, "utf8"), /CROSS_JAVASCRIPT_MAIN/);
+    const cottontailMetadata = JSON.parse(readFileSync(join(canaryResources, "build.json"), "utf8"));
+    assert.equal(cottontailMetadata.mainProcess, "cottontail");
+    assert.equal(cottontailMetadata.runtimeVersions.cottontail, cottontailVersion);
+    const cottontailUpdate = JSON.parse(readFileSync(join(project, "artifacts", `canary-${targetKey}-update.json`), "utf8"));
+    assert.equal(cottontailUpdate.arch, arch);
+    assert.equal(cottontailUpdate.platform, host.os);
+    assert.equal(readFileSync(toolCapture, "utf8").trim().split("\n").length, 3);
+    assert.equal(readFileSync(helperCapture, "utf8").trim().split("\n").map(JSON.parse)
+      .filter(args => args.some(arg => arg.endsWith("javascript-build-helper.mjs"))).length, 2);
+    assert.ok(readFileSync(join(project, ".hutch", "dependencies.lock"), "utf8")
+      .includes(`releases/cottontail/${cottontailVersion}/${revision}/${target.key}`));
+
+    env.HUTCH_ELECTROBUN_COTTONTAIL_BINARY = cottontail;
+    const localOverride = spawnSync(hutch, ["electrobun", "build", "--env=dev", `--arch=${arch}`], {
+      cwd: project, encoding: "utf8", env, timeout: 10_000,
+    });
+    assert.notEqual(localOverride.status, 0);
+    assert.match(localOverride.stderr, /CrossArchitectureCottontailRequiresPin|cross-architecture Cottontail builds require an exact runtime pin/);
+    delete env.HUTCH_ELECTROBUN_COTTONTAIL_BINARY;
+
+    delete manifest.toolchains.cottontail;
+    writeFixtureFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const legacyFallback = spawnSync(hutch, ["electrobun", "build", "--env=dev", `--arch=${arch}`], {
+      cwd: project, encoding: "utf8", env, timeout: 10_000,
+    });
+    assert.notEqual(legacyFallback.status, 0);
+    assert.match(legacyFallback.stderr, /CrossArchitectureCottontailRequiresPin|cross-architecture Cottontail builds require an exact runtime pin/);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

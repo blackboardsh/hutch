@@ -3003,6 +3003,7 @@ pub fn main(init: std.process.Init) !void {
             error.UnsupportedCrossArchitectureMainProcess,
             error.UnsupportedCrossArchitectureFlatpak,
             error.CrossArchitectureExecutionUnsupported,
+            error.CrossArchitectureCottontailRequiresPin,
             => 1,
             error.InvalidElectrobunTargetArchitecture,
             error.DuplicateElectrobunTargetArchitecture,
