@@ -152,6 +152,7 @@ const PlatformPaths = struct {
     wgpu_lib: []const u8,
     wgpu_auxiliary_libraries: []const []const u8,
     extractor: []const u8,
+    headless_installer: ?[]const u8 = null,
     bsdiff: []const u8,
     bspatch: []const u8,
     zig_zstd: []const u8,
@@ -190,6 +191,7 @@ const ReleaseState = struct {
     compressed_tar_path: []const u8,
     patch_path: ?[]const u8,
     flatpak_payload_path: ?[]const u8,
+    headless_installer_path: ?[]const u8 = null,
 };
 
 const ReleaseTarIntegrity = struct {
@@ -1265,6 +1267,9 @@ const BundleHashEntry = struct {
 };
 
 fn prepareRelease(ctx: *const Context, config: CommandContext) !ReleaseState {
+    // Fail before packaging a payload if an opted-in installer has no valid
+    // public download endpoint or has non-object application settings.
+    if (try headlessInstallerConfig(config.root) != null) _ = try headlessInstallerMetadataJson(ctx, config);
     const platform_paths = try getPlatformPaths(ctx, config.root);
     const bundle = try appBundlePaths(ctx, config);
     const app_file_name = try artifactAppFileName(ctx, config);
@@ -1481,6 +1486,49 @@ fn releaseGeneratesPatch(root: std.json.Value) bool {
     return value != .bool or value.bool;
 }
 
+fn headlessInstallerConfig(root: std.json.Value) !?std.json.ObjectMap {
+    const release = getObjectField(root, "release") orelse return null;
+    const value = release.get("headlessInstaller") orelse return null;
+    if (value != .object) return error.InvalidHeadlessInstallerConfig;
+    const enabled = value.object.get("enabled") orelse return error.InvalidHeadlessInstallerConfig;
+    if (enabled != .bool) return error.InvalidHeadlessInstallerConfig;
+    if (value.object.get("defaults")) |defaults| {
+        if (defaults != .object) return error.InvalidHeadlessInstallerDefaults;
+    }
+    return if (enabled.bool) value.object else null;
+}
+
+fn validateHeadlessInstallerBaseUrl(base_url: []const u8) !void {
+    const uri = std.Uri.parse(base_url) catch return error.InvalidHeadlessInstallerBaseUrl;
+    const host = uri.host orelse return error.InvalidHeadlessInstallerBaseUrl;
+    const host_name = switch (host) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const loopback = std.mem.eql(u8, host_name, "127.0.0.1") or std.mem.eql(u8, host_name, "[::1]");
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (host_name.len == 0 or uri.user != null or uri.password != null or uri.query != null or
+        uri.fragment != null or (!secure and !(loopback and std.ascii.eqlIgnoreCase(uri.scheme, "http"))))
+        return error.InvalidHeadlessInstallerBaseUrl;
+}
+
+fn headlessInstallerMetadataJson(ctx: *const Context, config: CommandContext) ![]const u8 {
+    const settings = (try headlessInstallerConfig(config.root)) orelse return error.HeadlessInstallerNotEnabled;
+    const base_url = try releaseBaseUrl(ctx, config.root);
+    try validateHeadlessInstallerBaseUrl(base_url);
+    var object: std.json.ObjectMap = .empty;
+    try object.put(ctx.allocator, "schemaVersion", .{ .integer = 1 });
+    try object.put(ctx.allocator, "identifier", .{ .string = try getAppIdentifier(ctx, config) });
+    try object.put(ctx.allocator, "name", .{ .string = try getAppName(ctx, config.root) });
+    try object.put(ctx.allocator, "channel", .{ .string = buildEnvironmentName(config.build_env) });
+    try object.put(ctx.allocator, "baseUrl", .{ .string = base_url });
+    try object.put(ctx.allocator, "platform", .{ .string = osName() });
+    try object.put(ctx.allocator, "arch", .{ .string = ctx.target.archName() });
+    try object.put(ctx.allocator, "defaults", settings.get("defaults") orelse .{ .object = .empty });
+    const json = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = object }, .{});
+    if (json.len > 1024 * 1024) return error.HeadlessInstallerConfigTooLarge;
+    return json;
+}
+
 test "managed release metadata keeps Insights independent from update authority" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1526,6 +1574,67 @@ test "managed release metadata keeps Insights independent from update authority"
         \\{"release":{"baseUrl":"https://static.example.test/"}}
     , .{});
     try std.testing.expectEqualStrings("https://static.example.test/", try releaseBaseUrl(&ctx, static));
+}
+
+test "headless installer metadata preserves app-owned settings and release identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = std.testing.io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .project_root = "",
+    };
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"app":{"name":"Cloud App","identifier":"dev.example.cloud","version":"1.0.0"},
+        \\ "release":{"baseUrl":"https://releases.example.test/apps/cloud/", "headlessInstaller":{
+        \\   "enabled":true,"defaults":{"startup":{"openWindow":false},"count":2,"items":[null,"value",true]}}}}
+    , .{});
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, allocator, try headlessInstallerMetadataJson(&ctx, .{
+        .root = root,
+        .raw_json = "",
+        .build_env = .canary,
+    }), .{});
+    try std.testing.expectEqualStrings("dev.example.cloud", metadata.object.get("identifier").?.string);
+    try std.testing.expectEqualStrings("Cloud App", metadata.object.get("name").?.string);
+    try std.testing.expectEqualStrings("canary", metadata.object.get("channel").?.string);
+    try std.testing.expectEqualStrings(osName(), metadata.object.get("platform").?.string);
+    try std.testing.expectEqualStrings(ctx.target.archName(), metadata.object.get("arch").?.string);
+    try std.testing.expectEqual(@as(i64, 1), metadata.object.get("schemaVersion").?.integer);
+    try std.testing.expect(!metadata.object.get("defaults").?.object.get("startup").?.object.get("openWindow").?.bool);
+    try std.testing.expectEqual(@as(usize, 3), metadata.object.get("defaults").?.object.get("items").?.array.items.len);
+    try std.testing.expect(metadata.object.get("version") == null);
+    try std.testing.expect(metadata.object.get("hash") == null);
+}
+
+test "headless installer configuration is explicit and requires a secure public update URL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"release\":{}}", "{\"release\":{\"headlessInstaller\":{\"enabled\":false}}}" }) |json| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+        try std.testing.expect(try headlessInstallerConfig(root) == null);
+    }
+    for ([_][]const u8{ "true", "{}", "{\"enabled\":\"yes\"}" }) |value| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"release\":{{\"headlessInstaller\":{s}}}}}", .{value});
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+        try std.testing.expectError(error.InvalidHeadlessInstallerConfig, headlessInstallerConfig(root));
+    }
+    const array_defaults = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"release":{"headlessInstaller":{"enabled":true,"defaults":[]}}}
+    , .{});
+    try std.testing.expectError(error.InvalidHeadlessInstallerDefaults, headlessInstallerConfig(array_defaults));
+    for ([_][]const u8{
+        "",                                        "http://releases.example.test", "https://secret@releases.example.test", "https://releases.example.test?secret=key",
+        "https://releases.example.test/#fragment", "file:///tmp/releases",         "http://localhost:8000",
+    }) |url| try std.testing.expectError(error.InvalidHeadlessInstallerBaseUrl, validateHeadlessInstallerBaseUrl(url));
+    for ([_][]const u8{ "https://releases.example.test/app/", "http://127.0.0.1:8000", "http://[::1]:8000" }) |url|
+        try validateHeadlessInstallerBaseUrl(url);
 }
 
 test "managed apps derive canary install identities while static identities remain unchanged" {
@@ -3012,11 +3121,15 @@ fn codesignDmg(ctx: *const Context, dmg_path: []const u8) !void {
 }
 
 fn notarizeAndStaple(ctx: *const Context, app_or_dmg_path: []const u8) !void {
+    return notarizeReleasePath(ctx, app_or_dmg_path, true);
+}
+
+fn notarizeReleasePath(ctx: *const Context, app_or_dmg_path: []const u8, staple: bool) !void {
     if (builtin.os.tag != .macos) return;
 
     var submission_path = app_or_dmg_path;
     var archive_path: ?[]const u8 = null;
-    if (std.mem.endsWith(u8, app_or_dmg_path, ".app")) {
+    if (!staple or std.mem.endsWith(u8, app_or_dmg_path, ".app")) {
         const zip_path = try std.mem.concat(ctx.allocator, u8, &.{ app_or_dmg_path, ".zip" });
         std.Io.Dir.cwd().deleteFile(ctx.io, zip_path) catch {};
         try runReleaseCommand(
@@ -3101,6 +3214,9 @@ fn notarizeAndStaple(ctx: *const Context, app_or_dmg_path: []const u8) !void {
         ctx.writeStderr("hutch electrobun: Apple rejected the notarization submission\n{s}\n", .{result.stdout});
         return error.NotarizationRejected;
     }
+    // A standalone command-line executable can be submitted in a zip, but
+    // stapler only supports app bundles, disk images, and installer packages.
+    if (!staple) return;
     try runReleaseCommand(
         ctx,
         &.{ "xcrun", "stapler", "staple", app_or_dmg_path },
@@ -3147,7 +3263,11 @@ fn finishRelease(ctx: *const Context, config: CommandContext, state: ReleaseStat
         else => {},
     }
 
-    try writeReleaseArtifacts(ctx, config, state, installer_path);
+    var final_state = state;
+    if (try headlessInstallerConfig(config.root) != null) {
+        final_state.headless_installer_path = try createHeadlessInstaller(ctx, config, state.bundle.build_root);
+    }
+    try writeReleaseArtifacts(ctx, config, final_state, installer_path);
     if (state.flatpak_payload_path) |payload_path| {
         defer deleteTreeWithin(ctx, state.bundle.build_root, payload_path) catch {};
         try writeFlatpakOutput(ctx, config, payload_path, .{});
@@ -3641,6 +3761,84 @@ fn extractorMetadataJson(ctx: *const Context, config: CommandContext, hash: []co
     return std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = object }, .{});
 }
 
+const headless_installer_slot_start = "ELECTROBUN_HEADLESS_CONFIG_V1_START";
+const headless_installer_slot_end = "ELECTROBUN_HEADLESS_CONFIG_V1_END";
+const headless_installer_config_capacity = 1024 * 1024;
+
+fn headlessInstallerSlot(bytes: []const u8) !usize {
+    const slot_size = headless_installer_slot_start.len + 8 + headless_installer_config_capacity + headless_installer_slot_end.len;
+    var found: ?usize = null;
+    var position: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, position, headless_installer_slot_start)) |offset| {
+        position = offset + headless_installer_slot_start.len;
+        if (bytes.len - offset < slot_size) continue;
+        const end = offset + slot_size - headless_installer_slot_end.len;
+        if (!std.mem.eql(u8, bytes[end..][0..headless_installer_slot_end.len], headless_installer_slot_end)) continue;
+        if (found != null) return error.AmbiguousHeadlessInstallerConfigSlot;
+        found = offset;
+    }
+    return found orelse error.HeadlessInstallerConfigSlotNotFound;
+}
+
+fn writeConfiguredHeadlessInstaller(
+    ctx: *const Context,
+    engine_path: []const u8,
+    metadata: []const u8,
+    output_path: []const u8,
+) !void {
+    if (metadata.len > headless_installer_config_capacity) return error.HeadlessInstallerConfigTooLarge;
+    const input = try std.Io.Dir.openFileAbsolute(ctx.io, engine_path, .{ .follow_symlinks = false });
+    defer input.close(ctx.io);
+    if ((try input.stat(ctx.io)).kind != .file) return error.InvalidHeadlessInstallerEngine;
+    var input_buffer: [64 * 1024]u8 = undefined;
+    var reader = input.reader(ctx.io, &input_buffer);
+    const bytes = try reader.interface.allocRemaining(ctx.allocator, .limited(128 * 1024 * 1024));
+    defer ctx.allocator.free(bytes);
+    const slot = try headlessInstallerSlot(bytes);
+    const length_offset = slot + headless_installer_slot_start.len;
+    std.mem.writeInt(u64, bytes[length_offset..][0..8], @intCast(metadata.len), .little);
+    const payload_offset = length_offset + 8;
+    @memset(bytes[payload_offset..][0..headless_installer_config_capacity], 0);
+    @memcpy(bytes[payload_offset..][0..metadata.len], metadata);
+    const output = try std.Io.Dir.createFileAbsolute(ctx.io, output_path, .{
+        .permissions = .executable_file,
+    });
+    defer output.close(ctx.io);
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var writer = output.writer(ctx.io, &output_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn createHeadlessInstaller(ctx: *const Context, config: CommandContext, build_root: []const u8) ![]const u8 {
+    const platform_paths = try getPlatformPaths(ctx, config.root);
+    const engine = platform_paths.headless_installer orelse {
+        ctx.writeStderr("hutch electrobun: release.headlessInstaller requires a devkit containing headless-installer; update the selected Electrobun release\n", .{});
+        return error.HeadlessInstallerEngineNotFound;
+    };
+    const filename = try std.mem.concat(ctx.allocator, u8, &.{
+        try artifactAppFileName(ctx, config),
+        "-Headless-Setup",
+        if (builtin.os.tag == .windows) ".exe" else "",
+    });
+    const output_path = try std.fs.path.join(ctx.allocator, &.{ build_root, filename });
+    const metadata = try headlessInstallerMetadataJson(ctx, config);
+    try writeConfiguredHeadlessInstaller(ctx, engine, metadata, output_path);
+    if (builtin.os.tag == .macos) {
+        // The reserved section preserves Mach-O load-command/file sizes.
+        // Re-seal the executable after replacing its app-specific settings.
+        if (shouldCodesign(config)) {
+            const developer_id = ctx.environ_map.get("ELECTROBUN_DEVELOPER_ID") orelse return error.MissingDeveloperId;
+            try codesignPath(ctx, developer_id, output_path, null, true);
+        } else {
+            try runReleaseCommand(ctx, &.{ "/usr/bin/codesign", "--force", "--sign", "-", output_path }, ctx.project_root, null);
+        }
+        try runReleaseCommand(ctx, &.{ "/usr/bin/codesign", "--verify", "--strict", output_path }, ctx.project_root, null);
+        if (shouldNotarize(ctx, config)) try notarizeReleasePath(ctx, output_path, false);
+    }
+    return output_path;
+}
+
 fn concatenateLinuxInstaller(
     ctx: *const Context,
     extractor_path: []const u8,
@@ -3717,11 +3915,13 @@ fn writeReleaseArtifacts(
         state.compressed_tar_path,
         state.patch_path,
         installer_path,
+        state.headless_installer_path,
     };
     for (candidates) |candidate| {
         const source = candidate orelse continue;
         if (!pathExists(ctx.io, source)) continue;
-        const destination_prefix = if (installer_path != null and std.mem.eql(u8, source, installer_path.?))
+        const destination_prefix = if ((installer_path != null and std.mem.eql(u8, source, installer_path.?)) or
+            (state.headless_installer_path != null and std.mem.eql(u8, source, state.headless_installer_path.?)))
             installer_prefix
         else
             prefix;
@@ -8411,6 +8611,7 @@ fn platformPathsFromDevkit(
         .wgpu_lib = devkit.runtime.wgpu_library,
         .wgpu_auxiliary_libraries = devkit.runtime.wgpu_auxiliary_libraries,
         .extractor = devkit.runtime.extractor,
+        .headless_installer = devkit.runtime.headless_installer,
         .bsdiff = devkit.runtime.bsdiff,
         .bspatch = devkit.runtime.bspatch,
         .zig_zstd = devkit.runtime.zig_zstd,
@@ -10831,6 +11032,26 @@ test "release artifacts use a legacy manifest replaceable checksum and channel-s
     try std.testing.expectEqualStrings("rebuilthash", rebuilt_checksum.object.get("hash").?.string);
     try std.testing.expect(!pathExists(io, stale_checksum_path));
 
+    // An opted-in native installer joins the flat output without replacing
+    // the ordinary installer or changing the update protocol filenames.
+    const headless_path = try std.fs.path.join(allocator, &.{ absolute_root, "MigrationApp-canary-Headless-Setup" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = canary_compressed_path, .data = "archive" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = canary_installer_path, .data = "installer" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = patch_path, .data = "patch" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = headless_path, .data = "headless installer" });
+    try writeReleaseArtifacts(&ctx, canary_config, .{
+        .bundle = unused_bundle,
+        .hash = "headlesshash",
+        .tar_integrity = .{ .sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".*, .size = 3 },
+        .compressed_tar_path = canary_compressed_path,
+        .patch_path = patch_path,
+        .flatpak_payload_path = null,
+        .headless_installer_path = headless_path,
+    }, canary_installer_path);
+    const headless_files = canary_files ++ [_][]const u8{try std.mem.concat(allocator, u8, &.{ canary_installer_prefix, "-MigrationApp-canary-Headless-Setup" })};
+    try Flat.expect(artifact_root, &headless_files);
+    try std.testing.expect(!pathExists(io, headless_path));
+
     // Managed hosting changes only the delivery base and public deployment
     // defaults. It must never introduce release folders or rename artifacts.
     var managed_root = root;
@@ -11121,6 +11342,48 @@ test "Linux installer payload uses the extractor marker contract" {
             "ELECTROBUN_ARCHIVE_V1ARCHIVE",
         bytes,
     );
+}
+
+test "headless installer config patch preserves native file layout and rejects ambiguous slots" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const ctx = Context{
+        .init = undefined,
+        .io = io,
+        .allocator = allocator,
+        .environ_map = &environment,
+        .self_exe_path = "",
+        .project_root = root,
+    };
+    const slot_size = headless_installer_slot_start.len + 8 + headless_installer_config_capacity + headless_installer_slot_end.len;
+    const engine = try allocator.alloc(u8, "NATIVE-ENGINE".len + slot_size + "SIGNATURE".len);
+    @memset(engine, 0);
+    @memcpy(engine[0.."NATIVE-ENGINE".len], "NATIVE-ENGINE");
+    @memcpy(engine["NATIVE-ENGINE".len..][0..headless_installer_slot_start.len], headless_installer_slot_start);
+    @memcpy(engine["NATIVE-ENGINE".len + slot_size - headless_installer_slot_end.len ..][0..headless_installer_slot_end.len], headless_installer_slot_end);
+    @memcpy(engine[engine.len - "SIGNATURE".len ..], "SIGNATURE");
+    try tmp.dir.writeFile(io, .{ .sub_path = "engine", .data = engine });
+    const output = try std.fs.path.join(allocator, &.{ root, "installer" });
+    const metadata = "{\"schemaVersion\":1,\"defaults\":{\"key\":\"value\"}}";
+    try writeConfiguredHeadlessInstaller(&ctx, try std.fs.path.join(allocator, &.{ root, "engine" }), metadata, output);
+    const bytes = try tmp.dir.readFileAlloc(io, "installer", allocator, .limited(2 * 1024 * 1024));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "NATIVE-ENGINE" ++ headless_installer_slot_start));
+    try std.testing.expect(std.mem.endsWith(u8, bytes, headless_installer_slot_end ++ "SIGNATURE"));
+    const length_offset = "NATIVE-ENGINE".len + headless_installer_slot_start.len;
+    const length = std.mem.readInt(u64, bytes[length_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, metadata.len), length);
+    try std.testing.expectEqualStrings(metadata, bytes[length_offset + 8 ..][0..metadata.len]);
+    try std.testing.expectEqual(engine.len, bytes.len);
+    try std.testing.expectError(error.HeadlessInstallerConfigSlotNotFound, headlessInstallerSlot("INVALID-ENGINE"));
+    const duplicate = try std.mem.concat(allocator, u8, &.{ engine, engine });
+    try std.testing.expectError(error.AmbiguousHeadlessInstallerConfigSlot, headlessInstallerSlot(duplicate));
 }
 
 test "Linux bundle archives desktop entries independently of icon configuration" {

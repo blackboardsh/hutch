@@ -286,7 +286,7 @@ fn safeFileName(value: []const u8) bool {
 }
 
 fn supportedArtifactSuffix(filename: []const u8) bool {
-    for ([_][]const u8{ "-update.json", "-update-v2.json", "-checksum.json", ".tar.zst", ".patch", ".dmg", ".zip", ".exe", ".tar.gz" }) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
+    for ([_][]const u8{ "-update.json", "-update-v2.json", "-checksum.json", ".tar.zst", ".patch", ".dmg", ".zip", ".exe", ".tar.gz", "-Headless-Setup" }) |suffix| if (std.mem.endsWith(u8, filename, suffix)) return true;
     return false;
 }
 
@@ -333,6 +333,31 @@ fn fixture(allocator: Allocator, dir: std.Io.Dir, channel: []const u8, target: [
 
 fn testFolder(allocator: Allocator, dir: std.Io.Dir) ![]const u8 {
     return dir.realPathFileAlloc(std.testing.io, ".", allocator);
+}
+
+test "inventory includes opted-in native headless installers for each target and channel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (channels) |channel| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        for (supported_targets) |target| {
+            try fixture(a, tmp.dir, channel, target, "1.2.3", "buildHash");
+            const prefix = if (std.mem.eql(u8, channel, "stable")) target else try std.fmt.allocPrint(a, "{s}-{s}", .{ channel, target });
+            const extension: []const u8 = if (std.mem.startsWith(u8, target, "win-")) ".exe" else "";
+            const filename = try std.fmt.allocPrint(a, "{s}-Example-Headless-Setup{s}", .{ prefix, extension });
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = "native-installer" });
+        }
+        const releases = try inventory(std.testing.io, a, try testFolder(a, tmp.dir), channel, null, null);
+        try std.testing.expectEqual(@as(usize, 1), releases.len);
+        try std.testing.expectEqual(@as(usize, supported_targets.len * 3), releases[0].files.len);
+        var installers: usize = 0;
+        for (releases[0].files) |file| if (std.mem.indexOf(u8, file.filename, "-Headless-Setup") != null) {
+            installers += 1;
+        };
+        try std.testing.expectEqual(@as(usize, supported_targets.len), installers);
+    }
 }
 
 test "inventory infers both channels and includes only their own patches and installers" {

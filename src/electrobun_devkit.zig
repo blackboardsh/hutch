@@ -39,6 +39,8 @@ pub const RuntimePaths = struct {
     bun: ?[]const u8,
     launcher: []const u8,
     extractor: []const u8,
+    /// Optional in schema-1 devkits published before unattended installers.
+    headless_installer: ?[]const u8 = null,
     core_library: []const u8,
     native_wrapper: []const u8,
     native_wrapper_cef: []const u8,
@@ -264,6 +266,10 @@ pub fn loadFor(
             try requiredExistingPath(io, allocator, core_root, runtime, "bun", .file),
         .launcher = try requiredExistingPath(io, allocator, core_root, runtime, "launcher", .file),
         .extractor = try requiredExistingPath(io, allocator, core_root, runtime, "extractor", .file),
+        .headless_installer = if (runtime.get("headlessInstaller") != null)
+            try requiredExistingPath(io, allocator, core_root, runtime, "headlessInstaller", .file)
+        else
+            null,
         .core_library = try requiredExistingPath(io, allocator, core_root, runtime, "coreLibrary", .file),
         .native_wrapper = try requiredExistingPath(io, allocator, core_root, runtime, "nativeWrapper", .file),
         .native_wrapper_cef = try requiredExistingPath(io, allocator, core_root, runtime, "nativeWrapperCef", .file),
@@ -1256,10 +1262,33 @@ test "package-free v2 devkit resolves runtime SDKs and toolchain defaults" {
     try std.testing.expectEqualStrings("1.4.0", resolution.toolchains.bun);
     try std.testing.expectEqualStrings("0.5.0", resolution.toolchains.cottontail.?);
     try std.testing.expect(resolution.runtime.bun == null);
+    try std.testing.expect(resolution.runtime.headless_installer == null);
     try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.preload_full, "preload-full.js"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.javascript.main, "api/sdks/main/index.ts"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.go.root, "go-sdk"));
     try std.testing.expect(std.mem.endsWith(u8, resolution.sdks.odin.collection, "odin-sdk"));
+}
+
+test "headless installer engine is optional for older devkits and validated when declared" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const version = "2.0.0-beta.1";
+    const root = try createTestDevkit(io, allocator, &tmp, version);
+    const manifest = try std.mem.replaceOwned(u8, allocator, try testManifestSource(allocator, version),
+        \\      "extractor": "bin/extractor",
+    ,
+        \\      "extractor": "bin/extractor",
+        \\      "headlessInstaller": "bin/headless-installer",
+    );
+    try tmp.dir.writeFile(io, .{ .sub_path = manifest_file_name, .data = manifest });
+    try std.testing.expectError(error.ElectrobunDevkitLayoutMissing, load(io, allocator, root, version));
+    try tmp.dir.writeFile(io, .{ .sub_path = "bin/headless-installer", .data = "native installer" });
+    const resolution = try load(io, allocator, root, version);
+    try std.testing.expect(std.mem.endsWith(u8, resolution.runtime.headless_installer.?, "bin/headless-installer"));
 }
 
 test "Electrobun 2.0.1-beta.18 schema-1 devkit preserves its embedded Bun runtime" {
