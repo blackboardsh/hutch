@@ -936,8 +936,24 @@ fn existingPath(
 ) ![]const u8 {
     try validateRelativePosixPath(relative_path);
     const absolute_path = try std.fs.path.join(allocator, &.{ core_root, relative_path });
-    const stat = std.Io.Dir.cwd().statFile(io, absolute_path, .{}) catch
+    const stat = std.Io.Dir.cwd().statFile(io, absolute_path, .{}) catch |err| {
+        // Preserve the original failure before reducing it to the public layout
+        // error. In particular, Windows stat can fail while opening a read
+        // handle even when a separate metadata-only probe succeeds.
+        var buffer: [2048]u8 = undefined;
+        var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
+        const stderr = &writer.interface;
+        stderr.print("hutch electrobun: native devkit path stat failed: {f}\n", .{
+            std.json.fmt(.{
+                .relativePath = relative_path,
+                .expectedKind = @tagName(kind),
+                .originalError = @errorName(err),
+                .engineArch = @tagName(builtin.cpu.arch),
+            }, .{}),
+        }) catch {};
+        stderr.flush() catch {};
         return error.ElectrobunDevkitLayoutMissing;
+    };
     switch (kind) {
         .file => if (stat.kind != .file) return error.ElectrobunDevkitLayoutInvalid,
         .directory => if (stat.kind != .directory) return error.ElectrobunDevkitLayoutInvalid,
